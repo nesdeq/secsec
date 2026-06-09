@@ -357,6 +357,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -521,6 +522,7 @@ dependencies = [
  "poly1305",
  "proptest",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]

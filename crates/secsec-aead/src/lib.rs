@@ -22,7 +22,9 @@
 //!
 //! `key` is `k_obj` from §9.4 and **MUST be unique per sealed object**. The 96-bit nonce is fixed
 //! at zero; that is sound *only* under this uniqueness (a unique key ⇒ a unique keystream). Never
-//! call [`seal`] twice with the same `key` and different plaintext.
+//! call [`seal`] twice with the same `key` and different plaintext. Key *lifecycle* (zeroization
+//! of `key` itself) is owned by the caller / key-management layer (§18); this crate zeroizes only
+//! its own secret transient (the Poly1305 one-time key).
 //!
 //! `AD` here is `FRAME ‖ id` (a fixed 43-byte string in secsec). The commitment input
 //! `"secsec-ctx-v1" ‖ AD ‖ T` is unambiguous because the label is a fixed prefix and `T` is a
@@ -35,6 +37,7 @@ use chacha20::ChaCha20;
 use poly1305::universal_hash::{KeyInit, UniversalHash};
 use poly1305::Poly1305;
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 /// Fixed all-zero 96-bit nonce. Sound only because `key` is unique per object (§9.4).
 const NONCE: [u8; 12] = [0u8; 12];
@@ -58,26 +61,8 @@ impl core::fmt::Display for AeadError {
 
 impl std::error::Error for AeadError {}
 
-/// Poly1305 one-time key = first 32 bytes of the ChaCha20 keystream at block 0 (RFC 8439 §2.6).
-fn poly1305_keygen(key: &[u8; 32]) -> [u8; 32] {
-    let mut cipher = ChaCha20::new_from_slices(key, &NONCE).expect("32-byte key / 12-byte nonce");
-    let mut otk = [0u8; 32];
-    cipher.apply_keystream(&mut otk); // XOR over zeros = keystream[0..32]
-    otk
-}
-
-/// Derive the Poly1305 one-time key (block 0) and XOR the ChaCha20 keystream from **block 1**
-/// into `buf` (RFC 8439: keystream for the message starts at counter 1). Returns the one-time key.
-fn keygen_and_xor(key: &[u8; 32], buf: &mut [u8]) -> [u8; 32] {
-    let mut cipher = ChaCha20::new_from_slices(key, &NONCE).expect("32-byte key / 12-byte nonce");
-    let mut otk = [0u8; 32];
-    cipher.apply_keystream(&mut otk); // consume block 0 -> one-time key
-    cipher.seek(64u64); // skip the rest of block 0; message keystream begins at block 1
-    cipher.apply_keystream(buf);
-    otk
-}
-
-/// RFC 8439 §2.8 AEAD tag over `(aad, ct)`: `MAC(aad ‖ pad16 ‖ ct ‖ pad16 ‖ le64|aad| ‖ le64|ct|)`.
+/// RFC 8439 §2.8 AEAD tag over `(aad, ct)`: `MAC(aad ‖ pad16 ‖ ct ‖ pad16 ‖ le64|aad| ‖ le64|ct|)`,
+/// where the MAC key is the Poly1305 one-time key derived from ChaCha20 block 0.
 fn poly1305_aead_tag(otk: &[u8; 32], aad: &[u8], ct: &[u8]) -> [u8; 16] {
     let mut mac = Poly1305::new_from_slice(otk).expect("32-byte poly1305 key");
     mac.update_padded(aad); // aad ‖ zero-pad to 16
@@ -109,8 +94,15 @@ fn ctx_commit(key: &[u8; 32], ad: &[u8], t: &[u8; 16]) -> CtxTag {
 /// See the crate docs for the **uniqueness contract** on `key`.
 #[must_use]
 pub fn seal(key: &[u8; 32], ad: &[u8], plaintext: &[u8]) -> (CtxTag, Vec<u8>) {
+    let mut cipher = ChaCha20::new_from_slices(key, &NONCE).expect("32-byte key / 12-byte nonce");
+    // Block 0 -> Poly1305 one-time key (RFC 8439 §2.6); zeroized on drop.
+    let mut otk = Zeroizing::new([0u8; 32]);
+    cipher.apply_keystream(&mut *otk);
+    // Message keystream begins at block 1.
+    cipher.seek(64u64);
     let mut ct = plaintext.to_vec();
-    let otk = keygen_and_xor(key, &mut ct);
+    cipher.apply_keystream(&mut ct);
+
     let t = poly1305_aead_tag(&otk, ad, &ct);
     let ctx_tag = ctx_commit(key, ad, &t);
     (ctx_tag, ct)
@@ -125,17 +117,22 @@ pub fn open(
     ctx_tag: &CtxTag,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, AeadError> {
-    // 1. Recompute T over (ad, ciphertext) — no plaintext produced.
-    let otk = poly1305_keygen(key);
+    let mut cipher = ChaCha20::new_from_slices(key, &NONCE).expect("32-byte key / 12-byte nonce");
+    // Block 0 -> one-time key; zeroized on drop.
+    let mut otk = Zeroizing::new([0u8; 32]);
+    cipher.apply_keystream(&mut *otk);
+
+    // 1. Recompute T over (ad, ciphertext) — no plaintext produced yet.
     let t = poly1305_aead_tag(&otk, ad, ciphertext);
     // 2. Recompute the commitment and compare in constant time.
     let expected = ctx_commit(key, ad, &t);
     if !bool::from(ctx_tag[..].ct_eq(&expected[..])) {
         return Err(AeadError);
     }
-    // 3. Only now decrypt (XOR keystream from block 1).
+    // 3. Only now decrypt: reuse the same cipher, advanced to block 1.
+    cipher.seek(64u64);
     let mut pt = ciphertext.to_vec();
-    let _ = keygen_and_xor(key, &mut pt);
+    cipher.apply_keystream(&mut pt);
     Ok(pt)
 }
 
@@ -164,7 +161,8 @@ mod tests {
 
     /// Cross-check: our raw ChaCha20 keystream (block 1+) and our RFC 8439 Poly1305 tag must match
     /// the audited reference `chacha20poly1305` crate exactly. This validates that our hand-rolled
-    /// tag framing is RFC-correct (the fiddly part of building CTX from raw primitives).
+    /// tag framing is RFC-correct (the fiddly part of building CTX from raw primitives), and serves
+    /// as the known-answer anchor until the `vectors/` harness lands frozen vectors at M0 wrap.
     #[test]
     fn ciphertext_and_tag_match_reference() {
         use chacha20poly1305::aead::AeadInPlace;
@@ -174,12 +172,16 @@ mod tests {
         let ad: &[u8] = b"some associated data of odd length!!";
         let pt: &[u8] = b"plaintext that is not a multiple of sixteen bytes long";
 
-        // ours
+        // ours: derive one-time key (block 0), encrypt from block 1, MAC.
+        let mut cipher = ChaCha20::new_from_slices(&key, &NONCE).unwrap();
+        let mut otk = [0u8; 32];
+        cipher.apply_keystream(&mut otk);
+        cipher.seek(64u64);
         let mut my_ct = pt.to_vec();
-        let otk = keygen_and_xor(&key, &mut my_ct);
+        cipher.apply_keystream(&mut my_ct);
         let my_t = poly1305_aead_tag(&otk, ad, &my_ct);
 
-        // reference, same key, nonce=0
+        // reference, same key, nonce = 0.
         let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
         let mut ref_ct = pt.to_vec();
         let ref_tag = cipher
