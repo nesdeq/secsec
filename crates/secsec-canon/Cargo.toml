@@ -1,0 +1,13 @@
+[package]
+name = "secsec-canon"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Canonical, deterministic wire encoding for hashed/signed/addressed secsec structures (finaldesign.md §9.3)."
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
