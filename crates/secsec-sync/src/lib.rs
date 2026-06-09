@@ -20,6 +20,7 @@
 
 pub mod dag;
 pub mod merge;
+pub mod rollback;
 
 use secsec_canon::{verify_reencode, CanonError, Reader, Writer};
 use secsec_frame::{Frame, FrameError, ObjType, FRAME_LEN, MAX_BLOB_SIZE};
