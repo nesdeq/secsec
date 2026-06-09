@@ -10,6 +10,8 @@ description = "QUIC+TLS1.3 transport: pinned self-signed host-key verifier (fina
 workspace = true
 
 [dependencies]
+secsec-sig = { path = "../secsec-sig" }
+secsec-canon = { path = "../secsec-canon" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 x509-cert = "0.2"
 blake3 = "1"

@@ -20,6 +20,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
+
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring::default_provider;
 use rustls::crypto::{verify_tls13_signature, WebPkiSupportedAlgorithms};

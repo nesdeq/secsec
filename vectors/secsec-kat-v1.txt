@@ -66,6 +66,11 @@ ref_hash     = 40d8bd93f870c83e494ff102e6604ee4e0d7683cc36da8e26eb24490d3e4cfa3
 head_nonce   = 070707070707070707070707
 head_blob    = 737365630101010000000307070707070707070707070732606c8303716a667b303fd332a3e95f60a85422ed82a4d278642d1d35301852bf4992736077b620823945e522d418cf6d06d04a394f84084274abd6e7e4a3ab17594fff0cf359b5065e4d15ca901501023755da139ab87cf0f0bb0dac3c1397c683ba9c3d36eabbc92789c8d8075b9c7e0e5de5e0
 
+[auth]   # asserts: secsec-transport  auth::tests::transcript_kat
+# §11 QUIC session transcript = running BLAKE3 over client-hello then server-hello.
+# version=1, client_nonce=0x01*32, server_nonce=0x02*32, host_id=0x03*32.
+session_transcript = d7da869b22932e7f1e55fe87d1bec0245d9c41273dc4b39e38c3c4e0328ebbde
+
 [sas]   # asserts: secsec-roster  tests::sas_kat
 # §7 enrollment short-authentication-string. Inputs:
 rfp         = 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a

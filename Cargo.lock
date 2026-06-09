@@ -1256,6 +1256,8 @@ dependencies = [
  "blake3",
  "rcgen",
  "rustls",
+ "secsec-canon",
+ "secsec-sig",
  "subtle",
  "x509-cert",
 ]
