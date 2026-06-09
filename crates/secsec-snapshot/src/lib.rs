@@ -602,10 +602,11 @@ fn restore_tree(
         match entry {
             Entry::File {
                 name,
+                mode,
+                mtime,
                 size,
                 path_salt,
                 chunks,
-                ..
             } => {
                 let mut data = Vec::new();
                 for cid in chunks {
@@ -615,18 +616,42 @@ fn restore_tree(
                 if data.len() as u64 != *size {
                     return Err(SnapError::Malformed("restored file size mismatch"));
                 }
-                std::fs::write(dir.join(name), &data)?;
+                let path = dir.join(name);
+                std::fs::write(&path, &data)?;
+                apply_metadata(&path, *mode, *mtime)?;
             }
             Entry::Dir {
                 name,
+                mode,
+                mtime,
                 subtree,
                 subtree_salt,
-                ..
             } => {
-                restore_tree(subtree, subtree_salt, mk, store, &dir.join(name), depth + 1)?;
+                let path = dir.join(name);
+                restore_tree(subtree, subtree_salt, mk, store, &path, depth + 1)?;
+                // Set the dir's metadata AFTER populating it (writing children bumps its mtime).
+                apply_metadata(&path, *mode, *mtime)?;
             }
         }
     }
+    Ok(())
+}
+
+/// Reproduce a tree entry's recorded `mode` (Unix perms) and `mtime` on the restored path, so that a
+/// snapshot → restore → snapshot round trip is **idempotent** (the tree id is content-addressed and
+/// includes mtime/mode, §6; if restore dropped them, every post-clone sync would see a phantom change
+/// and author a spurious commit). `mtime` is whole seconds (matching the snapshot's precision).
+fn apply_metadata(path: &Path, mode: u32, mtime: u64) -> Result<(), SnapError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if mode != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(mtime as i64, 0))?;
     Ok(())
 }
 
@@ -872,6 +897,13 @@ mod tests {
 
         let (root_tree, root_salt) = snapshot_tree(src.path(), &m, &store, None).unwrap();
         restore_tree_into(&root_tree, &root_salt, &m, &store, dst.path()).unwrap();
+
+        // restore→snapshot is idempotent: re-snapshotting the restored tree on top of the same base
+        // yields the IDENTICAL root id (mtimes/modes preserved). Without it, a phantom mtime change
+        // would make every post-clone sync author a spurious commit (the CommitReplay bug).
+        let (resnap, _) =
+            snapshot_tree(dst.path(), &m, &store, Some((&root_tree, &root_salt))).unwrap();
+        assert_eq!(resnap, root_tree, "restore→snapshot must be idempotent");
 
         assert_eq!(
             read_tree(src.path()),
