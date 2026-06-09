@@ -161,8 +161,9 @@ mod tests {
 
     /// Cross-check: our raw ChaCha20 keystream (block 1+) and our RFC 8439 Poly1305 tag must match
     /// the audited reference `chacha20poly1305` crate exactly. This validates that our hand-rolled
-    /// tag framing is RFC-correct (the fiddly part of building CTX from raw primitives), and serves
-    /// as the known-answer anchor until the `vectors/` harness lands frozen vectors at M0 wrap.
+    /// tag framing is RFC-correct (the fiddly part of building CTX from raw primitives); it is what
+    /// independently anchors the *ciphertext* half of the frozen `ctx_kat` vector — only the 32-byte
+    /// BLAKE3 commitment tag in that KAT is a self-captured golden value.
     #[test]
     fn ciphertext_and_tag_match_reference() {
         use chacha20poly1305::aead::AeadInPlace;
@@ -226,6 +227,30 @@ mod tests {
         let (tag, ct) = seal(&k1, ad, b"secret");
         assert_eq!(open(&k1, ad, &tag, &ct).unwrap(), b"secret");
         assert_eq!(open(&k2, ad, &tag, &ct), Err(AeadError));
+    }
+
+    fn hx(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Frozen CTX KAT, mirrored in `vectors/secsec-kat-v1.txt [aead]`. Pins the committing-AEAD
+    /// wire output (`ctx_tag ‖ ct`) for fixed `(key, ad, plaintext)` so any change to the
+    /// construction is caught against the committed vector.
+    #[test]
+    fn ctx_kat() {
+        let key = [0x42u8; 32];
+        let ad: &[u8] = b"secsec-aead-kat-ad";
+        let pt: &[u8] = b"secsec aead kat plaintext";
+        let (ctx_tag, ct) = seal(&key, ad, pt);
+        assert_eq!(
+            hx(&ctx_tag),
+            "03f2eb3d9adf7ce304751d18f32d02e9e169bf00cbea129e2a46cdfa3a141273"
+        );
+        assert_eq!(
+            hx(&ct),
+            "2a03875878d713ac89c03014944edc98cecbc5b0c4e1c1648b"
+        );
+        assert_eq!(open(&key, ad, &ctx_tag, &ct).unwrap(), pt);
     }
 
     proptest! {

@@ -197,6 +197,33 @@ mod tests {
         assert_ne!(a, content_id(&idk_t, &frame_t, &[1u8; 16], b"hello"));
     }
 
+    fn hx(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Frozen object-plane KAT, mirrored in `vectors/secsec-kat-v1.txt [object]`. Uses
+    /// `master_key=[0x11;32]` (the kdf vector key) so the whole vector chain is self-consistent:
+    /// a `Chunk` at `gen=1`, `path_salt=[0x01;16]`, plaintext `b"object-plane-kat"`.
+    #[test]
+    fn object_kat() {
+        let m = MasterKey::new(1, [0x11; 32]);
+        let salt = [0x01u8; 16];
+        let (id, blob) = seal_object(&m, ObjType::Chunk, &salt, b"object-plane-kat");
+        assert_eq!(
+            hx(&id),
+            "7e4b0ee5fbd6047722f1576005bd0b64f25e33b2ea772a9a19679066efc3d285"
+        );
+        assert_eq!(
+            hx(&blob),
+            "737365630101010000000093396520adcd7b6c1be2b70da845c23b38eae085e64b6c2143dd3158a62cc9d2c61b3694585207be869bf7f23c68da21"
+        );
+        // and it opens back to the plaintext (full three-way verify).
+        assert_eq!(
+            open_object(&m, ObjType::Chunk, &salt, &id, &blob).unwrap(),
+            b"object-plane-kat"
+        );
+    }
+
     #[test]
     fn seal_open_round_trip_chunk_and_nonpath() {
         let m = mk();

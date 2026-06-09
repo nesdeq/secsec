@@ -1205,6 +1205,31 @@ mod tests {
         ));
     }
 
+    /// Frozen wire KATs for the deterministic AEAD layers, mirrored in
+    /// `vectors/secsec-kat-v1.txt`. Input `roster_key` is `roster_key[g=1]` for
+    /// `master_key=[0x11;32]` (the kdf vector), so the chain of vectors is self-consistent.
+    #[test]
+    fn wire_kat() {
+        let rk = roster_key_for(1, [0x11; 32]); // == roster_key[g=1] in the [kdf] vector
+
+        // Roster entry AEAD (§9.5): FRAME(11) ‖ ctx_tag(32) ‖ ct, gen=1, seq=1.
+        let blob = seal_entry(&rk, 1, 1, b"roster-entry-kat");
+        assert_eq!(
+            hx(&blob),
+            "7373656301010100000004c69b06e76f52eb0570b7bac2eff9552c545c1906dddfc31b06a39faf2e36d4a764087224e2cb1ce70dbe9a15092153aa"
+        );
+        assert_eq!(open_entry(&rk, 1, 1, &blob).unwrap(), b"roster-entry-kat");
+
+        // Roster-key history (§8.2): bare ctx_tag(32) ‖ ct(32), g=1, wrapping 0x00..0x1f.
+        let kg: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let wrap = seal_roster_keyhist(&rk, 1, &kg);
+        assert_eq!(
+            hx(&wrap),
+            "92397f6784bd2df46eb8a3fb1984fa98970abc9d6ecc80656a8d674b55221483d7626d73f776a99579f59ba22ce7b32d3929091d7b720d4d465e0b3f775f4a68"
+        );
+        assert_eq!(&open_roster_keyhist(&rk, 1, &wrap).unwrap()[..], &kg[..]);
+    }
+
     fn hx(b: &[u8]) -> String {
         let mut s = String::with_capacity(b.len() * 2);
         for x in b {
