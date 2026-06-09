@@ -1,0 +1,15 @@
+[package]
+name = "secsec-proto"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Server-API per-op authorization: args_hash + write/read-auth signatures (finaldesign.md §12, §9.6)."
+
+[lints]
+workspace = true
+
+[dependencies]
+secsec-sig = { path = "../secsec-sig" }
+secsec-canon = { path = "../secsec-canon" }
+blake3 = "1"

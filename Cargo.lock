@@ -1188,6 +1188,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "secsec-proto"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "secsec-canon",
+ "secsec-sig",
+]
+
+[[package]]
 name = "secsec-roster"
 version = "0.0.0"
 dependencies = [
