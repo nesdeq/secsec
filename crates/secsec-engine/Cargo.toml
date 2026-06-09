@@ -16,8 +16,8 @@ secsec-store = { path = "../secsec-store" }
 secsec-kdf = { path = "../secsec-kdf" }
 secsec-object = { path = "../secsec-object" }
 secsec-frame = { path = "../secsec-frame" }
+secsec-sig = { path = "../secsec-sig" }
 
 [dev-dependencies]
 tempfile = "3"
-secsec-sig = { path = "../secsec-sig" }
 getrandom = "0.3"
