@@ -705,12 +705,13 @@ reads until reconnect depends on whether the server re-verifies keyslot existenc
   observations do not apply to future data; default-on object-size padding (below) eliminates the
   boundary signal required for key extraction; see §22.
 - **Padding:** size-bucket padding is **on by default for metadata objects** (trees/commits/roster
-  — small, cheap) and **on by default for chunk objects**. Chunk padding buckets are powers of
-  two from 16 KiB to 256 KiB: each chunk is padded to the nearest power-of-two size ≥ its actual
-  size, with a maximum bucket of 256 KiB (= FastCDC max chunk size). This ensures padded sizes
-  never reveal the true chunk boundary sequence and makes the "eliminates the CDC boundary signal"
-  claim verifiable. See §19 for the normative bucket table. Padding reduces chunk-size
-  fingerprinting. Opt-out available (space/dedup cost acknowledged).
+  — small, cheap) and **on by default for chunk objects**. The default chunk policy pads each
+  chunk to the next power-of-two size ≥ its size (reversible ISO/IEC 7816-4 bit padding), a bounded
+  ≤2× overhead that blurs sizes into power-of-two buckets. This **substantially reduces — but does
+  not fully eliminate** — the boundary-sequence signal (the bucket sequence still leaks coarse
+  sizes). **Full elimination** requires the **uniform** policy (pad all chunks to one fixed size),
+  available opt-in at higher space cost. Padding can also be turned **off** (opt-out; space/dedup
+  over privacy). See §19 for the normative policy values.
 - **Per-path random salt (default-on):** each path mixes a `path_salt` (16-byte random, per-path,
   generated at first sync and stored encrypted in the tree blob) into id derivation (§9.2):
   `id = BLAKE3::keyed_hash(id_key[gen][type], FRAME ‖ path_salt ‖ plaintext)`. This disables
@@ -1167,7 +1168,7 @@ path only.
 | `server_nonce` size / TTL | 32 B / 60 s | single-use; replay bound; server SHOULD re-verify keyslot existence on each per-op request and MUST do so at least once per this TTL window (§9.6, §12) |
 | GC grace window | 48 h | `GC_GRACE_WINDOW`; shields recent arrivals during multi-day offline periods; normative definition in §15 — this value MUST match §15 exactly |
 | Metadata padding buckets | powers of two | default-on (small objects) |
-| Chunk padding buckets | 256 KiB fixed | all chunks padded to FastCDC max size; eliminates CDC boundary signal entirely; opt-out available |
+| Chunk padding policy | power-of-two (default) / uniform (opt-in) / off (opt-out) | default pads to next power-of-two ≥ size (≤2× overhead) — *reduces* the boundary signal; uniform pads all chunks to one fixed size — *eliminates* it at higher cost; off saves space |
 | Per-key storage quota | 10 GiB default | configurable; server MUST enforce |
 | Per-key write rate | 100 MB/s sustained, burst 1 GiB | server MUST enforce after auth |
 | Per-key read rate | 200 MB/s sustained | server MUST enforce after auth; matches 2× write rate to allow sync catch-up without unbounded egress |
@@ -1274,7 +1275,7 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
 
 - **Keyed CDC chosen-plaintext key extraction.** `cdc_seed` secrecy is contingent: an adversary
   who can cause the victim to archive chosen-plaintext data can recover the secret gear-table key
-  (Alexeev et al., ePrint 2025/532). Default-on padding eliminates the boundary signal; `cdc_seed`
+  (Alexeev et al., ePrint 2025/532). Default-on power-of-two padding substantially reduces the boundary signal (the uniform policy, opt-in, eliminates it); `cdc_seed`
   is generation-scoped so rotation limits exposure. Not an information-theoretic impossibility;
   fixed substantially by default-on padding.
 
