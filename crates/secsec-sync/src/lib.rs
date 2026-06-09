@@ -18,6 +18,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dag;
+
 use secsec_canon::{verify_reencode, CanonError, Reader, Writer};
 use secsec_frame::{Frame, FrameError, ObjType, FRAME_LEN, MAX_BLOB_SIZE};
 use secsec_kdf::MasterKey;
