@@ -1,0 +1,18 @@
+[package]
+name = "secsec-roster"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Roster sigchain: entries, fold/succession, anti-rollback frontier (finaldesign.md §8.1)."
+
+[lints]
+workspace = true
+
+[dependencies]
+secsec-sig = { path = "../secsec-sig" }
+secsec-frame = { path = "../secsec-frame" }
+secsec-canon = { path = "../secsec-canon" }
+blake3 = "1"
+
+[dev-dependencies]

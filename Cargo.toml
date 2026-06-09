@@ -1,7 +1,7 @@
 # secsec — Cargo workspace. See IMPLEMENTATION.md for the crate map and build order.
 [workspace]
 resolver = "2"
-members = ["crates/secsec-canon", "crates/secsec-aead", "crates/secsec-kdf", "crates/secsec-frame", "crates/secsec-chunk", "crates/secsec-object", "crates/secsec-store", "crates/secsec-snapshot", "crates/secsec-sig", "crates/secsec-keyslot"]
+members = ["crates/secsec-canon", "crates/secsec-aead", "crates/secsec-kdf", "crates/secsec-frame", "crates/secsec-chunk", "crates/secsec-object", "crates/secsec-store", "crates/secsec-snapshot", "crates/secsec-sig", "crates/secsec-keyslot", "crates/secsec-roster"]
 
 [workspace.package]
 edition = "2021"

@@ -168,6 +168,16 @@ impl DevicePublic {
         Ok(self.key.to_bytes()?)
     }
 
+    /// Parse a key from its canonical SSH binary encoding (inverse of [`Self::to_canonical`]).
+    /// Rejects non-Ed25519 keys. Used to reconstruct a device pubkey from a sigchain entry.
+    pub fn from_canonical(bytes: &[u8]) -> Result<Self, SigError> {
+        let key = PublicKey::from_bytes(bytes)?;
+        if key.algorithm() != Algorithm::Ed25519 {
+            return Err(SigError::NotEd25519);
+        }
+        Ok(Self { key })
+    }
+
     /// This key's device id.
     pub fn device_id(&self) -> Result<DeviceId, SigError> {
         device_id_of(&self.key)
@@ -279,6 +289,16 @@ mod tests {
         let ab = a_sec.diffie_hellman(&XPub::from(b_pub));
         let ba = b_sec.diffie_hellman(&XPub::from(a_pub));
         assert_eq!(ab.as_bytes(), ba.as_bytes());
+    }
+
+    #[test]
+    fn canonical_public_round_trips() {
+        let k = DeviceKey::generate().unwrap();
+        let pk = k.public();
+        let canon = pk.to_canonical().unwrap();
+        let reparsed = DevicePublic::from_canonical(&canon).unwrap();
+        assert_eq!(reparsed.device_id().unwrap(), pk.device_id().unwrap());
+        assert_eq!(reparsed.to_canonical().unwrap(), canon);
     }
 
     #[test]
