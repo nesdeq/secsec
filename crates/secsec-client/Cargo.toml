@@ -16,6 +16,7 @@ secsec-object = { path = "../secsec-object" }
 secsec-frame = { path = "../secsec-frame" }
 secsec-kdf = { path = "../secsec-kdf" }
 secsec-sync = { path = "../secsec-sync" }
+secsec-engine = { path = "../secsec-engine" }
 secsec-sig = { path = "../secsec-sig" }
 blake3 = "1"
 

@@ -5,25 +5,31 @@
 //! read side fetches a head, fetches a commit's closure **verifying every object on arrival** (§9.2),
 //! and restores it. The remote is abstracted as the [`Remote`] trait so the orchestration is exercised
 //! against the real blind-CAS storage semantics in-process; the QUIC adapter (over `secsec-transport`)
-//! and the cross-device merge loop are layered on top.
+//! is a thin layer on top.
 //!
-//! **This slice is the linear single-author path** — push, then pull-and-restore by a holder of the
-//! same master key. Resolving *which* roster member signed a fetched head (needed before a
-//! cross-device three-way merge) is the next slice; here the caller supplies the expected signer key.
+//! - **Linear path:** [`push_objects`]/[`push_head`] then [`pull_restore`] — push, then
+//!   pull-and-restore by a holder of the same master key.
+//! - **Cross-device sync** ([`sync_ref`]): fetch the remote head, [`resolve_head_signer`] against the
+//!   folded roster (the head carries no `device_id`, so the signer is the one member key that
+//!   verifies it), bring the remote closure local, run the rollback-gated three-way merge
+//!   ([`secsec_engine::merge_heads`]), and push the merge — two devices reconciling through one blind
+//!   server with no silent data loss.
 
 #![forbid(unsafe_code)]
 
+use secsec_engine::{merge_heads, CommitAuthor, MergeError, SyncAction};
 use secsec_frame::ObjType;
 use secsec_kdf::MasterKey;
 use secsec_object::{open_object, Id, ObjError, PathSalt};
-use secsec_sig::DevicePublic;
+use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
 use secsec_snapshot::{Entry, SnapError};
 use secsec_store::{Store, StoreError, ABSENT_HEAD};
+use secsec_sync::rollback::{SiblingHead, SyncFrontier};
 use secsec_sync::{
     build_head, open_head, random_nonce, ref_hash, seal_head, sign_head, verify_head, Head,
     HeadError,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// An opaque error from a [`Remote`] implementation (network, storage, protocol). Carried as a string
@@ -77,6 +83,10 @@ pub enum ClientError {
     MissingRemote(Id),
     /// The `cas-head` lost the race (a concurrent writer advanced the ref).
     CasConflict,
+    /// A fetched head's signature matched no current roster member (forged or stale-roster head).
+    HeadNotMember,
+    /// The rollback-aware merge errored — notably [`MergeError::Rollback`], a §10 security alarm.
+    Merge(MergeError),
 }
 
 impl core::fmt::Display for ClientError {
@@ -92,10 +102,17 @@ impl core::fmt::Display for ClientError {
             ClientError::CasConflict => {
                 f.write_str("cas-head conflict (ref advanced concurrently)")
             }
+            ClientError::HeadNotMember => f.write_str("fetched head signed by a non-member"),
+            ClientError::Merge(e) => write!(f, "merge: {e}"),
         }
     }
 }
 impl std::error::Error for ClientError {}
+impl From<MergeError> for ClientError {
+    fn from(e: MergeError) -> Self {
+        ClientError::Merge(e)
+    }
+}
 impl From<RemoteError> for ClientError {
     fn from(e: RemoteError) -> Self {
         ClientError::Remote(e)
@@ -288,6 +305,125 @@ pub async fn pull_restore<R: Remote>(
     secsec_snapshot::verify_commit(signer, &commit, &csig)?;
     secsec_snapshot::restore_commit_tree(&commit, mk, store, dest)?;
     Ok(Some(head))
+}
+
+// ---- cross-device sync (fetch → resolve signer → rollback-gated merge → push) ----
+
+/// Resolve which roster member signed `head` by trying each member's key. The head carries no
+/// `device_id` (§9.6's signed message omits it) and refs are shared-per-name (§13 `H` keys only the
+/// ref name), so the signer is identified by the **one** member key that verifies the signature.
+/// Returns that member's `device_id`, or `None` if no current member signed it (forged / stale-roster
+/// head).
+#[must_use]
+pub fn resolve_head_signer(
+    members: &BTreeMap<DeviceId, DevicePublic>,
+    head: &Head,
+    sig: &[u8],
+) -> Option<DeviceId> {
+    members
+        .iter()
+        .find_map(|(id, pk)| verify_head(pk, head, sig).is_ok().then_some(*id))
+}
+
+/// The outcome of [`sync_ref`].
+#[derive(Debug, Clone)]
+pub struct SyncReport {
+    /// What was done with the ref (reuses the engine's classification).
+    pub action: SyncAction,
+    /// The frontier advanced by observing the remote head (§8.5: seal before the next write).
+    pub frontier: SyncFrontier,
+    /// The head we wrote, if we advanced the ref (merge or fast-forward-the-remote-to-us).
+    pub wrote: Option<(Head, Vec<u8>)>,
+}
+
+/// Reconcile our local `our_commit` for `ref_name` against the remote, end-to-end (§10):
+/// 1. fetch the remote head; if absent, this is the first head — push `our_commit` and create it.
+/// 2. resolve the head's signer against `members` and bring the remote commit's closure local.
+/// 3. run the rollback-gated [`merge_heads`] (a gate rejection is a §10 alarm, surfaced as
+///    [`ClientError::Merge`]).
+/// 4. **Merge** → push the merge commit and advance the ref; **AlreadyHave** (we are ahead) → push
+///    `our_commit` and advance; **FastForward** (remote is ahead) → adopt it, no write.
+///
+/// `author` stamps any commit/head we author. The returned [`SyncReport::frontier`] must be persisted
+/// before the next sync (§8.5; persistence is a later slice). Restoring the working tree is the
+/// caller's step (it holds the destination path).
+// The arguments are all distinct, caller-supplied inputs (remote / local store / key / roster /
+// frontier / ref / commit / authorship) with no cohesive subgroup; a parameter object here would
+// only exist to satisfy the lint.
+#[allow(clippy::too_many_arguments)]
+pub async fn sync_ref<R: Remote>(
+    remote: &R,
+    store: &Store,
+    mk: &MasterKey,
+    members: &BTreeMap<DeviceId, DevicePublic>,
+    frontier: &SyncFrontier,
+    ref_name: &str,
+    our_commit: &Id,
+    author: CommitAuthor<'_>,
+) -> Result<SyncReport, ClientError> {
+    let device: &DeviceKey = author.device;
+    let roster_seq = author.roster_seq;
+
+    // 1. Fetch the remote head. Absent → we are the first writer for this ref.
+    let Some((remote_head, remote_sig, remote_blob)) = fetch_head(remote, mk, ref_name).await?
+    else {
+        push_objects(remote, store, mk, our_commit).await?;
+        let (head, blob) =
+            push_head(remote, mk, device, ref_name, *our_commit, roster_seq, None).await?;
+        return Ok(SyncReport {
+            action: SyncAction::FastForward {
+                commit_id: *our_commit,
+            },
+            frontier: frontier.clone(),
+            wrote: Some((head, blob)),
+        });
+    };
+
+    // 2. Resolve the signer (and thereby verify the head against a member key) and bring its closure
+    //    local so the DAG/merge can read both histories.
+    let signer = resolve_head_signer(members, &remote_head, &remote_sig)
+        .ok_or(ClientError::HeadNotMember)?;
+    fetch_closure(remote, store, mk, &remote_head.commit_id).await?;
+
+    let sibling = SiblingHead {
+        device_id: signer,
+        head_version: remote_head.head_version,
+        roster_seq: remote_head.roster_seq,
+        commit_id: remote_head.commit_id,
+    };
+
+    // 3. Rollback-gated merge decision.
+    let plan = merge_heads(frontier, our_commit, &sibling, author, mk, store)?;
+
+    // 4. Apply: push whatever we authored and advance the ref (or fast-forward to the remote).
+    let new_commit = match &plan.action {
+        SyncAction::Merged { commit_id, .. } => Some(*commit_id),
+        SyncAction::AlreadyHave => Some(*our_commit), // we are ahead → publish our commit
+        SyncAction::FastForward { .. } => None,       // remote is ahead → adopt, nothing to push
+    };
+
+    let wrote = if let Some(commit_id) = new_commit {
+        push_objects(remote, store, mk, &commit_id).await?;
+        let (head, blob) = push_head(
+            remote,
+            mk,
+            device,
+            ref_name,
+            commit_id,
+            roster_seq,
+            Some((&remote_head, &remote_blob)),
+        )
+        .await?;
+        Some((head, blob))
+    } else {
+        None
+    };
+
+    Ok(SyncReport {
+        action: plan.action,
+        frontier: plan.frontier,
+        wrote,
+    })
 }
 
 #[cfg(test)]
@@ -486,5 +622,179 @@ mod tests {
         push_objects(&remote, &a_store, &m, &id3).await.unwrap();
         let stale = push_head(&remote, &m, &device, "main", id3, 0, Some((&h1, &b1))).await;
         assert!(matches!(stale, Err(ClientError::CasConflict)));
+    }
+
+    fn write_dir(dir: &Path, files: &[(&str, &[u8])]) {
+        for (name, content) in files {
+            std::fs::write(dir.join(name), content).unwrap();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seal_commit(
+        store: &Store,
+        m: &MasterKey,
+        dev: &DeviceKey,
+        root_tree: Id,
+        root_salt: PathSalt,
+        parents: Vec<Id>,
+        version: u64,
+        last_seen: Id,
+    ) -> Id {
+        let commit = secsec_snapshot::Commit {
+            root_tree,
+            root_salt,
+            parents,
+            device_id: dev.device_id().unwrap(),
+            version,
+            roster_seq: 0,
+            last_seen_head: last_seen,
+            ts: 0,
+        };
+        secsec_snapshot::seal_signed_commit(m, store, dev, &commit).unwrap()
+    }
+
+    #[tokio::test]
+    async fn two_devices_reconcile_through_blind_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mk();
+        let dev_a = DeviceKey::generate().unwrap();
+        let dev_b = DeviceKey::generate().unwrap();
+        let members: BTreeMap<DeviceId, DevicePublic> = [
+            (dev_a.device_id().unwrap(), dev_a.public()),
+            (dev_b.device_id().unwrap(), dev_b.public()),
+        ]
+        .into_iter()
+        .collect();
+
+        let remote = MemRemote {
+            store: open_store(dir.path(), "remote.redb"),
+        };
+        let a_store = open_store(dir.path(), "a.redb");
+        let b_store = open_store(dir.path(), "b.redb");
+
+        // base (A, v1): {keep:k0, shared:s0} → push + create head v1.
+        let base = tempfile::tempdir().unwrap();
+        write_dir(base.path(), &[("keep", b"k0"), ("shared", b"s0")]);
+        let (bt, bs) = secsec_snapshot::snapshot_tree(base.path(), &m, &a_store, None).unwrap();
+        let c_base = seal_commit(&a_store, &m, &dev_a, bt, bs, vec![], 1, [0u8; 32]);
+        push_objects(&remote, &a_store, &m, &c_base).await.unwrap();
+        let (h_base, b_base) = push_head(&remote, &m, &dev_a, "main", c_base, 0, None)
+            .await
+            .unwrap();
+
+        // B clones the base so it can build on it.
+        fetch_closure(&remote, &b_store, &m, &c_base).await.unwrap();
+
+        // A edits "shared" → c_A (a, v2), advances the ref to head v2.
+        let a_wt = tempfile::tempdir().unwrap();
+        write_dir(a_wt.path(), &[("keep", b"k0"), ("shared", b"sA")]);
+        let (at, asalt) =
+            secsec_snapshot::snapshot_tree(a_wt.path(), &m, &a_store, Some((&bt, &bs))).unwrap();
+        let c_a = seal_commit(&a_store, &m, &dev_a, at, asalt, vec![c_base], 2, c_base);
+        push_objects(&remote, &a_store, &m, &c_a).await.unwrap();
+        push_head(
+            &remote,
+            &m,
+            &dev_a,
+            "main",
+            c_a,
+            0,
+            Some((&h_base, &b_base)),
+        )
+        .await
+        .unwrap();
+
+        // B edits "shared" DIFFERENTLY → c_B (b, v1), divergent, NOT pushed.
+        let b_wt = tempfile::tempdir().unwrap();
+        write_dir(b_wt.path(), &[("keep", b"k0"), ("shared", b"sB")]);
+        let (bt2, bs2) =
+            secsec_snapshot::snapshot_tree(b_wt.path(), &m, &b_store, Some((&bt, &bs))).unwrap();
+        let c_b = seal_commit(&b_store, &m, &dev_b, bt2, bs2, vec![c_base], 1, c_base);
+
+        // B syncs: fetch A's head, rollback-gated merge with c_B, push the merge + advance the ref.
+        let rep_b = sync_ref(
+            &remote,
+            &b_store,
+            &m,
+            &members,
+            &SyncFrontier::default(),
+            "main",
+            &c_b,
+            CommitAuthor {
+                device: &dev_b,
+                version: 2,
+                roster_seq: 0,
+                ts: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let SyncAction::Merged {
+            commit_id: merge_id,
+            conflicts,
+        } = rep_b.action
+        else {
+            panic!("B must perform a real merge")
+        };
+        assert_eq!(conflicts.len(), 1, "shared was edited on both sides");
+        assert_eq!(conflicts[0].path, "shared");
+        // the frontier observed A's head_version (A advanced the ref to v2 before B synced).
+        assert_eq!(
+            rep_b
+                .frontier
+                .head_version_hwm
+                .get(&dev_a.device_id().unwrap()),
+            Some(&2)
+        );
+
+        // The remote head now points at B's merge and is signed by B.
+        let (rh, rsig, _) = fetch_head(&remote, &m, "main").await.unwrap().unwrap();
+        assert_eq!(rh.commit_id, merge_id);
+        assert_eq!(
+            resolve_head_signer(&members, &rh, &rsig),
+            Some(dev_b.device_id().unwrap())
+        );
+
+        // B's restored tree: shared kept-both, keep unchanged.
+        let (mc, _) = secsec_snapshot::open_signed_commit(&merge_id, &m, &b_store).unwrap();
+        let b_out = tempfile::tempdir().unwrap();
+        secsec_snapshot::restore_commit_tree(&mc, &m, &b_store, b_out.path()).unwrap();
+        let bf: BTreeMap<String, Vec<u8>> = read_tree(b_out.path()).into_iter().collect();
+        assert_eq!(bf.get("keep").unwrap(), b"k0");
+        assert_eq!(bf.get("shared").unwrap(), b"sB"); // ours (B) keeps the name
+        assert!(
+            bf.keys().any(|k| k.starts_with("shared.conflict-")),
+            "A's divergent shared kept-both"
+        );
+
+        // A re-syncs: the remote merge descends from c_A → fast-forward, no new commit.
+        let rep_a = sync_ref(
+            &remote,
+            &a_store,
+            &m,
+            &members,
+            &SyncFrontier::default(),
+            "main",
+            &c_a,
+            CommitAuthor {
+                device: &dev_a,
+                version: 3,
+                roster_seq: 0,
+                ts: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(rep_a.action, SyncAction::FastForward { commit_id } if commit_id == merge_id)
+        );
+        assert!(rep_a.wrote.is_none());
+
+        // A restores the same merged tree B produced.
+        let (mca, _) = secsec_snapshot::open_signed_commit(&merge_id, &m, &a_store).unwrap();
+        let a_out = tempfile::tempdir().unwrap();
+        secsec_snapshot::restore_commit_tree(&mca, &m, &a_store, a_out.path()).unwrap();
+        assert_eq!(read_tree(a_out.path()), read_tree(b_out.path()));
     }
 }
