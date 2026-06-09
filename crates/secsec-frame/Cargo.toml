@@ -1,0 +1,18 @@
+[package]
+name = "secsec-frame"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "secsec object framing, type tags, and pre-allocation bounds (finaldesign.md §9.1, §19)."
+
+[lints]
+workspace = true
+
+[dependencies]
+secsec-canon = { path = "../secsec-canon" }
+
+[dev-dependencies]
+secsec-aead = { path = "../secsec-aead" } # end-to-end object-plane crypto test
+secsec-kdf = { path = "../secsec-kdf" }
+proptest.workspace = true

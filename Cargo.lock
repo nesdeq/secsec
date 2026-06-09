@@ -533,6 +533,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "secsec-frame"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "secsec-aead",
+ "secsec-canon",
+ "secsec-kdf",
+]
+
+[[package]]
 name = "secsec-kdf"
 version = "0.0.0"
 dependencies = [

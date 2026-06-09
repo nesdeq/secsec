@@ -1,7 +1,7 @@
 # secsec — Cargo workspace. See IMPLEMENTATION.md for the crate map and build order.
 [workspace]
 resolver = "2"
-members = ["crates/secsec-canon", "crates/secsec-aead", "crates/secsec-kdf"]
+members = ["crates/secsec-canon", "crates/secsec-aead", "crates/secsec-kdf", "crates/secsec-frame"]
 
 [workspace.package]
 edition = "2021"
