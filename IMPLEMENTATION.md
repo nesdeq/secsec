@@ -85,7 +85,11 @@ Dependency direction is strictly downward (canon → aead/kdf/frame → object/s
 snapshot/store/keyslot/roster → sync → engine → remote/transport/proto → client/server). No security-critical
 crate depends on a higher layer. (`secsec-object`, `secsec-snapshot`, `secsec-keyslot` were split
 out as their own crates from the original `object`/`roster` grouping, keeping each core small and
-separately reviewable.)
+separately reviewable. `secsec-engine` is split from `secsec-sync` on the same principle: §10's
+merge/dag/rollback logic stays **storage-free and purely testable** inside `secsec-sync`, while the
+bridge that materializes stored trees into the merge model, re-seals the result, and authors the
+signed merge commit — the only §10 code that touches `store`+`snapshot` — lives in `secsec-engine`.
+`secsec-client` orchestrates the watcher, push/pull, and multi-remote loop on top of it.)
 
 ---
 
@@ -148,7 +152,9 @@ No OpenSSL anywhere.
 - **M4 — Transport.** `secsec-transport` + `secsec-proto`: QUIC + pinned verifier, channel-bound
   auth, rate limits/quotas. **Exit:** verifier negative tests (wrong key / tampered handshake /
   non-`ssh-ed25519` alg all fail); relay/MITM tests.
-- **M5 — Live sync.** `notify` watcher → commit-on-change; the `secsec-client`/`secsec-server`
+- **M5 — Live sync.** `secsec-engine` reconcile (snapshot-tree ↔ merge-node bridge, rollback gates,
+  signed two-parent merge commits); head push/pull wiring (`build_head` → `cas-head`, fetch → verify
+  → `merge_heads` → push); `notify` watcher → commit-on-change; the `secsec-client`/`secsec-server`
   orchestration end-to-end on one machine, then two.
 - **M6 — Durability & recovery.** Multi-remote reconcile + quorum, hardened GC, recovery flow,
   downgrade/min-algo enforcement, gossip. **Exit:** multi-writer GC sim; quorum put→get→verify.
