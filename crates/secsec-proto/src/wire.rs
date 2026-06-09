@@ -163,6 +163,12 @@ pub enum Request {
         /// The stored (encrypted) roster-entry blob.
         entry: Vec<u8>,
     },
+    /// Fetch the current stored head blob at `/refs/<ref_h>` (§13). A read op; the server returns the
+    /// opaque §9.8 head blob (or absent) and never learns the ref name behind `ref_h`.
+    GetRef {
+        /// Keyed-hash ref name `H = BLAKE3::keyed_hash(ref_name_key, ref_name)`.
+        ref_h: Id,
+    },
 }
 
 const T_GET: u8 = 0;
@@ -170,6 +176,7 @@ const T_HAS: u8 = 1;
 const T_PUT: u8 = 2;
 const T_CAS: u8 = 3;
 const T_ROSTER: u8 = 4;
+const T_GETREF: u8 = 5;
 
 impl Request {
     /// Canonical encoding (tag-prefixed).
@@ -208,6 +215,9 @@ impl Request {
             Request::RosterAppend { old_tip, entry } => {
                 w.u8(T_ROSTER).raw(old_tip).bytes(entry);
             }
+            Request::GetRef { ref_h } => {
+                w.u8(T_GETREF).raw(ref_h);
+            }
         }
         w.finish()
     }
@@ -244,6 +254,9 @@ impl Request {
             T_ROSTER => Request::RosterAppend {
                 old_tip: read32(&mut r)?,
                 entry: r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec(),
+            },
+            T_GETREF => Request::GetRef {
+                ref_h: read32(&mut r)?,
             },
             other => return Err(WireError::BadTag(other)),
         };
@@ -470,6 +483,7 @@ mod tests {
                 old_tip: [8; 32],
                 entry: b"entry-bytes".to_vec(),
             },
+            Request::GetRef { ref_h: [9; 32] },
         ];
         for req in reqs {
             assert_eq!(Request::decode(&req.encode()).unwrap(), req);

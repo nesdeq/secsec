@@ -17,6 +17,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod quic;
+
 use secsec_engine::{merge_heads, CommitAuthor, MergeError, SyncAction};
 use secsec_frame::ObjType;
 use secsec_kdf::MasterKey;

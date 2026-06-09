@@ -143,6 +143,10 @@ impl Server {
                 Ok(blob) => Response::Blob(blob),
                 Err(_) => Response::Err(ErrorCode::Internal),
             },
+            Request::GetRef { ref_h } => match self.store.get_ref(&ref_h) {
+                Ok(blob) => Response::Blob(blob),
+                Err(_) => Response::Err(ErrorCode::Internal),
+            },
             Request::Has { ids } => {
                 if ids.len() > limits::MAX_HAS_IDS {
                     return Response::Err(ErrorCode::TooManyIds);

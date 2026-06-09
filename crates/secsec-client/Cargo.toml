@@ -18,9 +18,14 @@ secsec-kdf = { path = "../secsec-kdf" }
 secsec-sync = { path = "../secsec-sync" }
 secsec-engine = { path = "../secsec-engine" }
 secsec-sig = { path = "../secsec-sig" }
+secsec-transport = { path = "../secsec-transport" }
+secsec-proto = { path = "../secsec-proto" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 blake3 = "1"
 
 [dev-dependencies]
 tempfile = "3"
 getrandom = "0.3"
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+secsec-server = { path = "../secsec-server" }
+rcgen = "0.13"

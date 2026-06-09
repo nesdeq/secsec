@@ -41,6 +41,8 @@ pub mod op {
     pub const GET: &str = "get";
     /// Existence check.
     pub const HAS: &str = "has";
+    /// Fetch the current stored head blob for a ref (`/refs/<H>`, §13).
+    pub const GET_REF: &str = "get-ref";
 }
 
 fn blake3_of(bytes: &[u8]) -> [u8; 32] {
@@ -96,6 +98,8 @@ pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
     match req {
         Request::Get { id } => (op::GET, args_read(op::GET, &[*id]), false),
         Request::Has { ids } => (op::HAS, args_read(op::HAS, ids), false),
+        // A read keyed by the ref hash (bound like a single-id read), §13/§9.6.
+        Request::GetRef { ref_h } => (op::GET_REF, args_read(op::GET_REF, &[*ref_h]), false),
         Request::Put {
             id, declared_size, ..
         } => (op::PUT, args_put(id, *declared_size), true),
@@ -244,6 +248,18 @@ mod tests {
         assert_ne!(args_read(op::GET, &[a]), args_read(op::GET, &[a, b])); // count bound
                                                                            // a count-prefix (not just concatenation) prevents [a]+[b..] aliasing a single id, etc.
         assert_ne!(args_read(op::GET, &[a, b]), args_read(op::GET, &[]));
+    }
+
+    #[test]
+    fn get_ref_is_a_read_op_bound_to_ref_hash() {
+        let (op, args, is_write) = op_and_args(&wire::Request::GetRef { ref_h: [7u8; 32] });
+        assert_eq!(op, op::GET_REF);
+        assert!(!is_write, "reading a head is a read op (secsec-read-v1)");
+        assert_eq!(args, args_read(op::GET_REF, &[[7u8; 32]]));
+        // a different ref hash gives a different binding; the op label is distinct from `get`.
+        let (_, other, _) = op_and_args(&wire::Request::GetRef { ref_h: [8u8; 32] });
+        assert_ne!(args, other);
+        assert_ne!(args, args_read(op::GET, &[[7u8; 32]]));
     }
 
     #[test]
