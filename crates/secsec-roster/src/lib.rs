@@ -447,6 +447,22 @@ pub struct State {
     pub min_algo: u8,
     /// Per-generation `mk_commit` recorded by genesis/rotate.
     pub mk_commits: BTreeMap<u32, MkCommit>,
+    /// For each current member added by an `AddDevice` (i.e. **not** genesis device-1), the device
+    /// that authored that grant. Drives the revoke-before-add closure (§8.1). Cleared on revoke.
+    pub added_by: BTreeMap<DeviceId, DeviceId>,
+    /// For each member in [`added_by`], the `seq` of its (latest) `AddDevice` entry.
+    pub added_at: BTreeMap<DeviceId, u64>,
+}
+
+impl State {
+    /// Whether `device` is a current member — the roster-layer read/write-auth predicate (§9.6,
+    /// §12). The per-op signature binding (`secsec-write-v1`/`secsec-read-v1` over
+    /// `op ‖ args_hash ‖ session_transcript ‖ server_nonce`) is enforced at the transport layer;
+    /// this is the membership half it checks against.
+    #[must_use]
+    pub fn is_member(&self, device: &DeviceId) -> bool {
+        self.members.contains_key(device)
+    }
 }
 
 fn verify_entry_sig(pubkey: &DevicePublic, e: &Entry) -> Result<(), RosterError> {
@@ -485,6 +501,8 @@ pub fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterError> {
         generation: 1,
         min_algo: secsec_frame::MIN_ALGO_ID,
         mk_commits: BTreeMap::new(),
+        added_by: BTreeMap::new(),
+        added_at: BTreeMap::new(),
     };
     st.members.insert(g.signer, gpub);
     st.mk_commits.insert(1, gmk);
@@ -507,10 +525,17 @@ pub fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterError> {
                 mk_commit: _,
             } => {
                 let p = DevicePublic::from_canonical(pubkey)?;
-                st.members.insert(p.device_id()?, p);
+                let id = p.device_id()?;
+                st.members.insert(id, p);
+                // Record provenance for the revoke-before-add closure (§8.1). A re-add overwrites
+                // the prior grant, so the latest adder/seq wins.
+                st.added_by.insert(id, e.signer);
+                st.added_at.insert(id, e.seq);
             }
             Op::RevokeDevice { device } => {
                 st.members.remove(device);
+                st.added_by.remove(device);
+                st.added_at.remove(device);
             }
             Op::Rotate { mk_commit } => {
                 st.generation += 1;
@@ -524,6 +549,26 @@ pub fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterError> {
         }
     }
     Ok(st)
+}
+
+/// The revoke-before-add closure (§8.1, §8.4 step 1): the current members that `revoked` granted at
+/// or after `after_seq`. When revoking a device B, the revoking device MUST also revoke every device
+/// in this set, because B could have added a colluding device just before being revoked. `after_seq`
+/// is the revoking device's last-authored-or-witnessed `seq` — grants B made before that point were
+/// already accepted under the prior trusted state and are out of scope.
+///
+/// The returned ids are sorted (the `State` maps are `BTreeMap`s), so the follow-on `RevokeDevice`
+/// entries are produced deterministically.
+#[must_use]
+pub fn devices_added_by(state: &State, revoked: &DeviceId, after_seq: u64) -> Vec<DeviceId> {
+    state
+        .added_by
+        .iter()
+        .filter(|(id, adder)| {
+            *adder == revoked && state.added_at.get(*id).is_some_and(|s| *s >= after_seq)
+        })
+        .map(|(id, _)| *id)
+        .collect()
 }
 
 /// A persisted anti-rollback frontier (§8.1): the highest accepted seq and that entry's hash.
@@ -674,6 +719,14 @@ mod tests {
         d.public().to_canonical().unwrap()
     }
 
+    /// An `AddDevice` op granting `d` at the generation-`MK` commitment.
+    fn add(d: &DeviceKey) -> Op {
+        Op::AddDevice {
+            pubkey: pubkey_of(d),
+            mk_commit: MK,
+        }
+    }
+
     /// device-1 genesis, then a list of appended ops, returns (entries, rfp).
     fn chain(d1: &DeviceKey, ops: Vec<(Op, &DeviceKey)>) -> (Vec<Entry>, [u8; 32]) {
         let (g, rfp) = genesis(d1, MK, 0).unwrap();
@@ -734,6 +787,84 @@ mod tests {
             "d2 revoked"
         );
         assert_eq!(st.mk_commits.get(&2), Some(&[0xBB; 32]));
+    }
+
+    #[test]
+    fn state_tracks_provenance_and_membership() {
+        let d1 = DeviceKey::generate().unwrap();
+        let d2 = DeviceKey::generate().unwrap();
+        let (entries, rfp) = chain(
+            &d1,
+            vec![(
+                Op::AddDevice {
+                    pubkey: pubkey_of(&d2),
+                    mk_commit: MK,
+                },
+                &d1,
+            )],
+        );
+        let st = fold(&entries, &rfp).unwrap();
+        let (id1, id2) = (d1.device_id().unwrap(), d2.device_id().unwrap());
+        // is_member predicate
+        assert!(st.is_member(&id1));
+        assert!(st.is_member(&id2));
+        assert!(!st.is_member(&DeviceKey::generate().unwrap().device_id().unwrap()));
+        // genesis device-1 has no adder; d2 was added by d1 at seq 1
+        assert!(!st.added_by.contains_key(&id1));
+        assert_eq!(st.added_by.get(&id2), Some(&id1));
+        assert_eq!(st.added_at.get(&id2), Some(&1));
+    }
+
+    /// §8.1/§8.4 revoke-before-add closure: revoking B must also catch devices B granted at/after
+    /// the revoking device's reference seq, but not earlier grants or grants by other devices.
+    #[test]
+    fn revoke_before_add_closure() {
+        let d1 = DeviceKey::generate().unwrap(); // founder / revoker
+        let b = DeviceKey::generate().unwrap(); // to-be-revoked
+        let early = DeviceKey::generate().unwrap(); // B-added, before the reference point
+        let c = DeviceKey::generate().unwrap(); // B-added, after the reference point
+        let dd = DeviceKey::generate().unwrap(); // B-added, after the reference point
+        let other = DeviceKey::generate().unwrap(); // added by d1, must not be swept
+
+        let (entries, rfp) = chain(
+            &d1,
+            vec![
+                (add(&b), &d1),     // seq 1: d1 adds B
+                (add(&early), &b),  // seq 2: B adds `early`
+                (add(&other), &d1), // seq 3: d1 adds `other`
+                (add(&c), &b),      // seq 4: B adds C
+                (add(&dd), &b),     // seq 5: B adds D
+            ],
+        );
+        let st = fold(&entries, &rfp).unwrap();
+        let b_id = b.device_id().unwrap();
+
+        // Reference seq = 3 (d1's last-authored entry before deciding to revoke B): only C(4) and
+        // D(5) are at/after it; `early`(2) is excluded.
+        let mut swept = devices_added_by(&st, &b_id, 3);
+        swept.sort();
+        let mut want = vec![c.device_id().unwrap(), dd.device_id().unwrap()];
+        want.sort();
+        assert_eq!(swept, want);
+
+        // `other` was added by d1, never swept regardless of seq.
+        assert!(!devices_added_by(&st, &b_id, 0).contains(&other.device_id().unwrap()));
+        // With reference seq 0, the whole of B's still-present grants are caught (incl. `early`).
+        assert_eq!(devices_added_by(&st, &b_id, 0).len(), 3);
+        // A device that is no longer a member is not reported: revoke `early`, re-fold.
+        let revoke_early = append(
+            entries.last().unwrap(),
+            Op::RevokeDevice {
+                device: early.device_id().unwrap(),
+            },
+            &d1,
+            0,
+        )
+        .unwrap();
+        let mut entries2 = entries.clone();
+        entries2.push(revoke_early);
+        let st2 = fold(&entries2, &rfp).unwrap();
+        assert_eq!(devices_added_by(&st2, &b_id, 0).len(), 2); // early gone, C+D remain
     }
 
     #[test]
