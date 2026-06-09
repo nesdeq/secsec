@@ -19,7 +19,7 @@ use secsec_frame::{
     assemble_blob, parse_blob, Frame, FrameError, ObjType, CTX_TAG_LEN, FRAME_LEN,
     MAX_ROSTER_ENTRY_SIZE,
 };
-use secsec_kdf::{roster_entry_key, roster_keyhist_key, SecretKey};
+use secsec_kdf::{roster_entry_key, roster_keyhist_key, MasterKey, SecretKey};
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic, NS_GRANT, NS_ROSTER};
 use std::collections::{BTreeMap, BTreeSet};
 use zeroize::{Zeroize, Zeroizing};
@@ -108,6 +108,12 @@ pub enum RosterError {
     Frame(FrameError),
     /// The per-entry AEAD failed to open (wrong key/generation, or tampered ciphertext/commitment).
     Aead,
+    /// Cold start: an entry's `FRAME.gen` had no peeled roster key (gen beyond `g_cur`, or a
+    /// tip/`g_cur` mismatch) — a forged or inconsistent chain.
+    BadGeneration,
+    /// Cold start: the keyslot-recovered candidate key failed `mk_commit_{g_cur}` from the
+    /// RFP-anchored chain (§7 step 3) — a forged keyslot / fake key.
+    MkCommitMismatch,
     /// Signing/key error.
     Sig(secsec_sig::SigError),
 }
@@ -128,6 +134,10 @@ impl core::fmt::Display for RosterError {
             RosterError::Canon(e) => write!(f, "canon: {e}"),
             RosterError::Frame(e) => write!(f, "frame: {e}"),
             RosterError::Aead => f.write_str("roster entry AEAD open failed"),
+            RosterError::BadGeneration => f.write_str("entry generation has no peeled roster key"),
+            RosterError::MkCommitMismatch => {
+                f.write_str("candidate key fails mk_commit from the RFP-anchored chain")
+            }
             RosterError::Sig(e) => write!(f, "sig: {e}"),
         }
     }
@@ -566,6 +576,72 @@ pub fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterError> {
         }
     }
     Ok(st)
+}
+
+/// Bootstrap the roster from cold: the full §8.1 "cold-start fold order" for a device with no local
+/// state (fresh enrollment or reinstall). Given the keyslot-recovered **candidate** `master_key`
+/// for the current generation `g_cur`, the pinned `rfp`, the never-trimmed roster-key history, and
+/// the encrypted sigchain blobs `/roster/<seq>` (index = seq), this:
+///
+/// 1. derives `roster_key_{g_cur}` and peels the history back to `roster_key_1` ([`peel_roster_keys`]);
+/// 2. for each stored entry, reads its plaintext `FRAME.gen`, decrypts it with the matching
+///    `roster_key_g` ([`open_entry`]) and strictly decodes it ([`decode_entry`]);
+/// 3. [`fold`]s the recovered chain — which enforces genesis = RFP, the `prev` hash chain, every
+///    signature, and succession;
+/// 4. verifies the candidate against `mk_commit_{g_cur}` recorded in that RFP-anchored chain (§7
+///    step 3) — closing the forged-keyslot / fake-key attack.
+///
+/// Returns the folded [`State`] and the now-**authenticated** [`MasterKey`]. A forged keyslot key
+/// either fails to decrypt the real chain (AEAD), or — if the server also serves a self-consistent
+/// fake universe — fails the genesis-vs-RFP check in [`fold`]; a wrong-but-decrypting key fails the
+/// `mk_commit` check here. The caller performs the HPKE keyslot open (it owns the device secret) and
+/// reads `g_cur` from the tip blob's `FRAME.gen` before calling.
+pub fn cold_start_fold(
+    candidate_master_key: &[u8; 32],
+    g_cur: u32,
+    rfp: &[u8; 32],
+    roster_keyhist: &BTreeMap<u32, Vec<u8>>,
+    stored_entries: &[Vec<u8>],
+) -> Result<(State, MasterKey), RosterError> {
+    let mk = MasterKey::new(g_cur, *candidate_master_key);
+
+    // §8.1 step 1 invariant: the tip's plaintext FRAME.gen is the current generation.
+    let tip = stored_entries.last().ok_or(RosterError::Empty)?;
+    let tip_frame = tip
+        .get(..FRAME_LEN)
+        .ok_or(RosterError::Frame(FrameError::ShortBlob))?;
+    if Frame::decode(tip_frame)?.gen != g_cur {
+        return Err(RosterError::BadGeneration);
+    }
+
+    // (1) derive roster_key_{g_cur} and peel back to roster_key_1.
+    let roster_key_cur = mk.roster_key();
+    let roster_keys = peel_roster_keys(&roster_key_cur, g_cur, roster_keyhist)?;
+
+    // (2) decrypt + decode every entry, selecting the key by each blob's authenticated FRAME.gen.
+    let mut entries = Vec::with_capacity(stored_entries.len());
+    for (seq, blob) in stored_entries.iter().enumerate() {
+        let frame_bytes = blob
+            .get(..FRAME_LEN)
+            .ok_or(RosterError::Frame(FrameError::ShortBlob))?;
+        let gen = Frame::decode(frame_bytes)?.gen;
+        let rk = roster_keys.get(&gen).ok_or(RosterError::BadGeneration)?;
+        let plaintext = open_entry(rk, gen, seq as u64, blob)?;
+        entries.push(decode_entry(&plaintext)?);
+    }
+
+    // (3) fold: genesis = RFP, prev-chain, signatures, succession.
+    let state = fold(&entries, rfp)?;
+
+    // (4) authenticity (§7 step 3): the candidate must match mk_commit_{g_cur} from the chain.
+    let expected = *state
+        .mk_commits
+        .get(&g_cur)
+        .ok_or(RosterError::BadGeneration)?;
+    if mk.mk_commit() != expected {
+        return Err(RosterError::MkCommitMismatch);
+    }
+    Ok((state, mk))
 }
 
 /// The revoke-before-add closure (§8.1, §8.4 step 1): the current members that `revoked` granted at
@@ -1486,6 +1562,115 @@ mod tests {
             "92397f6784bd2df46eb8a3fb1984fa98970abc9d6ecc80656a8d674b55221483d7626d73f776a99579f59ba22ce7b32d3929091d7b720d4d465e0b3f775f4a68"
         );
         assert_eq!(&open_roster_keyhist(&rk, 1, &wrap).unwrap()[..], &kg[..]);
+    }
+
+    // ---- Cold-start fold (§8.1 bootstrap; R5 capstone) ----
+
+    #[test]
+    fn cold_start_fold_bootstraps_multigen_chain() {
+        const MK1: [u8; 32] = [0x51; 32];
+        const MK2: [u8; 32] = [0x52; 32];
+        let mkc1 = MasterKey::new(1, MK1).mk_commit();
+        let mkc2 = MasterKey::new(2, MK2).mk_commit();
+        let rk1: [u8; 32] = *MasterKey::new(1, MK1).roster_key();
+        let rk2: [u8; 32] = *MasterKey::new(2, MK2).roster_key();
+
+        let d1 = DeviceKey::generate().unwrap();
+        let d2 = DeviceKey::generate().unwrap();
+
+        // Plaintext chain: genesis(g1), AddDevice(g1), Rotate→g2, SetMinAlgo(g2, signed by d2).
+        let (g, rfp) = genesis(&d1, mkc1, 0).unwrap();
+        let e1 = append(
+            &g,
+            Op::AddDevice {
+                pubkey: pubkey_of(&d2),
+                mk_commit: mkc1,
+            },
+            &d1,
+            0,
+        )
+        .unwrap();
+        let e2 = append(&e1, Op::Rotate { mk_commit: mkc2 }, &d1, 0).unwrap();
+        let e3 = append(&e2, Op::SetMinAlgo { min_algo: 2 }, &d2, 0).unwrap();
+
+        // Seal each entry under its generation: genesis+AddDevice = g1; Rotate and after = g2 (§9.5).
+        let stored = vec![
+            seal_entry(&rk1, 1, 0, &encode_entry(&g)),
+            seal_entry(&rk1, 1, 1, &encode_entry(&e1)),
+            seal_entry(&rk2, 2, 2, &encode_entry(&e2)),
+            seal_entry(&rk2, 2, 3, &encode_entry(&e3)),
+        ];
+        // Never-trimmed roster-key history: roster_key_1 wrapped under roster_key_2.
+        let mut hist = BTreeMap::new();
+        hist.insert(1u32, seal_roster_keyhist(&rk2, 1, &rk1).to_vec());
+
+        // Bootstrap from the gen-2 master key, as a fresh device would after keyslot unwrap.
+        let (state, mk) = cold_start_fold(&MK2, 2, &rfp, &hist, &stored).unwrap();
+        assert_eq!(state.generation, 2);
+        assert_eq!(state.min_algo, 2);
+        assert!(state.is_member(&d1.device_id().unwrap()));
+        assert!(state.is_member(&d2.device_id().unwrap()));
+        assert_eq!(mk.generation(), 2);
+        // the recovered key is the genuine gen-2 key (derives the same roster key)
+        assert_eq!(&mk.roster_key()[..], &rk2[..]);
+    }
+
+    #[test]
+    fn cold_start_rejects_forged_and_inconsistent_inputs() {
+        const MK1: [u8; 32] = [0x61; 32];
+        let mkc1 = MasterKey::new(1, MK1).mk_commit();
+        let rk1: [u8; 32] = *MasterKey::new(1, MK1).roster_key();
+        let empty: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+
+        let d1 = DeviceKey::generate().unwrap();
+        let d2 = DeviceKey::generate().unwrap();
+        let (g, rfp) = genesis(&d1, mkc1, 0).unwrap();
+        let e1 = append(
+            &g,
+            Op::AddDevice {
+                pubkey: pubkey_of(&d2),
+                mk_commit: mkc1,
+            },
+            &d1,
+            0,
+        )
+        .unwrap();
+        let stored = vec![
+            seal_entry(&rk1, 1, 0, &encode_entry(&g)),
+            seal_entry(&rk1, 1, 1, &encode_entry(&e1)),
+        ];
+
+        // happy path (gen-1-only chain)
+        assert!(cold_start_fold(&MK1, 1, &rfp, &empty, &stored).is_ok());
+
+        // forged keyslot serving a different key: its roster_key can't decrypt the real chain.
+        assert!(matches!(
+            cold_start_fold(&[0x99; 32], 1, &rfp, &empty, &stored),
+            Err(RosterError::Aead)
+        ));
+
+        // wrong pinned RFP -> fold rejects.
+        assert!(matches!(
+            cold_start_fold(&MK1, 1, &[0u8; 32], &empty, &stored),
+            Err(RosterError::RfpMismatch)
+        ));
+
+        // g_cur that disagrees with the tip's FRAME.gen.
+        assert!(matches!(
+            cold_start_fold(&MK1, 2, &rfp, &empty, &stored),
+            Err(RosterError::BadGeneration)
+        ));
+
+        // fake key: chain records a mk_commit for a DIFFERENT key than the one that sealed it. The
+        // candidate decrypts (its roster_key matches) and folds, but fails the §7-step-3 mk_commit
+        // check — the forged-keyslot / fake-universe defense.
+        let wrong_commit = MasterKey::new(1, [0xEE; 32]).mk_commit();
+        let (gf, rfpf) = genesis(&d1, wrong_commit, 0).unwrap();
+        let stored_f = vec![seal_entry(&rk1, 1, 0, &encode_entry(&gf))];
+        assert!(matches!(
+            cold_start_fold(&MK1, 1, &rfpf, &empty, &stored_f),
+            Err(RosterError::MkCommitMismatch)
+        ));
     }
 
     fn hx(b: &[u8]) -> String {

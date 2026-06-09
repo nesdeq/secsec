@@ -373,12 +373,15 @@ Against an untrusted server, `revoke` **always** rotates:
 1. Append `RevokeDevice(B)`. Compute B's **transitive add-by closure** over the folded roster
    (devices B added, devices they added, …) restricted to grants after the last entry the revoking
    device authored or witnessed; append `RevokeDevice` for each device in that closure (closes the
-   revoke-before-add backdoor race and its nested two-hop variant, §8.1). Then append `Rotate`.
+   revoke-before-add backdoor race and its nested two-hop variant, §8.1).
 2. Mint `master_key_{g+1}`, compute `mk_commit_{g+1}` = `BLAKE3::keyed_hash(master_key_{g+1},
    "secsec-mk-commit-v1" ‖ le32(g+1))`, extend the key-history chain (§8.2).
-3. Write fresh keyslots wrapping `master_key_{g+1}` to all remaining members; delete the revoked
+3. Append the `Rotate` entry recording `mk_commit_{g+1}`; it and every subsequent entry up to the
+   next rotation are written under generation `g+1` (§9.5). (The mint in step 2 necessarily precedes
+   this append, since the entry embeds `mk_commit_{g+1}`.)
+4. Write fresh keyslots wrapping `master_key_{g+1}` to all remaining members; delete the revoked
    keyslot(s).
-4. All new objects use generation `g+1`.
+5. All new objects use generation `g+1`.
 
 **Scope of access removal:** revocation removes access to data created *after* the rotation
 (forward secrecy, P11). A revoked device that retained `master_key_g` in memory can, colluding
@@ -667,7 +670,12 @@ one, and folding it (§8.1) requires reading **all** entries from genesis. To de
 written under generation `g`, a current member peels the key-history chain (§8.2) to recover
 `master_key_g`, derives `roster_key_g`, then `k_roster_entry[g][seq]`. The generation `g` is taken
 from `FRAME_roster.gen`, which is authenticated by the AEAD AD and cannot be altered by the server.
-Genesis (`seq 0`) is written under generation 1.
+Genesis (`seq 0`) is written under generation 1. A `Rotate` entry is written under the generation
+it **creates** (`g+1`): it records `mk_commit_{g+1}`, so `master_key_{g+1}` — hence
+`roster_key_{g+1}` — must already be minted when the entry is sealed. Every entry from a `Rotate`
+(inclusive) up to the next `Rotate` is written under that generation. Consequently the sigchain
+tip's plaintext `FRAME.gen` always equals the current generation `g_cur` — the invariant the
+cold-start fold (§8.1 step 1) reads to learn `g_cur`.
 
 ### 9.6 Signatures & domain separation
 
