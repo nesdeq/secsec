@@ -940,7 +940,8 @@ The §8.5 local sealed-state blob uses this same construction with `key = local_
 | Call | Auth | Purpose |
 |---|---|---|
 | `auth` | — establishes identity | SSHSIG challenge/response (§11) |
-| `get(id)` | **`secsec-read-v1` sig** per op | fetch a blob (ciphertext) |
+| `get(id)` | **`secsec-read-v1` sig** per op | fetch an object blob (ciphertext) from `/objects/<id>` |
+| `get-ref(ref_H)` | **`secsec-read-v1` sig** per op | fetch the current head blob at `/refs/<H>` (§13); the server returns the opaque §9.8 head ciphertext (or absent) and never learns the ref name behind `H`. Required to read heads for sync (§10, §14) |
 | `has(ids)` | **`secsec-read-v1` sig** per op | existence check (dedup); max 1,024 IDs per call |
 | `put(blob)` | **`secsec-write-v1` sig** | store an object, idempotent by id |
 | `cas-head(old,new,sig)` | **`secsec-write-v1` sig** + valid `secsec-head` | atomic ref CAS |
@@ -948,15 +949,17 @@ The §8.5 local sealed-state blob uses this same construction with `key = local_
 | `gc(keep-set,gen)` | **`secsec-write-v1` sig** | client-driven sweep (§15); max 100,000 IDs per keep-set |
 
 **Every repo operation — including reads — requires a per-op signature from a key that owns a
-keyslot** (i.e., a rostered device). `get` and `has` each require a fresh `secsec-read-v1`
-signature covering exactly the requested IDs; connection-level auth alone is not sufficient.
+keyslot** (i.e., a rostered device). `get`, `get-ref`, and `has` each require a fresh
+`secsec-read-v1` signature covering exactly the requested IDs (for `get-ref`, the ref hash `H`,
+bound as a single-id read: `args_hash = BLAKE3(canonical("get-ref" ‖ H))`); connection-level auth
+alone is not sufficient.
 `has(ids)` MUST reject requests with more than 1,024 IDs; the client batches larger check sets
 into sequential calls. The server returns a `too-many-ids` error before performing any lookups.
 `gc(keep-set, gen)` MUST reject requests with keep-sets exceeding 100,000 IDs; for repos with
 more live objects the client performs GC in generation-bounded batches.
 
 **Keyslot-existence enforcement (normative).** The server MUST verify, on every per-op request
-(including `get`, `has`, `put`, `cas-head`, `roster-append`, `gc`), that a keyslot blob exists at
+(including `get`, `get-ref`, `has`, `put`, `cas-head`, `roster-append`, `gc`), that a keyslot blob exists at
 `/keyslots/<device_id>/<any_g>` where `device_id = BLAKE3(canonical(authenticated_pubkey))` from
 the connection auth step. A request from a key with no stored keyslot MUST be rejected with a
 distinct `not-enrolled` error code before any read or write is performed. This check uses
