@@ -11,9 +11,9 @@
 //! 5. **execute** — against the blob store.
 //!
 //! The server is **blind**: it stores opaque blobs by id and never verifies or reads their content
-//! (content-addressing is re-checked by *clients* on fetch, §9.2). This slice handles the object ops
-//! (`get`/`has`/`put`); `cas-head`/`roster-append` need mutable ref/sigchain storage and land with
-//! the store extensions (their auth is still verified here).
+//! (content-addressing is re-checked by *clients* on fetch, §9.2). `get`/`has`/`put`/`cas-head` are
+//! executed; `cas-head` CASes on `BLAKE3` of the stored (encrypted) head blob (§12). `roster-append`
+//! (its `/roster-head` CAS) and `gc` land next; their auth is already verified here.
 //!
 //! The handler is pure and clock-injected (`now`), so the whole §12 pipeline is unit-testable by
 //! calling [`Server::handle`] directly — no sockets.
@@ -177,10 +177,31 @@ impl Server {
                     Err(_) => Response::Err(ErrorCode::Internal),
                 }
             }
-            // ref / sigchain storage lands with the store extensions; their auth was verified above.
-            Request::CasHead { .. } | Request::RosterAppend { .. } => {
-                Response::Err(ErrorCode::Internal)
+            Request::CasHead {
+                ref_h,
+                old_head,
+                new_head,
+                new_blob,
+            } => {
+                // The attached new head blob must hash to the signed new_head (§12 cas-head semantics).
+                if *blake3::hash(&new_blob).as_bytes() != new_head {
+                    return Response::Err(ErrorCode::BadRequest);
+                }
+                if !self
+                    .write_bucket(device_id, now)
+                    .try_take(new_blob.len() as u64, now)
+                {
+                    return Response::Err(ErrorCode::RateLimit);
+                }
+                // Atomic compare-and-swap on the server-visible blob hash (blind server, §12).
+                match self.store.cas_ref(&ref_h, &old_head, &new_blob) {
+                    Ok(true) => Response::Ok,
+                    Ok(false) => Response::Err(ErrorCode::CasConflict),
+                    Err(_) => Response::Err(ErrorCode::Internal),
+                }
             }
+            // sigchain (roster-append) storage + its /roster-head CAS land next; auth verified above.
+            Request::RosterAppend { .. } => Response::Err(ErrorCode::Internal),
         }
     }
 }
@@ -374,6 +395,65 @@ mod tests {
         assert_eq!(
             s.handle(read_req(&dev, Request::Has { ids }, T), 0),
             Response::Err(ErrorCode::TooManyIds)
+        );
+    }
+
+    #[test]
+    fn cas_head_first_write_conflict_and_blob_mismatch() {
+        let (mut s, _d) = server();
+        let dev = DeviceKey::generate().unwrap();
+        enroll(&s, &dev);
+        let ref_h = [0x33; 32];
+        let blob = b"head-blob-v1".to_vec();
+        let new_head = *blake3::hash(&blob).as_bytes();
+        let cas = |old: [u8; 32], nh: [u8; 32], b: Vec<u8>| Request::CasHead {
+            ref_h,
+            old_head: old,
+            new_head: nh,
+            new_blob: b,
+        };
+
+        // first write (expect-absent) succeeds.
+        let n1 = [0x10; 32];
+        s.issue_nonce(n1, 0);
+        assert_eq!(
+            s.handle(
+                write_req(&dev, cas([0; 32], new_head, blob.clone()), T, n1),
+                0
+            ),
+            Response::Ok
+        );
+
+        // a second expect-absent now loses the CAS.
+        let n2 = [0x11; 32];
+        s.issue_nonce(n2, 0);
+        assert_eq!(
+            s.handle(
+                write_req(&dev, cas([0; 32], new_head, blob.clone()), T, n2),
+                0
+            ),
+            Response::Err(ErrorCode::CasConflict)
+        );
+
+        // a swap to the correct expected-old (= BLAKE3 of the stored blob) succeeds.
+        let n3 = [0x12; 32];
+        s.issue_nonce(n3, 0);
+        let v2 = b"head-blob-v2".to_vec();
+        let v2_head = *blake3::hash(&v2).as_bytes();
+        assert_eq!(
+            s.handle(write_req(&dev, cas(new_head, v2_head, v2), T, n3), 0),
+            Response::Ok
+        );
+
+        // attached blob not matching the signed new_head -> BadRequest.
+        let n4 = [0x13; 32];
+        s.issue_nonce(n4, 0);
+        assert_eq!(
+            s.handle(
+                write_req(&dev, cas([0; 32], [0xAB; 32], b"x".to_vec()), T, n4),
+                0
+            ),
+            Response::Err(ErrorCode::BadRequest)
         );
     }
 }

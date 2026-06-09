@@ -25,8 +25,13 @@ const ARRIVAL: TableDefinition<'static, &[u8], u64> = TableDefinition::new("arri
 const COUNTERS: TableDefinition<'static, &str, u64> = TableDefinition::new("counters");
 /// `device_id(32) ‖ le32(gen)` → keyslot blob (§13 `/keyslots/<device_id>/<g>`).
 const KEYSLOTS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("keyslots");
+/// `ref_H(32)` → current head blob (§13 `/refs/<H>`); CAS-guarded by `BLAKE3(blob)`.
+const REFS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("refs");
 
 const PUT_EPOCH: &str = "put_epoch";
+
+/// `old_head_id` sentinel meaning "expect the ref to be absent" — a first `cas-head` (§12).
+pub const ABSENT_HEAD: [u8; 32] = [0u8; 32];
 
 /// The fixed length of a keyslot key: `device_id(32) ‖ le32(gen)`.
 const KEYSLOT_KEY_LEN: usize = 36;
@@ -86,9 +91,47 @@ impl Store {
             wtx.open_table(ARRIVAL)?;
             wtx.open_table(COUNTERS)?;
             wtx.open_table(KEYSLOTS)?;
+            wtx.open_table(REFS)?;
         }
         wtx.commit()?;
         Ok(Self { db })
+    }
+
+    /// The current head blob stored at `/refs/<ref_h>`, or `None`.
+    pub fn get_ref(&self, ref_h: &[u8; 32]) -> Result<Option<Vec<u8>>, StoreError> {
+        let rtx = self.db.begin_read()?;
+        let refs = rtx.open_table(REFS)?;
+        Ok(refs.get(&ref_h[..])?.map(|g| g.value().to_vec()))
+    }
+
+    /// Atomic `cas-head` (§12): if `BLAKE3(current stored blob)` (or [`ABSENT_HEAD`] when the ref is
+    /// absent) equals `expected_old`, replace the ref with `new_blob` and return `Ok(true)`;
+    /// otherwise leave it unchanged and return `Ok(false)` (CAS conflict). The whole compare-and-swap
+    /// runs in one write transaction. `new_blob`'s authenticity is the client's `secsec-head-v1`
+    /// signature inside it (§9.8) — the store only guards concurrency.
+    pub fn cas_ref(
+        &self,
+        ref_h: &[u8; 32],
+        expected_old: &[u8; 32],
+        new_blob: &[u8],
+    ) -> Result<bool, StoreError> {
+        let wtx = self.db.begin_write()?;
+        let swapped;
+        {
+            let mut refs = wtx.open_table(REFS)?;
+            let current = match refs.get(&ref_h[..])? {
+                Some(g) => *blake3::hash(g.value()).as_bytes(),
+                None => ABSENT_HEAD,
+            };
+            if current == *expected_old {
+                refs.insert(&ref_h[..], new_blob)?;
+                swapped = true;
+            } else {
+                swapped = false;
+            }
+        }
+        wtx.commit()?;
+        Ok(swapped)
     }
 
     /// Store (or overwrite) the keyslot blob for `device_id` at generation `gen`
@@ -315,5 +358,29 @@ mod tests {
         assert!(s.delete_keyslot(&dev_a, 2).unwrap());
         assert!(!s.keyslot_exists(&dev_a).unwrap());
         assert!(!s.delete_keyslot(&dev_a, 2).unwrap()); // already gone
+    }
+
+    #[test]
+    fn cas_ref_first_write_then_swap_then_conflict() {
+        let (_d, s) = temp_store();
+        let r = id(0x11);
+        assert_eq!(s.get_ref(&r).unwrap(), None);
+
+        // first write: expect-absent (ABSENT_HEAD) succeeds.
+        assert!(s.cas_ref(&r, &ABSENT_HEAD, b"head-v1").unwrap());
+        assert_eq!(s.get_ref(&r).unwrap().as_deref(), Some(&b"head-v1"[..]));
+
+        // a second first-write (still expecting absent) now conflicts.
+        assert!(!s.cas_ref(&r, &ABSENT_HEAD, b"head-vX").unwrap());
+        assert_eq!(s.get_ref(&r).unwrap().as_deref(), Some(&b"head-v1"[..])); // unchanged
+
+        // swap with the correct expected-old (= BLAKE3 of the current blob) succeeds.
+        let cur_hash = *blake3::hash(b"head-v1").as_bytes();
+        assert!(s.cas_ref(&r, &cur_hash, b"head-v2").unwrap());
+        assert_eq!(s.get_ref(&r).unwrap().as_deref(), Some(&b"head-v2"[..]));
+
+        // a stale expected-old conflicts.
+        assert!(!s.cas_ref(&r, &cur_hash, b"head-v3").unwrap());
+        assert_eq!(s.get_ref(&r).unwrap().as_deref(), Some(&b"head-v2"[..]));
     }
 }

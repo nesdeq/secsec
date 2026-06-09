@@ -1363,6 +1363,7 @@ dependencies = [
 name = "secsec-server"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "getrandom 0.3.4",
  "quinn",
  "rcgen",
@@ -1406,6 +1407,7 @@ dependencies = [
 name = "secsec-store"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "redb",
  "tempfile",
 ]

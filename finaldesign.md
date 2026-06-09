@@ -992,6 +992,17 @@ the server supplies only `server_nonce`. The `args_hash` per op is:
 - `roster-append`: `BLAKE3(canonical("roster-append" ‖ BLAKE3(canonical(entry))))`
 - `gc`: the GC serialization hash defined in §15.
 
+**`cas-head` head-id semantics (normative).** Because the server is **blind** it cannot read the
+encrypted head blob, so the compare-and-swap operates on a *server-computable* token: `old_head_id`
+and `new_head_id` are `BLAKE3` over the respective **stored head-blob bytes** (the §9.8 ciphertext as
+written to `/refs/<H>`), **not** the client-side plaintext head identity of §6/§10. The server
+atomically: computes `BLAKE3(current stored blob)` (or the all-zero sentinel if the ref is absent),
+requires it to equal `old_head_id`, requires the attached new blob to hash to `new_head_id`, and only
+then replaces the ref. A first write uses the all-zero `old_head_id` ("expect absent"). The client
+holds both blobs (it sealed the new one and fetched the old), so both tokens are client-computable
+too; this is purely a concurrency guard — the head's *authenticity* still rests on its `secsec-head-v1`
+signature inside the blob (§9.8), verified by readers against the roster.
+
 **Per-key storage quota and rate limits** (normative — server MUST enforce):
 - Per-key storage quota: 10 GiB default (configurable).
 - Per-key write rate: 100 MB/s sustained, burst 1 GiB.

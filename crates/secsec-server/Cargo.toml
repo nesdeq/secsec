@@ -17,6 +17,7 @@ secsec-frame = { path = "../secsec-frame" }
 secsec-transport = { path = "../secsec-transport" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 getrandom = "0.3"
+blake3 = "1"
 
 [dev-dependencies]
 tempfile = "3"
