@@ -75,6 +75,24 @@ impl Remote for QuicRemote<'_> {
         )
     }
 
+    async fn get_roster_entry(&self, seq: u64) -> Result<Option<Vec<u8>>, RemoteError> {
+        expect_blob(
+            "get-roster",
+            self.call(Request::GetRosterEntry { seq }).await?,
+        )
+    }
+
+    async fn get_keyslot(&self, device_id: &Id, gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
+        expect_blob(
+            "get-keyslot",
+            self.call(Request::GetKeyslot {
+                device_id: *device_id,
+                gen,
+            })
+            .await?,
+        )
+    }
+
     async fn cas_head(
         &self,
         ref_h: &Id,
@@ -217,6 +235,66 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none());
+
+            conn.close(0u32.into(), b"done");
+            let _ = srv.await;
+        });
+    }
+
+    /// Cold-start a repository **over live QUIC** (§8.1): the server's store is genesis-initialized
+    /// (`init_repo`); a pinned client handshakes and recovers its master key + roster by fetching the
+    /// sigchain + keyslot over the wire (`get-roster` / `get-keyslot`) and folding — never trusting
+    /// the blind server.
+    #[test]
+    fn cold_start_over_live_quic() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ck = generate_simple_self_signed(vec!["secsec.invalid".to_string()]).unwrap();
+            let (cert, key) = (ck.cert.der().to_vec(), ck.key_pair.serialize_der());
+            let pin = HostPin::from_cert(&cert).unwrap();
+            let host_id = pin.host_id();
+
+            let device = DeviceKey::generate().unwrap();
+            let srv_dir = tempfile::tempdir().unwrap();
+            let srv_store = Store::open(srv_dir.path().join("s.redb")).unwrap();
+            // genesis: writes the roster entry + this device's keyslot into the served store.
+            let rfp = crate::repo::init_repo(&srv_store, &device, 0).unwrap();
+            let mut server = Server::new(srv_store);
+
+            let endpoint =
+                quinn::Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                let conn = endpoint.accept().await.unwrap().await.unwrap();
+                let _ = serve_connection(&conn, &mut server, host_id, 1_000).await;
+            });
+
+            let mut client = quinn::Endpoint::client(loopback()).unwrap();
+            client.set_default_client_config(client_config(pin).unwrap());
+            let conn = client
+                .connect(addr, "secsec.invalid")
+                .unwrap()
+                .await
+                .unwrap();
+            let sess = client_handshake(&conn, &device, host_id, [0x11; 32])
+                .await
+                .unwrap();
+            let remote = QuicRemote::new(&conn, sess.transcript, &device);
+
+            // recover identity over the wire, anchored to the out-of-band RFP.
+            let (mk, state) = crate::repo::open_repo_remote(&remote, &device, &rfp)
+                .await
+                .unwrap();
+            assert_eq!(mk.generation(), 1);
+            assert!(state.is_member(&device.device_id().unwrap()));
+
+            // a wrong RFP fails the fold (the genesis anchor must match).
+            assert!(crate::repo::open_repo_remote(&remote, &device, &[0xAB; 32])
+                .await
+                .is_err());
 
             conn.close(0u32.into(), b"done");
             let _ = srv.await;

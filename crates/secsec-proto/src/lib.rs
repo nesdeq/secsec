@@ -43,6 +43,10 @@ pub mod op {
     pub const HAS: &str = "has";
     /// Fetch the current stored head blob for a ref (`/refs/<H>`, §13).
     pub const GET_REF: &str = "get-ref";
+    /// Fetch a sigchain entry blob by sequence (`/roster/<seq>`, §13) — for cold-start fold (§8.1).
+    pub const GET_ROSTER: &str = "get-roster";
+    /// Fetch a device's keyslot blob (`/keyslots/<device_id>/<g>`, §13) — for cold-start unwrap (§8.1).
+    pub const GET_KEYSLOT: &str = "get-keyslot";
 }
 
 fn blake3_of(bytes: &[u8]) -> [u8; 32] {
@@ -90,6 +94,24 @@ pub fn args_read(op: &str, ids: &[Id]) -> [u8; 32] {
     blake3_of(&w.finish())
 }
 
+/// `args_hash` for `get-roster` (§9.6/§12): `BLAKE3(canonical("get-roster" ‖ le64(seq)))`, binding
+/// the exact sigchain sequence requested.
+#[must_use]
+pub fn args_get_roster(seq: u64) -> [u8; 32] {
+    let mut w = Writer::new();
+    w.raw(op::GET_ROSTER.as_bytes()).u64(seq);
+    blake3_of(&w.finish())
+}
+
+/// `args_hash` for `get-keyslot` (§9.6/§12): `BLAKE3(canonical("get-keyslot" ‖ device_id ‖ le32(gen)))`,
+/// binding the exact keyslot (device, generation) requested.
+#[must_use]
+pub fn args_get_keyslot(device_id: &Id, gen: u32) -> [u8; 32] {
+    let mut w = Writer::new();
+    w.raw(op::GET_KEYSLOT.as_bytes()).raw(device_id).u32(gen);
+    blake3_of(&w.finish())
+}
+
 /// The op label, recomputed `args_hash`, and whether it is a write op, for a request (§12). Both the
 /// client (to sign) and the server (to verify) call this so neither can disagree on the binding.
 #[must_use]
@@ -100,6 +122,11 @@ pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
         Request::Has { ids } => (op::HAS, args_read(op::HAS, ids), false),
         // A read keyed by the ref hash (bound like a single-id read), §13/§9.6.
         Request::GetRef { ref_h } => (op::GET_REF, args_read(op::GET_REF, &[*ref_h]), false),
+        // Cold-start bootstrap reads (§8.1): roster entry by seq, keyslot by (device, gen).
+        Request::GetRosterEntry { seq } => (op::GET_ROSTER, args_get_roster(*seq), false),
+        Request::GetKeyslot { device_id, gen } => {
+            (op::GET_KEYSLOT, args_get_keyslot(device_id, *gen), false)
+        }
         Request::Put {
             id, declared_size, ..
         } => (op::PUT, args_put(id, *declared_size), true),

@@ -169,6 +169,19 @@ pub enum Request {
         /// Keyed-hash ref name `H = BLAKE3::keyed_hash(ref_name_key, ref_name)`.
         ref_h: Id,
     },
+    /// Fetch a sigchain entry blob at `/roster/<seq>` (§13) — cold-start fold (§8.1). Absent past the
+    /// tip, so the client reads `seq = 0, 1, …` until `None`.
+    GetRosterEntry {
+        /// Sigchain sequence number.
+        seq: u64,
+    },
+    /// Fetch a device's keyslot blob at `/keyslots/<device_id>/<gen>` (§13) — cold-start unwrap (§8.1).
+    GetKeyslot {
+        /// `device_id = BLAKE3(canonical(pubkey))`.
+        device_id: Id,
+        /// Master-key generation.
+        gen: u32,
+    },
 }
 
 const T_GET: u8 = 0;
@@ -177,6 +190,8 @@ const T_PUT: u8 = 2;
 const T_CAS: u8 = 3;
 const T_ROSTER: u8 = 4;
 const T_GETREF: u8 = 5;
+const T_GETROSTER: u8 = 6;
+const T_GETKEYSLOT: u8 = 7;
 
 impl Request {
     /// Canonical encoding (tag-prefixed).
@@ -218,6 +233,12 @@ impl Request {
             Request::GetRef { ref_h } => {
                 w.u8(T_GETREF).raw(ref_h);
             }
+            Request::GetRosterEntry { seq } => {
+                w.u8(T_GETROSTER).u64(*seq);
+            }
+            Request::GetKeyslot { device_id, gen } => {
+                w.u8(T_GETKEYSLOT).raw(device_id).u32(*gen);
+            }
         }
         w.finish()
     }
@@ -257,6 +278,11 @@ impl Request {
             },
             T_GETREF => Request::GetRef {
                 ref_h: read32(&mut r)?,
+            },
+            T_GETROSTER => Request::GetRosterEntry { seq: r.u64()? },
+            T_GETKEYSLOT => Request::GetKeyslot {
+                device_id: read32(&mut r)?,
+                gen: r.u32()?,
             },
             other => return Err(WireError::BadTag(other)),
         };
@@ -484,6 +510,11 @@ mod tests {
                 entry: b"entry-bytes".to_vec(),
             },
             Request::GetRef { ref_h: [9; 32] },
+            Request::GetRosterEntry { seq: 7 },
+            Request::GetKeyslot {
+                device_id: [10; 32],
+                gen: 3,
+            },
         ];
         for req in reqs {
             assert_eq!(Request::decode(&req.encode()).unwrap(), req);

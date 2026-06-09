@@ -10,8 +10,10 @@
 //! cold-start (peeling roster-key history across generations) needs the §8.2 key-history storage and
 //! the rotate flow, which are later milestones; [`open_repo`] errors clearly if the tip is past g = 1.
 
+use crate::{Remote, RemoteError};
 use secsec_frame::{Frame, FRAME_LEN};
 use secsec_kdf::MasterKey;
+use secsec_proto::server::limits::MAX_TOTAL_SIGCHAIN;
 use secsec_roster::{cold_start_fold, encode_entry, genesis, seal_entry, RosterError, State};
 use secsec_sig::DeviceKey;
 use secsec_store::{Store, StoreError, ABSENT_HEAD};
@@ -44,6 +46,8 @@ pub enum RepoError {
     /// The repo has rotated past genesis; rotation-era cold-start is not yet wired (needs §8.2
     /// roster-key-history storage).
     RotationUnsupported(u32),
+    /// The far side errored, or returned a roster longer than the §19 cap (a misbehaving server).
+    Remote(RemoteError),
 }
 
 impl core::fmt::Display for RepoError {
@@ -67,10 +71,16 @@ impl core::fmt::Display for RepoError {
                     "repo at generation {g}; rotation-era cold-start not yet wired"
                 )
             }
+            RepoError::Remote(e) => write!(f, "{e}"),
         }
     }
 }
 impl std::error::Error for RepoError {}
+impl From<RemoteError> for RepoError {
+    fn from(e: RemoteError) -> Self {
+        RepoError::Remote(e)
+    }
+}
 impl From<StoreError> for RepoError {
     fn from(e: StoreError) -> Self {
         RepoError::Store(e)
@@ -160,6 +170,48 @@ pub fn open_repo(
     let candidate = secsec_keyslot::unwrap_raw(&keyslot, g_cur, &device_id, &secret)?;
 
     // No roster-key history at genesis (no rotation yet).
+    let keyhist: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+    let (state, mk) = cold_start_fold(&candidate, g_cur, rfp, &keyhist, &entries)?;
+    Ok((mk, state))
+}
+
+/// §8.1 cold-start open against a **remote** (the network counterpart of [`open_repo`]). Fetches the
+/// sigchain entries (`seq = 0, 1, … `until absent, bounded by the §19 cap) and this device's keyslot
+/// over the [`Remote`], then runs the same `cold_start_fold` (peel, decrypt, fold, verify RFP +
+/// `mk_commit`). Genesis generation only (see module note). The objects/heads are fetched separately
+/// by the sync loop; this recovers the **identity** (master key + roster).
+pub async fn open_repo_remote<R: Remote>(
+    remote: &R,
+    device: &DeviceKey,
+    rfp: &[u8; 32],
+) -> Result<(MasterKey, State), RepoError> {
+    let mut entries: Vec<Vec<u8>> = Vec::new();
+    let mut seq = 0u64;
+    // The server returns absent past the tip; cap the walk at the §19 sigchain limit so a misbehaving
+    // server cannot stream entries forever.
+    while seq < MAX_TOTAL_SIGCHAIN {
+        match remote.get_roster_entry(seq).await? {
+            Some(blob) => entries.push(blob),
+            None => break,
+        }
+        seq += 1;
+    }
+    if entries.is_empty() {
+        return Err(RepoError::NotInitialized);
+    }
+    let g_cur = frame_gen(entries.last().expect("non-empty"))?;
+    if g_cur != 1 {
+        return Err(RepoError::RotationUnsupported(g_cur));
+    }
+
+    let device_id = device.device_id()?;
+    let keyslot = remote
+        .get_keyslot(&device_id, g_cur)
+        .await?
+        .ok_or(RepoError::NoKeyslot)?;
+    let secret = device.x25519_secret()?;
+    let candidate = secsec_keyslot::unwrap_raw(&keyslot, g_cur, &device_id, &secret)?;
+
     let keyhist: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     let (state, mk) = cold_start_fold(&candidate, g_cur, rfp, &keyhist, &entries)?;
     Ok((mk, state))

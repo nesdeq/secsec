@@ -147,6 +147,15 @@ impl Server {
                 Ok(blob) => Response::Blob(blob),
                 Err(_) => Response::Err(ErrorCode::Internal),
             },
+            Request::GetRosterEntry { seq } => match self.store.get_roster_entry(seq) {
+                Ok(blob) => Response::Blob(blob),
+                Err(_) => Response::Err(ErrorCode::Internal),
+            },
+            Request::GetKeyslot { device_id, gen } => match self.store.get_keyslot(&device_id, gen)
+            {
+                Ok(blob) => Response::Blob(blob),
+                Err(_) => Response::Err(ErrorCode::Internal),
+            },
             Request::Has { ids } => {
                 if ids.len() > limits::MAX_HAS_IDS {
                     return Response::Err(ErrorCode::TooManyIds);

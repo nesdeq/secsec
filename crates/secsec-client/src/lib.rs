@@ -59,6 +59,10 @@ pub trait Remote {
     async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<(), RemoteError>;
     /// Fetch the stored head blob for `/refs/<ref_h>` (`None` if absent).
     async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, RemoteError>;
+    /// Fetch the sigchain entry blob at `seq` (`None` past the tip) — cold-start fold (§8.1).
+    async fn get_roster_entry(&self, seq: u64) -> Result<Option<Vec<u8>>, RemoteError>;
+    /// Fetch a device's keyslot blob for generation `gen` (`None` if absent) — cold-start unwrap.
+    async fn get_keyslot(&self, device_id: &Id, gen: u32) -> Result<Option<Vec<u8>>, RemoteError>;
     /// Blind compare-and-swap (§12): replace `/refs/<ref_h>` with `new_blob` iff `BLAKE3(current
     /// stored blob)` (or [`ABSENT_HEAD`]) equals `expected_old`. Returns `true` on swap, `false` on
     /// conflict.
@@ -525,6 +529,20 @@ mod tests {
         async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
             self.store
                 .get_ref(ref_h)
+                .map_err(|e| RemoteError(e.to_string()))
+        }
+        async fn get_roster_entry(&self, seq: u64) -> Result<Option<Vec<u8>>, RemoteError> {
+            self.store
+                .get_roster_entry(seq)
+                .map_err(|e| RemoteError(e.to_string()))
+        }
+        async fn get_keyslot(
+            &self,
+            device_id: &Id,
+            gen: u32,
+        ) -> Result<Option<Vec<u8>>, RemoteError> {
+            self.store
+                .get_keyslot(device_id, gen)
                 .map_err(|e| RemoteError(e.to_string()))
         }
         async fn cas_head(
