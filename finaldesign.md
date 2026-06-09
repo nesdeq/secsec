@@ -51,7 +51,7 @@ Each row is a guarantee and the mechanism that earns it. Residuals in §22.
 | P4 | Server cannot feed a new/reinstalled device a **forged repository or key** | Out-of-band **RFP** anchor + `mk_commit` verification of any unwrapped master key + SAS with commitment-before-reveal at enrollment (§7) |
 | P5 | A connection ≠ the ability to read or write; unenrolled keys are rejected before any data access | Every repo RPC — including reads — requires a per-op signature from a **keyslot-owning** (rostered) key; server MUST verify keyslot existence at /keyslots/\<device_id\>/\<g\> on every per-op request, not only at connection time (§9.6, §11, §12); a revoked device with an open connection can still issue requests until keyslot deletion is checked — on cooperative servers the re-check window is ≤ the server-nonce TTL (60 s, §19); on a malicious server, keyslot deletion cannot be enforced (residual §22) |
 | P6 | Revocation removes access to data created after rotation (forward secrecy) | revoke ⇒ rotate: new master-key generation, re-wrap to remaining devices, delete keyslot; pre-rotation ciphertext remains a residual (§8.4, §22) |
-| P7 | Revocations cannot be lost or rolled back | Roster is an append-only, hash-chained, signed sigchain with succession + frontier (§8) |
+| P7 | Revocations cannot be lost or rolled back **by the untrusted server** | Roster is an append-only, hash-chained, signed sigchain with succession + frontier (§8). (Eviction of the legitimate device by a *compromised, online* peer racing the CAS is a separate adversary — the concurrent mutual-revocation residual, §22.) |
 | P8 | Rollback/replay of sigchain state is detected; cross-remote rollback of per-ref heads and sigchain is alarmed; fork evidence is computed and alarmed when two devices exchange commits with DAG-incomparable last_seen_head values | Monotonic, signed frontiers on every counter; local frontier sealed with a key derived from **private** key material (§8.5, requires device_ed25519_scalar_clamped, not the public key); rollback-aware merge (§8.5, §10); cross-remote head-rollback alarm mirrors sigchain alarm (§14); fork detection algorithm in §10 fires when received last_seen_head is DAG-incomparable to client head |
 | P9 | No cross-protocol signature reuse | Disjoint SSHSIG namespaces; server-chosen nonces confined to `auth`/`write` (§9.5) |
 | P10 | No catastrophic AEAD misuse / key-confusion for object and recovery wraps | Unique per-object key, fixed nonce, CMT-4 committing AEAD via CTX construction (§9.4); recovery wrap uses same CTX pattern (§8.6); key-history wrap (§8.2) uses CTX pattern with ctx_tag_keyhist = BLAKE3::keyed_hash(k_keyhist_g, "secsec-ctx-v1" ‖ AD_keyhist ‖ T), binding master_key_g as plaintext |
@@ -212,7 +212,10 @@ ops: Genesis | AddDevice | RevokeDevice | Rotate | SetMinAlgo | HistoryReanchor
   `RevokeDevice`; generation = #`Rotate`+1; `min_algo` = max over `SetMinAlgo`.
 - **No lost revoke:** updates *append*. The sigchain head is a CAS-guarded ref (`/roster-head`);
   on a CAS race the loser re-folds onto the new tip and re-appends — a `RevokeDevice` is retried
-  until durably appended, never abandoned.
+  until durably appended, never abandoned. (The sole exception is when the CAS winner's entry
+  *revokes the retrying device itself* — a compromised online peer evicting the legitimate device;
+  that retry necessarily fails succession. This is the §22 concurrent mutual-revocation residual,
+  not a lost honest revoke.)
 - **Revoke-before-add race:** an `AddDevice(C)` entry authored by a device B that is the subject
   of a concurrent `RevokeDevice(B)` is invalid when those two entries are ordered, regardless of
   which won the CAS. The revoking device MUST additionally compute the **transitive add-by closure**

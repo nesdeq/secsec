@@ -61,15 +61,17 @@ secsec/
 │   ├── secsec-aead/      §9.4  CTX/CMT-4 committing AEAD (the foundation primitive)
 │   ├── secsec-kdf/       §5,§9.5  BLAKE3 key hierarchy, mk_commit, all derivations + KATs
 │   ├── secsec-frame/     §9.1  FRAME, object types, pre-alloc bounds (decompression/alloc-bomb guards)
-│   ├── secsec-object/    §6,§9.2  content-addressing, chunk/tree/commit encode+verify
+│   ├── secsec-object/    §9.2  content-addressing, seal/open + 3-way verify, chunk padding
 │   ├── secsec-chunk/     §9.7  keyed FastCDC + padding
+│   ├── secsec-snapshot/  §6    Tree/Commit object graph + directory snapshot/restore
+│   ├── secsec-store/     §13   redb content-addressed blob store (server side)
 │   ├── secsec-sig/       §9.6  SSHSIG namespaces, verifier (alg pinning, negative tests)
-│   ├── secsec-roster/    §8    sigchain fold/succession, keyslots, generations, roster-key history, enrollment
+│   ├── secsec-keyslot/   §8.3  HPKE master-key wrap, mk_commit authenticity
+│   ├── secsec-roster/    §8    sigchain fold/succession, per-entry AEAD, roster-key history, generations, enrollment
 │   ├── secsec-sync/      §10   refs, cas-head, rollback-aware merge, fork detection
 │   ├── secsec-remote/    §14,§15  multi-remote reconcile, quorum, hardened GC
 │   ├── secsec-transport/ §11   QUIC+TLS pinned verifier, stdio mode, auth, channel binding
 │   ├── secsec-proto/     §12   wire protocol, RPC framing, write/read-auth, rate limits
-│   ├── secsec-store/     §13   redb index + packed blob store (server side)
 │   ├── secsec-client/          orchestration: watcher, commit, sync loop, recovery
 │   └── secsec-server/          serve loop, quota/rate-limit enforcement, GC executor
 ├── bin/secsec            thin CLI over the crates
@@ -78,8 +80,11 @@ secsec/
 └── xtask/                build/release (reproducible musl), vector generation
 ```
 
-Dependency direction is strictly downward (canon → aead/kdf/frame → object/sig → roster/sync →
-remote/transport/proto → client/server). No security-critical crate depends on a higher layer.
+Dependency direction is strictly downward (canon → aead/kdf/frame → object/sig/chunk →
+snapshot/store/keyslot/roster → sync → remote/transport/proto → client/server). No security-critical
+crate depends on a higher layer. (`secsec-object`, `secsec-snapshot`, `secsec-keyslot` were split
+out as their own crates from the original `object`/`roster` grouping, keeping each core small and
+separately reviewable.)
 
 ---
 
