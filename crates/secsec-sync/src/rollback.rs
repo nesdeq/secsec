@@ -19,11 +19,18 @@
 //! the §10 fork algorithm: a known, DAG-incomparable `last_seen_head` is a provable fork → alarm.
 
 use crate::dag::{self, Id, ParentMap};
+use secsec_canon::{CanonError, Reader, Writer};
+use secsec_frame::MAX_LIST_ELEMENTS;
 use secsec_sig::DeviceId;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The sentinel `last_seen_head` meaning "none" (§6: zero if none).
 pub const NO_HEAD: Id = [0u8; 32];
+
+/// Local sealed-state nonce length (§9.8): 96-bit.
+pub const FRONTIER_NONCE_LEN: usize = 12;
+/// Poly1305 tag length in the sealed frontier blob (§9.8).
+pub const FRONTIER_TAG_LEN: usize = 16;
 
 /// The persisted, monotonic client frontier (§8.5) the merge gates check against. Sealed locally
 /// under the device key (§8.5/§9.8); this is just the in-memory state.
@@ -230,6 +237,130 @@ pub fn fork_check(
     }
 }
 
+// ---- local sealed state (§8.5 / §9.8) ----
+
+/// Errors sealing/opening the local frontier state.
+#[derive(Debug)]
+pub enum FrontierError {
+    /// Blob too short for `nonce ‖ tag ‖ ct`.
+    BadBlobSize,
+    /// The §9.8 AEAD failed to open — wrong device key, wrong device_id AD, or a tampered/rolled-back
+    /// blob from a different device. A **lost-frontier event** (§8.5): alarm and treat as a reinstall.
+    Aead,
+    /// The decrypted state was not canonical (truncation, over-long map, trailing bytes).
+    Canon(CanonError),
+}
+impl core::fmt::Display for FrontierError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FrontierError::BadBlobSize => f.write_str("frontier blob size out of bounds"),
+            FrontierError::Aead => f.write_str("frontier AEAD open failed (lost-frontier event)"),
+            FrontierError::Canon(e) => write!(f, "canon: {e}"),
+        }
+    }
+}
+impl std::error::Error for FrontierError {}
+impl From<CanonError> for FrontierError {
+    fn from(e: CanonError) -> Self {
+        FrontierError::Canon(e)
+    }
+}
+
+fn encode_hwm(w: &mut Writer, map: &BTreeMap<DeviceId, u64>) {
+    // BTreeMap iterates in ascending key order → canonical.
+    w.u64(map.len() as u64);
+    for (id, v) in map {
+        w.raw(id).u64(*v);
+    }
+}
+
+fn decode_hwm(r: &mut Reader<'_>) -> Result<BTreeMap<DeviceId, u64>, CanonError> {
+    let n = r.u64()? as usize;
+    if n > MAX_LIST_ELEMENTS {
+        return Err(CanonError::LengthExceedsMax {
+            len: n as u64,
+            max: MAX_LIST_ELEMENTS,
+        });
+    }
+    let mut map = BTreeMap::new();
+    for _ in 0..n {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(r.raw(32)?);
+        map.insert(id, r.u64()?);
+    }
+    Ok(map)
+}
+
+impl SyncFrontier {
+    /// Canonical plaintext encoding of the frontier (the inner of the §8.5 sealed blob).
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u64(self.roster_seq);
+        encode_hwm(&mut w, &self.commit_version_hwm);
+        encode_hwm(&mut w, &self.head_version_hwm);
+        w.finish()
+    }
+
+    /// Strictly decode a frontier plaintext (inverse of [`Self::encode`]).
+    pub fn decode(bytes: &[u8]) -> Result<Self, FrontierError> {
+        let mut r = Reader::new(bytes);
+        let roster_seq = r.u64()?;
+        let commit_version_hwm = decode_hwm(&mut r)?;
+        let head_version_hwm = decode_hwm(&mut r)?;
+        r.finish()?;
+        Ok(SyncFrontier {
+            roster_seq,
+            commit_version_hwm,
+            head_version_hwm,
+        })
+    }
+}
+
+/// Seal the frontier as the §8.5 local-state blob `nonce(12) ‖ tag(16) ‖ ct` using the §9.8
+/// mutable-object AEAD (fresh OS-CSPRNG nonce per write — reuse is fatal) under `local_seal_key`
+/// ([`secsec_sig::DeviceKey::local_seal_key`]), with `device_id` as the AD (no FRAME, no signature —
+/// it is local-only and unsigned). Returns `None` on OS-RNG failure.
+#[must_use]
+pub fn seal_frontier(
+    frontier: &SyncFrontier,
+    local_seal_key: &[u8; 32],
+    device_id: &DeviceId,
+) -> Option<Vec<u8>> {
+    let mut nonce = [0u8; FRONTIER_NONCE_LEN];
+    getrandom::fill(&mut nonce).ok()?;
+    let (tag, ct) = secsec_aead::seal_mut(local_seal_key, &nonce, device_id, &frontier.encode());
+    let mut out = Vec::with_capacity(FRONTIER_NONCE_LEN + FRONTIER_TAG_LEN + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&tag);
+    out.extend_from_slice(&ct);
+    Some(out)
+}
+
+/// Open a sealed frontier blob. A size/AEAD/canonical failure is a §8.5 **lost-frontier event** the
+/// caller must surface to the user (alarm + treat the session as a reinstall). The `device_id` AD
+/// binds the blob to this device, so another device's (or a tampered) state will not open.
+pub fn open_frontier(
+    local_seal_key: &[u8; 32],
+    device_id: &DeviceId,
+    blob: &[u8],
+) -> Result<SyncFrontier, FrontierError> {
+    if blob.len() < FRONTIER_NONCE_LEN + FRONTIER_TAG_LEN {
+        return Err(FrontierError::BadBlobSize);
+    }
+    let nonce: [u8; FRONTIER_NONCE_LEN] = blob[..FRONTIER_NONCE_LEN]
+        .try_into()
+        .expect("slice is exactly FRONTIER_NONCE_LEN");
+    let tag: [u8; FRONTIER_TAG_LEN] = blob
+        [FRONTIER_NONCE_LEN..FRONTIER_NONCE_LEN + FRONTIER_TAG_LEN]
+        .try_into()
+        .expect("slice is exactly FRONTIER_TAG_LEN");
+    let ct = &blob[FRONTIER_NONCE_LEN + FRONTIER_TAG_LEN..];
+    let pt = secsec_aead::open_mut(local_seal_key, &nonce, device_id, &tag, ct)
+        .map_err(|_| FrontierError::Aead)?;
+    SyncFrontier::decode(&pt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +565,75 @@ mod tests {
             ForkStatus::Comparable
         );
         assert_eq!(fork_check(&g, &known, &id(2), &id(9)), ForkStatus::Unknown);
+    }
+
+    fn sample_frontier() -> SyncFrontier {
+        SyncFrontier {
+            roster_seq: 7,
+            commit_version_hwm: BTreeMap::from([(dev(1), 3), (dev(2), 9)]),
+            head_version_hwm: BTreeMap::from([(dev(2), 4)]),
+        }
+    }
+
+    #[test]
+    fn frontier_encode_round_trips_and_rejects_trailing() {
+        let f = sample_frontier();
+        assert_eq!(SyncFrontier::decode(&f.encode()).unwrap(), f);
+        // empty frontier too.
+        let empty = SyncFrontier::default();
+        assert_eq!(SyncFrontier::decode(&empty.encode()).unwrap(), empty);
+        // trailing bytes are rejected (malleability guard).
+        let mut bytes = f.encode();
+        bytes.push(0);
+        assert!(matches!(
+            SyncFrontier::decode(&bytes),
+            Err(FrontierError::Canon(CanonError::TrailingBytes { .. }))
+        ));
+    }
+
+    #[test]
+    fn frontier_seal_open_round_trip_and_fresh_nonce() {
+        let key = [0x5a; 32];
+        let device = dev(1);
+        let f = sample_frontier();
+
+        let b1 = seal_frontier(&f, &key, &device).unwrap();
+        let b2 = seal_frontier(&f, &key, &device).unwrap();
+        assert_ne!(
+            b1, b2,
+            "a fresh nonce must change the sealed blob each write (§9.8)"
+        );
+        assert_eq!(open_frontier(&key, &device, &b1).unwrap(), f);
+        assert_eq!(open_frontier(&key, &device, &b2).unwrap(), f);
+    }
+
+    #[test]
+    fn frontier_open_rejects_tamper_wrong_key_and_wrong_device() {
+        let key = [0x5a; 32];
+        let device = dev(1);
+        let blob = seal_frontier(&sample_frontier(), &key, &device).unwrap();
+
+        // tampered ciphertext.
+        let mut bad = blob.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            open_frontier(&key, &device, &bad),
+            Err(FrontierError::Aead)
+        ));
+        // a different device key cannot open it (lost-frontier on that device).
+        assert!(matches!(
+            open_frontier(&[0x5b; 32], &device, &blob),
+            Err(FrontierError::Aead)
+        ));
+        // the device_id AD binds the blob to this device; another device's id won't open.
+        assert!(matches!(
+            open_frontier(&key, &dev(2), &blob),
+            Err(FrontierError::Aead)
+        ));
+        // too-short blob.
+        assert!(matches!(
+            open_frontier(&key, &device, &blob[..10]),
+            Err(FrontierError::BadBlobSize)
+        ));
     }
 }

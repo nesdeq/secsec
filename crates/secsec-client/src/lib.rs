@@ -26,7 +26,9 @@ use secsec_object::{open_object, Id, ObjError, PathSalt};
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
 use secsec_snapshot::{Entry, SnapError};
 use secsec_store::{Store, StoreError, ABSENT_HEAD};
-use secsec_sync::rollback::{SiblingHead, SyncFrontier};
+use secsec_sync::rollback::{
+    open_frontier, seal_frontier, FrontierError, SiblingHead, SyncFrontier,
+};
 use secsec_sync::{
     build_head, open_head, random_nonce, ref_hash, seal_head, sign_head, verify_head, Head,
     HeadError,
@@ -89,6 +91,13 @@ pub enum ClientError {
     HeadNotMember,
     /// The rollback-aware merge errored — notably [`MergeError::Rollback`], a §10 security alarm.
     Merge(MergeError),
+    /// Filesystem I/O error (state-file read/write).
+    Io(std::io::Error),
+    /// The persisted local frontier exists but failed to open (corrupt / MAC-fail / wrong device) — a
+    /// §8.5 **lost-frontier event**: the caller MUST alarm and treat the session as a reinstall.
+    FrontierLost(FrontierError),
+    /// Key/signing error (e.g. deriving the local-seal key).
+    Sig(secsec_sig::SigError),
 }
 
 impl core::fmt::Display for ClientError {
@@ -106,10 +115,23 @@ impl core::fmt::Display for ClientError {
             }
             ClientError::HeadNotMember => f.write_str("fetched head signed by a non-member"),
             ClientError::Merge(e) => write!(f, "merge: {e}"),
+            ClientError::Io(e) => write!(f, "io: {e}"),
+            ClientError::FrontierLost(e) => write!(f, "lost local frontier: {e}"),
+            ClientError::Sig(e) => write!(f, "sig: {e}"),
         }
     }
 }
 impl std::error::Error for ClientError {}
+impl From<std::io::Error> for ClientError {
+    fn from(e: std::io::Error) -> Self {
+        ClientError::Io(e)
+    }
+}
+impl From<secsec_sig::SigError> for ClientError {
+    fn from(e: secsec_sig::SigError) -> Self {
+        ClientError::Sig(e)
+    }
+}
 impl From<MergeError> for ClientError {
     fn from(e: MergeError) -> Self {
         ClientError::Merge(e)
@@ -426,6 +448,56 @@ pub async fn sync_ref<R: Remote>(
         frontier: plan.frontier,
         wrote,
     })
+}
+
+// ---- local frontier persistence (§8.5 / §9.8) ----
+
+/// The result of [`load_frontier`].
+#[derive(Debug)]
+pub enum FrontierLoad {
+    /// No state file present. On a genuine first run this means "start from a default frontier"; for a
+    /// repo known to have been initialized, a *missing* file is itself a §8.5 lost-frontier event —
+    /// distinguishing the two is the caller's policy (it knows whether the repo was set up before).
+    Absent,
+    /// Loaded and authenticated against `device`.
+    Loaded(SyncFrontier),
+}
+
+/// Load `device`'s sealed frontier from `path` (§8.5/§9.8). A missing file is [`FrontierLoad::Absent`];
+/// a present-but-unopenable file (corrupt / tampered / MAC-fail / sealed by another device) is the
+/// §8.5 lost-frontier event [`ClientError::FrontierLost`] — the caller MUST alarm and treat the
+/// session as a reinstall (authenticity still holds via RFP + `mk_commit`, but freshness does not).
+pub fn load_frontier(path: &Path, device: &DeviceKey) -> Result<FrontierLoad, ClientError> {
+    let blob = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FrontierLoad::Absent),
+        Err(e) => return Err(ClientError::Io(e)),
+    };
+    let key = device.local_seal_key()?;
+    let device_id = device.device_id()?;
+    match open_frontier(&key, &device_id, &blob) {
+        Ok(f) => Ok(FrontierLoad::Loaded(f)),
+        Err(e) => Err(ClientError::FrontierLost(e)),
+    }
+}
+
+/// Seal `frontier` under `device`'s local-seal key (§8.5) and write it to `path` **atomically**
+/// (temp file + rename), so a crash mid-write cannot leave a torn, unopenable state file. Per §8.5 the
+/// caller persists the advanced frontier *before* writing the merge commit/head it authorized.
+pub fn save_frontier(
+    path: &Path,
+    frontier: &SyncFrontier,
+    device: &DeviceKey,
+) -> Result<(), ClientError> {
+    let key = device.local_seal_key()?;
+    let device_id = device.device_id()?;
+    let blob = seal_frontier(frontier, &key, &device_id).ok_or_else(|| {
+        ClientError::Io(std::io::Error::other("OS CSPRNG failure sealing frontier"))
+    })?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &blob)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -798,5 +870,47 @@ mod tests {
         let a_out = tempfile::tempdir().unwrap();
         secsec_snapshot::restore_commit_tree(&mca, &m, &a_store, a_out.path()).unwrap();
         assert_eq!(read_tree(a_out.path()), read_tree(b_out.path()));
+    }
+
+    #[test]
+    fn frontier_persists_across_restart_and_detects_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frontier.state");
+        let device = DeviceKey::generate().unwrap();
+
+        // missing file on a fresh repo → Absent (not yet a loss).
+        assert!(matches!(
+            load_frontier(&path, &device).unwrap(),
+            FrontierLoad::Absent
+        ));
+
+        let f = SyncFrontier {
+            roster_seq: 12,
+            head_version_hwm: BTreeMap::from([(device.device_id().unwrap(), 5)]),
+            commit_version_hwm: BTreeMap::from([(device.device_id().unwrap(), 9)]),
+        };
+        save_frontier(&path, &f, &device).unwrap();
+
+        // "restart": re-load → identical frontier (rollback gates survive a process restart).
+        let FrontierLoad::Loaded(got) = load_frontier(&path, &device).unwrap() else {
+            panic!("expected a loaded frontier")
+        };
+        assert_eq!(got, f);
+
+        // a different device cannot open it → lost-frontier event (the device_id AD binds it).
+        let other = DeviceKey::generate().unwrap();
+        assert!(matches!(
+            load_frontier(&path, &other),
+            Err(ClientError::FrontierLost(_))
+        ));
+
+        // a corrupted file is a lost-frontier event, not a silent reset.
+        let mut blob = std::fs::read(&path).unwrap();
+        *blob.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, &blob).unwrap();
+        assert!(matches!(
+            load_frontier(&path, &device),
+            Err(ClientError::FrontierLost(_))
+        ));
     }
 }

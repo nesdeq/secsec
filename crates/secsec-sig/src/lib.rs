@@ -140,6 +140,19 @@ impl DeviceKey {
         self.public().x25519_public()
     }
 
+    /// The §8.5 local-seal key: `BLAKE3::derive_key("secsec-local-seal-v1",
+    /// device_ed25519_scalar_clamped)`. Derived from the **private** clamped scalar
+    /// ([`Self::x25519_secret`]) — never the public key, which is recoverable from the
+    /// sigchain-published Ed25519 key via the birational map (§8.5 note). Re-derived at startup, never
+    /// stored. Used to seal the local frontier/state file (§9.8).
+    pub fn local_seal_key(&self) -> Result<Zeroizing<[u8; 32]>, SigError> {
+        let scalar = self.x25519_secret()?;
+        Ok(Zeroizing::new(blake3::derive_key(
+            "secsec-local-seal-v1",
+            scalar.as_slice(),
+        )))
+    }
+
     /// SSHSIG-sign `msg` under `namespace`, returning the PEM-encoded signature bytes.
     pub fn sign(&self, namespace: &str, msg: &[u8]) -> Result<Vec<u8>, SigError> {
         let sig = self.key.sign(namespace, SIG_HASH, msg)?;
@@ -289,6 +302,21 @@ mod tests {
         let ab = a_sec.diffie_hellman(&XPub::from(b_pub));
         let ba = b_sec.diffie_hellman(&XPub::from(a_pub));
         assert_eq!(ab.as_bytes(), ba.as_bytes());
+    }
+
+    #[test]
+    fn local_seal_key_is_private_derived_and_per_device() {
+        let a = DeviceKey::generate().unwrap();
+        let b = DeviceKey::generate().unwrap();
+        let ka = a.local_seal_key().unwrap();
+        // deterministic for a given device.
+        assert_eq!(*ka, *a.local_seal_key().unwrap());
+        // distinct per device.
+        assert_ne!(*ka, *b.local_seal_key().unwrap());
+        // §8.5: derived from the PRIVATE scalar, and not equal to that scalar nor to any
+        // public-recoverable material (it passes through derive_key, so it differs from x25519_secret).
+        assert_ne!(ka.as_slice(), a.x25519_secret().unwrap().as_slice());
+        assert_ne!(ka.as_slice(), &a.x25519_public().unwrap());
     }
 
     #[test]
