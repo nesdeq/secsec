@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// id (32 bytes) → object blob.
@@ -295,6 +296,40 @@ impl Store {
         Ok(arrival.get(&id[..])?.map(|v| v.value()))
     }
 
+    /// Execute a GC sweep (§15): delete every object whose arrival `put_epoch` ≤ `gc_gen` **and**
+    /// whose id is **not** in `keep_set`. Returns the number deleted. The arrival-generation +
+    /// grace-window eligibility is the client's responsibility — it chooses `gc_gen` so only objects
+    /// past the grace window are swept (§15); the `keep_set` is the reachable closure over all
+    /// rostered heads. Newer arrivals (`> gc_gen`) are always shielded. Runs in one write transaction.
+    pub fn gc(&self, keep_set: &BTreeSet<[u8; 32]>, gc_gen: u64) -> Result<u64, StoreError> {
+        let wtx = self.db.begin_write()?;
+        // Collect deletable ids first (can't mutate the table mid-iteration).
+        let mut to_delete: Vec<[u8; 32]> = Vec::new();
+        {
+            let arrival = wtx.open_table(ARRIVAL)?;
+            for item in arrival.iter()? {
+                let (k, v) = item?;
+                if v.value() <= gc_gen {
+                    if let Ok(id) = <[u8; 32]>::try_from(k.value()) {
+                        if !keep_set.contains(&id) {
+                            to_delete.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        {
+            let mut objs = wtx.open_table(OBJECTS)?;
+            let mut arr = wtx.open_table(ARRIVAL)?;
+            for id in &to_delete {
+                objs.remove(&id[..])?;
+                arr.remove(&id[..])?;
+            }
+        }
+        wtx.commit()?;
+        Ok(to_delete.len() as u64)
+    }
+
     /// Number of distinct objects stored.
     pub fn object_count(&self) -> Result<u64, StoreError> {
         let rtx = self.db.begin_read()?;
@@ -461,5 +496,27 @@ mod tests {
         // a racing append still pointing at tip0 (stale) is rejected — no chain poisoning.
         assert_eq!(s.append_roster(&tip0, b"racer").unwrap(), None);
         assert_eq!(s.roster_len().unwrap(), 2);
+    }
+
+    #[test]
+    fn gc_respects_keep_set_and_generation() {
+        let (_d, s) = temp_store();
+        s.put(&id(1), b"a").unwrap(); // put_epoch 1
+        s.put(&id(2), b"b").unwrap(); // put_epoch 2
+        s.put(&id(3), b"c").unwrap(); // put_epoch 3
+        s.put(&id(4), b"d").unwrap(); // put_epoch 4
+
+        // sweep gen ≤ 3, keeping id(2). id(1),id(3) collectible; id(2) kept; id(4) too new.
+        let keep = std::collections::BTreeSet::from([id(2)]);
+        assert_eq!(s.gc(&keep, 3).unwrap(), 2);
+
+        assert_eq!(s.get(&id(1)).unwrap(), None); // swept
+        assert_eq!(s.get(&id(2)).unwrap().as_deref(), Some(&b"b"[..])); // kept
+        assert_eq!(s.get(&id(3)).unwrap(), None); // swept
+        assert_eq!(s.get(&id(4)).unwrap().as_deref(), Some(&b"d"[..])); // too new (epoch > gc_gen)
+        assert_eq!(s.object_count().unwrap(), 2);
+
+        // a second identical sweep deletes nothing.
+        assert_eq!(s.gc(&keep, 3).unwrap(), 0);
     }
 }

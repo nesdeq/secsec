@@ -491,6 +491,76 @@ fn restore_tree(
     Ok(())
 }
 
+// ---- reachable closure (GC keep-set, §15) ----
+
+/// The full set of object ids reachable from `heads` (commit ids): each head, its transitive commit
+/// parents, every tree/subtree, and every chunk (§15 keep-set). Each commit/tree is fetched, opened
+/// (so §9.2 content-addressing is re-verified), and decoded; a **missing** object anywhere in the
+/// closure returns [`SnapError::Missing`] so GC **fails safe** (never deletes when the keep-set is
+/// incomplete, §15). The caller hashes the result with `secsec_proto::gc::keep_set_hash`.
+pub fn reachable_objects(
+    mk: &MasterKey,
+    store: &Store,
+    heads: &[Id],
+) -> Result<std::collections::BTreeSet<Id>, SnapError> {
+    use std::collections::BTreeSet;
+    let mut reachable: BTreeSet<Id> = BTreeSet::new();
+    let mut commits_done: BTreeSet<Id> = BTreeSet::new();
+    let mut work: Vec<Id> = heads.to_vec();
+
+    while let Some(cid) = work.pop() {
+        if !commits_done.insert(cid) {
+            continue;
+        }
+        reachable.insert(cid);
+        let commit = decode_commit(&fetch_open(mk, ObjType::Commit, &ZERO_SALT, &cid, store)?)?;
+        collect_tree(
+            mk,
+            store,
+            &commit.root_tree,
+            &commit.root_salt,
+            0,
+            &mut reachable,
+        )?;
+        for parent in commit.parents {
+            work.push(parent);
+        }
+    }
+    Ok(reachable)
+}
+
+fn collect_tree(
+    mk: &MasterKey,
+    store: &Store,
+    tree_id: &Id,
+    tree_salt: &PathSalt,
+    depth: usize,
+    reachable: &mut std::collections::BTreeSet<Id>,
+) -> Result<(), SnapError> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(SnapError::DepthExceeded);
+    }
+    if !reachable.insert(*tree_id) {
+        return Ok(()); // shared subtree already walked
+    }
+    let tree = decode_tree(&fetch_open(mk, ObjType::Tree, tree_salt, tree_id, store)?)?;
+    for entry in &tree.entries {
+        match entry {
+            Entry::File { chunks, .. } => {
+                for cid in chunks {
+                    reachable.insert(*cid);
+                }
+            }
+            Entry::Dir {
+                subtree,
+                subtree_salt,
+                ..
+            } => collect_tree(mk, store, subtree, subtree_salt, depth + 1, reachable)?,
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +662,33 @@ mod tests {
             read_tree(dst.path()),
             "restored tree differs from source"
         );
+    }
+
+    #[test]
+    fn reachable_objects_covers_graph_and_fails_safe() {
+        let src = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let m = mk();
+
+        std::fs::write(src.path().join("a.txt"), b"alpha").unwrap();
+        std::fs::create_dir_all(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/b.bin"), [3u8; 8 * 1024]).unwrap();
+
+        let commit_id = snapshot(src.path(), &m, &store, 0).unwrap();
+        let reachable = reachable_objects(&m, &store, &[commit_id]).unwrap();
+
+        // every stored object is reachable from the single commit (no garbage; keep-everything).
+        assert_eq!(reachable.len() as u64, store.object_count().unwrap());
+        assert!(reachable.contains(&commit_id));
+
+        // fail-safe (§15): an empty store can't resolve the commit → Missing, so GC must not proceed.
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = Store::open(empty_dir.path().join("e.redb")).unwrap();
+        assert!(matches!(
+            reachable_objects(&m, &empty, &[commit_id]),
+            Err(SnapError::Missing(_))
+        ));
     }
 
     #[test]
