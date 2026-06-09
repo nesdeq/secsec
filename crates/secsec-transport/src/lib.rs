@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod frame;
 pub mod quic;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};

@@ -1416,6 +1416,8 @@ dependencies = [
  "rcgen",
  "rustls",
  "secsec-canon",
+ "secsec-frame",
+ "secsec-proto",
  "secsec-sig",
  "subtle",
  "tokio",

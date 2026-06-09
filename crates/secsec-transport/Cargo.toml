@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 secsec-sig = { path = "../secsec-sig" }
 secsec-canon = { path = "../secsec-canon" }
+secsec-frame = { path = "../secsec-frame" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 x509-cert = "0.2"
@@ -19,5 +20,6 @@ blake3 = "1"
 subtle = "2"
 
 [dev-dependencies]
+secsec-proto = { path = "../secsec-proto" }
 rcgen = "0.13"
 tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
