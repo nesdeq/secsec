@@ -110,6 +110,10 @@ pub enum SnapError {
     NonUtf8Name,
     /// OS RNG failure.
     Rng,
+    /// Commit signature invalid, or the signer is not the commit's author (§9.6).
+    BadSignature,
+    /// Signing/key error.
+    Sig(secsec_sig::SigError),
 }
 
 impl core::fmt::Display for SnapError {
@@ -125,6 +129,8 @@ impl core::fmt::Display for SnapError {
             SnapError::UnsupportedFileType => f.write_str("unsupported file type"),
             SnapError::NonUtf8Name => f.write_str("non-UTF-8 file name"),
             SnapError::Rng => f.write_str("OS RNG failure"),
+            SnapError::BadSignature => f.write_str("commit signature invalid or wrong author"),
+            SnapError::Sig(e) => write!(f, "sig: {e}"),
         }
     }
 }
@@ -148,6 +154,11 @@ impl From<ObjError> for SnapError {
 impl From<CanonError> for SnapError {
     fn from(e: CanonError) -> Self {
         SnapError::Canon(e)
+    }
+}
+impl From<secsec_sig::SigError> for SnapError {
+    fn from(e: secsec_sig::SigError) -> Self {
+        SnapError::Sig(e)
     }
 }
 
@@ -312,6 +323,40 @@ fn decode_commit(bytes: &[u8]) -> Result<Commit, SnapError> {
         last_seen_head,
         ts,
     })
+}
+
+// ---- commit signing (§9.6 secsec-commit-v1) ----
+
+impl Commit {
+    /// The canonical signed message — the commit's encoded fields (§9.3/§9.6). The `device_id`,
+    /// `version`, `roster_seq`, and `last_seen_head` are all covered, binding the commit to its
+    /// author, its replay counter, the roster state it assumed, and the head it last saw.
+    #[must_use]
+    pub fn signed_message(&self) -> Vec<u8> {
+        encode_commit(self)
+    }
+}
+
+/// Sign a commit under [`secsec_sig::NS_COMMIT`] (§9.6). The signer should be the device named by
+/// `commit.device_id`; [`verify_commit`] enforces that.
+pub fn sign_commit(device: &secsec_sig::DeviceKey, commit: &Commit) -> Result<Vec<u8>, SnapError> {
+    Ok(device.sign(secsec_sig::NS_COMMIT, &commit.signed_message())?)
+}
+
+/// Verify a commit signature: the SSHSIG must be valid under `NS_COMMIT` **and** `pubkey` must be the
+/// commit's author (`pubkey.device_id() == commit.device_id`). The caller resolves `pubkey` from the
+/// RFP-anchored roster (§8) for `commit.device_id`, so a non-member cannot forge a commit (§9.6 P3).
+pub fn verify_commit(
+    pubkey: &secsec_sig::DevicePublic,
+    commit: &Commit,
+    sig: &[u8],
+) -> Result<(), SnapError> {
+    if pubkey.device_id()? != commit.device_id {
+        return Err(SnapError::BadSignature);
+    }
+    pubkey
+        .verify(secsec_sig::NS_COMMIT, &commit.signed_message(), sig)
+        .map_err(|_| SnapError::BadSignature)
 }
 
 // ---- snapshot ----
@@ -604,6 +649,39 @@ mod tests {
             ts: 1234,
         };
         assert_eq!(decode_commit(&encode_commit(&commit)).unwrap(), commit);
+    }
+
+    #[test]
+    fn commit_sign_verify_and_author_binding() {
+        use secsec_sig::DeviceKey;
+        let dev = DeviceKey::generate().unwrap();
+        let commit = Commit {
+            root_tree: [9u8; 32],
+            root_salt: [8u8; 16],
+            parents: vec![[7u8; 32]],
+            device_id: dev.device_id().unwrap(), // author = dev
+            version: 3,
+            roster_seq: 2,
+            last_seen_head: [5u8; 32],
+            ts: 1234,
+        };
+        let sig = sign_commit(&dev, &commit).unwrap();
+        assert!(verify_commit(&dev.public(), &commit, &sig).is_ok());
+
+        // a key that isn't the named author is rejected (device_id binding, §9.6).
+        let other = DeviceKey::generate().unwrap();
+        assert!(matches!(
+            verify_commit(&other.public(), &commit, &sig),
+            Err(SnapError::BadSignature)
+        ));
+
+        // tampering any signed field invalidates the signature.
+        let mut tampered = commit.clone();
+        tampered.version = 4;
+        assert!(matches!(
+            verify_commit(&dev.public(), &tampered, &sig),
+            Err(SnapError::BadSignature)
+        ));
     }
 
     /// Read a directory tree into a sorted map of relative-path -> contents for comparison.

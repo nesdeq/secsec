@@ -1399,6 +1399,7 @@ dependencies = [
  "secsec-frame",
  "secsec-kdf",
  "secsec-object",
+ "secsec-sig",
  "secsec-store",
  "tempfile",
 ]

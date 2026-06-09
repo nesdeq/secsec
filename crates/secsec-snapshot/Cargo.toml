@@ -16,6 +16,7 @@ secsec-kdf = { path = "../secsec-kdf" }
 secsec-object = { path = "../secsec-object" }
 secsec-chunk = { path = "../secsec-chunk" }
 secsec-store = { path = "../secsec-store" }
+secsec-sig = { path = "../secsec-sig" }
 getrandom = "0.3"
 
 [dev-dependencies]
