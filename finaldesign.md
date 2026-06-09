@@ -215,9 +215,16 @@ ops: Genesis | AddDevice | RevokeDevice | Rotate | SetMinAlgo | HistoryReanchor
   until durably appended, never abandoned.
 - **Revoke-before-add race:** an `AddDevice(C)` entry authored by a device B that is the subject
   of a concurrent `RevokeDevice(B)` is invalid when those two entries are ordered, regardless of
-  which won the CAS. The revoking device MUST additionally scan the folded roster for any device
-  added by B after the revoking device's last-authored or last-witnessed sigchain entry and append
-  `RevokeDevice` for each such device before finalising the key-history extension (§8.4 step 1).
+  which won the CAS. The revoking device MUST additionally compute the **transitive add-by closure**
+  of B over the folded roster — every current member B added, every member *those* devices added,
+  and so on — restricted to grants made after the revoking device's last-authored or last-witnessed
+  sigchain entry, and append `RevokeDevice` for each device in that closure before finalising the
+  key-history extension (§8.4 step 1). One level is insufficient: a compromised B can add C and have
+  C add E, so revoking only B's direct grants would leave the nested sleeper E to survive the
+  rotation and retain post-rotation access — defeating the forward secrecy `revoke⇒rotate` exists to
+  provide. (A grant made *before* the revoker's reference point was witnessed and implicitly accepted
+  under prior trust, so it is out of scope; a child grant trivially post-dates its parent and is
+  always in scope.)
 - **Anti-rollback:** clients persist `(max seq, tip hash)` and reject any chain shorter than
   their frontier or whose genesis ≠ pinned RFP.
 - **Tip-hash consistency (third rejection condition):** after fetching a chain of length M, the
@@ -360,9 +367,10 @@ Ed25519→X25519 conversion is the established one used by `age`/`ssh-to-age`.)
 ### 8.4 Rotation & revocation (closes "revoke is a no-op")
 
 Against an untrusted server, `revoke` **always** rotates:
-1. Append `RevokeDevice(B)`. Scan the folded roster for any device added by B after the last
-   entry the revoking device authored or witnessed; append `RevokeDevice` for each such device
-   (closes the revoke-before-add backdoor race, §8.1). Then append `Rotate`.
+1. Append `RevokeDevice(B)`. Compute B's **transitive add-by closure** over the folded roster
+   (devices B added, devices they added, …) restricted to grants after the last entry the revoking
+   device authored or witnessed; append `RevokeDevice` for each device in that closure (closes the
+   revoke-before-add backdoor race and its nested two-hop variant, §8.1). Then append `Rotate`.
 2. Mint `master_key_{g+1}`, compute `mk_commit_{g+1}` = `BLAKE3::keyed_hash(master_key_{g+1},
    "secsec-mk-commit-v1" ‖ le32(g+1))`, extend the key-history chain (§8.2).
 3. Write fresh keyslots wrapping `master_key_{g+1}` to all remaining members; delete the revoked

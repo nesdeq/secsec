@@ -21,7 +21,7 @@ use secsec_frame::{
 };
 use secsec_kdf::{roster_entry_key, roster_keyhist_key, SecretKey};
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic, NS_GRANT, NS_ROSTER};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use zeroize::{Zeroize, Zeroizing};
 
 /// A 256-bit master-key generation commitment (`mk_commit_g`, recorded for verification elsewhere).
@@ -437,6 +437,23 @@ pub fn append(
     })
 }
 
+/// Append a sequence of ops as a chain of signed entries after `prev_entry`, each linking to the
+/// one before it (so the whole batch is a valid hash-chain extension). Used to emit the multi-op
+/// `revoke⇒rotate` sequence from [`revoke_rotate_ops`] atomically in author order.
+pub fn append_many(
+    prev_entry: &Entry,
+    ops: Vec<Op>,
+    signer: &DeviceKey,
+    ts: u64,
+) -> Result<Vec<Entry>, RosterError> {
+    let mut out: Vec<Entry> = Vec::with_capacity(ops.len());
+    for op in ops {
+        let prev = out.last().unwrap_or(prev_entry);
+        out.push(append(prev, op, signer, ts)?);
+    }
+    Ok(out)
+}
+
 /// The folded roster state (§8.1).
 pub struct State {
     /// Current member device ids → their public keys.
@@ -569,6 +586,52 @@ pub fn devices_added_by(state: &State, revoked: &DeviceId, after_seq: u64) -> Ve
         })
         .map(|(id, _)| *id)
         .collect()
+}
+
+/// The **transitive** revoke-before-add closure (§8.1, §8.4 step 1): every current member reachable
+/// from `revoked` through the add-by graph within the window — devices `revoked` granted, devices
+/// *they* granted, and so on (all at/after `after_seq`). Returns the set **excluding** `revoked`
+/// itself, sorted.
+///
+/// One level is not enough: a compromised device B can add C and have C add E, so that revoking B
+/// (one level → only C) leaves E behind to survive the rotation. Closing only the direct level
+/// reopens the very backdoor `revoke⇒rotate` exists to shut, so the whole subtree is swept. Deeper
+/// levels trivially satisfy `after_seq` (a child cannot be added before its parent existed).
+#[must_use]
+pub fn revoke_closure(state: &State, revoked: &DeviceId, after_seq: u64) -> Vec<DeviceId> {
+    let mut found: BTreeSet<DeviceId> = BTreeSet::new();
+    let mut work = vec![*revoked];
+    while let Some(cur) = work.pop() {
+        for d in devices_added_by(state, &cur, after_seq) {
+            if found.insert(d) {
+                work.push(d);
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Build the ordered op sequence for `revoke⇒rotate` (§8.4): `RevokeDevice(revoked)`, then a
+/// `RevokeDevice` for every device in the transitive [`revoke_closure`], then `Rotate` to the next
+/// generation. `after_seq` is the revoking device's last-authored-or-witnessed `seq` (§8.4 step 1);
+/// `next_mk_commit` is `mk_commit_{g+1}`. The caller signs these into entries (e.g. via
+/// [`append_many`]) and performs the keyslot re-wrap / deletion (§8.4 steps 2–4) on top.
+#[must_use]
+pub fn revoke_rotate_ops(
+    state: &State,
+    revoked: &DeviceId,
+    after_seq: u64,
+    next_mk_commit: MkCommit,
+) -> Vec<Op> {
+    let mut ops = Vec::new();
+    ops.push(Op::RevokeDevice { device: *revoked });
+    for d in revoke_closure(state, revoked, after_seq) {
+        ops.push(Op::RevokeDevice { device: d });
+    }
+    ops.push(Op::Rotate {
+        mk_commit: next_mk_commit,
+    });
+    ops
 }
 
 /// A persisted anti-rollback frontier (§8.1): the highest accepted seq and that entry's hash.
@@ -865,6 +928,70 @@ mod tests {
         entries2.push(revoke_early);
         let st2 = fold(&entries2, &rfp).unwrap();
         assert_eq!(devices_added_by(&st2, &b_id, 0).len(), 2); // early gone, C+D remain
+    }
+
+    /// The transitive closure catches the two-hop sleeper that one level misses: B adds C, C adds E.
+    #[test]
+    fn revoke_closure_is_transitive() {
+        let d1 = DeviceKey::generate().unwrap();
+        let b = DeviceKey::generate().unwrap();
+        let c = DeviceKey::generate().unwrap();
+        let e = DeviceKey::generate().unwrap();
+        let (entries, rfp) = chain(
+            &d1,
+            vec![
+                (add(&b), &d1), // seq 1: d1 adds B
+                (add(&c), &b),  // seq 2: B adds C
+                (add(&e), &c),  // seq 3: C adds E (the nested sleeper)
+            ],
+        );
+        let st = fold(&entries, &rfp).unwrap();
+        let b_id = b.device_id().unwrap();
+
+        // one level sees only C ...
+        assert_eq!(
+            devices_added_by(&st, &b_id, 0),
+            vec![c.device_id().unwrap()]
+        );
+        // ... the transitive closure sweeps C and E both.
+        let mut closure = revoke_closure(&st, &b_id, 0);
+        closure.sort();
+        let mut want = vec![c.device_id().unwrap(), e.device_id().unwrap()];
+        want.sort();
+        assert_eq!(closure, want);
+    }
+
+    /// End-to-end: building revoke⇒rotate ops, appending them, and re-folding leaves none of the
+    /// suspect subtree as a member and bumps the generation.
+    #[test]
+    fn revoke_rotate_ops_evicts_whole_subtree() {
+        let d1 = DeviceKey::generate().unwrap();
+        let b = DeviceKey::generate().unwrap();
+        let c = DeviceKey::generate().unwrap();
+        let e = DeviceKey::generate().unwrap();
+        let (mut entries, rfp) = chain(&d1, vec![(add(&b), &d1), (add(&c), &b), (add(&e), &c)]);
+        let st = fold(&entries, &rfp).unwrap();
+        let b_id = b.device_id().unwrap();
+
+        // d1 builds and appends RevokeDevice(B), RevokeDevice(closure...), Rotate.
+        let ops = revoke_rotate_ops(&st, &b_id, 0, [0xCC; 32]);
+        // last op is the Rotate; the rest are revokes (B + its subtree = B, C, E -> 3 revokes).
+        assert!(matches!(ops.last(), Some(Op::Rotate { .. })));
+        assert_eq!(ops.len(), 1 /*B*/ + 2 /*C,E*/ + 1 /*Rotate*/);
+
+        let new_entries = append_many(entries.last().unwrap(), ops, &d1, 0).unwrap();
+        entries.extend(new_entries);
+
+        let st2 = fold(&entries, &rfp).unwrap();
+        assert!(st2.is_member(&d1.device_id().unwrap()), "founder remains");
+        for dead in [&b, &c, &e] {
+            assert!(
+                !st2.is_member(&dead.device_id().unwrap()),
+                "whole compromised subtree evicted"
+            );
+        }
+        assert_eq!(st2.generation, 2);
+        assert_eq!(st2.mk_commits.get(&2), Some(&[0xCC; 32]));
     }
 
     #[test]
