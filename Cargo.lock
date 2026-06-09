@@ -584,6 +584,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "secsec-snapshot"
+version = "0.0.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "secsec-canon",
+ "secsec-chunk",
+ "secsec-frame",
+ "secsec-kdf",
+ "secsec-object",
+ "secsec-store",
+ "tempfile",
+]
+
+[[package]]
 name = "secsec-store"
 version = "0.0.0"
 dependencies = [

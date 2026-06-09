@@ -1,0 +1,22 @@
+[package]
+name = "secsec-snapshot"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Object graph (Tree/Commit) + directory snapshot and restore (finaldesign.md §6, §9.2)."
+
+[lints]
+workspace = true
+
+[dependencies]
+secsec-canon = { path = "../secsec-canon" }
+secsec-frame = { path = "../secsec-frame" }
+secsec-kdf = { path = "../secsec-kdf" }
+secsec-object = { path = "../secsec-object" }
+secsec-chunk = { path = "../secsec-chunk" }
+secsec-store = { path = "../secsec-store" }
+getrandom = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
