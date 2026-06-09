@@ -22,6 +22,7 @@ roster_keyhist.g = 1
 enc_key[g=1][t=0]                       = f4980c049361ccff05371f5c95680bc6563786007cfb1cf94af33feef51c7102
 id_key[g=1][t=0]                        = 8cb578fd23622f39495fceb7bbaa8871d231d91d0fd5262be2481800ad2f4e27
 cdc_seed[g=1]                           = 6e792c1fbab509b44804004092e25b29de446feb222d27dab4da456627fadb69
+head_key[g=1]                           = b3e31ff53215dd1303397a658d6b31db1ed3ab63065a5fc4742e420784cf33b8
 roster_key[g=1]                         = 0ed99fa51a9e04918a45048b508afb58b38f14b8614d4d0d0c72e3d9a5f26fe7
 ref_name_key                            = fb53df1905087813330741d575f364bc8a32343cafa3105f9d5e1fc337520ac3
 mk_commit[g=1]                          = 73300b1d7cdd3cd2baeffd447f1b3ffdafde8e0e2f36c7c6feb99ed1cabf96a2

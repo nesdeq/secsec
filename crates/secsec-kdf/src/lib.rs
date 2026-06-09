@@ -23,6 +23,7 @@ pub type SecretKey = Zeroizing<[u8; 32]>;
 const L_ENC: &str = "secsec-enc-key-v1";
 const L_ID: &str = "secsec-id-key-v1";
 const L_CDC: &str = "secsec-cdc-seed-v1";
+const L_HEAD: &str = "secsec-head-enc-v1";
 const L_ROSTER: &str = "secsec-roster-enc-v1";
 const L_REFNAME: &str = "secsec-ref-name-v1";
 const L_ROSTER_ENTRY: &str = "secsec-roster-entry-v1";
@@ -80,6 +81,15 @@ impl MasterKey {
     #[must_use]
     pub fn cdc_seed(&self) -> SecretKey {
         derive(L_CDC, |w| {
+            w.raw(&self.key[..]).u32(self.generation);
+        })
+    }
+
+    /// `head_key_g` — the per-generation key for the mutable Head-blob AEAD (§9.8). Fresh-nonce
+    /// ChaCha20-Poly1305 (`secsec_aead::seal_mut`), distinct from the content-addressed object key.
+    #[must_use]
+    pub fn head_key(&self) -> SecretKey {
+        derive(L_HEAD, |w| {
             w.raw(&self.key[..]).u32(self.generation);
         })
     }
@@ -192,6 +202,8 @@ mod tests {
         push(*g2.id_key(0));
         push(*g1.cdc_seed());
         push(*g2.cdc_seed());
+        push(*g1.head_key());
+        push(*g2.head_key());
         push(*rk1);
         push(*rk2);
         push(*g1.ref_name_key()); // ref_name_key has no gen input → same across g; push once
@@ -263,6 +275,10 @@ mod tests {
         assert_eq!(
             hx(&g1.cdc_seed()[..]),
             "6e792c1fbab509b44804004092e25b29de446feb222d27dab4da456627fadb69"
+        );
+        assert_eq!(
+            hx(&g1.head_key()[..]),
+            "b3e31ff53215dd1303397a658d6b31db1ed3ab63065a5fc4742e420784cf33b8"
         );
         assert_eq!(
             hx(&rk[..]),
