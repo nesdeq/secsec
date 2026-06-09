@@ -19,7 +19,9 @@ secsec-store = { path = "../../crates/secsec-store" }
 secsec-transport = { path = "../../crates/secsec-transport" }
 secsec-client = { path = "../../crates/secsec-client" }
 secsec-sig = { path = "../../crates/secsec-sig" }
+secsec-sync = { path = "../../crates/secsec-sync" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+getrandom = "0.3"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rcgen = "0.13"

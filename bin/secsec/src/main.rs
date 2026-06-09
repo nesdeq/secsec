@@ -1,20 +1,26 @@
 //! `secsec` — the CLI binary (`finaldesign.md` §11, §12).
 //!
-//! Subcommands: `init` (repository genesis — §7), `serve` (the blind server), and `hostkey` (host-pin
-//! helper). `init` writes the genesis roster + this device's keyslot into a store and prints the RFP;
-//! `serve` is fully functional (the server is blind — no master key). The remaining client subcommand
-//! `sync` (cold-start over a remote + watcher-driven commit) needs the remote roster/keyslot read ops
-//! and is the next milestone.
+//! Subcommands: `init` (repository genesis — §7), `serve` (the blind server), `hostkey` (host-pin
+//! helper), and `sync` (cold-start over the wire, then reconcile a working dir with a ref — §8.1/§10).
+//! `init` writes the genesis roster + this device's keyslot and prints the RFP; `serve` is fully
+//! functional (the server is blind — no master key); `sync` recovers the master key + roster from the
+//! remote, snapshots the dir, and clones/publishes/pulls/merges. The watcher-driven continuous loop
+//! and `--host-fp` fingerprint pinning (vs the current full-cert `--host-cert`) are follow-ups.
 
 #![allow(missing_docs)] // a binary crate exports no public API
 
 use clap::{Parser, Subcommand};
-use secsec_client::repo::init_repo;
+use secsec_client::quic::QuicRemote;
+use secsec_client::repo::{init_repo, open_repo_remote};
+use secsec_client::sync::sync_once;
+use secsec_client::{load_frontier, save_frontier, FrontierLoad};
 use secsec_server::serve::serve_connection;
 use secsec_server::Server;
 use secsec_sig::DeviceKey;
 use secsec_store::Store;
-use secsec_transport::quic::server_config;
+use secsec_sync::rollback::SyncFrontier;
+use secsec_transport::handshake::client_handshake;
+use secsec_transport::quic::{client_config, server_config};
 use secsec_transport::HostPin;
 use std::error::Error;
 use std::net::SocketAddr;
@@ -64,6 +70,34 @@ enum Cmd {
         /// Directory holding the self-signed host key.
         #[arg(long)]
         hostkey_dir: PathBuf,
+    },
+    /// Sync a working directory with a remote ref once (cold-start over the wire, then reconcile).
+    Sync {
+        /// Server address (e.g. `127.0.0.1:8899`).
+        #[arg(long)]
+        remote: SocketAddr,
+        /// The server's host certificate (DER), e.g. `<hostkey_dir>/hostkey.crt` — the pin. (The §11
+        /// `--host-fp` fingerprint form needs a hash-comparing verifier; not yet wired.)
+        #[arg(long)]
+        host_cert: PathBuf,
+        /// This device's OpenSSH private key (the one enrolled at `init`).
+        #[arg(long)]
+        key: PathBuf,
+        /// The working directory to sync.
+        #[arg(long)]
+        dir: PathBuf,
+        /// The local object store (created if absent).
+        #[arg(long)]
+        store: PathBuf,
+        /// Directory holding local sync state (sealed frontier + base cursor).
+        #[arg(long)]
+        state: PathBuf,
+        /// The repository fingerprint (RFP) hex from `init` — the out-of-band trust anchor.
+        #[arg(long)]
+        rfp: String,
+        /// The ref name to sync.
+        #[arg(long, default_value = "main")]
+        r#ref: String,
     },
 }
 
@@ -144,6 +178,92 @@ fn run_init(store: PathBuf, key: PathBuf) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn parse_hex32(s: &str) -> Result<[u8; 32], Box<dyn Error>> {
+    let bytes: Vec<u8> = (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2).unwrap_or("zz"), 16))
+        .collect::<Result<_, _>>()
+        .map_err(|_| "invalid hex")?;
+    bytes
+        .try_into()
+        .map_err(|_| "expected 32 bytes (64 hex chars)".into())
+}
+
+/// The last-synced base cursor is a commit **content hash** (not secret — the server already stores
+/// objects by id), so it is persisted as plain hex; the anti-rollback frontier beside it IS sealed.
+fn read_base(path: &Path) -> Result<Option<[u8; 32]>, Box<dyn Error>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(parse_hex32(s.trim())?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_sync(
+    remote: SocketAddr,
+    host_cert: PathBuf,
+    key: PathBuf,
+    dir: PathBuf,
+    store_path: PathBuf,
+    state: PathBuf,
+    rfp_hex: String,
+    ref_name: String,
+) -> Result<(), Box<dyn Error>> {
+    let device = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
+    let pin = HostPin::from_cert(&std::fs::read(&host_cert)?)?;
+    let host_id = pin.host_id();
+    let rfp = parse_hex32(&rfp_hex)?;
+
+    // connect + §11 handshake.
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(client_config(pin)?);
+    let conn = endpoint.connect(remote, "secsec.invalid")?.await?;
+    let mut client_nonce = [0u8; 32];
+    getrandom::fill(&mut client_nonce)?;
+    let sess = client_handshake(&conn, &device, host_id, client_nonce).await?;
+    let rem = QuicRemote::new(&conn, sess.transcript, &device);
+
+    // cold-start: recover the master key + roster over the wire, anchored to the RFP.
+    let (mk, st) = open_repo_remote(&rem, &device, &rfp).await?;
+
+    // local state.
+    let store = Store::open(&store_path)?;
+    std::fs::create_dir_all(&state)?;
+    let frontier_path = state.join("frontier");
+    let base_path = state.join("base");
+    let frontier = match load_frontier(&frontier_path, &device)? {
+        FrontierLoad::Loaded(f) => f,
+        FrontierLoad::Absent => SyncFrontier::default(),
+    };
+    let base = read_base(&base_path)?;
+
+    // genesis-generation repos sit at roster_seq 0 (rotation-era sync is a later milestone).
+    let outcome = sync_once(
+        &rem,
+        &store,
+        &dir,
+        &mk,
+        &device,
+        &st.members,
+        &frontier,
+        &ref_name,
+        0,
+        base,
+        unix_secs(),
+    )
+    .await?;
+
+    save_frontier(&frontier_path, &outcome.frontier, &device)?;
+    if let Some(b) = outcome.base {
+        std::fs::write(&base_path, hex(&b))?;
+    }
+    println!("sync: {:?}", outcome.kind);
+    conn.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+    Ok(())
+}
+
 fn run_hostkey(hostkey_dir: PathBuf) -> Result<(), Box<dyn Error>> {
     let (cert, _key) = load_or_generate_hostkey(&hostkey_dir)?;
     let host_id = HostPin::from_cert(&cert)?.host_id();
@@ -164,5 +284,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             rt.block_on(run_serve(store, hostkey_dir, listen))
         }
         Cmd::Hostkey { hostkey_dir } => run_hostkey(hostkey_dir),
+        Cmd::Sync {
+            remote,
+            host_cert,
+            key,
+            dir,
+            store,
+            state,
+            rfp,
+            r#ref,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(run_sync(
+                remote, host_cert, key, dir, store, state, rfp, r#ref,
+            ))
+        }
     }
 }
