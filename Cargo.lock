@@ -1073,8 +1073,10 @@ name = "secsec-roster"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "secsec-aead",
  "secsec-canon",
  "secsec-frame",
+ "secsec-kdf",
  "secsec-sig",
 ]
 

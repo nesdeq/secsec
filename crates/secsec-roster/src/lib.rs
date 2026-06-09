@@ -15,7 +15,10 @@
 #![forbid(unsafe_code)]
 
 use secsec_canon::{verify_reencode, CanonError, Reader, Writer};
-use secsec_frame::MAX_ROSTER_ENTRY_SIZE;
+use secsec_frame::{
+    assemble_blob, parse_blob, Frame, FrameError, ObjType, FRAME_LEN, MAX_ROSTER_ENTRY_SIZE,
+};
+use secsec_kdf::roster_entry_key;
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic, NS_ROSTER};
 use std::collections::BTreeMap;
 
@@ -99,6 +102,10 @@ pub enum RosterError {
     /// Strict canonical decode failed (truncation, over-long field, trailing bytes, or
     /// non-canonical re-encode).
     Canon(CanonError),
+    /// The stored entry's FRAME was malformed or did not match the expected `(gen, type)` (§18).
+    Frame(FrameError),
+    /// The per-entry AEAD failed to open (wrong key/generation, or tampered ciphertext/commitment).
+    Aead,
     /// Signing/key error.
     Sig(secsec_sig::SigError),
 }
@@ -117,6 +124,8 @@ impl core::fmt::Display for RosterError {
             RosterError::Rollback => f.write_str("sigchain rolled back below frontier"),
             RosterError::BadOp => f.write_str("unknown roster op tag"),
             RosterError::Canon(e) => write!(f, "canon: {e}"),
+            RosterError::Frame(e) => write!(f, "frame: {e}"),
+            RosterError::Aead => f.write_str("roster entry AEAD open failed"),
             RosterError::Sig(e) => write!(f, "sig: {e}"),
         }
     }
@@ -131,6 +140,11 @@ impl From<secsec_sig::SigError> for RosterError {
 impl From<CanonError> for RosterError {
     fn from(e: CanonError) -> Self {
         RosterError::Canon(e)
+    }
+}
+impl From<FrameError> for RosterError {
+    fn from(e: FrameError) -> Self {
+        RosterError::Frame(e)
     }
 }
 
@@ -238,6 +252,54 @@ pub fn decode_entry(bytes: &[u8]) -> Result<Entry, RosterError> {
 #[must_use]
 pub fn entry_hash(e: &Entry) -> [u8; 32] {
     *blake3::hash(&encode_entry(e)).as_bytes()
+}
+
+// ---------------------------------------------------------------------------
+// Per-entry AEAD (§9.5 "Roster entry AEAD"): the entries are stored on the
+// untrusted server encrypted under a per-sequence subkey of `roster_key_g`.
+// ---------------------------------------------------------------------------
+
+/// `AD_roster = FRAME_roster ‖ le64(seq)` (§9.5). The 11-byte FRAME binds `type=roster` and the
+/// generation `g`; `seq` is appended because the FRAME does not carry it. This is the analogue of
+/// the object AEAD's `FRAME ‖ id`.
+fn ad_roster(frame: &Frame, seq: u64) -> [u8; FRAME_LEN + 8] {
+    let mut ad = [0u8; FRAME_LEN + 8];
+    ad[..FRAME_LEN].copy_from_slice(&frame.encode());
+    ad[FRAME_LEN..].copy_from_slice(&seq.to_le_bytes());
+    ad
+}
+
+/// Encrypt a canonical entry plaintext ([`encode_entry`] bytes) for storage under generation `gen`
+/// at sequence `seq`, using `roster_key_g`. Returns the stored blob `FRAME ‖ ctx_tag ‖ ciphertext`
+/// (§9.1/§9.5). The per-entry key `k_roster_entry[g][seq]` is unique per `(roster_key_g, seq)`, so
+/// the fixed zero nonce is safe; the CTX construction gives CMT-4.
+#[must_use]
+pub fn seal_entry(roster_key_g: &[u8; 32], gen: u32, seq: u64, entry_plaintext: &[u8]) -> Vec<u8> {
+    let k = roster_entry_key(roster_key_g, seq);
+    let frame = Frame::v1(gen, ObjType::RosterEntry);
+    let ad = ad_roster(&frame, seq);
+    let (ctx_tag, ct) = secsec_aead::seal(&k, &ad, entry_plaintext);
+    assemble_blob(&frame, &ctx_tag, &ct)
+}
+
+/// Decrypt a stored roster entry blob written under generation `gen` at sequence `seq`, using
+/// `roster_key_g`. Validates the stored FRAME against the expected `(gen, type=roster)` (§18) before
+/// any AEAD work, then opens with `AD_roster`. Returns the canonical entry plaintext on success.
+///
+/// The caller is responsible for deriving `roster_key_g` for the `gen` carried in the blob's
+/// (plaintext, server-readable) FRAME — typically via the §8.2 key-history peel — and then for
+/// [`decode_entry`]-ing and chain-verifying the returned bytes.
+pub fn open_entry(
+    roster_key_g: &[u8; 32],
+    gen: u32,
+    seq: u64,
+    stored: &[u8],
+) -> Result<Vec<u8>, RosterError> {
+    let frame = Frame::v1(gen, ObjType::RosterEntry);
+    let (ctx_tag, ct) = parse_blob(stored, &frame)?;
+    let ad = ad_roster(&frame, seq);
+    let k = roster_entry_key(roster_key_g, seq);
+    secsec_aead::open(&k, &ad, ctx_tag, ct).map_err(|_| RosterError::Aead)
 }
 
 /// Create the genesis entry (seq 0, self-signed by device-1). Returns `(entry, rfp)`.
@@ -657,5 +719,83 @@ mod tests {
         // The op tag sits right after seq(8) + prev(32). Flip Genesis(0) to an unknown tag.
         bytes[40] = 0xFF;
         assert!(matches!(decode_entry(&bytes), Err(RosterError::BadOp)));
+    }
+
+    // ---- Per-entry AEAD (§9.5) ----
+
+    use secsec_kdf::MasterKey;
+
+    fn roster_key_for(gen: u32, key: [u8; 32]) -> secsec_kdf::SecretKey {
+        MasterKey::new(gen, key).roster_key()
+    }
+
+    #[test]
+    fn entry_aead_round_trip() {
+        let d1 = DeviceKey::generate().unwrap();
+        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let pt = encode_entry(&g);
+        let rk = roster_key_for(1, [0x33; 32]);
+
+        let blob = seal_entry(&rk, 1, 0, &pt);
+        // The blob is FRAME(11) ‖ ctx_tag(32) ‖ ct and reveals nothing of the plaintext.
+        assert_ne!(&blob[FRAME_LEN + 32..], &pt[..]);
+
+        let got = open_entry(&rk, 1, 0, &blob).unwrap();
+        assert_eq!(got, pt);
+        // ...and the recovered bytes decode back to the original entry.
+        assert_eq!(decode_entry(&got).unwrap(), g);
+    }
+
+    #[test]
+    fn entry_aead_wrong_generation_is_frame_mismatch() {
+        let d1 = DeviceKey::generate().unwrap();
+        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let rk = roster_key_for(1, [0x33; 32]);
+        let blob = seal_entry(&rk, 1, 0, &encode_entry(&g));
+        // Opening as a different generation must fail at the FRAME check (§18) before any AEAD work.
+        assert!(matches!(
+            open_entry(&rk, 2, 0, &blob),
+            Err(RosterError::Frame(FrameError::FrameMismatch))
+        ));
+    }
+
+    #[test]
+    fn entry_aead_wrong_seq_rejected() {
+        let d1 = DeviceKey::generate().unwrap();
+        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let rk = roster_key_for(1, [0x33; 32]);
+        let blob = seal_entry(&rk, 1, 7, &encode_entry(&g));
+        // Same gen, wrong seq: both the per-entry key and AD differ -> AEAD open fails.
+        assert!(matches!(
+            open_entry(&rk, 1, 8, &blob),
+            Err(RosterError::Aead)
+        ));
+    }
+
+    #[test]
+    fn entry_aead_wrong_key_rejected() {
+        let d1 = DeviceKey::generate().unwrap();
+        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let rk = roster_key_for(1, [0x33; 32]);
+        let other = roster_key_for(1, [0x44; 32]);
+        let blob = seal_entry(&rk, 1, 0, &encode_entry(&g));
+        assert!(matches!(
+            open_entry(&other, 1, 0, &blob),
+            Err(RosterError::Aead)
+        ));
+    }
+
+    #[test]
+    fn entry_aead_tamper_rejected() {
+        let d1 = DeviceKey::generate().unwrap();
+        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let rk = roster_key_for(1, [0x33; 32]);
+        let mut blob = seal_entry(&rk, 1, 0, &encode_entry(&g));
+        // Flip a ciphertext byte (past FRAME + ctx_tag) -> commitment mismatch.
+        *blob.last_mut().unwrap() ^= 0x01;
+        assert!(matches!(
+            open_entry(&rk, 1, 0, &blob),
+            Err(RosterError::Aead)
+        ));
     }
 }
