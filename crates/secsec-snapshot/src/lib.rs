@@ -279,8 +279,10 @@ fn decode_tree(bytes: &[u8]) -> Result<Tree, SnapError> {
     Ok(Tree { entries })
 }
 
-fn encode_commit(c: &Commit) -> Vec<u8> {
-    let mut w = Writer::new();
+/// Maximum stored commit-signature length (an SSHSIG PEM is well under this).
+const MAX_COMMIT_SIG: usize = 4096;
+
+fn write_commit_fields(w: &mut Writer, c: &Commit) {
     w.raw(&c.root_tree)
         .raw(&c.root_salt)
         .u32(c.parents.len() as u32);
@@ -292,11 +294,9 @@ fn encode_commit(c: &Commit) -> Vec<u8> {
         .u64(c.roster_seq)
         .raw(&c.last_seen_head)
         .u64(c.ts);
-    w.finish()
 }
 
-fn decode_commit(bytes: &[u8]) -> Result<Commit, SnapError> {
-    let mut r = Reader::new(bytes);
+fn read_commit_fields(r: &mut Reader<'_>) -> Result<Commit, SnapError> {
     let root_tree = arr32(r.raw(32)?);
     let root_salt = arr16(r.raw(16)?);
     let parent_count = r.u32()? as usize;
@@ -312,7 +312,6 @@ fn decode_commit(bytes: &[u8]) -> Result<Commit, SnapError> {
     let roster_seq = r.u64()?;
     let last_seen_head = arr32(r.raw(32)?);
     let ts = r.u64()?;
-    r.finish()?;
     Ok(Commit {
         root_tree,
         root_salt,
@@ -323,6 +322,35 @@ fn decode_commit(bytes: &[u8]) -> Result<Commit, SnapError> {
         last_seen_head,
         ts,
     })
+}
+
+fn encode_commit(c: &Commit) -> Vec<u8> {
+    let mut w = Writer::new();
+    write_commit_fields(&mut w, c);
+    w.finish()
+}
+
+fn decode_commit(bytes: &[u8]) -> Result<Commit, SnapError> {
+    let mut r = Reader::new(bytes);
+    let c = read_commit_fields(&mut r)?;
+    r.finish()?;
+    Ok(c)
+}
+
+/// The stored signed-commit object: the canonical commit fields followed by the SSHSIG (§9.6).
+fn encode_signed_commit(c: &Commit, sig: &[u8]) -> Vec<u8> {
+    let mut w = Writer::new();
+    write_commit_fields(&mut w, c);
+    w.bytes(sig);
+    w.finish()
+}
+
+fn decode_signed_commit(bytes: &[u8]) -> Result<(Commit, Vec<u8>), SnapError> {
+    let mut r = Reader::new(bytes);
+    let c = read_commit_fields(&mut r)?;
+    let sig = r.bytes(MAX_COMMIT_SIG)?.to_vec();
+    r.finish()?;
+    Ok((c, sig))
 }
 
 // ---- commit signing (§9.6 secsec-commit-v1) ----
@@ -378,11 +406,23 @@ fn mtime_of(meta: &std::fs::Metadata) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Snapshot `root` into `store` under `mk`; returns the commit id. `ts` is the author-asserted
-/// timestamp to record (advisory).
-pub fn snapshot(root: &Path, mk: &MasterKey, store: &Store, ts: u64) -> Result<Id, SnapError> {
+/// Snapshot the directory `root` into `store` under `mk` and return its root **tree** id and salt
+/// (no commit). This is the content half of a sync push; the orchestration wraps it in a signed
+/// commit (see [`seal_signed_commit`]) carrying the version/roster_seq/parent metadata (§10).
+pub fn snapshot_tree(
+    root: &Path,
+    mk: &MasterKey,
+    store: &Store,
+) -> Result<(Id, PathSalt), SnapError> {
     let chunker = secsec_chunk::Chunker::with_defaults(&mk.cdc_seed());
-    let (root_tree, root_salt) = snapshot_dir(root, mk, store, &chunker, 0)?;
+    snapshot_dir(root, mk, store, &chunker, 0)
+}
+
+/// Snapshot `root` into `store` under `mk`; returns the commit id. `ts` is the author-asserted
+/// timestamp to record (advisory). The commit is **unsigned** with placeholder metadata — for the
+/// object-graph round trip and tests. Sync uses [`snapshot_tree`] + [`seal_signed_commit`].
+pub fn snapshot(root: &Path, mk: &MasterKey, store: &Store, ts: u64) -> Result<Id, SnapError> {
+    let (root_tree, root_salt) = snapshot_tree(root, mk, store)?;
     let commit = Commit {
         root_tree,
         root_salt,
@@ -396,6 +436,46 @@ pub fn snapshot(root: &Path, mk: &MasterKey, store: &Store, ts: u64) -> Result<I
     let (id, blob) = seal_object(mk, ObjType::Commit, &ZERO_SALT, &encode_commit(&commit));
     store.put(&id, &blob)?;
     Ok(id)
+}
+
+/// Sign `commit` (under `NS_COMMIT`, §9.6), seal the signed-commit object (fields ‖ sig) under `mk`,
+/// store it, and return its content id. The signer must be `commit.device_id` (a member key); the
+/// content id is the commit id a Head points at. See [`open_signed_commit`] for the read side.
+pub fn seal_signed_commit(
+    mk: &MasterKey,
+    store: &Store,
+    device: &secsec_sig::DeviceKey,
+    commit: &Commit,
+) -> Result<Id, SnapError> {
+    let sig = sign_commit(device, commit)?;
+    let bytes = encode_signed_commit(commit, &sig);
+    let (id, blob) = seal_object(mk, ObjType::Commit, &ZERO_SALT, &bytes);
+    store.put(&id, &blob)?;
+    Ok(id)
+}
+
+/// Fetch and open the signed-commit object `commit_id` from `store`, returning the decoded commit and
+/// its signature. The content id is re-verified by [`open_object`]; the caller still must
+/// [`verify_commit`] the signature against the author's roster key before trusting the commit (§9.6).
+pub fn open_signed_commit(
+    commit_id: &Id,
+    mk: &MasterKey,
+    store: &Store,
+) -> Result<(Commit, Vec<u8>), SnapError> {
+    let bytes = fetch_open(mk, ObjType::Commit, &ZERO_SALT, commit_id, store)?;
+    decode_signed_commit(&bytes)
+}
+
+/// Restore the tree named by `commit` (its `root_tree`/`root_salt`) into `dest` (created if absent).
+/// The caller is expected to have already [`verify_commit`]-ed the commit (§9.6).
+pub fn restore_commit_tree(
+    commit: &Commit,
+    mk: &MasterKey,
+    store: &Store,
+    dest: &Path,
+) -> Result<(), SnapError> {
+    std::fs::create_dir_all(dest)?;
+    restore_tree(&commit.root_tree, &commit.root_salt, mk, store, dest, 0)
 }
 
 fn snapshot_dir(
@@ -740,6 +820,50 @@ mod tests {
             read_tree(dst.path()),
             "restored tree differs from source"
         );
+    }
+
+    #[test]
+    fn signed_commit_lifecycle_round_trips() {
+        use secsec_sig::DeviceKey;
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let m = mk();
+        let device = DeviceKey::generate().unwrap();
+
+        std::fs::write(src.path().join("a.txt"), b"alpha").unwrap();
+        std::fs::create_dir_all(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/b.bin"), [3u8; 8 * 1024]).unwrap();
+
+        // produce side: snapshot the tree, wrap it in a signed commit, seal+store it.
+        let (root_tree, root_salt) = snapshot_tree(src.path(), &m, &store).unwrap();
+        let commit = Commit {
+            root_tree,
+            root_salt,
+            parents: vec![[0x44u8; 32]],
+            device_id: device.device_id().unwrap(),
+            version: 7,
+            roster_seq: 2,
+            last_seen_head: [0x55u8; 32],
+            ts: 99,
+        };
+        let commit_id = seal_signed_commit(&m, &store, &device, &commit).unwrap();
+
+        // consume side: fetch, verify against the author key, restore the tree.
+        let (got, sig) = open_signed_commit(&commit_id, &m, &store).unwrap();
+        assert_eq!(got, commit);
+        verify_commit(&device.public(), &got, &sig).unwrap();
+        restore_commit_tree(&got, &m, &store, dst.path()).unwrap();
+
+        assert_eq!(read_tree(src.path()), read_tree(dst.path()));
+
+        // a forged commit by a non-author is rejected on the consume side.
+        let attacker = DeviceKey::generate().unwrap();
+        assert!(matches!(
+            verify_commit(&attacker.public(), &got, &sig),
+            Err(SnapError::BadSignature)
+        ));
     }
 
     #[test]
