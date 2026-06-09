@@ -533,6 +533,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "secsec-chunk"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "proptest",
+]
+
+[[package]]
 name = "secsec-frame"
 version = "0.0.0"
 dependencies = [

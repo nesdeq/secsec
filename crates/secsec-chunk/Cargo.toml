@@ -1,0 +1,16 @@
+[package]
+name = "secsec-chunk"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Keyed FastCDC content-defined chunking with a cdc_seed-derived gear table (finaldesign.md §9.7)."
+
+[lints]
+workspace = true
+
+[dependencies]
+blake3 = "1"
+
+[dev-dependencies]
+proptest.workspace = true
