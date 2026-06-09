@@ -377,6 +377,15 @@ revocation provides forward secrecy only. See §22.
 
 A bare `revoke` without rotate is **not offered** under this threat model.
 
+**Concurrent mutual-revocation race (residual).** Devices are flat and equal; there is no
+privileged founder. A stolen device that is unlocked, online, and actively racing can issue
+`RevokeDevice(legit)+Rotate` concurrently with the user's `RevokeDevice(stolen)+Rotate`; the
+`/roster-head` CAS serializes the two and whichever lands first wins, evicting the loser (whose
+retry then fails succession, §8.1, because it is now revoked). A complete fix (recovery-code-gated
+revocation, or a privileged device-1 key for `RevokeDevice`/`Rotate`) was considered and
+deliberately **not** adopted, to preserve the flat-device model. This is an accepted residual —
+full statement and mitigation in §22.
+
 ### 8.5 Counters and local sealed state (precise; closes the "one frontier" ambiguity)
 
 Three independent monotonic counters, each signed and each with a **persisted client frontier**:
@@ -1255,6 +1264,21 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
   above). On a cooperative server, per-op keyslot re-verification (§12) closes the open-connection
   gap; on a malicious server that refuses keyslot deletion, the revoked device retains whatever
   gen-g access it had before the rotation event.
+
+- **Concurrent mutual-revocation race.** All devices are flat, equal members; there is no
+  privileged founder (§8.4). When the legitimate device revokes a stolen one (`RevokeDevice` +
+  `Rotate`), a stolen device that is unlocked, online, and racing can concurrently issue
+  `RevokeDevice` + `Rotate` against the legitimate device. The `/roster-head` CAS serializes the
+  two; whichever lands first wins. If the stolen device wins, the legitimate device re-folds onto
+  the new tip, finds itself revoked, and its retry fails succession (§8.1) — it cannot append, the
+  attacker keeps the repo, and the user is evicted. This bites **only** when the stolen device is
+  unlocked, online, and actively racing — a state in which it already holds `master_key_g` and thus
+  already had full data access; it is not a new exposure of data, only of repository control.
+  Mitigation: revoke promptly while the legitimate device is the only one online; device
+  credential/physical security. A complete fix (recovery-code-gated revocation, or a privileged
+  device-1 key for `RevokeDevice`/`Rotate`) was considered and deliberately not adopted, to
+  preserve the flat-device model — this race is the accepted cost. Detection still fires on
+  reconvergence with any honest peer (§10 fork detection).
 
 - **Bounded metadata leakage — cross-path (convergent mode).** Object sizes (within padding
   buckets), access timing, and cross-path chunk equality (identical chunks in different files
