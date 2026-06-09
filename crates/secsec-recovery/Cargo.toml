@@ -1,0 +1,21 @@
+[package]
+name = "secsec-recovery"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Recovery keyslot: recovery-code / passphrase wrap of the master key, RFP-anchored (finaldesign.md §8.6)."
+
+[lints]
+workspace = true
+
+[dependencies]
+secsec-aead = { path = "../secsec-aead" }
+secsec-kdf = { path = "../secsec-kdf" }
+secsec-canon = { path = "../secsec-canon" }
+blake3 = "1"
+argon2 = "0.5"
+zeroize = "1"
+
+[dev-dependencies]
+getrandom = "0.3"

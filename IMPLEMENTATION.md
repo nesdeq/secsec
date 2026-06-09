@@ -67,6 +67,7 @@ secsec/
 │   ├── secsec-store/     §13   redb content-addressed blob store (server side)
 │   ├── secsec-sig/       §9.6  SSHSIG namespaces, verifier (alg pinning, negative tests)
 │   ├── secsec-keyslot/   §8.3  HPKE master-key wrap, mk_commit authenticity
+│   ├── secsec-recovery/  §8.6  recovery-code / passphrase (Argon2id) master-key wrap; RFP-anchored
 │   ├── secsec-roster/    §8    sigchain fold/succession, per-entry AEAD, roster-key history, generations, enrollment
 │   ├── secsec-sync/      §10   refs, cas-head, rollback-aware merge (storage-free Node model), fork detection
 │   ├── secsec-engine/    §10   snapshot-tree ↔ merge-node bridge, three-way reconcile to the store
