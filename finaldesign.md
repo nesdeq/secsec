@@ -1147,10 +1147,14 @@ per-ref head rollback-detection step).
   bind the client's view of all mutable state at gc-request time:
   `args_hash = BLAKE3(canonical("gc" ‖ keep_set_hash ‖ gc_gen ‖ all_heads_hash ‖ roster_seq ‖ put_epoch))`,
   where
-  `all_heads_hash = BLAKE3(le64(n) ‖ (ref_H[0] ‖ le64(head_version[0])) ‖ … ‖ (ref_H[n-1] ‖ le64(head_version[n-1])))`
+  `all_heads_hash = BLAKE3(le64(n) ‖ (ref_H[0] ‖ head_blob_hash[0]) ‖ … ‖ (ref_H[n-1] ‖ head_blob_hash[n-1]))`
   is computed over all `n` active refs, the pairs sorted by `ref_H` in ascending byte-lexicographic
-  order. `head_version` is **per-ref** (§6, §8.5), so a single scalar cannot serialize a multi-ref
-  repo; the aggregate does. `put_epoch` is a single **global (per-repository) monotonic counter**
+  order, where `head_blob_hash = BLAKE3(stored §9.8 head blob)` — the **server-visible** per-ref token
+  (the same value `cas-head` compares on, §12). It MUST be the blob hash, **not** `head_version`: the
+  blind server cannot read the encrypted `head_version`, so it could not recompute the hash to verify
+  the compare-and-swap; the blob hash is computable by both sides from the stored bytes, and any
+  concurrent `cas-head` changes it (a single scalar cannot serialize a multi-ref repo; the aggregate
+  does). `put_epoch` is a single **global (per-repository) monotonic counter**
   maintained by the server and incremented on **every** successful `put` regardless of which device
   issued it — a per-device counter could not catch a concurrent in-flight `put` from another device.
   The client learns the current `put_epoch` from the **highest value carried in any signed arrival

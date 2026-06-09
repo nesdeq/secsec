@@ -67,11 +67,11 @@ head_nonce   = 070707070707070707070707
 head_blob    = 737365630101010000000307070707070707070707070732606c8303716a667b303fd332a3e95f60a85422ed82a4d278642d1d35301852bf4992736077b620823945e522d418cf6d06d04a394f84084274abd6e7e4a3ab17594fff0cf359b5065e4d15ca901501023755da139ab87cf0f0bb0dac3c1397c683ba9c3d36eabbc92789c8d8075b9c7e0e5de5e0
 
 [gc]   # asserts: secsec-proto  gc::tests::gc_kat
-# §15 GC serialization. keep_set={0x01*32, 0x02*32}; heads=[(0x03*32, head_version=1)];
+# §15 GC serialization. keep_set={0x01*32, 0x02*32}; heads=[(0x03*32, head_blob_hash=0x04*32)];
 # gc_gen=2, roster_seq=4, put_epoch=10.
 keep_set_hash  = 836c1e9f709d36a0835175b92cd71f65efdc00110bd0cc60b7dd876dfafdbf80
-all_heads_hash = dae575053ecceddc233923559778ed1170ad40939ee1295385835b3d10a8ccbb
-args_gc        = aca35078d0407a3897b70bff4bf259ebc00ae028ee62a7c5fb91fef69e324141
+all_heads_hash = 46ce83ca882351a884ac0dc037f9befce2d084cf83ff0534cb1c056d3fc55835
+args_gc        = 3de0fa63d87bdfb22b9e4df2a4cb5b8d9e636eb966f7f254514645c0eec3690a
 
 [auth]   # asserts: secsec-transport  auth::tests::transcript_kat
 # §11 QUIC session transcript = running BLAKE3 over client-hello then server-hello.

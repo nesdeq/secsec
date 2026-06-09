@@ -23,19 +23,21 @@ pub fn keep_set_hash(ids: &[Id]) -> [u8; 32] {
     *blake3::hash(&w.finish()).as_bytes()
 }
 
-/// `all_heads_hash = BLAKE3(le64(n) ‖ (ref_H[0] ‖ le64(head_version[0])) ‖ …)` over all active refs,
-/// pairs **sorted by `ref_H`** ascending byte-lexicographically (§15). A single scalar can't
-/// serialize a multi-ref repo; this aggregate does. Duplicate ref hashes are folded (last wins after
-/// the stable sort by key).
+/// `all_heads_hash = BLAKE3(le64(n) ‖ (ref_H[0] ‖ head_blob_hash[0]) ‖ …)` over all active refs, pairs
+/// **sorted by `ref_H`** ascending byte-lexicographically (§15). `head_blob_hash = BLAKE3(stored §9.8
+/// head blob)` is the **server-visible** per-ref token (the same value `cas-head` compares on) — it
+/// MUST be the blob hash, not the encrypted `head_version`, so the blind server can recompute it to
+/// verify the `gc` compare-and-swap. A single scalar can't serialize a multi-ref repo; this aggregate
+/// does. Duplicate ref hashes are folded (last wins after the stable sort by key).
 #[must_use]
-pub fn all_heads_hash(heads: &[(Id, u64)]) -> [u8; 32] {
-    let mut sorted: Vec<(Id, u64)> = heads.to_vec();
+pub fn all_heads_hash(heads: &[(Id, [u8; 32])]) -> [u8; 32] {
+    let mut sorted: Vec<(Id, [u8; 32])> = heads.to_vec();
     sorted.sort_by_key(|p| p.0);
     sorted.dedup_by(|a, b| a.0 == b.0);
     let mut w = Writer::new();
     w.u64(sorted.len() as u64);
-    for (ref_h, head_version) in &sorted {
-        w.raw(ref_h).u64(*head_version);
+    for (ref_h, head_blob_hash) in &sorted {
+        w.raw(ref_h).raw(head_blob_hash);
     }
     *blake3::hash(&w.finish()).as_bytes()
 }
@@ -86,19 +88,19 @@ mod tests {
     }
 
     #[test]
-    fn all_heads_hash_is_order_invariant_and_binds_versions() {
-        let r1 = ([0x10; 32], 5u64);
-        let r2 = ([0x20; 32], 9u64);
+    fn all_heads_hash_is_order_invariant_and_binds_blob_hashes() {
+        let r1 = ([0x10; 32], [0x05; 32]);
+        let r2 = ([0x20; 32], [0x09; 32]);
         let base = all_heads_hash(&[r1, r2]);
         assert_eq!(base, all_heads_hash(&[r2, r1])); // order-invariant
-        assert_ne!(base, all_heads_hash(&[([0x10; 32], 6), r2])); // a head_version bump differs
+        assert_ne!(base, all_heads_hash(&[([0x10; 32], [0x06; 32]), r2])); // a head-blob change differs
         assert_ne!(base, all_heads_hash(&[r1])); // a missing ref differs
     }
 
     #[test]
     fn args_gc_binds_every_field() {
         let ksh = keep_set_hash(&[[1; 32], [2; 32]]);
-        let ahh = all_heads_hash(&[([3; 32], 1)]);
+        let ahh = all_heads_hash(&[([3; 32], [1; 32])]);
         let base = args_gc(&ksh, 7, &ahh, 4, 100);
         assert_eq!(base, args_gc(&ksh, 7, &ahh, 4, 100));
         assert_ne!(base, args_gc(&ksh, 8, &ahh, 4, 100)); // gc_gen
@@ -111,21 +113,21 @@ mod tests {
     /// Frozen KAT, mirrored in `vectors/secsec-kat-v1.txt [gc]`.
     #[test]
     fn gc_kat() {
-        // keep-set {0x01*32, 0x02*32}; one head (ref=0x03*32, head_version=1); gc_gen=2,
+        // keep-set {0x01*32, 0x02*32}; one head (ref=0x03*32, head_blob_hash=0x04*32); gc_gen=2,
         // roster_seq=4, put_epoch=10.
         let ksh = keep_set_hash(&[[1; 32], [2; 32]]);
-        let ahh = all_heads_hash(&[([3; 32], 1)]);
+        let ahh = all_heads_hash(&[([3; 32], [4; 32])]);
         assert_eq!(
             hx(&ksh),
             "836c1e9f709d36a0835175b92cd71f65efdc00110bd0cc60b7dd876dfafdbf80"
         );
         assert_eq!(
             hx(&ahh),
-            "dae575053ecceddc233923559778ed1170ad40939ee1295385835b3d10a8ccbb"
+            "46ce83ca882351a884ac0dc037f9befce2d084cf83ff0534cb1c056d3fc55835"
         );
         assert_eq!(
             hx(&args_gc(&ksh, 2, &ahh, 4, 10)),
-            "aca35078d0407a3897b70bff4bf259ebc00ae028ee62a7c5fb91fef69e324141"
+            "3de0fa63d87bdfb22b9e4df2a4cb5b8d9e636eb966f7f254514645c0eec3690a"
         );
     }
 }
