@@ -260,11 +260,27 @@ mod tests {
                 .get(id)
                 .map_err(|e| crate::RemoteError(e.to_string()))
         }
-        async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<(), crate::RemoteError> {
+        async fn put_blob(
+            &self,
+            id: &Id,
+            blob: &[u8],
+        ) -> Result<crate::Receipt, crate::RemoteError> {
             self.store
                 .put(id, blob)
-                .map(|_| ())
-                .map_err(|e| crate::RemoteError(e.to_string()))
+                .map_err(|e| crate::RemoteError(e.to_string()))?;
+            let arrival_gen = self
+                .store
+                .arrival_epoch(id)
+                .map_err(|e| crate::RemoteError(e.to_string()))?
+                .unwrap_or(0);
+            let put_epoch = self
+                .store
+                .put_epoch()
+                .map_err(|e| crate::RemoteError(e.to_string()))?;
+            Ok(crate::Receipt {
+                arrival_gen,
+                put_epoch,
+            })
         }
         async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, crate::RemoteError> {
             self.store

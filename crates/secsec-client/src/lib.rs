@@ -50,14 +50,25 @@ impl core::fmt::Display for RemoteError {
 }
 impl std::error::Error for RemoteError {}
 
+/// A §15 arrival receipt returned on a successful `put`: the object's arrival generation and the
+/// server's current global `put_epoch`. The client records these to choose a safe `gc_gen` (objects
+/// whose `arrival_gen` is old enough) and to bind the `gc` compare-and-swap to `put_epoch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Receipt {
+    /// The object's arrival generation (the `put_epoch` it first landed at).
+    pub arrival_gen: u64,
+    /// The server's current global `put_epoch` after this put.
+    pub put_epoch: u64,
+}
+
 /// A content-addressed object + mutable-ref store on the far side of a connection (§12, §13). The
 /// blind server exposes exactly this surface; an in-process backing store implements it identically.
 #[allow(async_fn_in_trait)]
 pub trait Remote {
     /// Fetch a blob by id (`None` if absent).
     async fn get_blob(&self, id: &Id) -> Result<Option<Vec<u8>>, RemoteError>;
-    /// Store a blob (idempotent by id).
-    async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<(), RemoteError>;
+    /// Store a blob (idempotent by id); returns the §15 arrival [`Receipt`].
+    async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<Receipt, RemoteError>;
     /// Fetch the stored head blob for `/refs/<ref_h>` (`None` if absent).
     async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, RemoteError>;
     /// Fetch the sigchain entry blob at `seq` (`None` past the tip) — cold-start fold (§8.1).
@@ -182,21 +193,22 @@ impl From<HeadError> for ClientError {
 
 /// Push the full reachable object closure of `commit_id` from `store` to `remote` (idempotent puts).
 /// The id set is the §15 keep-set closure (commit + ancestors + trees + chunks); each blob is read
-/// from the local store and `put`. Returns the number of objects pushed.
+/// from the local store and `put`. Returns the per-object arrival [`Receipt`]s (for the caller to
+/// record toward `gc_gen`).
 pub async fn push_objects<R: Remote>(
     remote: &R,
     store: &Store,
     mk: &MasterKey,
     commit_id: &Id,
-) -> Result<usize, ClientError> {
+) -> Result<Vec<(Id, Receipt)>, ClientError> {
     let ids = secsec_snapshot::reachable_objects(mk, store, &[*commit_id])?;
-    let mut n = 0;
+    let mut receipts = Vec::with_capacity(ids.len());
     for id in &ids {
         let blob = store.get(id)?.ok_or(ClientError::MissingLocal(*id))?;
-        remote.put_blob(id, &blob).await?;
-        n += 1;
+        let receipt = remote.put_blob(id, &blob).await?;
+        receipts.push((*id, receipt));
     }
-    Ok(n)
+    Ok(receipts)
 }
 
 /// Advance `/refs/<ref_name>` to `commit_id`: seal a signed head (chained on `prev`), then blind-CAS
@@ -529,11 +541,23 @@ mod tests {
         async fn get_blob(&self, id: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
             self.store.get(id).map_err(|e| RemoteError(e.to_string()))
         }
-        async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<(), RemoteError> {
+        async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<Receipt, RemoteError> {
             self.store
                 .put(id, blob)
-                .map(|_| ())
-                .map_err(|e| RemoteError(e.to_string()))
+                .map_err(|e| RemoteError(e.to_string()))?;
+            let arrival_gen = self
+                .store
+                .arrival_epoch(id)
+                .map_err(|e| RemoteError(e.to_string()))?
+                .unwrap_or(0);
+            let put_epoch = self
+                .store
+                .put_epoch()
+                .map_err(|e| RemoteError(e.to_string()))?;
+            Ok(Receipt {
+                arrival_gen,
+                put_epoch,
+            })
         }
         async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
             self.store
@@ -638,7 +662,7 @@ mod tests {
         let pushed = push_objects(&remote, &a_store, &m, &commit_id)
             .await
             .unwrap();
-        assert!(pushed >= 4); // commit + root tree + subtree + ≥1 chunk
+        assert!(pushed.len() >= 4); // commit + root tree + subtree + ≥1 chunk
         let (head, _blob) = push_head(&remote, &m, &device, "main", commit_id, 0, None)
             .await
             .unwrap();

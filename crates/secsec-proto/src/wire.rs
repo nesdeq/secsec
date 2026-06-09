@@ -317,8 +317,17 @@ pub enum Response {
     Blob(Option<Vec<u8>>),
     /// `has` result: one bool per requested id, in order.
     Exists(Vec<bool>),
-    /// The write op (`put`/`cas-head`/`roster-append`) was accepted.
+    /// The write op (`cas-head`/`roster-append`/`gc`) was accepted.
     Ok,
+    /// A `put` was accepted, with its **arrival receipt** (§15): `arrival_gen` is the object's arrival
+    /// generation (the `put_epoch` it first landed at), `put_epoch` is the server's current global
+    /// counter. The client records these to derive a safe `gc_gen` and to bind the `gc` CAS.
+    Stored {
+        /// The object's arrival generation (its first-`put` epoch; idempotent puts keep the original).
+        arrival_gen: u64,
+        /// The server's current global `put_epoch` after this put.
+        put_epoch: u64,
+    },
     /// The op was rejected with this code.
     Err(ErrorCode),
 }
@@ -327,6 +336,7 @@ const R_BLOB: u8 = 0;
 const R_EXISTS: u8 = 1;
 const R_OK: u8 = 2;
 const R_ERR: u8 = 3;
+const R_STORED: u8 = 4;
 
 fn code_to_u8(c: ErrorCode) -> u8 {
     match c {
@@ -373,6 +383,12 @@ impl Response {
             Response::Ok => {
                 w.u8(R_OK);
             }
+            Response::Stored {
+                arrival_gen,
+                put_epoch,
+            } => {
+                w.u8(R_STORED).u64(*arrival_gen).u64(*put_epoch);
+            }
             Response::Err(c) => {
                 w.u8(R_ERR).u8(code_to_u8(*c));
             }
@@ -401,6 +417,10 @@ impl Response {
                 Response::Exists(bits)
             }
             R_OK => Response::Ok,
+            R_STORED => Response::Stored {
+                arrival_gen: r.u64()?,
+                put_epoch: r.u64()?,
+            },
             R_ERR => Response::Err(code_from_u8(r.u8()?)?),
             other => return Err(WireError::BadTag(other)),
         };
@@ -528,6 +548,10 @@ mod tests {
             Response::Blob(Some(b"blob".to_vec())),
             Response::Exists(vec![true, false, true]),
             Response::Ok,
+            Response::Stored {
+                arrival_gen: 7,
+                put_epoch: 42,
+            },
             Response::Err(ErrorCode::CasConflict),
             Response::Err(ErrorCode::NotEnrolled),
         ];

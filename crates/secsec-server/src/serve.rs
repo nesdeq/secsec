@@ -187,10 +187,10 @@ mod tests {
                 declared_size: blob.len() as u32,
                 blob: blob.clone(),
             };
-            assert_eq!(
+            assert!(matches!(
                 request(&conn, sess.transcript, &device, put).await.unwrap(),
-                Response::Ok
-            );
+                Response::Stored { .. }
+            ));
 
             // authorized get returns the stored blob.
             let got = request(&conn, sess.transcript, &device, Request::Get { id })
@@ -276,7 +276,7 @@ mod tests {
                 .transcript;
             let id = [0x77; 32];
             let blob = b"concurrent-bytes".to_vec();
-            assert_eq!(
+            assert!(matches!(
                 request(
                     &conn_b,
                     tb,
@@ -289,8 +289,8 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-                Response::Ok
-            );
+                Response::Stored { .. }
+            ));
             assert_eq!(
                 request(&conn_b, tb, &dev_b, Request::Get { id })
                     .await

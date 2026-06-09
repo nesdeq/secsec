@@ -220,8 +220,16 @@ impl Server {
                 if !present && !self.add_quota(device_id, blob.len() as u64) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
+                // Store, then return the §15 arrival receipt (the object's arrival generation + the
+                // server's current global put_epoch) so the client can derive gc_gen and bind the gc CAS.
                 match self.store.put(&id, &blob) {
-                    Ok(_) => Response::Ok,
+                    Ok(_) => match (self.store.arrival_epoch(&id), self.store.put_epoch()) {
+                        (Ok(Some(arrival_gen)), Ok(put_epoch)) => Response::Stored {
+                            arrival_gen,
+                            put_epoch,
+                        },
+                        _ => Response::Err(ErrorCode::Internal),
+                    },
                     Err(_) => Response::Err(ErrorCode::Internal),
                 }
             }
@@ -346,7 +354,10 @@ mod tests {
             declared_size: blob.len() as u32,
             blob: blob.clone(),
         };
-        assert_eq!(s.handle(write_req(&dev, put, T, nonce), 0), Response::Ok);
+        assert!(matches!(
+            s.handle(write_req(&dev, put, T, nonce), 0),
+            Response::Stored { .. }
+        ));
 
         // get it back.
         let got = s.handle(read_req(&dev, Request::Get { id }, T), 0);
@@ -394,10 +405,10 @@ mod tests {
             blob: vec![0u8],
         };
         // first use ok.
-        assert_eq!(
+        assert!(matches!(
             s.handle(write_req(&dev, put.clone(), T, nonce), 0),
-            Response::Ok
-        );
+            Response::Stored { .. }
+        ));
         // replay with the same nonce -> rejected (single-use).
         assert_eq!(
             s.handle(write_req(&dev, put, T, nonce), 0),

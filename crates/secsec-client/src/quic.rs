@@ -51,7 +51,7 @@ impl Remote for QuicRemote<'_> {
         expect_blob("get", self.call(Request::Get { id: *id }).await?)
     }
 
-    async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<(), RemoteError> {
+    async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<crate::Receipt, RemoteError> {
         // Blobs are bounded by the §19 16 MiB object cap, so the length fits a u32 declared_size.
         let declared_size = blob.len() as u32;
         match self
@@ -62,7 +62,13 @@ impl Remote for QuicRemote<'_> {
             })
             .await?
         {
-            Response::Ok => Ok(()),
+            Response::Stored {
+                arrival_gen,
+                put_epoch,
+            } => Ok(crate::Receipt {
+                arrival_gen,
+                put_epoch,
+            }),
             Response::Err(c) => Err(RemoteError(format!("put: {c:?}"))),
             other => Err(RemoteError(format!("put: unexpected {other:?}"))),
         }
