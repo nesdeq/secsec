@@ -19,6 +19,7 @@
 
 pub mod quic;
 pub mod repo;
+pub mod sync;
 pub mod watcher;
 
 use secsec_engine::{merge_heads, CommitAuthor, MergeError, SyncAction};
@@ -104,6 +105,8 @@ pub enum ClientError {
     FrontierLost(FrontierError),
     /// Key/signing error (e.g. deriving the local-seal key).
     Sig(secsec_sig::SigError),
+    /// Engine error loading the commit DAG.
+    Engine(secsec_engine::EngineError),
 }
 
 impl core::fmt::Display for ClientError {
@@ -124,10 +127,16 @@ impl core::fmt::Display for ClientError {
             ClientError::Io(e) => write!(f, "io: {e}"),
             ClientError::FrontierLost(e) => write!(f, "lost local frontier: {e}"),
             ClientError::Sig(e) => write!(f, "sig: {e}"),
+            ClientError::Engine(e) => write!(f, "engine: {e}"),
         }
     }
 }
 impl std::error::Error for ClientError {}
+impl From<secsec_engine::EngineError> for ClientError {
+    fn from(e: secsec_engine::EngineError) -> Self {
+        ClientError::Engine(e)
+    }
+}
 impl From<std::io::Error> for ClientError {
     fn from(e: std::io::Error) -> Self {
         ClientError::Io(e)
