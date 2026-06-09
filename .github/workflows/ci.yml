@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Format + lint once (fast, OS-independent).
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Build + test on all three target platforms (v1 supports Linux/macOS/Windows).
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all --all-features
+
+  # Supply-chain: advisory scan. (cargo-vet bring-up is tracked separately.)
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  # Continuous fuzzing requires a nightly toolchain + cargo-fuzz (libFuzzer). Until the dev
+  # toolchain is rustup-managed, the "decoder never panics on arbitrary input" property is
+  # covered by the stable proptest robustness tests in each crate's tests/robustness.rs (run by
+  # the `test` job above). This job is a placeholder for the nightly libFuzzer harness.
+  #
+  # fuzz:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@nightly
+  #     - run: cargo install cargo-fuzz --locked
+  #     - run: cargo fuzz build
+  #     - run: for t in $(cargo fuzz list); do cargo fuzz run "$t" -- -max_total_time=60; done
