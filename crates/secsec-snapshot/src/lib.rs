@@ -1,10 +1,13 @@
 //! `secsec-snapshot` — the object graph and directory snapshot/restore (`finaldesign.md` §6, §9.2).
 //!
 //! A snapshot is a `Commit` pointing at a root `Tree`; trees list files (chunk-id lists) and
-//! subtrees, content-addressed via [`secsec_object`]. [`snapshot`] walks a directory, chunks files
-//! with keyed FastCDC, seals every chunk/tree/commit and `put`s it to a [`Store`]; [`restore`]
-//! walks the commit back, `get`s each object, opens it with full verification (§9.2 three-way
-//! check), un-pads, and rebuilds the directory byte-for-byte.
+//! subtrees, content-addressed via [`secsec_object`]. [`snapshot_tree`] walks a directory, chunks
+//! files with keyed FastCDC, and seals every chunk/tree, `put`ting them to a [`Store`];
+//! [`seal_signed_commit`] wraps the root tree in an SSHSIG-signed `Commit` (§6, §9.6 — commits are
+//! **always** signed). On the read side [`open_signed_commit`] fetches+verifies a commit and
+//! [`restore_commit_tree`] / [`restore_tree_into`] walk the tree back, `get`ting each object, opening
+//! it with full verification (§9.2 three-way check), un-padding, and rebuilding the directory
+//! byte-for-byte.
 //!
 //! **Per-path salts (§9.2/§9.7).** Each file's chunks and each subtree are addressed with a 16-byte
 //! `path_salt`; a tree stores the salt of each child, and the commit stores the root tree's salt.
@@ -336,13 +339,6 @@ fn encode_commit(c: &Commit) -> Vec<u8> {
     w.finish()
 }
 
-fn decode_commit(bytes: &[u8]) -> Result<Commit, SnapError> {
-    let mut r = Reader::new(bytes);
-    let c = read_commit_fields(&mut r)?;
-    r.finish()?;
-    Ok(c)
-}
-
 /// The stored signed-commit object: the canonical commit fields followed by the SSHSIG (§9.6).
 fn encode_signed_commit(c: &Commit, sig: &[u8]) -> Vec<u8> {
     let mut w = Writer::new();
@@ -445,26 +441,6 @@ fn entry_name(e: &Entry) -> &str {
     match e {
         Entry::File { name, .. } | Entry::Dir { name, .. } => name,
     }
-}
-
-/// Snapshot `root` into `store` under `mk`; returns the commit id. `ts` is the author-asserted
-/// timestamp to record (advisory). The commit is **unsigned** with placeholder metadata — for the
-/// object-graph round trip and tests. Sync uses [`snapshot_tree`] + [`seal_signed_commit`].
-pub fn snapshot(root: &Path, mk: &MasterKey, store: &Store, ts: u64) -> Result<Id, SnapError> {
-    let (root_tree, root_salt) = snapshot_tree(root, mk, store, None)?;
-    let commit = Commit {
-        root_tree,
-        root_salt,
-        parents: Vec::new(),
-        device_id: [0u8; 32],
-        version: 1,
-        roster_seq: 0,
-        last_seen_head: [0u8; 32],
-        ts,
-    };
-    let (id, blob) = seal_object(mk, ObjType::Commit, &ZERO_SALT, &encode_commit(&commit));
-    store.put(&id, &blob)?;
-    Ok(id)
 }
 
 /// Sign `commit` (under `NS_COMMIT`, §9.6), seal the signed-commit object (fields ‖ sig) under `mk`,
@@ -609,24 +585,6 @@ fn fetch_open(
     Ok(open_object(mk, obj_type, salt, id, &blob)?)
 }
 
-/// Restore the snapshot `commit_id` from `store` into `dest` (created if absent).
-pub fn restore(
-    commit_id: &Id,
-    mk: &MasterKey,
-    store: &Store,
-    dest: &Path,
-) -> Result<(), SnapError> {
-    let commit = decode_commit(&fetch_open(
-        mk,
-        ObjType::Commit,
-        &ZERO_SALT,
-        commit_id,
-        store,
-    )?)?;
-    std::fs::create_dir_all(dest)?;
-    restore_tree(&commit.root_tree, &commit.root_salt, mk, store, dest, 0)
-}
-
 fn restore_tree(
     tree_id: &Id,
     tree_salt: &PathSalt,
@@ -732,7 +690,9 @@ pub fn reachable_objects(
             continue;
         }
         reachable.insert(cid);
-        let commit = decode_commit(&fetch_open(mk, ObjType::Commit, &ZERO_SALT, &cid, store)?)?;
+        // Commits are the signed form (§6); we only need parents + root tree to traverse.
+        let (commit, _sig) =
+            decode_signed_commit(&fetch_open(mk, ObjType::Commit, &ZERO_SALT, &cid, store)?)?;
         collect_tree(
             mk,
             store,
@@ -822,7 +782,11 @@ mod tests {
             last_seen_head: [5u8; 32],
             ts: 1234,
         };
-        assert_eq!(decode_commit(&encode_commit(&commit)).unwrap(), commit);
+        // the stored commit object is the signed form (fields ‖ sig); round-trips through the codec.
+        let (got, sig) =
+            decode_signed_commit(&encode_signed_commit(&commit, b"sig-bytes")).unwrap();
+        assert_eq!(got, commit);
+        assert_eq!(sig, b"sig-bytes");
     }
 
     #[test]
@@ -906,8 +870,8 @@ mod tests {
         std::fs::write(src.path().join("sub/note.md"), b"# note\n").unwrap();
         std::fs::write(src.path().join("sub/deeper/leaf"), [7u8; 40 * 1024]).unwrap();
 
-        let commit_id = snapshot(src.path(), &m, &store, 0).unwrap();
-        restore(&commit_id, &m, &store, dst.path()).unwrap();
+        let (root_tree, root_salt) = snapshot_tree(src.path(), &m, &store, None).unwrap();
+        restore_tree_into(&root_tree, &root_salt, &m, &store, dst.path()).unwrap();
 
         assert_eq!(
             read_tree(src.path()),
@@ -1034,7 +998,7 @@ mod tests {
         std::fs::create_dir_all(src.path().join("sub")).unwrap();
         std::fs::write(src.path().join("sub/b.bin"), [3u8; 8 * 1024]).unwrap();
 
-        let commit_id = snapshot(src.path(), &m, &store, 0).unwrap();
+        let commit_id = test_signed_commit(src.path(), &m, &store);
         let reachable = reachable_objects(&m, &store, &[commit_id]).unwrap();
 
         // every stored object is reachable from the single commit (no garbage; keep-everything).
@@ -1053,19 +1017,35 @@ mod tests {
     #[test]
     fn restore_detects_missing_object() {
         let src = tempfile::tempdir().unwrap();
-        let dst = tempfile::tempdir().unwrap();
         let store_dir = tempfile::tempdir().unwrap();
         let store = Store::open(store_dir.path().join("s.redb")).unwrap();
         let m = mk();
         std::fs::write(src.path().join("f"), b"data").unwrap();
-        let commit_id = snapshot(src.path(), &m, &store, 0).unwrap();
+        let commit_id = test_signed_commit(src.path(), &m, &store);
 
-        // Restoring against a *fresh empty* store must fail (commit object missing), not panic.
+        // Reading the commit against a *fresh empty* store must fail (object missing), not panic.
         let empty_dir = tempfile::tempdir().unwrap();
         let empty = Store::open(empty_dir.path().join("e.redb")).unwrap();
         assert!(matches!(
-            restore(&commit_id, &m, &empty, dst.path()),
+            open_signed_commit(&commit_id, &m, &empty),
             Err(SnapError::Missing(_))
         ));
+    }
+
+    /// Snapshot `src` and seal a signed commit (a throwaway device) — the production commit form.
+    fn test_signed_commit(src: &Path, m: &MasterKey, store: &Store) -> Id {
+        let dev = secsec_sig::DeviceKey::generate().unwrap();
+        let (root_tree, root_salt) = snapshot_tree(src, m, store, None).unwrap();
+        let commit = Commit {
+            root_tree,
+            root_salt,
+            parents: Vec::new(),
+            device_id: dev.device_id().unwrap(),
+            version: 1,
+            roster_seq: 0,
+            last_seen_head: [0u8; 32],
+            ts: 0,
+        };
+        seal_signed_commit(m, store, &dev, &commit).unwrap()
     }
 }
