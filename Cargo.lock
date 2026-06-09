@@ -1363,11 +1363,16 @@ dependencies = [
 name = "secsec-server"
 version = "0.0.0"
 dependencies = [
+ "getrandom 0.3.4",
+ "quinn",
+ "rcgen",
  "secsec-frame",
  "secsec-proto",
  "secsec-sig",
  "secsec-store",
+ "secsec-transport",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

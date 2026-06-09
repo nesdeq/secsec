@@ -20,6 +20,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod serve;
+
 use secsec_proto::server::{limits, NonceStore, StorageQuota, TokenBucket};
 use secsec_proto::wire::{ErrorCode, Request, Response};
 use secsec_proto::{op_and_args, ReadAuth, WriteAuth};
