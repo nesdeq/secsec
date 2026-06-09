@@ -1,0 +1,322 @@
+//! Server-side enforcement (`finaldesign.md` §11, §12, §19). Pure, deterministic policy the QUIC
+//! serve loop drives — kept clock-injected (every method takes `now`, unix seconds) so the security
+//! state machines are unit-testable without sockets or a real clock.
+//!
+//! - [`NonceStore`] — `server_nonce` freshness + single-use replay defense (§11): the server issues
+//!   a fresh nonce per challenge and consumes it exactly once within the TTL.
+//! - [`TokenBucket`] — byte/connection rate limits (§19 per-key write/read rate + burst).
+//! - [`WindowCounter`] — "N events per rolling window" caps (§19 `gc` 4/hr, sigchain 60/hr).
+//! - [`StorageQuota`] — the per-key storage cap (§19).
+//!
+//! Keyslot-existence enforcement (§12) is a store lookup and lives with the server's object store.
+
+use std::collections::{HashMap, VecDeque};
+
+/// Normative §19 limit constants (server MUST enforce).
+pub mod limits {
+    /// `server_nonce` time-to-live, seconds (§19): single-use within this window.
+    pub const SERVER_NONCE_TTL_SECS: u64 = 60;
+    /// Max `has()` ids per call (§12/§19); the client batches larger sets.
+    pub const MAX_HAS_IDS: usize = 1_024;
+    /// Max `gc()` keep-set ids per call (§12/§19).
+    pub const MAX_GC_KEEP_SET_IDS: usize = 100_000;
+    /// Max `gc()` calls per key per hour (§19).
+    pub const MAX_GC_CALLS_PER_HOUR: u64 = 4;
+    /// Max sigchain entries per authenticated connection identity per hour (§19).
+    pub const MAX_SIGCHAIN_ENTRIES_PER_CONN_PER_HOUR: u64 = 60;
+    /// Max total sigchain length (§19, configurable default).
+    pub const MAX_TOTAL_SIGCHAIN: u64 = 10_000;
+    /// Per-key storage quota, bytes — 10 GiB default (§19).
+    pub const PER_KEY_STORAGE_QUOTA: u64 = 10 * 1024 * 1024 * 1024;
+    /// Per-key sustained write rate, bytes/sec — 100 MB/s (§19, decimal MB).
+    pub const WRITE_RATE_BYTES_PER_SEC: u64 = 100_000_000;
+    /// Per-key write burst, bytes — 1 GiB (§19).
+    pub const WRITE_BURST_BYTES: u64 = 1024 * 1024 * 1024;
+    /// Per-key sustained read rate, bytes/sec — 200 MB/s (§19, decimal MB).
+    pub const READ_RATE_BYTES_PER_SEC: u64 = 200_000_000;
+    /// New connections/sec per source IP (§19).
+    pub const CONN_RATE_PER_SEC: u64 = 10;
+    /// Concurrent connections per authenticated key (§19).
+    pub const MAX_CONCURRENT_CONNS_PER_KEY: u64 = 3;
+    /// One hour, in seconds (window for the per-hour caps).
+    pub const HOUR_SECS: u64 = 3_600;
+}
+
+/// `server_nonce` freshness + single-use store (§11). The server [`issue`](Self::issue)s a fresh
+/// random nonce per challenge; a returned auth signature is only honoured if its nonce
+/// [`consume`](Self::consume)s successfully — issued, unexpired, and not already used.
+#[derive(Debug, Clone)]
+pub struct NonceStore {
+    ttl: u64,
+    /// nonce → expiry (unix seconds). Presence = issued & not yet consumed.
+    live: HashMap<[u8; 32], u64>,
+}
+
+impl Default for NonceStore {
+    fn default() -> Self {
+        Self::new(limits::SERVER_NONCE_TTL_SECS)
+    }
+}
+
+impl NonceStore {
+    /// A store with an explicit TTL (use [`Default`] for the §19 60-second TTL).
+    #[must_use]
+    pub fn new(ttl_secs: u64) -> Self {
+        Self {
+            ttl: ttl_secs,
+            live: HashMap::new(),
+        }
+    }
+
+    /// Record a freshly-issued `nonce`, valid until `now + ttl`. (The caller draws `nonce` from the
+    /// OS CSPRNG.)
+    pub fn issue(&mut self, nonce: [u8; 32], now: u64) {
+        self.live.insert(nonce, now.saturating_add(self.ttl));
+    }
+
+    /// Consume `nonce`: returns `true` iff it was issued, has not expired at `now`, and has not been
+    /// consumed before — and removes it (single-use). Any replay or expiry returns `false`.
+    pub fn consume(&mut self, nonce: &[u8; 32], now: u64) -> bool {
+        match self.live.get(nonce) {
+            Some(&expiry) if now < expiry => {
+                self.live.remove(nonce);
+                true
+            }
+            // expired-but-present: drop it and reject.
+            Some(_) => {
+                self.live.remove(nonce);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Drop all expired nonces (periodic housekeeping; bounds memory).
+    pub fn evict_expired(&mut self, now: u64) {
+        self.live.retain(|_, &mut expiry| now < expiry);
+    }
+
+    /// Number of live (issued, unconsumed, unexpired-at-last-eviction) nonces.
+    #[must_use]
+    pub fn live_count(&self) -> usize {
+        self.live.len()
+    }
+}
+
+/// A token-bucket rate limiter (§19 byte/connection rates): `capacity` is the burst, `refill_per_sec`
+/// the sustained rate. Tokens accrue with elapsed time up to `capacity`.
+#[derive(Debug, Clone)]
+pub struct TokenBucket {
+    capacity: u64,
+    refill_per_sec: u64,
+    tokens: u64,
+    last: u64,
+}
+
+impl TokenBucket {
+    /// A full bucket at time `now`.
+    #[must_use]
+    pub fn new(capacity: u64, refill_per_sec: u64, now: u64) -> Self {
+        Self {
+            capacity,
+            refill_per_sec,
+            tokens: capacity,
+            last: now,
+        }
+    }
+
+    fn refill(&mut self, now: u64) {
+        let elapsed = now.saturating_sub(self.last);
+        if elapsed > 0 {
+            let added = elapsed.saturating_mul(self.refill_per_sec);
+            self.tokens = self.tokens.saturating_add(added).min(self.capacity);
+            self.last = now;
+        }
+    }
+
+    /// Refill for elapsed time, then take `amount` if available. Returns `true` if allowed.
+    pub fn try_take(&mut self, amount: u64, now: u64) -> bool {
+        self.refill(now);
+        if self.tokens >= amount {
+            self.tokens -= amount;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Current token count (after refilling to `now`).
+    pub fn available(&mut self, now: u64) -> u64 {
+        self.refill(now);
+        self.tokens
+    }
+}
+
+/// A rolling-window event counter (§19 per-hour caps): at most `max` events within any trailing
+/// `window` seconds.
+#[derive(Debug, Clone)]
+pub struct WindowCounter {
+    window: u64,
+    max: u64,
+    events: VecDeque<u64>,
+}
+
+impl WindowCounter {
+    /// At most `max` events per trailing `window` seconds.
+    #[must_use]
+    pub fn new(window_secs: u64, max: u64) -> Self {
+        Self {
+            window: window_secs,
+            max,
+            events: VecDeque::new(),
+        }
+    }
+
+    fn prune(&mut self, now: u64) {
+        let cutoff = now.saturating_sub(self.window);
+        while let Some(&front) = self.events.front() {
+            if front < cutoff {
+                self.events.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Record an event at `now` if it keeps the window within `max`; returns `true` if recorded,
+    /// `false` if the cap is already reached (the event is rejected, not recorded).
+    pub fn try_record(&mut self, now: u64) -> bool {
+        self.prune(now);
+        if (self.events.len() as u64) < self.max {
+            self.events.push_back(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Events currently within the trailing window (after pruning to `now`).
+    pub fn count(&mut self, now: u64) -> u64 {
+        self.prune(now);
+        self.events.len() as u64
+    }
+}
+
+/// A simple per-key storage accumulator against a fixed `limit` (§19 per-key quota).
+#[derive(Debug, Clone)]
+pub struct StorageQuota {
+    limit: u64,
+    used: u64,
+}
+
+impl StorageQuota {
+    /// A quota of `limit` bytes (use [`limits::PER_KEY_STORAGE_QUOTA`] for the §19 default).
+    #[must_use]
+    pub fn new(limit: u64) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    /// Reserve `amount` bytes if it fits under the limit; returns `true` if allowed.
+    pub fn try_add(&mut self, amount: u64) -> bool {
+        match self.used.checked_add(amount) {
+            Some(new) if new <= self.limit => {
+                self.used = new;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Release `amount` bytes (e.g. after GC).
+    pub fn release(&mut self, amount: u64) {
+        self.used = self.used.saturating_sub(amount);
+    }
+
+    /// Bytes currently in use.
+    #[must_use]
+    pub fn used(&self) -> u64 {
+        self.used
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonce_fresh_consume_replay_and_expiry() {
+        let mut s = NonceStore::new(60);
+        let n = [7u8; 32];
+        // unissued nonce is rejected.
+        assert!(!s.consume(&n, 100));
+        // issue, then consume once.
+        s.issue(n, 100);
+        assert!(s.consume(&n, 110));
+        // replay (already consumed) is rejected.
+        assert!(!s.consume(&n, 111));
+
+        // expiry: issued at 100, ttl 60 -> expires at 160.
+        let m = [8u8; 32];
+        s.issue(m, 100);
+        assert!(!s.consume(&m, 160), "at/after expiry must reject");
+        // and it was dropped.
+        assert!(!s.consume(&m, 100));
+    }
+
+    #[test]
+    fn nonce_evicts_expired() {
+        let mut s = NonceStore::new(60);
+        s.issue([1; 32], 100);
+        s.issue([2; 32], 200);
+        s.evict_expired(170); // [1] expired (160), [2] expires at 260
+        assert_eq!(s.live_count(), 1);
+        assert!(s.consume(&[2; 32], 170));
+    }
+
+    #[test]
+    fn token_bucket_burst_refill_and_deny() {
+        // capacity 1000, refill 100/s.
+        let mut b = TokenBucket::new(1000, 100, 0);
+        assert!(b.try_take(1000, 0)); // drain the burst
+        assert!(!b.try_take(1, 0)); // empty -> deny
+        assert!(b.try_take(500, 5)); // 5s -> +500 tokens, take 500
+        assert!(!b.try_take(1, 5)); // empty again
+                                    // refill caps at capacity (100s would add 10_000 but max is 1000).
+        assert_eq!(b.available(200), 1000);
+    }
+
+    #[test]
+    fn window_counter_caps_per_window() {
+        // gc: 4 per hour.
+        let mut w = WindowCounter::new(limits::HOUR_SECS, 4);
+        for t in [0, 10, 20, 30] {
+            assert!(w.try_record(t), "first 4 allowed");
+        }
+        assert!(!w.try_record(40), "5th within the hour denied");
+        // after the window slides past the early events, capacity frees up.
+        assert!(w.try_record(3601), "event at 3601 prunes the t=0 event");
+        assert_eq!(w.count(3601), 4); // t in {10,20,30,3601}
+    }
+
+    #[test]
+    fn storage_quota_accumulates_and_releases() {
+        let mut q = StorageQuota::new(1000);
+        assert!(q.try_add(600));
+        assert!(!q.try_add(500), "600+500 > 1000 denied");
+        assert!(q.try_add(400)); // 600+400 = 1000 exactly
+        assert_eq!(q.used(), 1000);
+        q.release(400);
+        assert!(q.try_add(300));
+        assert_eq!(q.used(), 900);
+    }
+
+    #[test]
+    fn limits_match_spec_19() {
+        // spot-check the normative §19 values.
+        assert_eq!(limits::SERVER_NONCE_TTL_SECS, 60);
+        assert_eq!(limits::MAX_HAS_IDS, 1024);
+        assert_eq!(limits::MAX_GC_CALLS_PER_HOUR, 4);
+        assert_eq!(limits::MAX_SIGCHAIN_ENTRIES_PER_CONN_PER_HOUR, 60);
+        assert_eq!(limits::PER_KEY_STORAGE_QUOTA, 10 * 1024 * 1024 * 1024);
+    }
+}
