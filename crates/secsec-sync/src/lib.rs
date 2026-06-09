@@ -11,10 +11,13 @@
 //!
 //! The head is **mutable** (re-pointed on each commit), so it uses the fresh-nonce construction of
 //! §9.8 — **not** the content-addressed `nonce=0` AEAD of §9.4. Rollback/replay of an old head is
-//! caught by the per-ref `head_version` frontier and HWM checks (§8.5, §10), not by this layer.
+//! caught by the per-ref `head_version` frontier and HWM checks (§8.5, §10, [`rollback`]).
 //!
-//! Not yet here (later §10 slices): `cas-head` semantics, rollback-aware three-way merge, and fork
-//! detection.
+//! The rest of §10 lives in submodules: [`dag`] (commit-DAG ancestry), [`merge`] (per-path
+//! three-way merge), and [`rollback`] (the rollback-aware merge gates + fork detection). The
+//! `cas-head` client side ([`build_head`]/[`is_head_successor`]) is here in this module. What
+//! remains for the orchestration layer (needs transport): commit signing wiring, the actual
+//! server-side CAS (§12), and the multi-remote loop (§14).
 
 #![forbid(unsafe_code)]
 
@@ -151,6 +154,49 @@ pub fn verify_head(pubkey: &DevicePublic, head: &Head, sig: &[u8]) -> Result<(),
     pubkey
         .verify(NS_HEAD, &head.signed_message(), sig)
         .map_err(|_| HeadError::BadSignature)
+}
+
+/// The deterministic identity of a head pointer: `BLAKE3` over its canonical signed content (§6).
+/// Used to chain heads via [`Head::prev_head`] and as the `last_seen_head` referent. Deterministic
+/// (unlike the random-nonce stored blob), so two clients agree on a head's id.
+#[must_use]
+pub fn head_id(head: &Head) -> Id {
+    *blake3::hash(&head.signed_message()).as_bytes()
+}
+
+/// Build the next head for a ref (`cas-head` client side, §10): version `+1`, `prev_head` = the id of
+/// `prev` (or [`NO_PREV_HEAD`] for the first head), pointing at `commit_id` under `roster_seq`. The
+/// caller then [`sign_head`]s and [`seal_head`]s it, and the transport performs the atomic CAS (§12).
+#[must_use]
+pub fn build_head(
+    ref_name: impl Into<String>,
+    commit_id: Id,
+    roster_seq: u64,
+    prev: Option<&Head>,
+) -> Head {
+    Head {
+        ref_name: ref_name.into(),
+        commit_id,
+        head_version: prev.map_or(1, |p| p.head_version + 1),
+        roster_seq,
+        prev_head: prev.map_or(NO_PREV_HEAD, head_id),
+    }
+}
+
+/// Validate that `new` is a well-formed successor of `prev` on the same ref (the head-chain
+/// anti-rollback link, complementing the §8.5 `head_version` frontier): for the first head, version
+/// 1 with no predecessor; otherwise `head_version` increments by one and `prev_head` is exactly the
+/// id of `prev`, on the same ref.
+#[must_use]
+pub fn is_head_successor(prev: Option<&Head>, new: &Head) -> bool {
+    match prev {
+        None => new.head_version == 1 && new.prev_head == NO_PREV_HEAD,
+        Some(p) => {
+            new.ref_name == p.ref_name
+                && new.head_version == p.head_version + 1
+                && new.prev_head == head_id(p)
+        }
+    }
 }
 
 /// The encrypted plaintext: the head fields followed by its signature, canonically encoded.
@@ -422,6 +468,39 @@ mod tests {
         let (h, s) = decode_head(&bytes).unwrap();
         assert_eq!(h, head);
         assert_eq!(s, b"sig-bytes");
+    }
+
+    #[test]
+    fn build_head_chains_and_is_successor() {
+        // first head: version 1, no predecessor.
+        let h1 = build_head("main", [0xC1; 32], 4, None);
+        assert_eq!(h1.head_version, 1);
+        assert_eq!(h1.prev_head, NO_PREV_HEAD);
+        assert!(is_head_successor(None, &h1));
+        assert!(!is_head_successor(Some(&h1), &h1)); // h1 is not its own successor
+
+        // next head: version 2, prev_head = id(h1), same ref.
+        let h2 = build_head("main", [0xC2; 32], 5, Some(&h1));
+        assert_eq!(h2.head_version, 2);
+        assert_eq!(h2.prev_head, head_id(&h1));
+        assert!(is_head_successor(Some(&h1), &h2));
+
+        // a non-successor: skipped version / wrong prev / wrong ref are all rejected.
+        let mut bad_ver = h2.clone();
+        bad_ver.head_version = 3;
+        assert!(!is_head_successor(Some(&h1), &bad_ver));
+        let mut bad_prev = h2.clone();
+        bad_prev.prev_head = [0xFF; 32];
+        assert!(!is_head_successor(Some(&h1), &bad_prev));
+        let wrong_ref = build_head("other", [0xC2; 32], 5, Some(&h1));
+        assert!(!is_head_successor(Some(&h1), &wrong_ref));
+
+        // head_id is content-deterministic and distinguishes versions.
+        assert_eq!(
+            head_id(&h1),
+            head_id(&build_head("main", [0xC1; 32], 4, None))
+        );
+        assert_ne!(head_id(&h1), head_id(&h2));
     }
 
     /// Frozen KATs, mirrored in `vectors/secsec-kat-v1.txt [head]`. `ref_name_key` is from the
