@@ -22,12 +22,15 @@
 
 pub mod serve;
 
-use secsec_proto::server::{limits, NonceStore, StorageQuota, TokenBucket};
+use secsec_proto::server::{limits, NonceStore, StorageQuota, TokenBucket, WindowCounter};
 use secsec_proto::wire::{ErrorCode, Request, Response};
-use secsec_proto::{op_and_args, ReadAuth, WriteAuth};
+use secsec_proto::{gc, op, op_and_args, ReadAuth, WriteAuth};
 use secsec_sig::{DeviceId, DevicePublic};
 use secsec_store::Store;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+
+/// One hour, in seconds — the `gc` rate-limit window (§19: 4 gc calls / key / hour).
+const GC_WINDOW_SECS: u64 = 3600;
 
 /// One authenticated per-op request, as resolved by the connection-auth + framing layers: the
 /// connection's authenticated public key, the operation, its per-op signature, the session
@@ -54,9 +57,17 @@ struct ServerState {
     nonces: NonceStore,
     write_buckets: HashMap<DeviceId, TokenBucket>,
     quotas: HashMap<DeviceId, StorageQuota>,
+    gc_calls: HashMap<DeviceId, WindowCounter>,
 }
 
 impl ServerState {
+    fn gc_record(&mut self, d: DeviceId, now: u64) -> bool {
+        self.gc_calls
+            .entry(d)
+            .or_insert_with(|| WindowCounter::new(GC_WINDOW_SECS, limits::MAX_GC_CALLS_PER_HOUR))
+            .try_record(now)
+    }
+
     fn take_write(&mut self, d: DeviceId, n: u64, now: u64) -> bool {
         self.write_buckets
             .entry(d)
@@ -133,6 +144,10 @@ impl Server {
         self.state.lock().expect("server state").add_quota(d, n)
     }
 
+    fn gc_allow(&self, d: DeviceId, now: u64) -> bool {
+        self.state.lock().expect("server state").gc_record(d, now)
+    }
+
     /// Run the §12 pipeline for one request and return the response.
     pub fn handle(&self, inc: Incoming<'_>, now: u64) -> Response {
         // (1) keyslot existence: the connecting key must be rostered.
@@ -143,6 +158,12 @@ impl Server {
         // keyslot presence only (no decryption) — a store error fails closed.
         if !self.store.keyslot_exists(&device_id).unwrap_or(false) {
             return Response::Err(ErrorCode::NotEnrolled);
+        }
+
+        // gc has a state-dependent args_hash (§15 compare-and-swap), so it is authorized separately
+        // from the generic op_and_args path below.
+        if matches!(inc.request, Request::Gc { .. }) {
+            return self.handle_gc(inc, device_id, now);
         }
 
         // (2) per-op authorization: recompute args_hash from the request and verify the signature.
@@ -264,6 +285,68 @@ impl Server {
                     Err(_) => Response::Err(ErrorCode::Internal),
                 }
             }
+            // gc is dispatched before this match (state-dependent auth, §15); never reached here.
+            Request::Gc { .. } => Response::Err(ErrorCode::Internal),
+        }
+    }
+
+    /// The §15 `gc` pipeline. The `args_hash` is recomputed from the **server's** current mutable state
+    /// (`all_heads_hash` over the stored head blobs, `roster_seq`, `put_epoch`); verifying the client's
+    /// `secsec-write-v1` signature over that message **is** the compare-and-swap — a concurrent
+    /// `cas-head`/`roster-append`/`put` changes a bound value, so the recomputed message differs and the
+    /// signature fails (`BadAuth`), aborting the sweep rather than deleting against stale state.
+    fn handle_gc(&self, inc: Incoming<'_>, device_id: DeviceId, now: u64) -> Response {
+        let Request::Gc { keep_set, gc_gen } = inc.request else {
+            return Response::Err(ErrorCode::Internal);
+        };
+        if keep_set.len() > limits::MAX_GC_KEEP_SET_IDS {
+            return Response::Err(ErrorCode::TooManyIds);
+        }
+        let Some(nonce) = inc.server_nonce else {
+            return Response::Err(ErrorCode::BadAuth);
+        };
+
+        // Recompute args_gc from the server's current state.
+        let (refs, roster_len, put_epoch) = match (
+            self.store.ref_blob_hashes(),
+            self.store.roster_len(),
+            self.store.put_epoch(),
+        ) {
+            (Ok(r), Ok(n), Ok(p)) => (r, n, p),
+            _ => return Response::Err(ErrorCode::Internal),
+        };
+        let roster_seq = roster_len.saturating_sub(1);
+        let args_hash = gc::args_gc(
+            &gc::keep_set_hash(&keep_set),
+            gc_gen,
+            &gc::all_heads_hash(&refs),
+            roster_seq,
+            put_epoch,
+        );
+
+        let wa = WriteAuth {
+            op: op::GC,
+            args_hash,
+            session_transcript: inc.session_transcript,
+            server_nonce: nonce,
+        };
+        if wa.verify(inc.pubkey, &inc.op_sig).is_err() {
+            // Bad signature OR the client's view of all_heads_hash/roster_seq/put_epoch != the
+            // server's (a concurrent mutation since the client computed it) — the §15 CAS failed.
+            return Response::Err(ErrorCode::BadAuth);
+        }
+        if !self.consume_nonce(&nonce, now) {
+            return Response::Err(ErrorCode::BadAuth);
+        }
+        // §19: at most 4 gc calls per key per hour — rejected before any object scan.
+        if !self.gc_allow(device_id, now) {
+            return Response::Err(ErrorCode::RateLimit);
+        }
+
+        let keep: BTreeSet<[u8; 32]> = keep_set.into_iter().collect();
+        match self.store.gc(&keep, gc_gen) {
+            Ok(_deleted) => Response::Ok,
+            Err(_) => Response::Err(ErrorCode::Internal),
         }
     }
 }

@@ -127,6 +127,17 @@ pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
         Request::GetKeyslot { device_id, gen } => {
             (op::GET_KEYSLOT, args_get_keyslot(device_id, *gen), false)
         }
+        // gc's real args_hash binds the SERVER's all_heads_hash/roster_seq/put_epoch (a §15
+        // compare-and-swap), so it is computed in the server's gc handler and the client's gc driver,
+        // NOT here. `handle` dispatches Gc before reaching op_and_args; this keep_set+gc_gen-only
+        // binding is never the gc authorization source.
+        Request::Gc { keep_set, gc_gen } => {
+            let mut w = Writer::new();
+            w.raw(op::GC.as_bytes())
+                .raw(&gc::keep_set_hash(keep_set))
+                .u64(*gc_gen);
+            (op::GC, blake3_of(&w.finish()), true)
+        }
         Request::Put {
             id, declared_size, ..
         } => (op::PUT, args_put(id, *declared_size), true),

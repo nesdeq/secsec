@@ -182,6 +182,16 @@ pub enum Request {
         /// Master-key generation.
         gen: u32,
     },
+    /// Client-driven garbage-collection sweep (§15): delete every object with arrival `put_epoch ≤
+    /// gc_gen` that is **not** in `keep_set`. The `secsec-write-v1` `args_hash` binds `keep_set`,
+    /// `gc_gen`, and the server's current `all_heads_hash`/`roster_seq`/`put_epoch` (a compare-and-swap;
+    /// see [`crate::gc`]). `keep_set` is capped at [`MAX_GC_KEEP_SET_IDS`].
+    Gc {
+        /// The reachable-object closure to keep (sorted/deduped by the hash; the server folds again).
+        keep_set: Vec<Id>,
+        /// Sweep objects whose arrival `put_epoch ≤ gc_gen`.
+        gc_gen: u64,
+    },
 }
 
 const T_GET: u8 = 0;
@@ -192,6 +202,7 @@ const T_ROSTER: u8 = 4;
 const T_GETREF: u8 = 5;
 const T_GETROSTER: u8 = 6;
 const T_GETKEYSLOT: u8 = 7;
+const T_GC: u8 = 8;
 
 impl Request {
     /// Canonical encoding (tag-prefixed).
@@ -239,6 +250,13 @@ impl Request {
             Request::GetKeyslot { device_id, gen } => {
                 w.u8(T_GETKEYSLOT).raw(device_id).u32(*gen);
             }
+            Request::Gc { keep_set, gc_gen } => {
+                w.u8(T_GC).u32(keep_set.len() as u32);
+                for id in keep_set {
+                    w.raw(id);
+                }
+                w.u64(*gc_gen);
+            }
         }
         w.finish()
     }
@@ -284,6 +302,20 @@ impl Request {
                 device_id: read32(&mut r)?,
                 gen: r.u32()?,
             },
+            T_GC => {
+                let n = r.u32()? as usize;
+                if n > crate::server::limits::MAX_GC_KEEP_SET_IDS {
+                    return Err(WireError::TooLarge);
+                }
+                let mut keep_set = Vec::with_capacity(n);
+                for _ in 0..n {
+                    keep_set.push(read32(&mut r)?);
+                }
+                Request::Gc {
+                    keep_set,
+                    gc_gen: r.u64()?,
+                }
+            }
             other => return Err(WireError::BadTag(other)),
         };
         r.finish()?;
@@ -534,6 +566,10 @@ mod tests {
             Request::GetKeyslot {
                 device_id: [10; 32],
                 gen: 3,
+            },
+            Request::Gc {
+                keep_set: vec![[11; 32], [12; 32]],
+                gc_gen: 9,
             },
         ];
         for req in reqs {

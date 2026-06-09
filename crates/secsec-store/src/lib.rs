@@ -36,6 +36,9 @@ const PUT_EPOCH: &str = "put_epoch";
 /// `old_head_id` sentinel meaning "expect the ref to be absent" — a first `cas-head` (§12).
 pub const ABSENT_HEAD: [u8; 32] = [0u8; 32];
 
+/// A ref hash paired with the `BLAKE3` of its stored head blob (§15 `all_heads_hash` input).
+pub type RefBlobHash = ([u8; 32], [u8; 32]);
+
 /// The fixed length of a keyslot key: `device_id(32) ‖ le32(gen)`.
 const KEYSLOT_KEY_LEN: usize = 36;
 
@@ -155,6 +158,23 @@ impl Store {
         let rtx = self.db.begin_read()?;
         let refs = rtx.open_table(REFS)?;
         Ok(refs.get(&ref_h[..])?.map(|g| g.value().to_vec()))
+    }
+
+    /// Every active ref as `(ref_h, BLAKE3(stored head blob))` (§15 `all_heads_hash` input). The blob
+    /// hash is the **server-visible** per-ref token (the same one `cas-head` compares on); both the
+    /// blind server and the client compute it from the stored bytes, so a `gc` can be CAS-serialized
+    /// against a concurrent `cas-head`.
+    pub fn ref_blob_hashes(&self) -> Result<Vec<RefBlobHash>, StoreError> {
+        let rtx = self.db.begin_read()?;
+        let refs = rtx.open_table(REFS)?;
+        let mut out = Vec::new();
+        for item in refs.iter()? {
+            let (k, v) = item?;
+            if let Ok(ref_h) = <[u8; 32]>::try_from(k.value()) {
+                out.push((ref_h, *blake3::hash(v.value()).as_bytes()));
+            }
+        }
+        Ok(out)
     }
 
     /// Atomic `cas-head` (§12): if `BLAKE3(current stored blob)` (or [`ABSENT_HEAD`] when the ref is
