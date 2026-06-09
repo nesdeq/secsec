@@ -122,7 +122,8 @@ anchor (RFP).
 **`init` (device 1):**
 1. Generate `master_key_1`; compute `mk_commit_1`.
 2. Write genesis sigchain entry (seq 0), self-signed, containing device-1 pubkey + `mk_commit_1`.
-3. Compute and **display RFP** ("Repository fingerprint: `SHA256:…`"). The user records it.
+3. Compute and **display RFP** ("Repository fingerprint: `BLAKE3:…`" — RFP is `BLAKE3(canonical(genesis))`
+   per §5, so it MUST be labeled/compared as BLAKE3, not SHA256). The user records it.
 4. Optionally create a recovery keyslot (§8.6).
 
 **`grant` (add device D), performed on an already-enrolled device E that holds `master_key`:**

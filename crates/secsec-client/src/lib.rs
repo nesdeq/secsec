@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod quic;
+pub mod repo;
 pub mod watcher;
 
 use secsec_engine::{merge_heads, CommitAuthor, MergeError, SyncAction};

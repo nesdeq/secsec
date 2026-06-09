@@ -104,6 +104,26 @@ pub fn unwrap(
     recip_x25519_secret: &[u8; 32],
     expected_mk_commit: &[u8; 32],
 ) -> Result<MasterKey, KeyslotError> {
+    let mk_bytes = unwrap_raw(keyslot, gen, device_id, recip_x25519_secret)?;
+    let mk = MasterKey::new(gen, *mk_bytes);
+    // Authenticity: the recovered key must match the RFP-anchored commitment (§8.3).
+    if !bool::from(mk.mk_commit().ct_eq(expected_mk_commit)) {
+        return Err(KeyslotError::CommitMismatch);
+    }
+    Ok(mk)
+}
+
+/// HPKE-open a keyslot to its raw 32-byte master-key bytes **without** the `mk_commit` authenticity
+/// check. This is **only** for the cold-start bootstrap (§8.1): the commitment to verify against lives
+/// inside the still-encrypted sigchain, so the device must first recover this candidate, decrypt the
+/// chain with it, and then verify — which [`secsec_kdf`]-keyed `cold_start_fold` does as its final
+/// step. Every other caller MUST use [`unwrap`], which performs the check.
+pub fn unwrap_raw(
+    keyslot: &[u8],
+    gen: u32,
+    device_id: &[u8; 32],
+    recip_x25519_secret: &[u8; 32],
+) -> Result<Zeroizing<[u8; 32]>, KeyslotError> {
     if keyslot.len() < ENCAPPED_LEN {
         return Err(KeyslotError::Malformed);
     }
@@ -125,13 +145,7 @@ pub fn unwrap(
     let mut mk_bytes = Zeroizing::new([0u8; 32]);
     mk_bytes.copy_from_slice(&pt);
     pt.zeroize();
-
-    let mk = MasterKey::new(gen, *mk_bytes);
-    // Authenticity: the recovered key must match the RFP-anchored commitment (§8.3).
-    if !bool::from(mk.mk_commit().ct_eq(expected_mk_commit)) {
-        return Err(KeyslotError::CommitMismatch);
-    }
-    Ok(mk)
+    Ok(mk_bytes)
 }
 
 #[cfg(test)]

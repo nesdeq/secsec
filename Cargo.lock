@@ -1461,7 +1461,9 @@ dependencies = [
  "clap",
  "quinn",
  "rcgen",
+ "secsec-client",
  "secsec-server",
+ "secsec-sig",
  "secsec-store",
  "secsec-transport",
  "tokio",
@@ -1507,8 +1509,10 @@ dependencies = [
  "secsec-engine",
  "secsec-frame",
  "secsec-kdf",
+ "secsec-keyslot",
  "secsec-object",
  "secsec-proto",
+ "secsec-roster",
  "secsec-server",
  "secsec-sig",
  "secsec-snapshot",
@@ -1517,6 +1521,7 @@ dependencies = [
  "secsec-transport",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

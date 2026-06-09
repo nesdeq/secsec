@@ -1,16 +1,18 @@
 //! `secsec` — the CLI binary (`finaldesign.md` §11, §12).
 //!
-//! This skeleton ships the **server** side (`serve`) and a host-key helper (`hostkey`). The server is
-//! blind — it needs no master key, only a self-signed host identity and a store — so it is fully
-//! functional today. The client subcommands (`init` / `sync`) depend on the §7 enrollment flow
-//! (master-key genesis + keyslot), which is the next milestone, and are intentionally not stubbed in
-//! with fake key material.
+//! Subcommands: `init` (repository genesis — §7), `serve` (the blind server), and `hostkey` (host-pin
+//! helper). `init` writes the genesis roster + this device's keyslot into a store and prints the RFP;
+//! `serve` is fully functional (the server is blind — no master key). The remaining client subcommand
+//! `sync` (cold-start over a remote + watcher-driven commit) needs the remote roster/keyslot read ops
+//! and is the next milestone.
 
 #![allow(missing_docs)] // a binary crate exports no public API
 
 use clap::{Parser, Subcommand};
+use secsec_client::repo::init_repo;
 use secsec_server::serve::serve_connection;
 use secsec_server::Server;
+use secsec_sig::DeviceKey;
 use secsec_store::Store;
 use secsec_transport::quic::server_config;
 use secsec_transport::HostPin;
@@ -34,6 +36,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Initialize a new repository (device 1): write the genesis roster + this device's keyslot into
+    /// the store and print the RFP anchor to record out-of-band (§7).
+    Init {
+        /// Path to the redb store to initialize (created if absent).
+        #[arg(long)]
+        store: PathBuf,
+        /// Path to this device's OpenSSH **private** key (Ed25519).
+        #[arg(long)]
+        key: PathBuf,
+    },
     /// Run the blind sync server.
     Serve {
         /// Path to the redb object store (created if absent).
@@ -114,6 +126,24 @@ async fn run_serve(
     Ok(())
 }
 
+fn run_init(store: PathBuf, key: PathBuf) -> Result<(), Box<dyn Error>> {
+    let pem = std::fs::read_to_string(&key)?;
+    let device = DeviceKey::from_openssh(&pem)?;
+    let store = Store::open(store)?;
+    let rfp = init_repo(&store, &device, unix_secs())?;
+    println!(
+        "repository initialized for device {}",
+        hex(&device.device_id()?)
+    );
+    // RFP = BLAKE3(canonical(genesis)) (§5) — labeled as such, NOT "SHA256:", so an out-of-band
+    // fingerprint comparison uses the right algorithm.
+    println!(
+        "RFP (BLAKE3; record this out-of-band, share at every enrollment): {}",
+        hex(&rfp)
+    );
+    Ok(())
+}
+
 fn run_hostkey(hostkey_dir: PathBuf) -> Result<(), Box<dyn Error>> {
     let (cert, _key) = load_or_generate_hostkey(&hostkey_dir)?;
     let host_id = HostPin::from_cert(&cert)?.host_id();
@@ -124,6 +154,7 @@ fn run_hostkey(hostkey_dir: PathBuf) -> Result<(), Box<dyn Error>> {
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Init { store, key } => run_init(store, key),
         Cmd::Serve {
             store,
             hostkey_dir,
