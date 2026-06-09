@@ -101,7 +101,7 @@ All objects are content-addressed, framed, encrypted (§9.1).
 | **Chunk** | a content-defined slice of a file | id (§9.2) |
 | **Tree** | dir listing: name → { mode, mtime, size, chunk-list \| subtree } | id |
 | **Commit** | root tree id, parent id(s), `device_id`, `version`, `roster_seq`, `last_seen_head`, ts; SSHSIG-signed | id |
-| **Head** | per-ref signed pointer { commit id, `head_version`, `roster_seq`, prev-head id } | name |
+| **Head** | per-ref **signed + encrypted** pointer { commit id, `head_version`, `roster_seq`, prev-head id } (§9.8) | name |
 | **Roster entry** | one signed, hash-chained sigchain record (§8) | by seq + hash |
 | **Keyslot** | versioned, authenticated wrap of `master_key_g` to a device key (§8.3) | device_id + gen |
 
@@ -439,12 +439,12 @@ Curve25519 public key, which is derivable from the sigchain-published Ed25519 pu
 birational map — it MUST NOT be used as the key material for `local_seal_key`. The key is
 re-derived at startup from the SSH private key and never stored.
 
-The frontier state file is encrypted with ChaCha20-Poly1305 under `local_seal_key` with
-`device_id` in the AD. A **fresh 96-bit (12-byte) nonce** is generated via OS CSPRNG on each
-write and prepended to the ciphertext:
+The frontier state file is encrypted with the **mutable-object AEAD of §9.8** (fresh 96-bit OS-CSPRNG
+nonce per write) under `local_seal_key`, with `device_id` as the AD — no `FRAME` and no signature, as
+it is local-only and unsigned:
 
 ```
-nonce(12B) ‖ ChaCha20Poly1305(local_seal_key, nonce, AD=device_id, plaintext_frontiers)
+nonce(12B) ‖ tag(16) ‖ ChaCha20Poly1305_ct(local_seal_key, nonce, AD=device_id, plaintext_frontiers)
 ```
 
 **Cold-boot sequence (normative):**
@@ -612,6 +612,8 @@ id_key[g][t]   = BLAKE3::derive_key("secsec-id-key-v1",
                                      master_key_g ‖ le32(g) ‖ u8(t))
 cdc_seed[g]    = BLAKE3::derive_key("secsec-cdc-seed-v1",
                                      master_key_g ‖ le32(g))
+head_key_g     = BLAKE3::derive_key("secsec-head-enc-v1",
+                                     master_key_g ‖ le32(g))   // mutable head-blob key (§9.8)
 roster_key_g   = BLAKE3::derive_key("secsec-roster-enc-v1", master_key_g)   // one per generation g
 ref_name_key   = BLAKE3::derive_key("secsec-ref-name-v1",  master_key_g)
 
@@ -632,7 +634,7 @@ Distinct context strings prevent `enc_key[g][t] == id_key[g][t]` for any `(g, t)
 `le32(g) ‖ u8(t)` encodings prevent `enc_key[1][CHUNK]` from equalling `enc_key[2][TREE]`
 (collision via variable-length concatenation). `BLAKE3::derive_key` places the context string
 as the KDF key and the key material as the message, keeping the high-entropy input (`master_key_g`,
-`roster_key_g`, or `roster_key_{g+1}`) in the IKM role **for all seven `derive_key` derivations
+`roster_key_g`, or `roster_key_{g+1}`) in the IKM role **for all eight `derive_key` derivations
 listed above**.
 
 > **Note:** `mk_commit_g` uses `BLAKE3::keyed_hash(master_key_g, ...)` — placing `master_key_g`
@@ -640,7 +642,7 @@ listed above**.
 > where `master_key_g` serves as a BLAKE3 key argument; the two uses are domain-separated by
 > BLAKE3's internal API distinction. Implementors MUST NOT substitute `BLAKE3::derive_key` here.
 
-**Test vectors must be provided in the implementation for all eight derivations** (the seven
+**Test vectors must be provided in the implementation for all nine derivations** (the eight
 `derive_key` derivations plus the `mk_commit_g` `keyed_hash`).
 
 `roster_key_g` (= `derive_key("secsec-roster-enc-v1", master_key_g)`, **one per generation**)
@@ -757,6 +759,50 @@ reads until reconnect depends on whether the server re-verifies keyslot existenc
   tradeoff.
 - Residual leaks (sizes within padding bounds, timing, intra-file temporal equality, intra-repo
   equality in convergent mode) are bounded and documented (§22).
+
+### 9.8 Mutable-object AEAD (fresh-nonce) — heads & local sealed state
+
+The committing AEAD of §9.4 relies on a **unique key per object** (so `nonce=0` is safe) and applies
+only to **immutable, content-addressed** objects. Two objects are **mutable** — re-encrypted in
+place under a *stable* key — so they MUST NOT use §9.4's fixed nonce (that would be catastrophic
+nonce reuse). They instead use a **fresh random nonce per write**: the per-ref **Head** (§6, §13)
+and the **local sealed state** (§8.5).
+
+```
+nonce          = 96-bit OS CSPRNG, fresh on EVERY write     // never a counter; reuse is fatal
+ct, tag        = ChaCha20Poly1305(key, nonce, AD, plaintext)  // standard RFC 8439 AEAD; raw 16-byte tag
+blob           = [FRAME] ‖ nonce(12) ‖ tag(16) ‖ ct          // FRAME present for server-stored heads
+```
+
+A fresh nonce per write makes keystream reuse impossible even though `key` is reused across updates,
+so this construction does not need §9.4's per-object-unique key. It is deliberately **not**
+key-committing (CMT): unnecessary here, because the key is a single high-entropy, master-key-derived
+value (no multi-key / low-entropy partitioning-oracle surface, unlike keyslots/recovery), and
+authenticity against other devices and the server rests on the object's **signature**, not the
+symmetric tag.
+
+**Head blob (normative).** Stored at `/refs/<H>`, `H = BLAKE3::keyed_hash(ref_name_key, ref_name)`
+(§13). The head is **both signed and encrypted**:
+
+```
+sig        = SSHSIG("secsec-head-v1",                                  // §9.6
+                    ref_name ‖ commit_id ‖ head_version ‖ roster_seq ‖ prev_head)
+plaintext  = canonical(ref_name, commit_id, head_version, roster_seq, prev_head, sig)
+key        = head_key_g = BLAKE3::derive_key("secsec-head-enc-v1", master_key_g ‖ le32(g))   // §9.5
+AD         = FRAME ‖ H        // FRAME: type=Head, gen=g; binds the blob to its ref slot
+head_blob  = FRAME(11) ‖ nonce(12) ‖ tag(16) ‖ ct
+```
+
+The **signature** (verified against the RFP-anchored roster, §8) is what prevents the server or a
+non-member from forging or substituting a head; the AEAD hides the ref→commit linkage and the
+counters from the server and binds the blob to its ref slot via `H`. `head_version` (per ref,
+strictly increasing, §8.5) is covered by the signature and checked against the client's persisted
+frontier and `per_device_head_version_hwm` (§8.5, §10) — replay/rollback of an old head is caught
+there, not by the AEAD. The generation `g` is read from the plaintext `FRAME.gen`; a current member
+already holds (or peels, §8.2) the `master_key_g` needed for `head_key_g`.
+
+The §8.5 local sealed-state blob uses this same construction with `key = local_seal_key` and
+`AD = device_id` (no `FRAME`, no signature — it is local-only and unsigned).
 
 ---
 ## 10. Sync semantics
@@ -987,9 +1033,9 @@ Path notes:
   key for verification. `device_id = BLAKE3(canonical(pubkey))` is already opaque.
 - `/refs/<H>` replaces `/refs/<device_id>` — ref names are stored under a keyed hash
   `H = BLAKE3::keyed_hash(ref_name_key, ref_name)`, where `ref_name_key` is derived from
-  `master_key` (§9.5). The signed head blob contains the ref name in plaintext for authenticated
-  clients; the server sees only the hash `H`. This closes the ref-name leak without requiring
-  structural changes to the head blob format.
+  `master_key` (§9.5). The head blob is **signed and encrypted** (§9.8): the ref name lives **inside
+  the encryption** (recoverable only by a client holding `head_key_g`), so the server sees only the
+  hash `H` and ciphertext. This closes the ref-name leak.
 - The `/recovery` blob includes a 16-byte random salt field (before the key_commit) for the
   Argon2id path (§8.6).
 
