@@ -533,6 +533,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "secsec-kdf"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "proptest",
+ "secsec-aead",
+ "secsec-canon",
+ "zeroize",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
