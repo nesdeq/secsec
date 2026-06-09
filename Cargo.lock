@@ -562,6 +562,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "secsec-object"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "proptest",
+ "secsec-aead",
+ "secsec-chunk",
+ "secsec-frame",
+ "secsec-kdf",
+ "subtle",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
