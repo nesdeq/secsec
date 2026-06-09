@@ -149,9 +149,9 @@ async fn run_serve(
     let (cert, key) = load_or_generate_hostkey(&hostkey_dir)?;
     let host_id = HostPin::from_cert(&cert)?.host_id();
     let store = Store::open(store)?;
-    // Shared behind an async mutex, locked per-request inside serve_connection, so connections are
-    // served CONCURRENTLY (an idle connection holds no lock).
-    let server = std::sync::Arc::new(tokio::sync::Mutex::new(Server::new(store)));
+    // Shared via Arc; the store is lock-free (redb-transactional) and only the small replay/rate-limit
+    // state is briefly locked inside handle(), so connections are served CONCURRENTLY.
+    let server = std::sync::Arc::new(Server::new(store));
 
     let endpoint = quinn::Endpoint::server(server_config(&cert, &key)?, listen)?;
     println!("secsec serve — host pin {}", hex(&host_id));

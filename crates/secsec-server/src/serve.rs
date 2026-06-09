@@ -50,12 +50,12 @@ fn random32() -> [u8; 32] {
 
 /// Handshake the connection and serve its request streams until it closes. `host_id` is the server's
 /// own `host_id`; `now` is a clock (unix seconds) read fresh per request (so nonce TTLs stay current
-/// on a long-lived connection). The `server` is shared behind an async mutex and locked **per
-/// request** (only around `issue_nonce` and `handle`, never across the network I/O between them), so
-/// many connections can be served concurrently — an idle connection holds no lock.
+/// on a long-lived connection). `server` is shared via `&Server` (typically `Arc<Server>`) and serves
+/// many connections concurrently — its store is lock-free and only the small replay/rate-limit state
+/// is briefly mutex-guarded inside [`Server::handle`].
 pub async fn serve_connection<F>(
     conn: &Connection,
-    server: &tokio::sync::Mutex<Server>,
+    server: &Server,
     host_id: [u8; 32],
     now: F,
 ) -> Result<(), ServeError>
@@ -70,15 +70,12 @@ where
         .pubkey
         .device_id()
         .map_err(|e| ServeError::Store(e.to_string()))?;
+    if !server
+        .store()
+        .keyslot_exists(&device_id)
+        .map_err(|e| ServeError::Store(e.to_string()))?
     {
-        let s = server.lock().await;
-        if !s
-            .store()
-            .keyslot_exists(&device_id)
-            .map_err(|e| ServeError::Store(e.to_string()))?
-        {
-            return Err(ServeError::NotEnrolled);
-        }
+        return Err(ServeError::NotEnrolled);
     }
 
     // Request loop: one bidi stream per op.
@@ -87,33 +84,27 @@ where
         if read_frame(&mut recv, 0).await.is_err() {
             break;
         }
-        // Issue a fresh single-use per-op nonce (lock held only for the issue) and challenge.
+        // Issue a fresh single-use per-op nonce and challenge the client.
         let nonce = random32();
-        {
-            server.lock().await.issue_nonce(nonce, now());
-        }
+        server.issue_nonce(nonce, now());
         write_frame(&mut send, &nonce)
             .await
             .map_err(|e| ServeError::Wire(e.to_string()))?;
 
-        // The client signs + sends while we hold no lock (a slow client blocks only itself).
         let bytes = read_frame(&mut recv, MAX_FRAME_LEN)
             .await
             .map_err(|e| ServeError::Wire(e.to_string()))?;
         let resp = match AuthedRequest::decode(&bytes) {
-            Ok(ar) => {
-                let mut s = server.lock().await;
-                s.handle(
-                    Incoming {
-                        pubkey: &session.pubkey,
-                        request: ar.request,
-                        op_sig: ar.op_sig,
-                        session_transcript: session.transcript,
-                        server_nonce: Some(nonce),
-                    },
-                    now(),
-                )
-            }
+            Ok(ar) => server.handle(
+                Incoming {
+                    pubkey: &session.pubkey,
+                    request: ar.request,
+                    op_sig: ar.op_sig,
+                    session_transcript: session.transcript,
+                    server_nonce: Some(nonce),
+                },
+                now(),
+            ),
             Err(_) => Response::Err(secsec_proto::wire::ErrorCode::BadRequest),
         };
 
@@ -130,7 +121,7 @@ mod tests {
     use super::*;
     use crate::Server;
     use rcgen::generate_simple_self_signed;
-    use secsec_proto::wire::{Request, Response};
+    use secsec_proto::wire::{ErrorCode, Request, Response};
     use secsec_sig::DeviceKey;
     use secsec_store::Store;
     use secsec_transport::handshake::client_handshake;
@@ -164,7 +155,7 @@ mod tests {
             store
                 .put_keyslot(&device.device_id().unwrap(), 1, b"keyslot")
                 .unwrap(); // enroll
-            let server = tokio::sync::Mutex::new(Server::new(store));
+            let server = Server::new(store);
 
             let endpoint =
                 quinn::Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
@@ -249,7 +240,7 @@ mod tests {
             store
                 .put_keyslot(&dev_b.device_id().unwrap(), 1, b"keyslot")
                 .unwrap();
-            let server = std::sync::Arc::new(tokio::sync::Mutex::new(Server::new(store)));
+            let server = std::sync::Arc::new(Server::new(store));
 
             let endpoint =
                 quinn::Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
@@ -308,6 +299,96 @@ mod tests {
                 "B was served while A held an idle connection"
             );
 
+            conn_b.close(0u32.into(), b"done");
+        });
+    }
+
+    /// **Racing writers:** two clients `cas-head` the same ref (both expecting it absent) at the same
+    /// time. The blind-CAS over the redb write txn must let **exactly one** win; the other gets
+    /// `CasConflict` (and would re-fetch + merge, §10). This is the concurrency-correctness guarantee
+    /// the whole sync model rests on.
+    #[test]
+    fn two_clients_racing_cas_head_one_wins() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ck = generate_simple_self_signed(vec!["secsec.invalid".to_string()]).unwrap();
+            let (cert, key) = (ck.cert.der().to_vec(), ck.key_pair.serialize_der());
+            let pin = HostPin::from_cert(&cert).unwrap();
+            let host_id = pin.host_id();
+
+            let dev_a = DeviceKey::generate().unwrap();
+            let dev_b = DeviceKey::generate().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path().join("s.redb")).unwrap();
+            for d in [&dev_a, &dev_b] {
+                store
+                    .put_keyslot(&d.device_id().unwrap(), 1, b"keyslot")
+                    .unwrap();
+            }
+            let server = std::sync::Arc::new(Server::new(store));
+
+            let endpoint =
+                quinn::Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let server = server.clone();
+                    tokio::spawn(async move {
+                        if let Ok(conn) = incoming.await {
+                            let _ = serve_connection(&conn, &server, host_id, || 1_000).await;
+                        }
+                    });
+                }
+            });
+
+            let mut ca = quinn::Endpoint::client(loopback()).unwrap();
+            ca.set_default_client_config(client_config(pin.clone()).unwrap());
+            let conn_a = ca.connect(addr, "secsec.invalid").unwrap().await.unwrap();
+            let ta = client_handshake(&conn_a, &dev_a, host_id, [0x01; 32])
+                .await
+                .unwrap()
+                .transcript;
+            let mut cb = quinn::Endpoint::client(loopback()).unwrap();
+            cb.set_default_client_config(client_config(pin).unwrap());
+            let conn_b = cb.connect(addr, "secsec.invalid").unwrap().await.unwrap();
+            let tb = client_handshake(&conn_b, &dev_b, host_id, [0x02; 32])
+                .await
+                .unwrap()
+                .transcript;
+
+            // Both cas-head the SAME ref, both expecting absent (all-zero old), with distinct blobs.
+            let ref_h = [0x55; 32];
+            let cas = |blob: Vec<u8>| Request::CasHead {
+                ref_h,
+                old_head: [0u8; 32],
+                new_head: *blake3::hash(&blob).as_bytes(),
+                new_blob: blob,
+            };
+            let (ra, rb) = tokio::join!(
+                request(&conn_a, ta, &dev_a, cas(b"head-from-A".to_vec())),
+                request(&conn_b, tb, &dev_b, cas(b"head-from-B".to_vec())),
+            );
+            let (ra, rb) = (ra.unwrap(), rb.unwrap());
+
+            // Exactly one Ok, exactly one CasConflict — never two winners, never two losers.
+            let oks = [&ra, &rb].iter().filter(|r| ***r == Response::Ok).count();
+            let conflicts = [&ra, &rb]
+                .iter()
+                .filter(|r| ***r == Response::Err(ErrorCode::CasConflict))
+                .count();
+            assert_eq!(
+                oks, 1,
+                "exactly one racing writer must win: {ra:?} / {rb:?}"
+            );
+            assert_eq!(
+                conflicts, 1,
+                "the other must get CasConflict: {ra:?} / {rb:?}"
+            );
+
+            conn_a.close(0u32.into(), b"done");
             conn_b.close(0u32.into(), b"done");
         });
     }

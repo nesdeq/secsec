@@ -45,13 +45,46 @@ pub struct Incoming<'a> {
     pub server_nonce: Option<[u8; 32]>,
 }
 
-/// The server's per-op handler state. The §12 keyslot-existence check reads the keyslot store
-/// directly (`/keyslots/<device_id>/*`).
-pub struct Server {
-    store: Store,
+/// The brief, mutable rate-limit / replay state — the only thing that needs synchronizing between
+/// concurrent requests. Held behind a fast `std::sync::Mutex` and locked only for the duration of a
+/// counter update (no I/O, no `await`), so it never blocks the redb store, which is itself
+/// transactional and accessed lock-free.
+#[derive(Default)]
+struct ServerState {
     nonces: NonceStore,
     write_buckets: HashMap<DeviceId, TokenBucket>,
     quotas: HashMap<DeviceId, StorageQuota>,
+}
+
+impl ServerState {
+    fn take_write(&mut self, d: DeviceId, n: u64, now: u64) -> bool {
+        self.write_buckets
+            .entry(d)
+            .or_insert_with(|| {
+                TokenBucket::new(
+                    limits::WRITE_BURST_BYTES,
+                    limits::WRITE_RATE_BYTES_PER_SEC,
+                    now,
+                )
+            })
+            .try_take(n, now)
+    }
+
+    fn add_quota(&mut self, d: DeviceId, n: u64) -> bool {
+        self.quotas
+            .entry(d)
+            .or_insert_with(|| StorageQuota::new(limits::PER_KEY_STORAGE_QUOTA))
+            .try_add(n)
+    }
+}
+
+/// The server's per-op handler. The §12 keyslot-existence check and all object ops read/write the
+/// redb store **without a lock** (redb is transactional); only the small replay/rate-limit
+/// [`ServerState`] is mutex-guarded. `handle` takes `&self`, so the whole server is shared via
+/// `Arc<Server>` and serves requests concurrently.
+pub struct Server {
+    store: Store,
+    state: std::sync::Mutex<ServerState>,
 }
 
 impl Server {
@@ -60,9 +93,7 @@ impl Server {
     pub fn new(store: Store) -> Self {
         Self {
             store,
-            nonces: NonceStore::default(),
-            write_buckets: HashMap::new(),
-            quotas: HashMap::new(),
+            state: std::sync::Mutex::new(ServerState::default()),
         }
     }
 
@@ -75,28 +106,35 @@ impl Server {
 
     /// Issue a fresh `server_nonce` challenge (the caller draws it from the OS CSPRNG and sends it to
     /// the client). It is honoured once, within the §19 TTL.
-    pub fn issue_nonce(&mut self, nonce: [u8; 32], now: u64) {
-        self.nonces.issue(nonce, now);
+    pub fn issue_nonce(&self, nonce: [u8; 32], now: u64) {
+        self.state
+            .lock()
+            .expect("server state")
+            .nonces
+            .issue(nonce, now);
     }
 
-    fn write_bucket(&mut self, d: DeviceId, now: u64) -> &mut TokenBucket {
-        self.write_buckets.entry(d).or_insert_with(|| {
-            TokenBucket::new(
-                limits::WRITE_BURST_BYTES,
-                limits::WRITE_RATE_BYTES_PER_SEC,
-                now,
-            )
-        })
+    fn consume_nonce(&self, nonce: &[u8; 32], now: u64) -> bool {
+        self.state
+            .lock()
+            .expect("server state")
+            .nonces
+            .consume(nonce, now)
     }
 
-    fn quota(&mut self, d: DeviceId) -> &mut StorageQuota {
-        self.quotas
-            .entry(d)
-            .or_insert_with(|| StorageQuota::new(limits::PER_KEY_STORAGE_QUOTA))
+    fn take_write(&self, d: DeviceId, n: u64, now: u64) -> bool {
+        self.state
+            .lock()
+            .expect("server state")
+            .take_write(d, n, now)
+    }
+
+    fn add_quota(&self, d: DeviceId, n: u64) -> bool {
+        self.state.lock().expect("server state").add_quota(d, n)
     }
 
     /// Run the §12 pipeline for one request and return the response.
-    pub fn handle(&mut self, inc: Incoming<'_>, now: u64) -> Response {
+    pub fn handle(&self, inc: Incoming<'_>, now: u64) -> Response {
         // (1) keyslot existence: the connecting key must be rostered.
         let device_id = match inc.pubkey.device_id() {
             Ok(d) => d,
@@ -123,7 +161,7 @@ impl Server {
                 return Response::Err(ErrorCode::BadAuth);
             }
             // (3) nonce freshness: consume exactly once (after verifying the sig binds it).
-            if !self.nonces.consume(&nonce, now) {
+            if !self.consume_nonce(&nonce, now) {
                 return Response::Err(ErrorCode::BadAuth);
             }
         } else {
@@ -174,15 +212,12 @@ impl Server {
                     return Response::Err(ErrorCode::BadRequest);
                 }
                 // write byte-rate limit (§19: 100 MB/s sustained, 1 GiB burst).
-                if !self
-                    .write_bucket(device_id, now)
-                    .try_take(blob.len() as u64, now)
-                {
+                if !self.take_write(device_id, blob.len() as u64, now) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
                 // storage quota — only charge a genuinely new object (put is idempotent by id).
                 let present = self.store.has(&[id]).map(|b| b[0]).unwrap_or(false);
-                if !present && !self.quota(device_id).try_add(blob.len() as u64) {
+                if !present && !self.add_quota(device_id, blob.len() as u64) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
                 match self.store.put(&id, &blob) {
@@ -200,10 +235,7 @@ impl Server {
                 if *blake3::hash(&new_blob).as_bytes() != new_head {
                     return Response::Err(ErrorCode::BadRequest);
                 }
-                if !self
-                    .write_bucket(device_id, now)
-                    .try_take(new_blob.len() as u64, now)
-                {
+                if !self.take_write(device_id, new_blob.len() as u64, now) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
                 // Atomic compare-and-swap on the server-visible blob hash (blind server, §12).
@@ -214,10 +246,7 @@ impl Server {
                 }
             }
             Request::RosterAppend { old_tip, entry } => {
-                if !self
-                    .write_bucket(device_id, now)
-                    .try_take(entry.len() as u64, now)
-                {
+                if !self.take_write(device_id, entry.len() as u64, now) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
                 // Append CAS-guarded by the /roster-head tip (§8.1): a racing append loses.
@@ -295,7 +324,7 @@ mod tests {
 
     #[test]
     fn unenrolled_key_is_rejected() {
-        let (mut s, _d) = server();
+        let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         let resp = s.handle(read_req(&dev, Request::Get { id: [1; 32] }, T), 0);
         assert_eq!(resp, Response::Err(ErrorCode::NotEnrolled));
@@ -303,7 +332,7 @@ mod tests {
 
     #[test]
     fn put_then_get_round_trip() {
-        let (mut s, _d) = server();
+        let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
         let id = [0x22; 32];
@@ -331,7 +360,7 @@ mod tests {
 
     #[test]
     fn bad_signature_is_rejected() {
-        let (mut s, _d) = server();
+        let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
         // tamper the signature.
@@ -343,7 +372,7 @@ mod tests {
     #[test]
     fn forged_args_are_rejected() {
         // a request whose fields differ from what was signed must fail (server recomputes args_hash).
-        let (mut s, _d) = server();
+        let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
         let mut inc = read_req(&dev, Request::Get { id: [1; 32] }, T);
@@ -354,7 +383,7 @@ mod tests {
 
     #[test]
     fn write_nonce_is_single_use() {
-        let (mut s, _d) = server();
+        let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
         let nonce = [0x05; 32];
@@ -378,7 +407,7 @@ mod tests {
 
     #[test]
     fn write_without_issued_nonce_is_rejected() {
-        let (mut s, _d) = server();
+        let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
         // never issued -> consume fails.
@@ -395,7 +424,7 @@ mod tests {
 
     #[test]
     fn put_declared_size_mismatch_is_bad_request() {
-        let (mut s, _d) = server();
+        let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
         let nonce = [0x06; 32];
@@ -413,7 +442,7 @@ mod tests {
 
     #[test]
     fn has_over_cap_is_rejected() {
-        let (mut s, _d) = server();
+        let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
         let ids = vec![[0u8; 32]; limits::MAX_HAS_IDS + 1];
@@ -425,7 +454,7 @@ mod tests {
 
     #[test]
     fn cas_head_first_write_conflict_and_blob_mismatch() {
-        let (mut s, _d) = server();
+        let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
         let ref_h = [0x33; 32];
@@ -484,7 +513,7 @@ mod tests {
 
     #[test]
     fn roster_append_chains_and_rejects_race() {
-        let (mut s, _d) = server();
+        let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
         let append = |old_tip: [u8; 32], entry: Vec<u8>| Request::RosterAppend { old_tip, entry };

@@ -172,7 +172,7 @@ mod tests {
             srv_store
                 .put_keyslot(&device.device_id().unwrap(), 1, b"keyslot")
                 .unwrap(); // enroll the client device
-            let server = tokio::sync::Mutex::new(Server::new(srv_store));
+            let server = Server::new(srv_store);
 
             let endpoint =
                 quinn::Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
@@ -262,7 +262,7 @@ mod tests {
             let srv_store = Store::open(srv_dir.path().join("s.redb")).unwrap();
             // genesis: writes the roster entry + this device's keyslot into the served store.
             let rfp = crate::repo::init_repo(&srv_store, &device, 0).unwrap();
-            let server = tokio::sync::Mutex::new(Server::new(srv_store));
+            let server = Server::new(srv_store);
 
             let endpoint =
                 quinn::Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
