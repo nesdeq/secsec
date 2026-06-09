@@ -21,6 +21,7 @@ secsec-sig = { path = "../secsec-sig" }
 secsec-transport = { path = "../secsec-transport" }
 secsec-proto = { path = "../secsec-proto" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+notify = "8"
 blake3 = "1"
 
 [dev-dependencies]

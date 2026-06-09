@@ -1,0 +1,23 @@
+[package]
+name = "secsec"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "secsec CLI — the single static binary (finaldesign.md §11, §12)."
+
+[[bin]]
+name = "secsec"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+secsec-server = { path = "../../crates/secsec-server" }
+secsec-store = { path = "../../crates/secsec-store" }
+secsec-transport = { path = "../../crates/secsec-transport" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rcgen = "0.13"
