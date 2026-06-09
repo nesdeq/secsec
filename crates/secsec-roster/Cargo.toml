@@ -16,5 +16,6 @@ secsec-canon = { path = "../secsec-canon" }
 secsec-aead = { path = "../secsec-aead" }
 secsec-kdf = { path = "../secsec-kdf" }
 blake3 = "1"
+zeroize = "1"
 
 [dev-dependencies]

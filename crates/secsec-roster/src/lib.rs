@@ -16,11 +16,13 @@
 
 use secsec_canon::{verify_reencode, CanonError, Reader, Writer};
 use secsec_frame::{
-    assemble_blob, parse_blob, Frame, FrameError, ObjType, FRAME_LEN, MAX_ROSTER_ENTRY_SIZE,
+    assemble_blob, parse_blob, Frame, FrameError, ObjType, CTX_TAG_LEN, FRAME_LEN,
+    MAX_ROSTER_ENTRY_SIZE,
 };
-use secsec_kdf::roster_entry_key;
+use secsec_kdf::{roster_entry_key, roster_keyhist_key, SecretKey};
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic, NS_ROSTER};
 use std::collections::BTreeMap;
+use zeroize::{Zeroize, Zeroizing};
 
 /// A 256-bit master-key generation commitment (`mk_commit_g`, recorded for verification elsewhere).
 pub type MkCommit = [u8; 32];
@@ -300,6 +302,95 @@ pub fn open_entry(
     let ad = ad_roster(&frame, seq);
     let k = roster_entry_key(roster_key_g, seq);
     secsec_aead::open(&k, &ad, ctx_tag, ct).map_err(|_| RosterError::Aead)
+}
+
+// ---------------------------------------------------------------------------
+// Roster-key history (§8.2 "Roster-key history (never trimmed)"): a forward
+// chain of wraps that lets a current member peel `roster_key_current → … →
+// roster_key_1`, so the *whole* sigchain (every generation) can be decrypted
+// and signature-verified at cold start. A revoked device, lacking the current
+// roster key, cannot peel forward — roster forward secrecy (P11).
+// ---------------------------------------------------------------------------
+
+/// A 256-bit roster key, the plaintext wrapped by the roster-key history.
+const ROSTER_KEY_LEN: usize = 32;
+/// Stored size of one `roster_keyhist_g` wrap: `ctx_tag(32) ‖ ct(32)` (§8.2, "64 bytes total").
+/// Unlike a normal blob there is **no** FRAME prefix — `g` is known from the storage path and the
+/// `FRAME_rkh` AD is reconstructed by the reader.
+pub const ROSTER_KEYHIST_LEN: usize = CTX_TAG_LEN + ROSTER_KEY_LEN;
+
+/// Wrap `roster_key_g` so it can be recovered by a holder of `roster_key_{g+1}` (the next
+/// generation). Keyed by `k_rkh_g = derive_key("secsec-roster-keyhist-v1", roster_key_{g+1} ‖
+/// le32(g))`, AD = `FRAME_rkh(type=roster-keyhist, gen=g)`. Returns the bare
+/// [`ROSTER_KEYHIST_LEN`]-byte `ctx_tag ‖ ct`.
+#[must_use]
+pub fn seal_roster_keyhist(
+    roster_key_next: &[u8; 32],
+    g: u32,
+    roster_key_g: &[u8; 32],
+) -> [u8; ROSTER_KEYHIST_LEN] {
+    let k = roster_keyhist_key(roster_key_next, g);
+    let ad = Frame::v1(g, ObjType::RosterKeyhist).encode();
+    let (ctx_tag, ct) = secsec_aead::seal(&k, &ad, roster_key_g);
+    let mut out = [0u8; ROSTER_KEYHIST_LEN];
+    out[..CTX_TAG_LEN].copy_from_slice(&ctx_tag);
+    out[CTX_TAG_LEN..].copy_from_slice(&ct);
+    out
+}
+
+/// Recover `roster_key_g` from a `roster_keyhist_g` wrap using `roster_key_{g+1}`. Verifies the
+/// CMT-4 commitment before releasing the key. Returns the zeroizing-wrapped recovered key.
+pub fn open_roster_keyhist(
+    roster_key_next: &[u8; 32],
+    g: u32,
+    stored: &[u8],
+) -> Result<SecretKey, RosterError> {
+    if stored.len() != ROSTER_KEYHIST_LEN {
+        return Err(RosterError::Aead);
+    }
+    let ctx_tag: &[u8; CTX_TAG_LEN] = stored[..CTX_TAG_LEN]
+        .try_into()
+        .expect("slice is exactly CTX_TAG_LEN");
+    let ct = &stored[CTX_TAG_LEN..];
+    let ad = Frame::v1(g, ObjType::RosterKeyhist).encode();
+    let k = roster_keyhist_key(roster_key_next, g);
+    let mut pt = secsec_aead::open(&k, &ad, ctx_tag, ct).map_err(|_| RosterError::Aead)?;
+    if pt.len() != ROSTER_KEY_LEN {
+        pt.zeroize();
+        return Err(RosterError::Aead);
+    }
+    let mut out = Zeroizing::new([0u8; ROSTER_KEY_LEN]);
+    out.copy_from_slice(&pt);
+    pt.zeroize();
+    Ok(out)
+}
+
+/// Peel the entire roster-key history: starting from `roster_key_current` (generation
+/// `current_gen`), recover `roster_key_g` for every `g` in `1..current_gen` using the wraps in
+/// `history` (keyed by generation `g`, each [`ROSTER_KEYHIST_LEN`] bytes). Returns a map of
+/// `g → roster_key_g` for all `1..=current_gen` (including `current_gen` itself).
+///
+/// `history` MUST contain a wrap for every `g` in `1..current_gen`; a missing or unopenable wrap
+/// aborts the peel (a current member can always produce the never-trimmed chain). The peel proceeds
+/// downward because decrypting `roster_keyhist_g` requires `roster_key_{g+1}`.
+pub fn peel_roster_keys(
+    roster_key_current: &[u8; 32],
+    current_gen: u32,
+    history: &BTreeMap<u32, Vec<u8>>,
+) -> Result<BTreeMap<u32, SecretKey>, RosterError> {
+    let mut keys: BTreeMap<u32, SecretKey> = BTreeMap::new();
+    keys.insert(current_gen, Zeroizing::new(*roster_key_current));
+    let mut g = current_gen;
+    while g > 1 {
+        let next = keys
+            .get(&g)
+            .expect("roster_key for current peel generation is present");
+        let wrap = history.get(&(g - 1)).ok_or(RosterError::Aead)?;
+        let prev = open_roster_keyhist(next, g - 1, wrap)?;
+        keys.insert(g - 1, prev);
+        g -= 1;
+    }
+    Ok(keys)
 }
 
 /// Create the genesis entry (seq 0, self-signed by device-1). Returns `(entry, rfp)`.
@@ -795,6 +886,90 @@ mod tests {
         *blob.last_mut().unwrap() ^= 0x01;
         assert!(matches!(
             open_entry(&rk, 1, 0, &blob),
+            Err(RosterError::Aead)
+        ));
+    }
+
+    // ---- Roster-key history (§8.2) ----
+
+    #[test]
+    fn roster_keyhist_round_trip_is_64_bytes() {
+        let rk1 = roster_key_for(1, [0x01; 32]);
+        let rk2 = roster_key_for(2, [0x02; 32]);
+        let wrap = seal_roster_keyhist(&rk2, 1, &rk1);
+        assert_eq!(wrap.len(), ROSTER_KEYHIST_LEN);
+        assert_eq!(ROSTER_KEYHIST_LEN, 64);
+        let got = open_roster_keyhist(&rk2, 1, &wrap).unwrap();
+        assert_eq!(&got[..], &rk1[..]);
+    }
+
+    #[test]
+    fn roster_keyhist_wrong_next_key_rejected() {
+        let rk1 = roster_key_for(1, [0x01; 32]);
+        let rk2 = roster_key_for(2, [0x02; 32]);
+        let wrong = roster_key_for(2, [0x99; 32]);
+        let wrap = seal_roster_keyhist(&rk2, 1, &rk1);
+        assert!(matches!(
+            open_roster_keyhist(&wrong, 1, &wrap),
+            Err(RosterError::Aead)
+        ));
+    }
+
+    #[test]
+    fn roster_keyhist_wrong_generation_rejected() {
+        // The AD binds g; opening the g=1 wrap as g=2 must fail (FRAME_rkh mismatch in the AD).
+        let rk1 = roster_key_for(1, [0x01; 32]);
+        let rk2 = roster_key_for(2, [0x02; 32]);
+        let wrap = seal_roster_keyhist(&rk2, 1, &rk1);
+        assert!(matches!(
+            open_roster_keyhist(&rk2, 2, &wrap),
+            Err(RosterError::Aead)
+        ));
+    }
+
+    #[test]
+    fn roster_keyhist_tamper_and_bad_length_rejected() {
+        let rk1 = roster_key_for(1, [0x01; 32]);
+        let rk2 = roster_key_for(2, [0x02; 32]);
+        let mut wrap = seal_roster_keyhist(&rk2, 1, &rk1);
+        wrap[ROSTER_KEYHIST_LEN - 1] ^= 0x01;
+        assert!(matches!(
+            open_roster_keyhist(&rk2, 1, &wrap),
+            Err(RosterError::Aead)
+        ));
+        assert!(matches!(
+            open_roster_keyhist(&rk2, 1, &wrap[..ROSTER_KEYHIST_LEN - 1]),
+            Err(RosterError::Aead)
+        ));
+    }
+
+    #[test]
+    fn peel_recovers_every_generation() {
+        // Five generations with independent master keys; build the never-trimmed wrap chain.
+        let n = 5u32;
+        let rks: Vec<SecretKey> = (1..=n).map(|g| roster_key_for(g, [g as u8; 32])).collect();
+        let mut history: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        for g in 1..n {
+            // wrap roster_key_g under roster_key_{g+1}
+            let wrap = seal_roster_keyhist(&rks[g as usize], g, &rks[(g - 1) as usize]);
+            history.insert(g, wrap.to_vec());
+        }
+        let peeled = peel_roster_keys(&rks[(n - 1) as usize], n, &history).unwrap();
+        assert_eq!(peeled.len(), n as usize);
+        for g in 1..=n {
+            assert_eq!(&peeled[&g][..], &rks[(g - 1) as usize][..], "gen {g}");
+        }
+    }
+
+    #[test]
+    fn peel_aborts_on_missing_wrap() {
+        let n = 3u32;
+        let rks: Vec<SecretKey> = (1..=n).map(|g| roster_key_for(g, [g as u8; 32])).collect();
+        let mut history: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        // Only provide the wrap for g=2, omit g=1.
+        history.insert(2, seal_roster_keyhist(&rks[2], 2, &rks[1]).to_vec());
+        assert!(matches!(
+            peel_roster_keys(&rks[(n - 1) as usize], n, &history),
             Err(RosterError::Aead)
         ));
     }

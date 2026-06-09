@@ -1078,6 +1078,7 @@ dependencies = [
  "secsec-frame",
  "secsec-kdf",
  "secsec-sig",
+ "zeroize",
 ]
 
 [[package]]
