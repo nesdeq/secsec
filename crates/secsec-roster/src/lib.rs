@@ -1673,6 +1673,99 @@ mod tests {
         ));
     }
 
+    // ---- Model-based differential test (R5): fold vs an independent reference state machine ----
+
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum Act {
+        Add(usize),
+        Revoke(usize),
+        Rotate,
+        SetMinAlgo(u8),
+    }
+
+    fn act_strategy() -> impl Strategy<Value = (usize, Act)> {
+        let kind = prop_oneof![
+            (0usize..6).prop_map(Act::Add),
+            (0usize..6).prop_map(Act::Revoke),
+            Just(Act::Rotate),
+            (0u8..6).prop_map(Act::SetMinAlgo),
+        ];
+        (0usize..6, kind)
+    }
+
+    /// Deterministically pick a current member (always non-empty: device 0 is never revoked).
+    fn pick_member(members: &BTreeSet<usize>, hint: usize) -> usize {
+        let v: Vec<usize> = members.iter().copied().collect();
+        v[hint % v.len()]
+    }
+
+    fn commit_for(gen: u32) -> MkCommit {
+        MasterKey::new(gen, [gen as u8; 32]).mk_commit()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Build a random *valid* sigchain (signers are always current members, by construction) and
+        /// assert `fold` reproduces an independently-computed reference state — membership set,
+        /// generation, and min_algo. This is the R5 fold-vs-model differential check.
+        #[test]
+        fn fold_matches_reference_model(actions in proptest::collection::vec(act_strategy(), 0..40)) {
+            let devices: Vec<DeviceKey> = (0..6).map(|_| DeviceKey::generate().unwrap()).collect();
+            let ids: Vec<DeviceId> = devices.iter().map(|d| d.device_id().unwrap()).collect();
+
+            // Genesis by device 0 (the never-revoked founder, so a signer always exists).
+            let (g, rfp) = genesis(&devices[0], commit_for(1), 0).unwrap();
+            let mut entries = vec![g];
+
+            // Reference model.
+            let mut members: BTreeSet<usize> = BTreeSet::from([0]);
+            let mut generation: u32 = 1;
+            let mut min_algo: u8 = secsec_frame::MIN_ALGO_ID;
+
+            for (signer_hint, kind) in actions {
+                let signer = pick_member(&members, signer_hint);
+                let prev = entries.last().unwrap();
+                match kind {
+                    Act::Add(target) if target != 0 && !members.contains(&target) => {
+                        let op = Op::AddDevice {
+                            pubkey: pubkey_of(&devices[target]),
+                            mk_commit: commit_for(generation),
+                        };
+                        entries.push(append(prev, op, &devices[signer], 0).unwrap());
+                        members.insert(target);
+                    }
+                    Act::Revoke(target) if target != 0 && members.contains(&target) => {
+                        let op = Op::RevokeDevice { device: ids[target] };
+                        entries.push(append(prev, op, &devices[signer], 0).unwrap());
+                        members.remove(&target);
+                    }
+                    Act::Rotate => {
+                        generation += 1;
+                        let op = Op::Rotate { mk_commit: commit_for(generation) };
+                        entries.push(append(prev, op, &devices[signer], 0).unwrap());
+                    }
+                    Act::SetMinAlgo(v) => {
+                        let op = Op::SetMinAlgo { min_algo: v };
+                        entries.push(append(prev, op, &devices[signer], 0).unwrap());
+                        min_algo = min_algo.max(v);
+                    }
+                    // Add of an existing/founder device, or revoke of a non-member: skip (no-op).
+                    _ => {}
+                }
+            }
+
+            let st = fold(&entries, &rfp).unwrap();
+            prop_assert_eq!(st.generation, generation);
+            prop_assert_eq!(st.min_algo, min_algo);
+            let got: BTreeSet<DeviceId> = st.members.keys().copied().collect();
+            let want: BTreeSet<DeviceId> = members.iter().map(|i| ids[*i]).collect();
+            prop_assert_eq!(got, want);
+        }
+    }
+
     fn hx(b: &[u8]) -> String {
         let mut s = String::with_capacity(b.len() * 2);
         for x in b {

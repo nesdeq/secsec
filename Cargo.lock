@@ -1073,6 +1073,7 @@ name = "secsec-roster"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "proptest",
  "secsec-aead",
  "secsec-canon",
  "secsec-frame",
