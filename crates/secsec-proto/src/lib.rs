@@ -87,6 +87,27 @@ pub fn args_read(op: &str, ids: &[Id]) -> [u8; 32] {
     blake3_of(&w.finish())
 }
 
+/// The op label, recomputed `args_hash`, and whether it is a write op, for a request (§12). Both the
+/// client (to sign) and the server (to verify) call this so neither can disagree on the binding.
+#[must_use]
+pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
+    use wire::Request;
+    match req {
+        Request::Get { id } => (op::GET, args_read(op::GET, &[*id]), false),
+        Request::Has { ids } => (op::HAS, args_read(op::HAS, ids), false),
+        Request::Put {
+            id, declared_size, ..
+        } => (op::PUT, args_put(id, *declared_size), true),
+        Request::CasHead {
+            ref_h,
+            old_head,
+            new_head,
+            ..
+        } => (op::CAS_HEAD, args_cas_head(ref_h, old_head, new_head), true),
+        Request::RosterAppend { entry } => (op::ROSTER_APPEND, args_roster_append(entry), true),
+    }
+}
+
 /// Errors from per-op authorization.
 #[derive(Debug)]
 pub enum ProtoError {

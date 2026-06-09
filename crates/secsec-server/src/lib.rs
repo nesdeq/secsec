@@ -22,9 +22,7 @@
 
 use secsec_proto::server::{limits, NonceStore, StorageQuota, TokenBucket};
 use secsec_proto::wire::{ErrorCode, Request, Response};
-use secsec_proto::{
-    args_cas_head, args_put, args_read, args_roster_append, op, ReadAuth, WriteAuth,
-};
+use secsec_proto::{op_and_args, ReadAuth, WriteAuth};
 use secsec_sig::{DeviceId, DevicePublic};
 use secsec_store::Store;
 use std::collections::HashMap;
@@ -182,24 +180,6 @@ impl Server {
                 Response::Err(ErrorCode::Internal)
             }
         }
-    }
-}
-
-/// The op label, recomputed `args_hash`, and write/read class for a request (§12).
-fn op_and_args(req: &Request) -> (&'static str, [u8; 32], bool) {
-    match req {
-        Request::Get { id } => (op::GET, args_read(op::GET, &[*id]), false),
-        Request::Has { ids } => (op::HAS, args_read(op::HAS, ids), false),
-        Request::Put {
-            id, declared_size, ..
-        } => (op::PUT, args_put(id, *declared_size), true),
-        Request::CasHead {
-            ref_h,
-            old_head,
-            new_head,
-            ..
-        } => (op::CAS_HEAD, args_cas_head(ref_h, old_head, new_head), true),
-        Request::RosterAppend { entry } => (op::ROSTER_APPEND, args_roster_append(entry), true),
     }
 }
 

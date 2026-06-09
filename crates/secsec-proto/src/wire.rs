@@ -13,6 +13,13 @@ use secsec_frame::{MAX_BLOB_SIZE, MAX_ROSTER_ENTRY_SIZE};
 /// A 256-bit id / hash.
 pub type Id = [u8; 32];
 
+/// Maximum canonical device-pubkey length (Ed25519 SSH encoding is ~51 bytes; bounded generously).
+pub const MAX_PUBKEY: usize = 1024;
+/// Maximum SSHSIG length (a PEM SSHSIG is well under this).
+pub const MAX_SIG: usize = MAX_ROSTER_ENTRY_SIZE;
+/// Maximum encoded `Request` length: a 16 MiB `put` blob plus envelope overhead.
+pub const MAX_REQUEST_LEN: usize = MAX_BLOB_SIZE + 4096;
+
 /// Errors decoding a wire message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
@@ -359,6 +366,65 @@ impl Response {
     }
 }
 
+/// The client's connection-auth message (§11): its canonical device public key plus the
+/// `secsec-auth-v1` signature over the handshake. The server verifies the signature against the
+/// presented key and checks that key owns a keyslot (§12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAuth {
+    /// Canonical SSH encoding of the client's device public key.
+    pub pubkey: Vec<u8>,
+    /// SSHSIG over the §9.6 `secsec-auth-v1` payload.
+    pub sig: Vec<u8>,
+}
+
+impl ClientAuth {
+    /// Canonical encoding `bytes(pubkey) ‖ bytes(sig)`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.bytes(&self.pubkey).bytes(&self.sig);
+        w.finish()
+    }
+
+    /// Strictly decode, bounding the pubkey and signature.
+    pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader::new(bytes);
+        let pubkey = r.bytes(MAX_PUBKEY)?.to_vec();
+        let sig = r.bytes(MAX_SIG)?.to_vec();
+        r.finish()?;
+        Ok(Self { pubkey, sig })
+    }
+}
+
+/// A per-op request with its authorization signature (§12): the wire form of one RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthedRequest {
+    /// The per-op `secsec-write-v1` / `secsec-read-v1` signature.
+    pub op_sig: Vec<u8>,
+    /// The operation.
+    pub request: Request,
+}
+
+impl AuthedRequest {
+    /// Canonical encoding `bytes(op_sig) ‖ bytes(request)`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.bytes(&self.op_sig).bytes(&self.request.encode());
+        w.finish()
+    }
+
+    /// Strictly decode, bounding the signature and request.
+    pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader::new(bytes);
+        let op_sig = r.bytes(MAX_SIG)?.to_vec();
+        let req_bytes = r.bytes(MAX_REQUEST_LEN)?;
+        let request = Request::decode(req_bytes)?;
+        r.finish()?;
+        Ok(Self { op_sig, request })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +484,25 @@ mod tests {
         for resp in resps {
             assert_eq!(Response::decode(&resp.encode()).unwrap(), resp);
         }
+    }
+
+    #[test]
+    fn client_auth_and_authed_request_round_trip() {
+        let ca = ClientAuth {
+            pubkey: b"ssh-ed25519-canonical-bytes".to_vec(),
+            sig: b"sshsig-pem".to_vec(),
+        };
+        assert_eq!(ClientAuth::decode(&ca.encode()).unwrap(), ca);
+
+        let ar = AuthedRequest {
+            op_sig: b"write-auth-sig".to_vec(),
+            request: Request::Put {
+                id: [9; 32],
+                declared_size: 3,
+                blob: b"abc".to_vec(),
+            },
+        };
+        assert_eq!(AuthedRequest::decode(&ar.encode()).unwrap(), ar);
     }
 
     #[test]

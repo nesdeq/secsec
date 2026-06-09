@@ -22,6 +22,7 @@
 
 pub mod auth;
 pub mod frame;
+pub mod handshake;
 pub mod quic;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
