@@ -172,14 +172,14 @@ mod tests {
             srv_store
                 .put_keyslot(&device.device_id().unwrap(), 1, b"keyslot")
                 .unwrap(); // enroll the client device
-            let mut server = Server::new(srv_store);
+            let server = tokio::sync::Mutex::new(Server::new(srv_store));
 
             let endpoint =
                 quinn::Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
             let addr = endpoint.local_addr().unwrap();
             let srv = tokio::spawn(async move {
                 let conn = endpoint.accept().await.unwrap().await.unwrap();
-                let _ = serve_connection(&conn, &mut server, host_id, 1_000).await;
+                let _ = serve_connection(&conn, &server, host_id, || 1_000).await;
             });
 
             let mut client = quinn::Endpoint::client(loopback()).unwrap();
@@ -262,14 +262,14 @@ mod tests {
             let srv_store = Store::open(srv_dir.path().join("s.redb")).unwrap();
             // genesis: writes the roster entry + this device's keyslot into the served store.
             let rfp = crate::repo::init_repo(&srv_store, &device, 0).unwrap();
-            let mut server = Server::new(srv_store);
+            let server = tokio::sync::Mutex::new(Server::new(srv_store));
 
             let endpoint =
                 quinn::Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
             let addr = endpoint.local_addr().unwrap();
             let srv = tokio::spawn(async move {
                 let conn = endpoint.accept().await.unwrap().await.unwrap();
-                let _ = serve_connection(&conn, &mut server, host_id, 1_000).await;
+                let _ = serve_connection(&conn, &server, host_id, || 1_000).await;
             });
 
             let mut client = quinn::Endpoint::client(loopback()).unwrap();

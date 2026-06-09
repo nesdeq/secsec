@@ -98,6 +98,18 @@ enum Cmd {
         /// The ref name to sync.
         #[arg(long, default_value = "main")]
         r#ref: String,
+        /// Keep running: re-sync on every debounced filesystem change and on a periodic remote poll
+        /// (continuous live sync, §10).
+        #[arg(long)]
+        watch: bool,
+        /// Debounce window for coalescing a burst of file changes into one sync, in milliseconds.
+        /// (Snapshot cadence is config, §19; this is the overridable default.)
+        #[arg(long, default_value_t = 1000)]
+        debounce_ms: u64,
+        /// In `--watch` mode, also poll the remote this often (seconds) to pick up other devices'
+        /// pushes. Overridable; mirrors the §19 keepalive-scale cadence.
+        #[arg(long, default_value_t = 15)]
+        poll_secs: u64,
     },
 }
 
@@ -137,25 +149,28 @@ async fn run_serve(
     let (cert, key) = load_or_generate_hostkey(&hostkey_dir)?;
     let host_id = HostPin::from_cert(&cert)?.host_id();
     let store = Store::open(store)?;
-    let mut server = Server::new(store);
+    // Shared behind an async mutex, locked per-request inside serve_connection, so connections are
+    // served CONCURRENTLY (an idle connection holds no lock).
+    let server = std::sync::Arc::new(tokio::sync::Mutex::new(Server::new(store)));
 
     let endpoint = quinn::Endpoint::server(server_config(&cert, &key)?, listen)?;
     println!("secsec serve — host pin {}", hex(&host_id));
     println!("listening on {}", endpoint.local_addr()?);
 
-    // Serve connections sequentially (one at a time) — the shared Server state (nonce store, rate
-    // limiters) is single-owner; concurrent serving would wrap it in a lock. A skeleton limitation.
     while let Some(incoming) = endpoint.accept().await {
-        let conn = match incoming.await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("accept failed: {e}");
-                continue;
+        let server = server.clone();
+        tokio::spawn(async move {
+            let conn = match incoming.await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("accept failed: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = serve_connection(&conn, &server, host_id, unix_secs).await {
+                eprintln!("connection closed: {e}");
             }
-        };
-        if let Err(e) = serve_connection(&conn, &mut server, host_id, unix_secs()).await {
-            eprintln!("connection closed: {e}");
-        }
+        });
     }
     Ok(())
 }
@@ -209,7 +224,12 @@ async fn run_sync(
     state: PathBuf,
     rfp_hex: String,
     ref_name: String,
+    watch: bool,
+    debounce_ms: u64,
+    poll_secs: u64,
 ) -> Result<(), Box<dyn Error>> {
+    use std::time::Duration;
+
     let device = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
     let pin = HostPin::from_cert(&std::fs::read(&host_cert)?)?;
     let host_id = pin.host_id();
@@ -232,33 +252,77 @@ async fn run_sync(
     std::fs::create_dir_all(&state)?;
     let frontier_path = state.join("frontier");
     let base_path = state.join("base");
-    let frontier = match load_frontier(&frontier_path, &device)? {
+    let mut frontier = match load_frontier(&frontier_path, &device)? {
         FrontierLoad::Loaded(f) => f,
         FrontierLoad::Absent => SyncFrontier::default(),
     };
-    let base = read_base(&base_path)?;
+    let mut base = read_base(&base_path)?;
 
-    // genesis-generation repos sit at roster_seq 0 (rotation-era sync is a later milestone).
-    let outcome = sync_once(
-        &rem,
-        &store,
-        &dir,
-        &mk,
-        &device,
-        &st.members,
-        &frontier,
-        &ref_name,
-        0,
-        base,
-        unix_secs(),
-    )
-    .await?;
-
-    save_frontier(&frontier_path, &outcome.frontier, &device)?;
-    if let Some(b) = outcome.base {
-        std::fs::write(&base_path, hex(&b))?;
+    // In --watch mode, a background thread feeds debounced file-change ticks; a periodic timer feeds
+    // remote-poll ticks (to pick up other devices' pushes). Either triggers a re-sync.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    if watch {
+        let wdir = dir.clone();
+        std::thread::spawn(move || {
+            let _ = secsec_client::watcher::watch_dir(
+                &wdir,
+                Duration::from_millis(debounce_ms),
+                || tx.send(()).is_ok(),
+            );
+        });
+        println!(
+            "watching {} (debounce {debounce_ms}ms, poll {poll_secs}s) — Ctrl-C to stop",
+            dir.display()
+        );
     }
-    println!("sync: {:?}", outcome.kind);
+    let mut poll = tokio::time::interval(Duration::from_secs(poll_secs.max(1)));
+    poll.tick().await; // consume the immediate first tick
+
+    let mut initial = true;
+    loop {
+        if !initial {
+            // Wait for a file-change or poll tick (watch mode only; one-shot breaks below).
+            tokio::select! {
+                ev = rx.recv() => { if ev.is_none() { break; } }
+                _ = poll.tick() => {}
+            }
+        }
+        // genesis-generation repos sit at roster_seq 0 (rotation-era sync is a later milestone).
+        match sync_once(
+            &rem,
+            &store,
+            &dir,
+            &mk,
+            &device,
+            &st.members,
+            &frontier,
+            &ref_name,
+            0,
+            base,
+            unix_secs(),
+        )
+        .await
+        {
+            Ok(outcome) => {
+                save_frontier(&frontier_path, &outcome.frontier, &device)?;
+                if let Some(b) = outcome.base {
+                    std::fs::write(&base_path, hex(&b))?;
+                }
+                // Quiet on a no-op poll; report real work and the first sync.
+                if initial || !matches!(outcome.kind, secsec_client::sync::SyncKind::UpToDate) {
+                    println!("sync: {:?}", outcome.kind);
+                }
+                frontier = outcome.frontier;
+                base = outcome.base;
+            }
+            Err(e) => eprintln!("sync error: {e}"),
+        }
+        initial = false;
+        if !watch {
+            break;
+        }
+    }
+
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
     Ok(())
@@ -293,10 +357,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             state,
             rfp,
             r#ref,
+            watch,
+            debounce_ms,
+            poll_secs,
         } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(run_sync(
-                remote, host_cert, key, dir, store, state, rfp, r#ref,
+                remote,
+                host_cert,
+                key,
+                dir,
+                store,
+                state,
+                rfp,
+                r#ref,
+                watch,
+                debounce_ms,
+                poll_secs,
             ))
         }
     }

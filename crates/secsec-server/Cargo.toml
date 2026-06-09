@@ -16,6 +16,7 @@ secsec-sig = { path = "../secsec-sig" }
 secsec-frame = { path = "../secsec-frame" }
 secsec-transport = { path = "../secsec-transport" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+tokio = { version = "1", features = ["sync"] }
 getrandom = "0.3"
 blake3 = "1"
 

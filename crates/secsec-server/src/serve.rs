@@ -49,13 +49,19 @@ fn random32() -> [u8; 32] {
 }
 
 /// Handshake the connection and serve its request streams until it closes. `host_id` is the server's
-/// own `host_id`; `now` is the wall-clock (unix seconds) used for nonce TTLs and rate limits.
-pub async fn serve_connection(
+/// own `host_id`; `now` is a clock (unix seconds) read fresh per request (so nonce TTLs stay current
+/// on a long-lived connection). The `server` is shared behind an async mutex and locked **per
+/// request** (only around `issue_nonce` and `handle`, never across the network I/O between them), so
+/// many connections can be served concurrently — an idle connection holds no lock.
+pub async fn serve_connection<F>(
     conn: &Connection,
-    server: &mut Server,
+    server: &tokio::sync::Mutex<Server>,
     host_id: [u8; 32],
-    now: u64,
-) -> Result<(), ServeError> {
+    now: F,
+) -> Result<(), ServeError>
+where
+    F: Fn() -> u64,
+{
     // §11 application handshake: authenticate the connecting key.
     let session = server_handshake(conn, host_id, random32()).await?;
 
@@ -64,12 +70,15 @@ pub async fn serve_connection(
         .pubkey
         .device_id()
         .map_err(|e| ServeError::Store(e.to_string()))?;
-    if !server
-        .store()
-        .keyslot_exists(&device_id)
-        .map_err(|e| ServeError::Store(e.to_string()))?
     {
-        return Err(ServeError::NotEnrolled);
+        let s = server.lock().await;
+        if !s
+            .store()
+            .keyslot_exists(&device_id)
+            .map_err(|e| ServeError::Store(e.to_string()))?
+        {
+            return Err(ServeError::NotEnrolled);
+        }
     }
 
     // Request loop: one bidi stream per op.
@@ -78,27 +87,33 @@ pub async fn serve_connection(
         if read_frame(&mut recv, 0).await.is_err() {
             break;
         }
-        // Issue a fresh single-use per-op nonce and challenge the client with it.
+        // Issue a fresh single-use per-op nonce (lock held only for the issue) and challenge.
         let nonce = random32();
-        server.issue_nonce(nonce, now);
+        {
+            server.lock().await.issue_nonce(nonce, now());
+        }
         write_frame(&mut send, &nonce)
             .await
             .map_err(|e| ServeError::Wire(e.to_string()))?;
 
+        // The client signs + sends while we hold no lock (a slow client blocks only itself).
         let bytes = read_frame(&mut recv, MAX_FRAME_LEN)
             .await
             .map_err(|e| ServeError::Wire(e.to_string()))?;
         let resp = match AuthedRequest::decode(&bytes) {
-            Ok(ar) => server.handle(
-                Incoming {
-                    pubkey: &session.pubkey,
-                    request: ar.request,
-                    op_sig: ar.op_sig,
-                    session_transcript: session.transcript,
-                    server_nonce: Some(nonce),
-                },
-                now,
-            ),
+            Ok(ar) => {
+                let mut s = server.lock().await;
+                s.handle(
+                    Incoming {
+                        pubkey: &session.pubkey,
+                        request: ar.request,
+                        op_sig: ar.op_sig,
+                        session_transcript: session.transcript,
+                        server_nonce: Some(nonce),
+                    },
+                    now(),
+                )
+            }
             Err(_) => Response::Err(secsec_proto::wire::ErrorCode::BadRequest),
         };
 
@@ -149,7 +164,7 @@ mod tests {
             store
                 .put_keyslot(&device.device_id().unwrap(), 1, b"keyslot")
                 .unwrap(); // enroll
-            let mut server = Server::new(store);
+            let server = tokio::sync::Mutex::new(Server::new(store));
 
             let endpoint =
                 quinn::Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
@@ -158,7 +173,7 @@ mod tests {
             let srv = tokio::spawn(async move {
                 let conn = endpoint.accept().await.unwrap().await.unwrap();
                 // serve until the client closes (the loop ends on connection close).
-                let _ = serve_connection(&conn, &mut server, host_id, 1_000).await;
+                let _ = serve_connection(&conn, &server, host_id, || 1_000).await;
             });
 
             // client connects + handshakes.
@@ -205,6 +220,95 @@ mod tests {
 
             conn.close(0u32.into(), b"done");
             let _ = srv.await;
+        });
+    }
+
+    /// **Concurrency:** two clients are served at the same time. One holds an idle connection (no
+    /// request in flight) while the other completes a put+get — proving the per-request lock is
+    /// released between requests, so an idle connection never blocks another (the bug that made the
+    /// server one-client-at-a-time).
+    #[test]
+    fn serves_two_clients_concurrently() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ck = generate_simple_self_signed(vec!["secsec.invalid".to_string()]).unwrap();
+            let (cert, key) = (ck.cert.der().to_vec(), ck.key_pair.serialize_der());
+            let pin = HostPin::from_cert(&cert).unwrap();
+            let host_id = pin.host_id();
+
+            let dev_a = DeviceKey::generate().unwrap();
+            let dev_b = DeviceKey::generate().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path().join("s.redb")).unwrap();
+            store
+                .put_keyslot(&dev_a.device_id().unwrap(), 1, b"keyslot")
+                .unwrap();
+            store
+                .put_keyslot(&dev_b.device_id().unwrap(), 1, b"keyslot")
+                .unwrap();
+            let server = std::sync::Arc::new(tokio::sync::Mutex::new(Server::new(store)));
+
+            let endpoint =
+                quinn::Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            // Concurrent accept loop: a task per connection (as `secsec serve` does).
+            tokio::spawn(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let server = server.clone();
+                    tokio::spawn(async move {
+                        if let Ok(conn) = incoming.await {
+                            let _ = serve_connection(&conn, &server, host_id, || 1_000).await;
+                        }
+                    });
+                }
+            });
+
+            // Client A connects and then sits IDLE (opens no request stream). Keep `_ca`/`_conn_a`
+            // alive so its connection stays open the whole time.
+            let mut ca = quinn::Endpoint::client(loopback()).unwrap();
+            ca.set_default_client_config(client_config(pin.clone()).unwrap());
+            let conn_a = ca.connect(addr, "secsec.invalid").unwrap().await.unwrap();
+            let _sess_a = client_handshake(&conn_a, &dev_a, host_id, [0x01; 32])
+                .await
+                .unwrap();
+
+            // Client B, concurrently, does a full put + get — must succeed despite A holding a conn.
+            let mut cb = quinn::Endpoint::client(loopback()).unwrap();
+            cb.set_default_client_config(client_config(pin).unwrap());
+            let conn_b = cb.connect(addr, "secsec.invalid").unwrap().await.unwrap();
+            let tb = client_handshake(&conn_b, &dev_b, host_id, [0x02; 32])
+                .await
+                .unwrap()
+                .transcript;
+            let id = [0x77; 32];
+            let blob = b"concurrent-bytes".to_vec();
+            assert_eq!(
+                request(
+                    &conn_b,
+                    tb,
+                    &dev_b,
+                    Request::Put {
+                        id,
+                        declared_size: blob.len() as u32,
+                        blob: blob.clone(),
+                    },
+                )
+                .await
+                .unwrap(),
+                Response::Ok
+            );
+            assert_eq!(
+                request(&conn_b, tb, &dev_b, Request::Get { id })
+                    .await
+                    .unwrap(),
+                Response::Blob(Some(blob)),
+                "B was served while A held an idle connection"
+            );
+
+            conn_b.close(0u32.into(), b"done");
         });
     }
 }
