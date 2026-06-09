@@ -1341,6 +1341,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "secsec-canon",
+ "secsec-frame",
  "secsec-sig",
 ]
 

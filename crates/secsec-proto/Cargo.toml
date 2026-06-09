@@ -12,4 +12,5 @@ workspace = true
 [dependencies]
 secsec-sig = { path = "../secsec-sig" }
 secsec-canon = { path = "../secsec-canon" }
+secsec-frame = { path = "../secsec-frame" }
 blake3 = "1"

@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod server;
+pub mod wire;
 
 use secsec_canon::Writer;
 use secsec_sig::{DeviceKey, DevicePublic, NS_READ, NS_WRITE};
