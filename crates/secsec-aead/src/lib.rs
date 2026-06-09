@@ -29,6 +29,13 @@
 //! `AD` here is `FRAME ‖ id` (a fixed 43-byte string in secsec). The commitment input
 //! `"secsec-ctx-v1" ‖ AD ‖ T` is unambiguous because the label is a fixed prefix and `T` is a
 //! fixed 16-byte suffix, so the triple `(AD, T)` is recovered injectively.
+//!
+//! # Mutable variant (§9.8)
+//!
+//! [`seal_mut`] / [`open_mut`] are plain RFC 8439 ChaCha20-Poly1305 with a **caller-supplied fresh
+//! nonce**, for *mutable* objects re-encrypted under a stable key (the per-ref Head, §9.8; local
+//! sealed state, §8.5). They store the raw Poly1305 tag and are deliberately **not** key-committing.
+//! Their contract is the inverse of [`seal`]'s: a fresh random *nonce* per write, not a unique key.
 
 #![forbid(unsafe_code)]
 
@@ -130,6 +137,56 @@ pub fn open(
         return Err(AeadError);
     }
     // 3. Only now decrypt: reuse the same cipher, advanced to block 1.
+    cipher.seek(64u64);
+    let mut pt = ciphertext.to_vec();
+    cipher.apply_keystream(&mut pt);
+    Ok(pt)
+}
+
+/// Standard RFC 8439 ChaCha20-Poly1305 with a **caller-supplied nonce** — the §9.8 *mutable-object*
+/// AEAD, for objects re-encrypted in place under a stable key (the per-ref Head, §6/§9.8; local
+/// sealed state, §8.5). Returns `(tag, ciphertext)` with the **raw 16-byte Poly1305 tag stored**
+/// (unlike [`seal`], which folds the tag into a BLAKE3 commitment).
+///
+/// # Contract
+/// The caller **MUST** pass a **fresh random nonce on every call** with a given `key` (OS CSPRNG,
+/// never a counter). Reusing `(key, nonce)` across two plaintexts is catastrophic. This is the
+/// opposite contract to [`seal`], which requires a unique *key* and fixes the nonce at zero. This
+/// construction is **not** key-committing (§9.8); authenticity against other parties rests on the
+/// object's signature, not this tag.
+#[must_use]
+pub fn seal_mut(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    ad: &[u8],
+    plaintext: &[u8],
+) -> ([u8; 16], Vec<u8>) {
+    let mut cipher = ChaCha20::new_from_slices(key, nonce).expect("32-byte key / 12-byte nonce");
+    let mut otk = Zeroizing::new([0u8; 32]);
+    cipher.apply_keystream(&mut *otk);
+    cipher.seek(64u64);
+    let mut ct = plaintext.to_vec();
+    cipher.apply_keystream(&mut ct);
+    let tag = poly1305_aead_tag(&otk, ad, &ct);
+    (tag, ct)
+}
+
+/// Open a [`seal_mut`] ciphertext: recompute the Poly1305 tag over `(ad, ct)`, constant-time compare
+/// to `tag`, and only on a match decrypt. Any mismatch returns [`AeadError`] with no plaintext.
+pub fn open_mut(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    ad: &[u8],
+    tag: &[u8; 16],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, AeadError> {
+    let mut cipher = ChaCha20::new_from_slices(key, nonce).expect("32-byte key / 12-byte nonce");
+    let mut otk = Zeroizing::new([0u8; 32]);
+    cipher.apply_keystream(&mut *otk);
+    let expected = poly1305_aead_tag(&otk, ad, ciphertext);
+    if !bool::from(tag[..].ct_eq(&expected[..])) {
+        return Err(AeadError);
+    }
     cipher.seek(64u64);
     let mut pt = ciphertext.to_vec();
     cipher.apply_keystream(&mut pt);
@@ -251,6 +308,83 @@ mod tests {
             "2a03875878d713ac89c03014944edc98cecbc5b0c4e1c1648b"
         );
         assert_eq!(open(&key, ad, &ctx_tag, &ct).unwrap(), pt);
+    }
+
+    // ---- §9.8 mutable-object AEAD (seal_mut / open_mut) ----
+
+    #[test]
+    fn mut_round_trip() {
+        let key = [7u8; 32];
+        let nonce = [0x11u8; 12];
+        let ad = b"FRAME||H";
+        let (tag, ct) = seal_mut(&key, &nonce, ad, b"head plaintext");
+        assert_eq!(
+            open_mut(&key, &nonce, ad, &tag, &ct).unwrap(),
+            b"head plaintext"
+        );
+    }
+
+    /// `seal_mut` is plain RFC 8439 ChaCha20-Poly1305 — must match the audited reference crate
+    /// byte-for-byte for the same key/nonce/ad/plaintext (ciphertext and detached tag).
+    #[test]
+    fn mut_matches_reference() {
+        use chacha20poly1305::aead::AeadInPlace;
+        use chacha20poly1305::{ChaCha20Poly1305, KeyInit as _};
+
+        let key = [0x42u8; 32];
+        let nonce = [0x24u8; 12];
+        let ad: &[u8] = b"associated data";
+        let pt: &[u8] = b"plaintext of arbitrary, non-block-aligned length!";
+
+        let (my_tag, my_ct) = seal_mut(&key, &nonce, ad, pt);
+
+        let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+        let mut ref_ct = pt.to_vec();
+        let ref_tag = cipher
+            .encrypt_in_place_detached((&nonce).into(), ad, &mut ref_ct)
+            .unwrap();
+
+        assert_eq!(my_ct, ref_ct, "ciphertext differs from reference");
+        assert_eq!(
+            &my_tag[..],
+            ref_tag.as_slice(),
+            "tag differs from reference"
+        );
+    }
+
+    #[test]
+    fn mut_rejects_tamper_wrong_nonce_key_ad() {
+        let key = [7u8; 32];
+        let nonce = [0x11u8; 12];
+        let ad = b"ad";
+        let (tag, ct) = seal_mut(&key, &nonce, ad, b"secret head");
+
+        let mut bad_ct = ct.clone();
+        bad_ct[0] ^= 0x01;
+        assert_eq!(open_mut(&key, &nonce, ad, &tag, &bad_ct), Err(AeadError));
+        let mut bad_tag = tag;
+        bad_tag[0] ^= 0x01;
+        assert_eq!(open_mut(&key, &nonce, ad, &bad_tag, &ct), Err(AeadError));
+        assert_eq!(open_mut(&key, &[0x99; 12], ad, &tag, &ct), Err(AeadError));
+        assert_eq!(open_mut(&[8u8; 32], &nonce, ad, &tag, &ct), Err(AeadError));
+        assert_eq!(
+            open_mut(&key, &nonce, b"other-ad", &tag, &ct),
+            Err(AeadError)
+        );
+    }
+
+    /// The whole point of the mutable construction: a fresh nonce yields a different ciphertext for
+    /// the same plaintext under the same key (no keystream reuse), yet both open correctly.
+    #[test]
+    fn mut_fresh_nonce_changes_ciphertext() {
+        let key = [7u8; 32];
+        let ad = b"ad";
+        let pt = b"same plaintext, two writes";
+        let (t1, c1) = seal_mut(&key, &[1u8; 12], ad, pt);
+        let (t2, c2) = seal_mut(&key, &[2u8; 12], ad, pt);
+        assert_ne!(c1, c2, "different nonce must give different ciphertext");
+        assert_eq!(open_mut(&key, &[1u8; 12], ad, &t1, &c1).unwrap(), pt);
+        assert_eq!(open_mut(&key, &[2u8; 12], ad, &t2, &c2).unwrap(), pt);
     }
 
     proptest! {
