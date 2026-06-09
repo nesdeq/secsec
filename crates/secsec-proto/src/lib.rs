@@ -11,12 +11,13 @@
 //!   `op ‖ args_hash ‖ session_transcript`. No `server_nonce` — `session_transcript` provides
 //!   per-connection freshness (§9.6).
 //!
-//! The `args_hash` per op is the normative §12 binding. `gc`'s full serialization (§15:
-//! `keep_set_hash`, `all_heads_hash`, `put_epoch`) lands with the hardened-GC work (M6); this crate
-//! has the common `put`/`cas-head`/`roster-append`/`get`/`has` bindings.
+//! The `args_hash` per op is the normative §12 binding: `put`/`cas-head`/`roster-append`/`get`/`has`
+//! here, and `gc`'s §15 serialization (`keep_set_hash`, `all_heads_hash`, `args_gc`) in [`gc`]. The
+//! GC *executor* (keep-set traversal, generation/grace sweep) is the hardened-GC work of M6.
 
 #![forbid(unsafe_code)]
 
+pub mod gc;
 pub mod server;
 pub mod wire;
 
