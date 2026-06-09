@@ -14,7 +14,8 @@
 
 #![forbid(unsafe_code)]
 
-use secsec_canon::Writer;
+use secsec_canon::{verify_reencode, CanonError, Reader, Writer};
+use secsec_frame::MAX_ROSTER_ENTRY_SIZE;
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic, NS_ROSTER};
 use std::collections::BTreeMap;
 
@@ -93,6 +94,11 @@ pub enum RosterError {
     BadSignature,
     /// A fetched chain was shorter than, or inconsistent with, the persisted frontier (rollback).
     Rollback,
+    /// An entry's encoded op carried an unknown tag.
+    BadOp,
+    /// Strict canonical decode failed (truncation, over-long field, trailing bytes, or
+    /// non-canonical re-encode).
+    Canon(CanonError),
     /// Signing/key error.
     Sig(secsec_sig::SigError),
 }
@@ -109,6 +115,8 @@ impl core::fmt::Display for RosterError {
             RosterError::NotMember => f.write_str("entry signed by a non-member (succession)"),
             RosterError::BadSignature => f.write_str("entry signature invalid"),
             RosterError::Rollback => f.write_str("sigchain rolled back below frontier"),
+            RosterError::BadOp => f.write_str("unknown roster op tag"),
+            RosterError::Canon(e) => write!(f, "canon: {e}"),
             RosterError::Sig(e) => write!(f, "sig: {e}"),
         }
     }
@@ -118,6 +126,11 @@ impl std::error::Error for RosterError {}
 impl From<secsec_sig::SigError> for RosterError {
     fn from(e: secsec_sig::SigError) -> Self {
         RosterError::Sig(e)
+    }
+}
+impl From<CanonError> for RosterError {
+    fn from(e: CanonError) -> Self {
+        RosterError::Canon(e)
     }
 }
 
@@ -150,8 +163,11 @@ fn signed_bytes(seq: u64, prev: &[u8; 32], op: &Op, ts: u64, signer: &DeviceId) 
     w.finish()
 }
 
-/// The full entry (signed portion + signature), as hashed for the chain.
-fn full_bytes(e: &Entry) -> Vec<u8> {
+/// The canonical wire encoding of a full entry (signed portion + signature). This is the byte
+/// string that is hashed for the chain (`prev`/RFP) and that the per-entry AEAD layer (§9.5)
+/// encrypts. Field order: `seq ‖ prev ‖ op ‖ ts ‖ signer ‖ sig`.
+#[must_use]
+pub fn encode_entry(e: &Entry) -> Vec<u8> {
     let mut w = Writer::new();
     w.u64(e.seq).raw(&e.prev);
     encode_op(&mut w, &e.op);
@@ -159,10 +175,69 @@ fn full_bytes(e: &Entry) -> Vec<u8> {
     w.finish()
 }
 
+fn decode_op(r: &mut Reader<'_>) -> Result<Op, RosterError> {
+    let tag = r.u8()?;
+    Ok(match tag {
+        0 => {
+            let pubkey = r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec();
+            Op::Genesis {
+                pubkey,
+                mk_commit: read32(r)?,
+            }
+        }
+        1 => {
+            let pubkey = r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec();
+            Op::AddDevice {
+                pubkey,
+                mk_commit: read32(r)?,
+            }
+        }
+        2 => Op::RevokeDevice { device: read32(r)? },
+        3 => Op::Rotate {
+            mk_commit: read32(r)?,
+        },
+        4 => Op::SetMinAlgo { min_algo: r.u8()? },
+        _ => return Err(RosterError::BadOp),
+    })
+}
+
+fn read32(r: &mut Reader<'_>) -> Result<[u8; 32], RosterError> {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(r.raw(32)?);
+    Ok(out)
+}
+
+/// Strictly decode a full entry from its canonical wire bytes (inverse of [`encode_entry`]).
+///
+/// Rejects truncation, over-long length-prefixed fields (bounded by
+/// [`secsec_frame::MAX_ROSTER_ENTRY_SIZE`]), trailing bytes, and — via the §9.3 re-encode guard —
+/// any non-canonical encoding of an otherwise-valid entry. This is the malleability boundary: the
+/// bytes a signature/hash is computed over are the unique canonical encoding of the parsed value.
+pub fn decode_entry(bytes: &[u8]) -> Result<Entry, RosterError> {
+    let mut r = Reader::new(bytes);
+    let seq = r.u64()?;
+    let prev = read32(&mut r)?;
+    let op = decode_op(&mut r)?;
+    let ts = r.u64()?;
+    let signer = read32(&mut r)?;
+    let sig = r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec();
+    r.finish()?;
+    let entry = Entry {
+        seq,
+        prev,
+        op,
+        ts,
+        signer,
+        sig,
+    };
+    verify_reencode(bytes, &entry, encode_entry)?;
+    Ok(entry)
+}
+
 /// BLAKE3 of the full entry — the chain link `prev` and the genesis RFP.
 #[must_use]
 pub fn entry_hash(e: &Entry) -> [u8; 32] {
-    *blake3::hash(&full_bytes(e)).as_bytes()
+    *blake3::hash(&encode_entry(e)).as_bytes()
 }
 
 /// Create the genesis entry (seq 0, self-signed by device-1). Returns `(entry, rfp)`.
@@ -509,5 +584,78 @@ mod tests {
             check_frontier(truncated, &frontier),
             Err(RosterError::Rollback)
         ));
+    }
+
+    #[test]
+    fn codec_round_trips_every_op_and_preserves_hash() {
+        let d1 = DeviceKey::generate().unwrap();
+        let d2 = DeviceKey::generate().unwrap();
+        let (entries, _rfp) = chain(
+            &d1,
+            vec![
+                (
+                    Op::AddDevice {
+                        pubkey: pubkey_of(&d2),
+                        mk_commit: MK,
+                    },
+                    &d1,
+                ),
+                (
+                    Op::Rotate {
+                        mk_commit: [0xBB; 32],
+                    },
+                    &d1,
+                ),
+                (Op::SetMinAlgo { min_algo: 9 }, &d2),
+                (
+                    Op::RevokeDevice {
+                        device: d2.device_id().unwrap(),
+                    },
+                    &d1,
+                ),
+            ],
+        );
+        // Genesis + all four other op variants survive a decode→encode round trip byte-for-byte,
+        // and the chain hash is identical to the in-memory entry's hash.
+        for e in &entries {
+            let bytes = encode_entry(e);
+            let decoded = decode_entry(&bytes).unwrap();
+            assert_eq!(&decoded, e);
+            assert_eq!(encode_entry(&decoded), bytes);
+            assert_eq!(entry_hash(&decoded), entry_hash(e));
+        }
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let d1 = DeviceKey::generate().unwrap();
+        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let mut bytes = encode_entry(&g);
+        bytes.push(0x00);
+        assert!(matches!(
+            decode_entry(&bytes),
+            Err(RosterError::Canon(CanonError::TrailingBytes { .. }))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_truncation() {
+        let d1 = DeviceKey::generate().unwrap();
+        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let bytes = encode_entry(&g);
+        assert!(matches!(
+            decode_entry(&bytes[..bytes.len() - 1]),
+            Err(RosterError::Canon(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_unknown_op_tag() {
+        let d1 = DeviceKey::generate().unwrap();
+        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let mut bytes = encode_entry(&g);
+        // The op tag sits right after seq(8) + prev(32). Flip Genesis(0) to an unknown tag.
+        bytes[40] = 0xFF;
+        assert!(matches!(decode_entry(&bytes), Err(RosterError::BadOp)));
     }
 }
