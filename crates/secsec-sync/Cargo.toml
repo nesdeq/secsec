@@ -1,0 +1,21 @@
+[package]
+name = "secsec-sync"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sync plane: signed+encrypted per-ref Head, keyed-hash ref names (finaldesign.md §6, §9.8, §13)."
+
+[lints]
+workspace = true
+
+[dependencies]
+secsec-canon = { path = "../secsec-canon" }
+secsec-frame = { path = "../secsec-frame" }
+secsec-kdf = { path = "../secsec-kdf" }
+secsec-sig = { path = "../secsec-sig" }
+secsec-aead = { path = "../secsec-aead" }
+blake3 = "1"
+getrandom = "0.3"
+
+[dev-dependencies]

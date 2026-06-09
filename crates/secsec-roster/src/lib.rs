@@ -9,8 +9,10 @@
 //! + [`check_frontier`] implement the §8.1 anti-rollback (a chain shorter than, or inconsistent
 //!   with, a persisted frontier is rejected).
 //!
-//! This slice handles the **plaintext** sigchain logic. Per-entry encryption under `roster_key_g`
-//! (§9.5) and the key-history chains (§8.2) are a separate layer that wraps these bytes.
+//! Beyond the plaintext sigchain (entries, codec, fold/succession, frontier) this crate also holds
+//! the layers that wrap it: the per-entry AEAD under `roster_key_g` (§9.5), the never-trimmed
+//! roster-key history and its peel (§8.2), the cold-start bootstrap fold (§8.1), the enrollment
+//! primitives (SAS + grant attestation, §7/§9.6), and the revoke⇒rotate op builder (§8.4).
 
 #![forbid(unsafe_code)]
 

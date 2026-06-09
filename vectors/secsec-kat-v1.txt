@@ -55,6 +55,17 @@ plaintext  = "object-plane-kat"              # 16 ASCII bytes, not hex
 content_id = 7e4b0ee5fbd6047722f1576005bd0b64f25e33b2ea772a9a19679066efc3d285
 blob       = 737365630101010000000093396520adcd7b6c1be2b70da845c23b38eae085e64b6c2143dd3158a62cc9d2c61b3694585207be869bf7f23c68da21
 
+[head]   # asserts: secsec-sync  tests::head_kat
+# §9.8 mutable Head blob, keyed by head_key[g=1]; ref name keyed by ref_name_key (both from the
+# master_key=0x11*32 chain). ref_hash = BLAKE3::keyed_hash(ref_name_key, ref_name).
+ref_name     = "main"                         # ASCII, not hex
+ref_hash     = 40d8bd93f870c83e494ff102e6604ee4e0d7683cc36da8e26eb24490d3e4cfa3
+# Head fields: commit_id=0xC0*32, head_version=3, roster_seq=5, prev_head=0xB0*32, sig="dummy-sig".
+# Blob = FRAME(11) ‖ nonce(12) ‖ tag(16) ‖ ct, with a FIXED nonce=0x07*12 (production nonces are
+# fresh-random per write, §9.8; fixed here only to pin the wire format).
+head_nonce   = 070707070707070707070707
+head_blob    = 737365630101010000000307070707070707070707070732606c8303716a667b303fd332a3e95f60a85422ed82a4d278642d1d35301852bf4992736077b620823945e522d418cf6d06d04a394f84084274abd6e7e4a3ab17594fff0cf359b5065e4d15ca901501023755da139ab87cf0f0bb0dac3c1397c683ba9c3d36eabbc92789c8d8075b9c7e0e5de5e0
+
 [sas]   # asserts: secsec-roster  tests::sas_kat
 # §7 enrollment short-authentication-string. Inputs:
 rfp         = 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a
