@@ -11,7 +11,10 @@
 
 #![forbid(unsafe_code)]
 
+use ssh_key::private::KeypairData;
+use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
+use zeroize::Zeroizing;
 
 /// Connection-auth namespace (§9.6).
 pub const NS_AUTH: &str = "secsec-auth-v1";
@@ -43,6 +46,8 @@ pub enum SigError {
     NotEd25519,
     /// Signature verification failed (bad signature, wrong key, or wrong namespace).
     VerifyFailed,
+    /// Ed25519 → X25519 key conversion failed (malformed key point).
+    KeyConversion,
 }
 
 impl core::fmt::Display for SigError {
@@ -51,6 +56,7 @@ impl core::fmt::Display for SigError {
             SigError::Ssh(e) => write!(f, "ssh-key: {e}"),
             SigError::NotEd25519 => f.write_str("key/signature is not Ed25519"),
             SigError::VerifyFailed => f.write_str("signature verification failed"),
+            SigError::KeyConversion => f.write_str("Ed25519 to X25519 conversion failed"),
         }
     }
 }
@@ -102,6 +108,38 @@ impl DeviceKey {
         device_id_of(self.key.public_key())
     }
 
+    /// The raw Ed25519 private seed. Zeroized on drop. Private to the crate.
+    fn ed25519_seed(&self) -> Result<Zeroizing<[u8; 32]>, SigError> {
+        match self.key.key_data() {
+            KeypairData::Ed25519(kp) => Ok(Zeroizing::new(kp.private.to_bytes())),
+            _ => Err(SigError::NotEd25519),
+        }
+    }
+
+    /// This device's X25519 secret scalar (the Ed25519→X25519 / `age` map): the **raw clamped**
+    /// `SHA-512(seed)[..32]` used for keyslot ECDH (§8.3). Also the `device_ed25519_scalar_clamped`
+    /// of §8.5. Zeroized on drop.
+    ///
+    /// Note: this is the raw clamped value, *not* `SigningKey::to_scalar()` — the latter reduces
+    /// mod the group order, which X25519 clamping would then corrupt.
+    pub fn x25519_secret(&self) -> Result<Zeroizing<[u8; 32]>, SigError> {
+        use sha2::{Digest, Sha512};
+        let seed = self.ed25519_seed()?;
+        let h = Sha512::digest(seed.as_slice());
+        let mut k = Zeroizing::new([0u8; 32]);
+        k.copy_from_slice(&h[..32]);
+        // RFC 7748 X25519 clamp.
+        k[0] &= 248;
+        k[31] &= 127;
+        k[31] |= 64;
+        Ok(k)
+    }
+
+    /// This device's X25519 public key (Montgomery-u of the Ed25519 public point).
+    pub fn x25519_public(&self) -> Result<[u8; 32], SigError> {
+        self.public().x25519_public()
+    }
+
     /// SSHSIG-sign `msg` under `namespace`, returning the PEM-encoded signature bytes.
     pub fn sign(&self, namespace: &str, msg: &[u8]) -> Result<Vec<u8>, SigError> {
         let sig = self.key.sign(namespace, SIG_HASH, msg)?;
@@ -133,6 +171,21 @@ impl DevicePublic {
     /// This key's device id.
     pub fn device_id(&self) -> Result<DeviceId, SigError> {
         device_id_of(&self.key)
+    }
+
+    fn ed25519_public_bytes(&self) -> Result<[u8; 32], SigError> {
+        match self.key.key_data() {
+            KeyData::Ed25519(pk) => Ok(pk.0),
+            _ => Err(SigError::NotEd25519),
+        }
+    }
+
+    /// This key's X25519 public key (Montgomery-u of the Ed25519 public point), for keyslot ECDH.
+    pub fn x25519_public(&self) -> Result<[u8; 32], SigError> {
+        let ed = self.ed25519_public_bytes()?;
+        let vk =
+            ed25519_dalek::VerifyingKey::from_bytes(&ed).map_err(|_| SigError::KeyConversion)?;
+        Ok(vk.to_montgomery().to_bytes())
     }
 
     /// Verify an SSHSIG (PEM bytes) over `msg` under `namespace`.
@@ -207,6 +260,25 @@ mod tests {
             other.verify(NS_ROSTER, b"entry", &sig),
             Err(SigError::VerifyFailed)
         ));
+    }
+
+    #[test]
+    fn x25519_conversion_consistent_and_dh_agrees() {
+        use x25519_dalek::{PublicKey as XPub, StaticSecret};
+        let a = DeviceKey::generate().unwrap();
+        let b = DeviceKey::generate().unwrap();
+        let a_sec = StaticSecret::from(*a.x25519_secret().unwrap());
+        let b_sec = StaticSecret::from(*b.x25519_secret().unwrap());
+        let a_pub = a.x25519_public().unwrap();
+        let b_pub = b.x25519_public().unwrap();
+        // The X25519 public derived from our converted secret must equal our converted public —
+        // this is the correctness condition the age/ssh-to-age conversion relies on.
+        assert_eq!(XPub::from(&a_sec).as_bytes(), &a_pub);
+        assert_eq!(XPub::from(&b_sec).as_bytes(), &b_pub);
+        // ECDH agrees in both directions.
+        let ab = a_sec.diffie_hellman(&XPub::from(b_pub));
+        let ba = b_sec.diffie_hellman(&XPub::from(a_pub));
+        assert_eq!(ab.as_bytes(), ba.as_bytes());
     }
 
     #[test]
