@@ -11,9 +11,9 @@
 //! 5. **execute** — against the blob store.
 //!
 //! The server is **blind**: it stores opaque blobs by id and never verifies or reads their content
-//! (content-addressing is re-checked by *clients* on fetch, §9.2). `get`/`has`/`put`/`cas-head` are
-//! executed; `cas-head` CASes on `BLAKE3` of the stored (encrypted) head blob (§12). `roster-append`
-//! (its `/roster-head` CAS) and `gc` land next; their auth is already verified here.
+//! (content-addressing is re-checked by *clients* on fetch, §9.2). `get`/`has`/`put`/`cas-head`/
+//! `roster-append` are all executed; the mutable ops CAS on a `BLAKE3` of the stored (encrypted) tip
+//! blob (§12, blind-server). `gc` (§15) is the remaining op and lands with the hardened-GC work (M6).
 //!
 //! The handler is pure and clock-injected (`now`), so the whole §12 pipeline is unit-testable by
 //! calling [`Server::handle`] directly — no sockets.
@@ -200,8 +200,20 @@ impl Server {
                     Err(_) => Response::Err(ErrorCode::Internal),
                 }
             }
-            // sigchain (roster-append) storage + its /roster-head CAS land next; auth verified above.
-            Request::RosterAppend { .. } => Response::Err(ErrorCode::Internal),
+            Request::RosterAppend { old_tip, entry } => {
+                if !self
+                    .write_bucket(device_id, now)
+                    .try_take(entry.len() as u64, now)
+                {
+                    return Response::Err(ErrorCode::RateLimit);
+                }
+                // Append CAS-guarded by the /roster-head tip (§8.1): a racing append loses.
+                match self.store.append_roster(&old_tip, &entry) {
+                    Ok(Some(_seq)) => Response::Ok,
+                    Ok(None) => Response::Err(ErrorCode::CasConflict),
+                    Err(_) => Response::Err(ErrorCode::Internal),
+                }
+            }
         }
     }
 }
@@ -454,6 +466,45 @@ mod tests {
                 0
             ),
             Response::Err(ErrorCode::BadRequest)
+        );
+    }
+
+    #[test]
+    fn roster_append_chains_and_rejects_race() {
+        let (mut s, _d) = server();
+        let dev = DeviceKey::generate().unwrap();
+        enroll(&s, &dev);
+        let append = |old_tip: [u8; 32], entry: Vec<u8>| Request::RosterAppend { old_tip, entry };
+
+        // genesis append (expect-absent).
+        let n1 = [0x20; 32];
+        s.issue_nonce(n1, 0);
+        assert_eq!(
+            s.handle(
+                write_req(&dev, append([0; 32], b"genesis".to_vec()), T, n1),
+                0
+            ),
+            Response::Ok
+        );
+
+        // a racing genesis (still expect-absent) loses the CAS.
+        let n2 = [0x21; 32];
+        s.issue_nonce(n2, 0);
+        assert_eq!(
+            s.handle(
+                write_req(&dev, append([0; 32], b"genesis2".to_vec()), T, n2),
+                0
+            ),
+            Response::Err(ErrorCode::CasConflict)
+        );
+
+        // append seq 1 on the correct tip succeeds.
+        let tip0 = *blake3::hash(b"genesis").as_bytes();
+        let n3 = [0x22; 32];
+        s.issue_nonce(n3, 0);
+        assert_eq!(
+            s.handle(write_req(&dev, append(tip0, b"entry1".to_vec()), T, n3), 0),
+            Response::Ok
         );
     }
 }

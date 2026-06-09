@@ -27,6 +27,8 @@ const COUNTERS: TableDefinition<'static, &str, u64> = TableDefinition::new("coun
 const KEYSLOTS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("keyslots");
 /// `ref_H(32)` → current head blob (§13 `/refs/<H>`); CAS-guarded by `BLAKE3(blob)`.
 const REFS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("refs");
+/// `be64(seq)` → encrypted roster sigchain entry blob (§13 `/roster/<seq>`); the tip is CAS-guarded.
+const ROSTER: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("roster");
 
 const PUT_EPOCH: &str = "put_epoch";
 
@@ -92,9 +94,59 @@ impl Store {
             wtx.open_table(COUNTERS)?;
             wtx.open_table(KEYSLOTS)?;
             wtx.open_table(REFS)?;
+            wtx.open_table(ROSTER)?;
         }
         wtx.commit()?;
         Ok(Self { db })
+    }
+
+    /// The number of sigchain entries stored (the next append's `seq`).
+    pub fn roster_len(&self) -> Result<u64, StoreError> {
+        let rtx = self.db.begin_read()?;
+        let roster = rtx.open_table(ROSTER)?;
+        Ok(roster.len()?)
+    }
+
+    /// The stored roster entry blob at `seq`, or `None`.
+    pub fn get_roster_entry(&self, seq: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        let rtx = self.db.begin_read()?;
+        let roster = rtx.open_table(ROSTER)?;
+        Ok(roster.get(seq)?.map(|g| g.value().to_vec()))
+    }
+
+    /// Append a sigchain entry, CAS-guarded by the `/roster-head` tip (§8.1). In one write
+    /// transaction: compute the current tip token (`BLAKE3` of the last entry blob, or
+    /// [`ABSENT_HEAD`] when empty); only if it equals `expected_old_tip`, store `entry` at the next
+    /// `seq` and return `Ok(Some(seq))`. A mismatch (a concurrent append happened) returns `Ok(None)`
+    /// — the client re-folds onto the new tip and retries (§8.1), so a racing append can never poison
+    /// the chain with a non-chaining entry.
+    pub fn append_roster(
+        &self,
+        expected_old_tip: &[u8; 32],
+        entry: &[u8],
+    ) -> Result<Option<u64>, StoreError> {
+        let wtx = self.db.begin_write()?;
+        let result;
+        {
+            let mut roster = wtx.open_table(ROSTER)?;
+            let count = roster.len()?;
+            let current_tip = if count == 0 {
+                ABSENT_HEAD
+            } else {
+                match roster.get(count - 1)? {
+                    Some(g) => *blake3::hash(g.value()).as_bytes(),
+                    None => ABSENT_HEAD, // non-contiguous (impossible for append-only): treat as empty
+                }
+            };
+            if current_tip == *expected_old_tip {
+                roster.insert(count, entry)?;
+                result = Some(count);
+            } else {
+                result = None;
+            }
+        }
+        wtx.commit()?;
+        Ok(result)
     }
 
     /// The current head blob stored at `/refs/<ref_h>`, or `None`.
@@ -382,5 +434,32 @@ mod tests {
         // a stale expected-old conflicts.
         assert!(!s.cas_ref(&r, &cur_hash, b"head-v3").unwrap());
         assert_eq!(s.get_ref(&r).unwrap().as_deref(), Some(&b"head-v2"[..]));
+    }
+
+    #[test]
+    fn append_roster_cas_chains_and_rejects_races() {
+        let (_d, s) = temp_store();
+        assert_eq!(s.roster_len().unwrap(), 0);
+
+        // genesis: expect-absent.
+        assert_eq!(s.append_roster(&ABSENT_HEAD, b"genesis").unwrap(), Some(0));
+        assert_eq!(s.roster_len().unwrap(), 1);
+        assert_eq!(
+            s.get_roster_entry(0).unwrap().as_deref(),
+            Some(&b"genesis"[..])
+        );
+
+        // a second genesis (still expect-absent) loses the CAS.
+        assert_eq!(s.append_roster(&ABSENT_HEAD, b"genesis2").unwrap(), None);
+        assert_eq!(s.roster_len().unwrap(), 1);
+
+        // append seq 1 with the correct tip (= BLAKE3 of entry 0).
+        let tip0 = *blake3::hash(b"genesis").as_bytes();
+        assert_eq!(s.append_roster(&tip0, b"entry1").unwrap(), Some(1));
+        assert_eq!(s.roster_len().unwrap(), 2);
+
+        // a racing append still pointing at tip0 (stale) is rejected — no chain poisoning.
+        assert_eq!(s.append_roster(&tip0, b"racer").unwrap(), None);
+        assert_eq!(s.roster_len().unwrap(), 2);
     }
 }

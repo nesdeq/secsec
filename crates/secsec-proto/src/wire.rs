@@ -155,9 +155,12 @@ pub enum Request {
         /// The new head blob to store.
         new_blob: Vec<u8>,
     },
-    /// Append a sigchain entry (the encrypted entry blob).
+    /// Append a sigchain entry, CAS-guarded by the current `/roster-head` tip (§8.1).
     RosterAppend {
-        /// The stored roster-entry blob.
+        /// `BLAKE3` of the current tip entry blob the client built on, or [`secsec_frame`]'s
+        /// all-zero sentinel for the genesis append (the server CASes on this).
+        old_tip: Id,
+        /// The stored (encrypted) roster-entry blob.
         entry: Vec<u8>,
     },
 }
@@ -202,8 +205,8 @@ impl Request {
                     .raw(new_head)
                     .bytes(new_blob);
             }
-            Request::RosterAppend { entry } => {
-                w.u8(T_ROSTER).bytes(entry);
+            Request::RosterAppend { old_tip, entry } => {
+                w.u8(T_ROSTER).raw(old_tip).bytes(entry);
             }
         }
         w.finish()
@@ -239,6 +242,7 @@ impl Request {
                 new_blob: r.bytes(MAX_BLOB_SIZE)?.to_vec(),
             },
             T_ROSTER => Request::RosterAppend {
+                old_tip: read32(&mut r)?,
                 entry: r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec(),
             },
             other => return Err(WireError::BadTag(other)),
@@ -463,6 +467,7 @@ mod tests {
                 new_blob: b"head".to_vec(),
             },
             Request::RosterAppend {
+                old_tip: [8; 32],
                 entry: b"entry-bytes".to_vec(),
             },
         ];

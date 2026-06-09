@@ -104,7 +104,7 @@ pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
             new_head,
             ..
         } => (op::CAS_HEAD, args_cas_head(ref_h, old_head, new_head), true),
-        Request::RosterAppend { entry } => (op::ROSTER_APPEND, args_roster_append(entry), true),
+        Request::RosterAppend { entry, .. } => (op::ROSTER_APPEND, args_roster_append(entry), true),
     }
 }
 
