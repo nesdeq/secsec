@@ -1,0 +1,23 @@
+[package]
+name = "secsec-engine"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sync orchestration: the snapshot-tree <-> merge-node bridge, three-way reconcile to disk (finaldesign.md §10)."
+
+[lints]
+workspace = true
+
+[dependencies]
+secsec-snapshot = { path = "../secsec-snapshot" }
+secsec-sync = { path = "../secsec-sync" }
+secsec-store = { path = "../secsec-store" }
+secsec-kdf = { path = "../secsec-kdf" }
+secsec-object = { path = "../secsec-object" }
+secsec-frame = { path = "../secsec-frame" }
+
+[dev-dependencies]
+tempfile = "3"
+secsec-sig = { path = "../secsec-sig" }
+getrandom = "0.3"

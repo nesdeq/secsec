@@ -19,6 +19,9 @@ use std::collections::BTreeMap;
 /// A 256-bit chunk content-address (§9.2).
 pub type Id = [u8; 32];
 
+/// A 16-byte per-path salt (§9.2/§9.7).
+pub type PathSalt = [u8; 16];
+
 /// An in-memory file-tree node. A directory maps child name → node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
@@ -30,11 +33,23 @@ pub enum Node {
         mtime: u64,
         /// Plaintext size.
         size: u64,
+        /// Per-file path salt that the `chunks` were sealed under — load-bearing for chunk-id
+        /// re-verification on restore (§9.2), so it rides with the file through merge/keep-both. Not
+        /// used for merge equality (content identity is the chunk list alone).
+        path_salt: PathSalt,
         /// Ordered chunk ids — the file's content identity.
         chunks: Vec<Id>,
     },
-    /// A directory: child name → child node.
-    Dir(BTreeMap<String, Node>),
+    /// A directory. `mode`/`mtime` are advisory (preserved through merge so re-sealing keeps subdir
+    /// permissions; never compared for equality). Identity is the `children` map.
+    Dir {
+        /// Unix mode bits.
+        mode: u32,
+        /// Modification time (advisory; not used for merge equality).
+        mtime: u64,
+        /// Child name → child node.
+        children: BTreeMap<String, Node>,
+    },
 }
 
 /// Why a path conflicted.
@@ -74,7 +89,7 @@ pub struct Merge {
 fn same_content(a: &Node, b: &Node) -> bool {
     match (a, b) {
         (Node::File { chunks: x, .. }, Node::File { chunks: y, .. }) => x == y,
-        (Node::Dir(x), Node::Dir(y)) => {
+        (Node::Dir { children: x, .. }, Node::Dir { children: y, .. }) => {
             x.len() == y.len()
                 && x.iter()
                     .all(|(k, v)| y.get(k).is_some_and(|w| same_content(v, w)))
@@ -162,10 +177,18 @@ fn merge_dir(
 
         // Genuine divergence.
         match (o, t) {
-            // Two diverged directories merge recursively — never a conflict on the dir itself.
-            (Some(Node::Dir(od)), Some(Node::Dir(td))) => {
+            // Two diverged directories merge recursively — never a conflict on the dir itself. The
+            // merged dir keeps ours's advisory mode/mtime (deterministic; metadata, not content).
+            (
+                Some(Node::Dir {
+                    mode: omode,
+                    mtime: omtime,
+                    children: od,
+                }),
+                Some(Node::Dir { children: td, .. }),
+            ) => {
                 let bd = match b {
-                    Some(Node::Dir(d)) => d.clone(),
+                    Some(Node::Dir { children, .. }) => children.clone(),
                     _ => BTreeMap::new(), // base absent or a file: merge against empty
                 };
                 let mut sub = Merge {
@@ -173,7 +196,14 @@ fn merge_dir(
                     conflicts: Vec::new(),
                 };
                 merge_dir(&path, &bd, od, td, their_label, &mut sub);
-                out.tree.insert(name.clone(), Node::Dir(sub.tree));
+                out.tree.insert(
+                    name.clone(),
+                    Node::Dir {
+                        mode: *omode,
+                        mtime: *omtime,
+                        children: sub.tree,
+                    },
+                );
                 out.conflicts.extend(sub.conflicts);
             }
             // Everything else diverging is a keep-both conflict (no data loss).
@@ -194,7 +224,7 @@ fn merge_dir(
 
 fn classify(b: Option<&Node>, o: Option<&Node>, t: Option<&Node>) -> ConflictKind {
     let is_file = |n: Option<&Node>| matches!(n, Some(Node::File { .. }));
-    let is_dir = |n: Option<&Node>| matches!(n, Some(Node::Dir(_)));
+    let is_dir = |n: Option<&Node>| matches!(n, Some(Node::Dir { .. }));
     match (o, t) {
         (None, _) | (_, None) => ConflictKind::ModifyDelete,
         _ if (is_file(o) && is_dir(t)) || (is_dir(o) && is_file(t)) => ConflictKind::TypeChange,
@@ -212,25 +242,30 @@ mod tests {
             mode: 0o644,
             mtime: 0,
             size: 1,
+            path_salt: [0u8; 16],
             chunks: vec![[byte; 32]],
         }
     }
-    /// Same content as `file(byte)` but a different mtime — must NOT be a conflict (§10).
+    /// Same content as `file(byte)` but a different mtime AND path_salt — must NOT be a conflict
+    /// (§10: equality is by chunk list alone; salt/mtime ride along but don't gate the merge).
     fn file_touched(byte: u8) -> Node {
         Node::File {
             mode: 0o644,
             mtime: 999,
             size: 1,
+            path_salt: [0xAB; 16],
             chunks: vec![[byte; 32]],
         }
     }
     fn dir(entries: &[(&str, Node)]) -> Node {
-        Node::Dir(
-            entries
+        Node::Dir {
+            mode: 0o755,
+            mtime: 0,
+            children: entries
                 .iter()
                 .map(|(n, v)| ((*n).to_string(), v.clone()))
                 .collect(),
-        )
+        }
     }
     fn map(entries: &[(&str, Node)]) -> BTreeMap<String, Node> {
         entries
@@ -329,7 +364,7 @@ mod tests {
         let m = three_way_merge(&base, &ours, &theirs, "L");
         assert_eq!(m.conflicts.first().unwrap().kind, ConflictKind::TypeChange);
         assert_eq!(m.tree.get("a"), Some(&file(2)));
-        assert!(matches!(m.tree.get("a.conflict-L"), Some(Node::Dir(_))));
+        assert!(matches!(m.tree.get("a.conflict-L"), Some(Node::Dir { .. })));
     }
 
     #[test]
@@ -362,7 +397,7 @@ mod tests {
                 kind: ConflictKind::ModifyModify
             }]
         );
-        let Some(Node::Dir(d)) = m.tree.get("d") else {
+        let Some(Node::Dir { children: d, .. }) = m.tree.get("d") else {
             panic!("d must be a dir")
         };
         assert_eq!(d.get("x"), Some(&file(2)));

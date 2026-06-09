@@ -10,6 +10,12 @@
 //! `path_salt`; a tree stores the salt of each child, and the commit stores the root tree's salt.
 //! On restore the salts come from the parent object, so the id re-verification in
 //! [`secsec_object::open_object`] is meaningful.
+//!
+//! **Incremental snapshots.** A path's salt is generated once (first sync) and is **constant across
+//! all versions** (§9.7): [`snapshot_tree`] takes the previous root `(id, salt)` and reuses each
+//! path's salt from the prior tree, so an unchanged file re-chunks to the identical ids. That
+//! stability is what makes incremental upload/dedup and the three-way merge's content equality work
+//! — it is not an optimization but a correctness requirement of the sync model.
 
 #![forbid(unsafe_code)]
 
@@ -409,20 +415,43 @@ fn mtime_of(meta: &std::fs::Metadata) -> u64 {
 /// Snapshot the directory `root` into `store` under `mk` and return its root **tree** id and salt
 /// (no commit). This is the content half of a sync push; the orchestration wraps it in a signed
 /// commit (see [`seal_signed_commit`]) carrying the version/roster_seq/parent metadata (§10).
+///
+/// `prev` is the previous snapshot's root `(tree_id, salt)`, or `None` for the very first sync. When
+/// given, every path's salt is **reused** from the prior tree (§9.2/§9.7: a path's `path_salt` is
+/// generated once at first sync and is constant across all versions). This is what makes an
+/// unchanged file re-chunk to the **same** ids — the basis for incremental upload/dedup and for the
+/// three-way merge's content equality. Only genuinely new paths get a fresh random salt.
 pub fn snapshot_tree(
     root: &Path,
     mk: &MasterKey,
     store: &Store,
+    prev: Option<(&Id, &PathSalt)>,
 ) -> Result<(Id, PathSalt), SnapError> {
     let chunker = secsec_chunk::Chunker::with_defaults(&mk.cdc_seed());
-    snapshot_dir(root, mk, store, &chunker, 0)
+    let prev_tree = match prev {
+        Some((id, salt)) => Some(load_tree(id, salt, mk, store)?),
+        None => None,
+    };
+    // The root tree's own salt persists too (reused if the repo has synced before).
+    let root_salt = match prev {
+        Some((_, salt)) => *salt,
+        None => random_salt()?,
+    };
+    snapshot_dir(root, mk, store, &chunker, 0, prev_tree.as_ref(), root_salt)
+}
+
+/// The name field of a tree entry (file or dir).
+fn entry_name(e: &Entry) -> &str {
+    match e {
+        Entry::File { name, .. } | Entry::Dir { name, .. } => name,
+    }
 }
 
 /// Snapshot `root` into `store` under `mk`; returns the commit id. `ts` is the author-asserted
 /// timestamp to record (advisory). The commit is **unsigned** with placeholder metadata — for the
 /// object-graph round trip and tests. Sync uses [`snapshot_tree`] + [`seal_signed_commit`].
 pub fn snapshot(root: &Path, mk: &MasterKey, store: &Store, ts: u64) -> Result<Id, SnapError> {
-    let (root_tree, root_salt) = snapshot_tree(root, mk, store)?;
+    let (root_tree, root_salt) = snapshot_tree(root, mk, store, None)?;
     let commit = Commit {
         root_tree,
         root_salt,
@@ -484,6 +513,8 @@ fn snapshot_dir(
     store: &Store,
     chunker: &secsec_chunk::Chunker,
     depth: usize,
+    prev: Option<&Tree>,
+    this_salt: PathSalt,
 ) -> Result<(Id, PathSalt), SnapError> {
     if depth > MAX_TREE_DEPTH {
         return Err(SnapError::DepthExceeded);
@@ -501,9 +532,15 @@ fn snapshot_dir(
         let path = dir.join(&name_os);
         let meta = std::fs::symlink_metadata(&path)?;
         let ft = meta.file_type();
+        // The same-named entry in the prior tree (if any), used to reuse this path's salt.
+        let prev_entry = prev.and_then(|t| t.entries.iter().find(|e| entry_name(e) == name));
         if ft.is_file() {
             let data = std::fs::read(&path)?;
-            let path_salt = random_salt()?;
+            // Reuse the path's salt across versions (§9.7); a path first seen now gets a fresh one.
+            let path_salt = match prev_entry {
+                Some(Entry::File { path_salt, .. }) => *path_salt,
+                _ => random_salt()?,
+            };
             let mut chunks = Vec::new();
             for chunk in chunker.chunks(&data) {
                 let padded = secsec_object::pad_chunk(chunk, Padding::PowerOfTwo);
@@ -520,7 +557,27 @@ fn snapshot_dir(
                 chunks,
             });
         } else if ft.is_dir() {
-            let (subtree, subtree_salt) = snapshot_dir(&path, mk, store, chunker, depth + 1)?;
+            // Reuse the subdir's salt and feed its prior tree down so its descendants reuse salts too.
+            let (prev_sub, sub_salt) = match prev_entry {
+                Some(Entry::Dir {
+                    subtree,
+                    subtree_salt,
+                    ..
+                }) => (
+                    Some(load_tree(subtree, subtree_salt, mk, store)?),
+                    *subtree_salt,
+                ),
+                _ => (None, random_salt()?),
+            };
+            let (subtree, subtree_salt) = snapshot_dir(
+                &path,
+                mk,
+                store,
+                chunker,
+                depth + 1,
+                prev_sub.as_ref(),
+                sub_salt,
+            )?;
             entries.push(Entry::Dir {
                 name,
                 mode: mode_of(&meta),
@@ -534,10 +591,9 @@ fn snapshot_dir(
     }
 
     let tree = Tree { entries };
-    let salt = random_salt()?;
-    let (id, blob) = seal_object(mk, ObjType::Tree, &salt, &encode_tree(&tree));
+    let (id, blob) = seal_object(mk, ObjType::Tree, &this_salt, &encode_tree(&tree));
     store.put(&id, &blob)?;
-    Ok((id, salt))
+    Ok((id, this_salt))
 }
 
 // ---- restore ----
@@ -614,6 +670,44 @@ fn restore_tree(
         }
     }
     Ok(())
+}
+
+// ---- tree bridge primitives (§10 merge orchestration) ----
+//
+// Single-level tree I/O exposed for the sync engine, which converts a `Tree` to/from its in-memory
+// merge model and drives the recursion itself (it does not pull `secsec-sync` in here).
+
+/// Fetch, open (re-verifying the content address, §9.2), and decode a single `Tree` object. Used by
+/// the merge engine to materialize one directory level; it recurses on `Entry::Dir` children itself.
+pub fn load_tree(
+    tree_id: &Id,
+    tree_salt: &PathSalt,
+    mk: &MasterKey,
+    store: &Store,
+) -> Result<Tree, SnapError> {
+    decode_tree(&fetch_open(mk, ObjType::Tree, tree_salt, tree_id, store)?)
+}
+
+/// Seal a single `Tree` object under a fresh random salt, store it, and return its `(id, salt)`. The
+/// caller seals child subtrees first and records each child's returned salt in its `Entry::Dir`.
+pub fn seal_tree(tree: &Tree, mk: &MasterKey, store: &Store) -> Result<(Id, PathSalt), SnapError> {
+    let salt = random_salt()?;
+    let (id, blob) = seal_object(mk, ObjType::Tree, &salt, &encode_tree(tree));
+    store.put(&id, &blob)?;
+    Ok((id, salt))
+}
+
+/// Restore the tree named by `(tree_id, tree_salt)` into `dest` (created if absent). Like [`restore`]
+/// but starting from a bare tree id rather than a commit — used to materialize a merged tree.
+pub fn restore_tree_into(
+    tree_id: &Id,
+    tree_salt: &PathSalt,
+    mk: &MasterKey,
+    store: &Store,
+    dest: &Path,
+) -> Result<(), SnapError> {
+    std::fs::create_dir_all(dest)?;
+    restore_tree(tree_id, tree_salt, mk, store, dest, 0)
 }
 
 // ---- reachable closure (GC keep-set, §15) ----
@@ -837,7 +931,7 @@ mod tests {
         std::fs::write(src.path().join("sub/b.bin"), [3u8; 8 * 1024]).unwrap();
 
         // produce side: snapshot the tree, wrap it in a signed commit, seal+store it.
-        let (root_tree, root_salt) = snapshot_tree(src.path(), &m, &store).unwrap();
+        let (root_tree, root_salt) = snapshot_tree(src.path(), &m, &store, None).unwrap();
         let commit = Commit {
             root_tree,
             root_salt,
@@ -864,6 +958,69 @@ mod tests {
             verify_commit(&attacker.public(), &got, &sig),
             Err(SnapError::BadSignature)
         ));
+    }
+
+    #[test]
+    fn incremental_snapshot_reuses_salts_and_is_idempotent() {
+        let src = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let m = mk();
+
+        std::fs::write(src.path().join("a.txt"), b"AAAA").unwrap();
+        std::fs::write(src.path().join("b.txt"), b"BBBB").unwrap();
+        std::fs::create_dir_all(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/c"), b"CCCC").unwrap();
+
+        let (id1, salt1) = snapshot_tree(src.path(), &m, &store, None).unwrap();
+        let tree1 = load_tree(&id1, &salt1, &m, &store).unwrap();
+
+        // Re-snapshot with NO change, feeding the prior tree: full idempotence — identical root id
+        // and salt (§9.2/§9.7: salts are constant across versions). Without salt reuse this would
+        // mint all-new ids.
+        let (id2, salt2) = snapshot_tree(src.path(), &m, &store, Some((&id1, &salt1))).unwrap();
+        assert_eq!(
+            id1, id2,
+            "unchanged repo must produce the identical root tree id"
+        );
+        assert_eq!(salt1, salt2);
+
+        // Change exactly one file; unchanged paths keep their entries verbatim (same salt → same
+        // chunk ids → idempotent put), only a.txt's chunks change, and the root salt persists.
+        std::fs::write(src.path().join("a.txt"), b"A-modified").unwrap();
+        let (id3, salt3) = snapshot_tree(src.path(), &m, &store, Some((&id2, &salt2))).unwrap();
+        assert_ne!(id1, id3, "a real change must change the root tree");
+        assert_eq!(salt3, salt1, "root salt persists across versions");
+        let tree3 = load_tree(&id3, &salt3, &m, &store).unwrap();
+
+        let find = |t: &Tree, n: &str| {
+            t.entries
+                .iter()
+                .find(|e| entry_name(e) == n)
+                .unwrap()
+                .clone()
+        };
+        // b.txt and the sub/ subtree are byte-for-byte the same entries as before.
+        assert_eq!(find(&tree1, "b.txt"), find(&tree3, "b.txt"));
+        assert_eq!(find(&tree1, "sub"), find(&tree3, "sub"));
+        // a.txt: salt reused (constant per path), chunk ids differ (content changed).
+        let (
+            Entry::File {
+                path_salt: ps1,
+                chunks: ch1,
+                ..
+            },
+            Entry::File {
+                path_salt: ps3,
+                chunks: ch3,
+                ..
+            },
+        ) = (find(&tree1, "a.txt"), find(&tree3, "a.txt"))
+        else {
+            panic!("a.txt must be a file")
+        };
+        assert_eq!(ps1, ps3, "path_salt is constant across versions");
+        assert_ne!(ch1, ch3, "changed content yields new chunk ids");
     }
 
     #[test]

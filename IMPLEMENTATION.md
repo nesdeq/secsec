@@ -68,7 +68,8 @@ secsec/
 │   ├── secsec-sig/       §9.6  SSHSIG namespaces, verifier (alg pinning, negative tests)
 │   ├── secsec-keyslot/   §8.3  HPKE master-key wrap, mk_commit authenticity
 │   ├── secsec-roster/    §8    sigchain fold/succession, per-entry AEAD, roster-key history, generations, enrollment
-│   ├── secsec-sync/      §10   refs, cas-head, rollback-aware merge, fork detection
+│   ├── secsec-sync/      §10   refs, cas-head, rollback-aware merge (storage-free Node model), fork detection
+│   ├── secsec-engine/    §10   snapshot-tree ↔ merge-node bridge, three-way reconcile to the store
 │   ├── secsec-remote/    §14,§15  multi-remote reconcile, quorum, hardened GC
 │   ├── secsec-transport/ §11   QUIC+TLS pinned verifier, stdio mode, auth, channel binding
 │   ├── secsec-proto/     §12   wire protocol, RPC framing, write/read-auth, rate limits
@@ -81,7 +82,7 @@ secsec/
 ```
 
 Dependency direction is strictly downward (canon → aead/kdf/frame → object/sig/chunk →
-snapshot/store/keyslot/roster → sync → remote/transport/proto → client/server). No security-critical
+snapshot/store/keyslot/roster → sync → engine → remote/transport/proto → client/server). No security-critical
 crate depends on a higher layer. (`secsec-object`, `secsec-snapshot`, `secsec-keyslot` were split
 out as their own crates from the original `object`/`roster` grouping, keeping each core small and
 separately reviewable.)

@@ -1289,6 +1289,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "secsec-engine"
+version = "0.0.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "secsec-frame",
+ "secsec-kdf",
+ "secsec-object",
+ "secsec-sig",
+ "secsec-snapshot",
+ "secsec-store",
+ "secsec-sync",
+ "tempfile",
+]
+
+[[package]]
 name = "secsec-frame"
 version = "0.0.0"
 dependencies = [
