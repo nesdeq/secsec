@@ -27,7 +27,7 @@ use secsec_proto::{
 };
 use secsec_sig::{DeviceId, DevicePublic};
 use secsec_store::Store;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// One authenticated per-op request, as resolved by the connection-auth + framing layers: the
 /// connection's authenticated public key, the operation, its per-op signature, the session
@@ -45,12 +45,11 @@ pub struct Incoming<'a> {
     pub server_nonce: Option<[u8; 32]>,
 }
 
-/// The server's per-op handler state. `enrolled` is the set of `device_id`s that own a keyslot
-/// (the §12 keyslot-existence oracle; a real serve loop checks `/keyslots/<device_id>/*` on disk).
+/// The server's per-op handler state. The §12 keyslot-existence check reads the keyslot store
+/// directly (`/keyslots/<device_id>/*`).
 pub struct Server {
     store: Store,
     nonces: NonceStore,
-    enrolled: HashSet<DeviceId>,
     write_buckets: HashMap<DeviceId, TokenBucket>,
     quotas: HashMap<DeviceId, StorageQuota>,
 }
@@ -62,16 +61,16 @@ impl Server {
         Self {
             store,
             nonces: NonceStore::default(),
-            enrolled: HashSet::new(),
             write_buckets: HashMap::new(),
             quotas: HashMap::new(),
         }
     }
 
-    /// Mark `device_id` as keyslot-owning (rostered). The real serve loop derives this from keyslot
-    /// presence on disk; tests / orchestration call this directly.
-    pub fn enroll(&mut self, device_id: DeviceId) {
-        self.enrolled.insert(device_id);
+    /// Borrow the underlying object + keyslot store (e.g. for enrollment writes by the orchestration
+    /// layer, or `keyslot_exists` queries).
+    #[must_use]
+    pub fn store(&self) -> &Store {
+        &self.store
     }
 
     /// Issue a fresh `server_nonce` challenge (the caller draws it from the OS CSPRNG and sends it to
@@ -103,7 +102,8 @@ impl Server {
             Ok(d) => d,
             Err(_) => return Response::Err(ErrorCode::BadRequest),
         };
-        if !self.enrolled.contains(&device_id) {
+        // keyslot presence only (no decryption) — a store error fails closed.
+        if !self.store.keyslot_exists(&device_id).unwrap_or(false) {
             return Response::Err(ErrorCode::NotEnrolled);
         }
 
@@ -214,6 +214,13 @@ mod tests {
         (Server::new(store), dir)
     }
 
+    /// Enroll `dev` by writing it a keyslot (the §12 keyslot-existence backing).
+    fn enroll(s: &Server, dev: &DeviceKey) {
+        s.store()
+            .put_keyslot(&dev.device_id().unwrap(), 1, b"keyslot")
+            .unwrap();
+    }
+
     /// Sign a read request as `dev` would.
     fn read_req(dev: &DeviceKey, request: Request, transcript: [u8; 32]) -> Incoming<'_> {
         let (op_label, args_hash, _) = op_and_args(&request);
@@ -270,7 +277,7 @@ mod tests {
     fn put_then_get_round_trip() {
         let (mut s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
-        s.enroll(dev.device_id().unwrap());
+        enroll(&s, &dev);
         let id = [0x22; 32];
         let blob = b"object-bytes".to_vec();
 
@@ -298,7 +305,7 @@ mod tests {
     fn bad_signature_is_rejected() {
         let (mut s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
-        s.enroll(dev.device_id().unwrap());
+        enroll(&s, &dev);
         // tamper the signature.
         let mut inc = read_req(&dev, Request::Get { id: [1; 32] }, T);
         *inc.op_sig.last_mut().unwrap() ^= 0x01;
@@ -310,7 +317,7 @@ mod tests {
         // a request whose fields differ from what was signed must fail (server recomputes args_hash).
         let (mut s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
-        s.enroll(dev.device_id().unwrap());
+        enroll(&s, &dev);
         let mut inc = read_req(&dev, Request::Get { id: [1; 32] }, T);
         // swap the requested id after signing.
         inc.request = Request::Get { id: [2; 32] };
@@ -321,7 +328,7 @@ mod tests {
     fn write_nonce_is_single_use() {
         let (mut s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
-        s.enroll(dev.device_id().unwrap());
+        enroll(&s, &dev);
         let nonce = [0x05; 32];
         s.issue_nonce(nonce, 0);
         let put = Request::Put {
@@ -345,7 +352,7 @@ mod tests {
     fn write_without_issued_nonce_is_rejected() {
         let (mut s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
-        s.enroll(dev.device_id().unwrap());
+        enroll(&s, &dev);
         // never issued -> consume fails.
         let put = Request::Put {
             id: [4; 32],
@@ -362,7 +369,7 @@ mod tests {
     fn put_declared_size_mismatch_is_bad_request() {
         let (mut s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
-        s.enroll(dev.device_id().unwrap());
+        enroll(&s, &dev);
         let nonce = [0x06; 32];
         s.issue_nonce(nonce, 0);
         let put = Request::Put {
@@ -380,7 +387,7 @@ mod tests {
     fn has_over_cap_is_rejected() {
         let (mut s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
-        s.enroll(dev.device_id().unwrap());
+        enroll(&s, &dev);
         let ids = vec![[0u8; 32]; limits::MAX_HAS_IDS + 1];
         assert_eq!(
             s.handle(read_req(&dev, Request::Has { ids }, T), 0),

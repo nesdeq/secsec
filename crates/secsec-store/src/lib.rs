@@ -2,12 +2,15 @@
 //!
 //! Objects are opaque, content-addressed ciphertext blobs keyed by their 32-byte id. They are
 //! stored in a single embedded `redb` database (its B-tree *is* the packing — the server is never
-//! flooded with tiny files). The store records only `{id, blob, arrival put_epoch}`; it never sees
-//! plaintext or plaintext-derived metadata.
+//! flooded with tiny files). The store holds opaque blobs (`{id, blob, arrival put_epoch}`) and the
+//! per-device **keyslots** (§13 `/keyslots/<device_id>/<g>`); it never sees plaintext or
+//! plaintext-derived metadata (device_ids and keyslot blobs are all opaque).
 //!
 //! Operations are the read/write primitives behind the §11/§12 server API: [`Store::put`]
-//! (idempotent by id), [`Store::get`], and [`Store::has`]. The monotonic `put_epoch` counter is
-//! incremented on every *new* object and underpins the GC serialization of §15.
+//! (idempotent by id), [`Store::get`], [`Store::has`], and the keyslot store
+//! ([`Store::put_keyslot`] / [`Store::get_keyslot`] / [`Store::keyslot_exists`] /
+//! [`Store::delete_keyslot`] — the latter drives the §12 keyslot-existence auth check and §8.4
+//! revocation). The monotonic `put_epoch` counter underpins the GC serialization of §15.
 
 #![forbid(unsafe_code)]
 
@@ -20,8 +23,20 @@ const OBJECTS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("ob
 const ARRIVAL: TableDefinition<'static, &[u8], u64> = TableDefinition::new("arrival");
 /// named counters; currently just `"put_epoch"`.
 const COUNTERS: TableDefinition<'static, &str, u64> = TableDefinition::new("counters");
+/// `device_id(32) ‖ le32(gen)` → keyslot blob (§13 `/keyslots/<device_id>/<g>`).
+const KEYSLOTS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("keyslots");
 
 const PUT_EPOCH: &str = "put_epoch";
+
+/// The fixed length of a keyslot key: `device_id(32) ‖ le32(gen)`.
+const KEYSLOT_KEY_LEN: usize = 36;
+
+fn keyslot_key(device_id: &[u8; 32], gen: u32) -> [u8; KEYSLOT_KEY_LEN] {
+    let mut k = [0u8; KEYSLOT_KEY_LEN];
+    k[..32].copy_from_slice(device_id);
+    k[32..].copy_from_slice(&gen.to_le_bytes());
+    k
+}
 
 /// An error from the store (wraps the underlying `redb` error).
 #[derive(Debug)]
@@ -70,9 +85,63 @@ impl Store {
             wtx.open_table(OBJECTS)?;
             wtx.open_table(ARRIVAL)?;
             wtx.open_table(COUNTERS)?;
+            wtx.open_table(KEYSLOTS)?;
         }
         wtx.commit()?;
         Ok(Self { db })
+    }
+
+    /// Store (or overwrite) the keyslot blob for `device_id` at generation `gen`
+    /// (§13 `/keyslots/<device_id>/<g>`).
+    pub fn put_keyslot(
+        &self,
+        device_id: &[u8; 32],
+        gen: u32,
+        blob: &[u8],
+    ) -> Result<(), StoreError> {
+        let wtx = self.db.begin_write()?;
+        {
+            let mut ks = wtx.open_table(KEYSLOTS)?;
+            ks.insert(&keyslot_key(device_id, gen)[..], blob)?;
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// Fetch the keyslot blob for `device_id` at generation `gen`, or `None`.
+    pub fn get_keyslot(
+        &self,
+        device_id: &[u8; 32],
+        gen: u32,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let rtx = self.db.begin_read()?;
+        let ks = rtx.open_table(KEYSLOTS)?;
+        Ok(ks
+            .get(&keyslot_key(device_id, gen)[..])?
+            .map(|g| g.value().to_vec()))
+    }
+
+    /// Delete the keyslot for `device_id` at `gen` (revocation, §8.4). Returns `Ok(true)` if one was
+    /// present.
+    pub fn delete_keyslot(&self, device_id: &[u8; 32], gen: u32) -> Result<bool, StoreError> {
+        let wtx = self.db.begin_write()?;
+        let existed;
+        {
+            let mut ks = wtx.open_table(KEYSLOTS)?;
+            existed = ks.remove(&keyslot_key(device_id, gen)[..])?.is_some();
+        }
+        wtx.commit()?;
+        Ok(existed)
+    }
+
+    /// Whether **any** keyslot exists for `device_id` (the §12 keyslot-existence check). Scans the
+    /// `device_id` prefix across generations — filesystem presence only, no decryption.
+    pub fn keyslot_exists(&self, device_id: &[u8; 32]) -> Result<bool, StoreError> {
+        let lo = keyslot_key(device_id, 0);
+        let hi = keyslot_key(device_id, u32::MAX);
+        let rtx = self.db.begin_read()?;
+        let ks = rtx.open_table(KEYSLOTS)?;
+        Ok(ks.range(&lo[..]..=&hi[..])?.next().is_some())
     }
 
     /// Store an object idempotently by `id`. Returns `Ok(true)` if newly stored, `Ok(false)` if an
@@ -210,5 +279,41 @@ mod tests {
         let blob = vec![0xABu8; 4 * 1024 * 1024];
         s.put(&id(9), &blob).unwrap();
         assert_eq!(s.get(&id(9)).unwrap().unwrap(), blob);
+    }
+
+    #[test]
+    fn keyslot_put_get_exists_delete() {
+        let (_d, s) = temp_store();
+        let dev_a = id(0xA0);
+        let dev_b = id(0xB0);
+
+        // no keyslots initially.
+        assert!(!s.keyslot_exists(&dev_a).unwrap());
+        assert_eq!(s.get_keyslot(&dev_a, 1).unwrap(), None);
+
+        // store a keyslot for dev_a at gen 1 and gen 2.
+        s.put_keyslot(&dev_a, 1, b"slot-a1").unwrap();
+        s.put_keyslot(&dev_a, 2, b"slot-a2").unwrap();
+        assert_eq!(
+            s.get_keyslot(&dev_a, 1).unwrap().as_deref(),
+            Some(&b"slot-a1"[..])
+        );
+        assert_eq!(
+            s.get_keyslot(&dev_a, 2).unwrap().as_deref(),
+            Some(&b"slot-a2"[..])
+        );
+
+        // existence is per device, across generations; dev_b still has none.
+        assert!(s.keyslot_exists(&dev_a).unwrap());
+        assert!(!s.keyslot_exists(&dev_b).unwrap());
+
+        // delete gen 1 — dev_a still enrolled via gen 2.
+        assert!(s.delete_keyslot(&dev_a, 1).unwrap());
+        assert_eq!(s.get_keyslot(&dev_a, 1).unwrap(), None);
+        assert!(s.keyslot_exists(&dev_a).unwrap());
+        // delete the last one — now no keyslot for dev_a.
+        assert!(s.delete_keyslot(&dev_a, 2).unwrap());
+        assert!(!s.keyslot_exists(&dev_a).unwrap());
+        assert!(!s.delete_keyslot(&dev_a, 2).unwrap()); // already gone
     }
 }
