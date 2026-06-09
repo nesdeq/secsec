@@ -1360,6 +1360,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "secsec-server"
+version = "0.0.0"
+dependencies = [
+ "secsec-frame",
+ "secsec-proto",
+ "secsec-sig",
+ "secsec-store",
+ "tempfile",
+]
+
+[[package]]
 name = "secsec-sig"
 version = "0.0.0"
 dependencies = [

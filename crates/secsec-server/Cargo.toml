@@ -1,0 +1,19 @@
+[package]
+name = "secsec-server"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Server request handler: §12 per-op authorization pipeline over the object store (finaldesign.md §12, §19)."
+
+[lints]
+workspace = true
+
+[dependencies]
+secsec-proto = { path = "../secsec-proto" }
+secsec-store = { path = "../secsec-store" }
+secsec-sig = { path = "../secsec-sig" }
+secsec-frame = { path = "../secsec-frame" }
+
+[dev-dependencies]
+tempfile = "3"
