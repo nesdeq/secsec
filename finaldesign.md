@@ -320,26 +320,16 @@ single-user repo that will essentially never reach hundreds of rotations.)
 
 ### 8.3 Keyslots — versioned, authenticated by commitment, PQ-ready
 
-A keyslot wraps `master_key_g` to a device key. Format is `algo_id`-versioned:
+A keyslot wraps `master_key_g` to a device. It is stored `algo_id(1B) ‖ body`. **Post-quantum is
+mandatory: X-Wing is the *only* keyslot algorithm** (`algo_id = 2`). The classical X25519/HPKE wrap
+(and the RSA-OAEP variant) were **removed** — after the harvest-now-decrypt-later argument of §17, a
+pre-quantum keyslot is the one harvestable asymmetric exposure, so shipping it as an option is
+incoherent. The `algo_id` tag and the §16 `min_algo` floor remain for forward agility (a future PQ KEM
+bumps the floor); any keyslot below X-Wing is rejected at cold-start.
 
-- **classical (Ed25519 device key):** wrap to the device's X25519 key (Ed25519→X25519 per the
-  standard birational map). HPKE base mode (RFC 9180), pinned suite
-  **DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20Poly1305** (RFC 9180 ciphersuite `0x0021`).
-  The HPKE `info` parameter is:
-  ```
-  info = "secsec-keyslot-v1" ‖ canonical(device_id) ‖ le32(gen)
-  ```
-  This binds the keyslot ciphertext irrevocably to one device and one generation at the HPKE
-  layer. The `info` value and ciphersuite are listed in the §9.6 domain-separation table.
-- **classical (RSA device key):** RSA-OAEP with SHA-256 as the hash and MGF1 function. The OAEP
-  label `L` is the UTF-8 string `secsec-keyslot-v1` (17 bytes); OAEP computes
-  `lHash = SHA-256(b"secsec-keyslot-v1")` internally per RFC 8017 §7.1.1. The §9.6
-  domain-separation table entry reads: `RSA keyslot OAEP label L = b"secsec-keyslot-v1"`
-  (OAEP hash = SHA-256; MGF1 hash = SHA-256). This label provides domain separation between the
-  keyslot-unwrap path and the SSHSIG signing path (which share the same RSA private key). RSA
-  private key material is required on disk for OAEP unwrap; agent/FIDO cannot perform it.
-- **hybrid-PQ:** wrap via **X-Wing** (§17); keyslot ciphertext = `ct_MLKEM(1088 B) ‖ ct_X(32 B)`.
-  ML-KEM-768 key pairs stored exclusively in `(d, z)` seed form (§17, §8.3 note). The device's X-Wing
+- **X-Wing (the only keyslot, §17):** keyslot ciphertext = `ct_MLKEM(1088 B) ‖ ct_X(32 B)`, AEAD AD =
+  `info = "secsec-keyslot-v1" ‖ canonical(device_id) ‖ le32(gen)` (binds it to one device + generation).
+  ML-KEM-768 key pairs stored exclusively in `(d, z)` seed form (§17). The device's X-Wing
   decapsulation seed is `BLAKE3::derive_key("secsec-xwing-seed-v1", ed25519_private_seed)` — derived
   from the raw 32-byte Ed25519 **seed**, **NOT** the clamped scalar `a = clamp(SHA-512(seed)[..32])`.
   This is load-bearing for the post-quantum property: a quantum adversary recovers `a` from the
@@ -1234,9 +1224,13 @@ key generation the FIPS 203 §7.1 keypair consistency check MUST be performed; f
 expanded `ek` is never stored persistently. This requirement prevents MAL-BIND-K-CT and MAL-BIND-K-PK
 failures that arise under the expanded-key representation (Schmieg, ePrint 2024/523).
 
-Signatures are lower urgency (forgery is online, not harvestable). Rollout is a `SetMinAlgo` bump (§16).
-Until the hybrid-PQ keyslot is implemented, §4 P1/P10 mechanism columns reference the classical
-path only.
+The hybrid-PQ keyslot is **mandatory and the only keyslot** (§8.3): every keyslot — at `init`, `grant`,
+and every `rotate` — is X-Wing, so the harvestable asymmetric exposure is post-quantum by default, not
+opt-in. **Signatures**, by contrast, remain classical (Ed25519): forgery is *online*, not harvestable
+(an attacker needs the quantum computer at the moment of the attack, and a recorded signature broken
+later is worthless), so a PQ signature is lower urgency and is added later via the same `algo_id` /
+`SetMinAlgo` agility when quantum is imminent. Confidentiality (the symmetric data plane + the X-Wing
+keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today.
 ## 18. Implementation hardening
 
 - **Memory:** `master_key`, all derived subkeys, `recovery_key`, SSH private material → `secrecy`
@@ -1269,7 +1263,7 @@ path only.
 | Min RSA / preferred | 3072 / Ed25519 | reject weak RSA |
 | Argon2id (passphrase recovery) | m=64 MiB, t=3, p=1, salt=16 B random | offline-attack floor (RFC 9106 second recommended / OWASP high-security); high-entropy code path uses HKDF |
 | Argon2id salt | 16 bytes, OS CSPRNG, per-keyslot, rotated on re-wrap | RFC 9106 §4 mandatory; stored in /recovery blob |
-| HPKE ciphersuite (Ed25519 keyslots) | DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20Poly1305 (RFC 9180 ciphersuite 0x0021); info = "secsec-keyslot-v1" ‖ canonical(device_id) ‖ le32(gen) | consistent with ChaCha20Poly1305 used elsewhere; info binding makes each keyslot ciphertext irrevocably device- and generation-specific at the HPKE layer |
+| Keyslot KEM (mandatory) | **X-Wing** (ML-KEM-768 ⊕ X25519, draft-connolly-cfrg-xwing-kem-10), `algo_id = 2`; CTX AEAD AD = "secsec-keyslot-v1" ‖ canonical(device_id) ‖ le32(gen); device X-Wing seed = `derive_key("secsec-xwing-seed-v1", ed25519_seed)` | post-quantum mandatory — the only keyslot algorithm; classical X25519/HPKE removed (§8.3). Floor enforced at cold-start (§16) |
 | Durability quorum | 2 remotes (put→get→verify round-trip each) | availability under hostile server |
 | Retention | keep-all; prune opt-in | no silent deletion |
 | SAS length | ~20 bits human-verified (6-digit decimal, mod 1,000,000 of 32-bit BLAKE3 truncation) | NIST SP 800-63B-4 floor: ≥20 bits met; the 6-digit decimal encoding conveys log₂(1,000,000) ≈ 19.93 bits of human-verified entropy — the ZRTP 32-bit claim does not apply to this decimal encoding |

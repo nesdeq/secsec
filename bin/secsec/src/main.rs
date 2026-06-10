@@ -312,7 +312,7 @@ fn run_rotate(
 /// X-Wing public key, both hex) to hand to a granter out-of-band during enrollment (§7).
 fn run_enroll_pubkey(key: PathBuf) -> Result<(), Box<dyn Error>> {
     let device = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
-    let xwing = secsec_client::repo::enroll_pub_for(&device, secsec_client::repo::ALGO_XWING)?;
+    let xwing = secsec_client::repo::device_xwing_pub(&device)?;
     println!("device id:      {}", hex(&device.device_id()?));
     println!("ssh pubkey hex: {}", hex(&device.public().to_canonical()?));
     println!("xwing pubkey:   {}", hex(&xwing));
@@ -335,10 +335,9 @@ fn run_grant(
     let granter = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
     let store = Store::open(store)?;
     let rfp = parse_hex32(&rfp_hex)?;
-    let (mk, st) = open_repo(&store, &granter, &rfp)?;
+    let (mk, _st) = open_repo(&store, &granter, &rfp)?;
 
     let d_pub = secsec_sig::DevicePublic::from_canonical(&parse_hex(&device_pub_hex)?)?;
-    let d_x25519 = d_pub.x25519_public()?;
     let d_xwing = parse_hex(&xwing_pub_hex)?;
     let mut enrollment_nonce = [0u8; 32];
     getrandom::fill(&mut enrollment_nonce)?;
@@ -347,9 +346,7 @@ fn run_grant(
         &store,
         &granter,
         &mk,
-        &st,
         &d_pub,
-        &d_x25519,
         &d_xwing,
         &enrollment_nonce,
         unix_secs(),
