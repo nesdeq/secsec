@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod gc;
+pub mod gossip;
 pub mod multiremote;
 pub mod quic;
 pub mod repo;

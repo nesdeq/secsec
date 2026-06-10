@@ -19,10 +19,10 @@ Running status of milestones (M), risks (R), and forward-carried debts. Updated 
 | M3 Sync | head, dag, merge, rollback gates, fork detection | ✅ done |
 | M4 Transport | QUIC pinned verifier, §12 wire + server pipeline, limits | ✅ done |
 | M5 Live sync | watcher, concurrent multi-client, clone/publish/pull/merge, init, frontier seal, `sync --watch` | ✅ done |
-| M6 Durability & recovery | see below | 🟡 in progress |
+| M6 Durability & recovery | see below | ✅ **done** |
 | M7 Later | PQ keyslot, stdio, RSA, WebDAV | ❌ deferred |
 
-### M6 detail
+### M6 detail — all done
 
 - ✅ §8.5 local frontier persistence (sealed under SSH-key)
 - ✅ §8.6 recovery keyslot (`secsec-recovery`: code + passphrase/Argon2id, mk_commit-verified)
@@ -30,9 +30,13 @@ Running status of milestones (M), risks (R), and forward-carried debts. Updated 
 - ✅ §15 `all_heads_hash` bug fixed (server-visible head-blob hashes, not encrypted head_version)
 - ✅ §15 GC orchestration — arrival receipts + `gc` wire op + CAS-serialized handler + client driver
   (live-QUIC proven: sweeps garbage, keeps reachable, CAS fails on stale state). **R6 fully closed.**
-  Receipt *signature* (host-key SIG, §15 defence-in-depth) is the one follow-up.
-- ⏳ §14 multi-remote + quorum (`secsec-remote`)
-- ⏳ §10/§14 gossip (head-hash cross-check)
+- ✅ §14 multi-remote + quorum — `client::multiremote`: quorum put→get→verify (P15), sigchain
+  cross-remote reconciliation (longest valid chain + rollback alarms), per-ref head-rollback detection.
+- ✅ §10/§14 gossip — `client::gossip::cross_remote_fork_scan`: DAG-incomparable head detection across
+  remotes → ForkEvent audit records (§10 step 3).
+
+**M6 follow-ups (small, non-blocking):** receipt host-key signature (§15 defence-in-depth); fork-event
+log to disk; device-to-device gossip transport (thin layer over the same fork check).
 
 ## Risks
 
