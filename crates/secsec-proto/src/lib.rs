@@ -50,6 +50,10 @@ pub mod op {
     pub const GET_KEYSLOT: &str = "get-keyslot";
     /// Store a device's keyslot blob (`/keyslots/<device_id>/<g>`, §13) — the network half of enrollment.
     pub const PUT_KEYSLOT: &str = "put-keyslot";
+    /// Post to the transient pairing mailbox (§7 invite onboarding); allowed pre-enrollment.
+    pub const PAIR_PUT: &str = "pair-put";
+    /// Read the transient pairing mailbox (§7 invite onboarding); allowed pre-enrollment.
+    pub const PAIR_GET: &str = "pair-get";
     /// Fetch a roster-key-history wrap (`/roster-keyhist/<g>`, §8.2) — for rotation-era cold-start.
     pub const GET_ROSTER_KEYHIST: &str = "get-roster-keyhist";
     /// Fetch a DATA key-history wrap (`/keyhist/<g>`, §8.2) — peeling `master_key_g` for old objects.
@@ -131,6 +135,16 @@ pub fn args_put_keyslot(device_id: &Id, gen: u32, blob: &[u8]) -> [u8; 32] {
     blake3_of(&w.finish())
 }
 
+/// `args_hash` for the pairing mailbox ops (§7): `BLAKE3(canonical(op ‖ slot))`. The blob itself is
+/// MAC'd under the invite code end-to-end, so the per-op signature only proves the connecting key
+/// holds its private SSH key (pre-enrollment), not authorization.
+#[must_use]
+pub fn args_pair(op_label: &str, slot: &Id) -> [u8; 32] {
+    let mut w = Writer::new();
+    w.raw(op_label.as_bytes()).raw(slot);
+    blake3_of(&w.finish())
+}
+
 /// The op label, recomputed `args_hash`, and whether it is a write op, for a request (§12). Both the
 /// client (to sign) and the server (to verify) call this so neither can disagree on the binding.
 #[must_use]
@@ -188,6 +202,10 @@ pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
             args_put_keyslot(device_id, *gen, blob),
             true,
         ),
+        // Pairing ops are read-auth (signed by the connecting key, no server_nonce); the server
+        // dispatches them before the enrollment check (§7 invite onboarding).
+        Request::PairPut { slot, .. } => (op::PAIR_PUT, args_pair(op::PAIR_PUT, slot), false),
+        Request::PairGet { slot } => (op::PAIR_GET, args_pair(op::PAIR_GET, slot), false),
     }
 }
 

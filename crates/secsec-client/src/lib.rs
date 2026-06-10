@@ -21,6 +21,7 @@ pub mod enroll;
 pub mod gc;
 pub mod gossip;
 pub mod multiremote;
+pub mod pair;
 pub mod quic;
 pub mod repo;
 pub mod sync;
@@ -162,6 +163,14 @@ pub trait Remote {
     /// CAS conflict (re-fold + retry). Defaults to an error for read-only backends.
     async fn roster_append(&self, _old_tip: &Id, _entry: &[u8]) -> Result<bool, RemoteError> {
         Err(RemoteError("roster_append unsupported by this remote".to_string()))
+    }
+    /// Post an opaque blob to the §7 invite-onboarding pairing mailbox slot. Allowed pre-enrollment.
+    async fn pair_put(&self, _slot: &Id, _blob: &[u8]) -> Result<(), RemoteError> {
+        Err(RemoteError("pair_put unsupported by this remote".to_string()))
+    }
+    /// Read a §7 pairing mailbox slot (`None` if empty/expired). Allowed pre-enrollment.
+    async fn pair_get(&self, _slot: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
+        Err(RemoteError("pair_get unsupported by this remote".to_string()))
     }
 }
 

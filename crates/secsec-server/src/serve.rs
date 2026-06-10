@@ -65,18 +65,10 @@ where
     // §11 application handshake: authenticate the connecting key.
     let session = server_handshake(conn, host_id, random32()).await?;
 
-    // §12 keyslot existence: the authenticated key must be rostered.
-    let device_id = session
-        .pubkey
-        .device_id()
-        .map_err(|e| ServeError::Store(e.to_string()))?;
-    if !server
-        .store()
-        .keyslot_exists(&device_id)
-        .map_err(|e| ServeError::Store(e.to_string()))?
-    {
-        return Err(ServeError::NotEnrolled);
-    }
+    // Enrollment is enforced **per op** inside `Server::handle` (§12 keyslot-existence check): an
+    // unenrolled key may complete the handshake and run only the §7 pairing-mailbox ops; every other
+    // op is rejected with `NotEnrolled`. We deliberately do **not** reject the connection here, so a
+    // joining device (which owns no keyslot yet) can pair over the wire.
 
     // Request loop: one bidi stream per op.
     while let Ok((mut send, mut recv)) = conn.accept_bi().await {

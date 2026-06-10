@@ -31,6 +31,11 @@ use std::collections::{BTreeSet, HashMap};
 
 /// One hour, in seconds — the `gc` rate-limit window (§19: 4 gc calls / key / hour).
 const GC_WINDOW_SECS: u64 = 3600;
+/// Pairing-mailbox entry TTL (§7 invite onboarding): the agreed invite lifetime (~10 minutes). An
+/// unclaimed pairing slot is evicted after this; an invite is single-use and short-lived.
+const PAIR_TTL_SECS: u64 = 600;
+/// Anti-abuse cap on concurrent pairing-mailbox slots (each ≤ `MAX_ROSTER_ENTRY_SIZE`, TTL-evicted).
+const MAX_PAIR_SLOTS: usize = 256;
 
 /// One authenticated per-op request, as resolved by the connection-auth + framing layers: the
 /// connection's authenticated public key, the operation, its per-op signature, the session
@@ -58,9 +63,27 @@ struct ServerState {
     write_buckets: HashMap<DeviceId, TokenBucket>,
     quotas: HashMap<DeviceId, StorageQuota>,
     gc_calls: HashMap<DeviceId, WindowCounter>,
+    /// §7 invite-onboarding mailbox: `slot → (blob, expiry)`. Transient, never persisted, TTL-evicted.
+    pairing: HashMap<[u8; 32], (Vec<u8>, u64)>,
 }
 
 impl ServerState {
+    /// Post to a pairing slot (evicting expired entries first); `false` if the mailbox is full.
+    fn pair_put(&mut self, slot: [u8; 32], blob: Vec<u8>, now: u64) -> bool {
+        self.pairing.retain(|_, (_, exp)| *exp > now);
+        if self.pairing.len() >= MAX_PAIR_SLOTS && !self.pairing.contains_key(&slot) {
+            return false;
+        }
+        self.pairing.insert(slot, (blob, now + PAIR_TTL_SECS));
+        true
+    }
+
+    /// Read a pairing slot (`None` if empty/expired), evicting expired entries.
+    fn pair_get(&mut self, slot: &[u8; 32], now: u64) -> Option<Vec<u8>> {
+        self.pairing.retain(|_, (_, exp)| *exp > now);
+        self.pairing.get(slot).map(|(b, _)| b.clone())
+    }
+
     fn gc_record(&mut self, d: DeviceId, now: u64) -> bool {
         self.gc_calls
             .entry(d)
@@ -161,6 +184,53 @@ impl Server {
         self.state.lock().expect("server state").gc_record(d, now)
     }
 
+    fn pair_put(&self, slot: [u8; 32], blob: Vec<u8>, now: u64) -> bool {
+        self.state
+            .lock()
+            .expect("server state")
+            .pair_put(slot, blob, now)
+    }
+
+    fn pair_get(&self, slot: &[u8; 32], now: u64) -> Option<Vec<u8>> {
+        self.state.lock().expect("server state").pair_get(slot, now)
+    }
+
+    /// §7 invite-onboarding pairing mailbox. Allowed **pre-enrollment** (a joining device owns no
+    /// keyslot yet), so it is dispatched before the keyslot-existence check. Authenticated only by the
+    /// read-auth signature (proving the connecting key holds its private SSH key); the payload is MAC'd
+    /// under the invite code end to end, so the blind server merely relays + TTLs it. Slot ids are
+    /// `BLAKE3(label ‖ code)`, so the server never learns the code.
+    fn handle_pair(&self, inc: Incoming<'_>, now: u64) -> Response {
+        let (op_label, args_hash, _) = op_and_args(&inc.request);
+        let ra = ReadAuth {
+            op: op_label,
+            args_hash,
+            session_transcript: inc.session_transcript,
+        };
+        if ra.verify(inc.pubkey, &inc.op_sig).is_err() {
+            return Response::Err(ErrorCode::BadAuth);
+        }
+        let device_id = match inc.pubkey.device_id() {
+            Ok(d) => d,
+            Err(_) => return Response::Err(ErrorCode::BadRequest),
+        };
+        match inc.request {
+            Request::PairPut { slot, blob } => {
+                // Rate-limit posts via the connecting key's write bucket (anti-mailbox-flood).
+                if !self.take_write(device_id, blob.len() as u64, now) {
+                    return Response::Err(ErrorCode::RateLimit);
+                }
+                if self.pair_put(slot, blob, now) {
+                    Response::Ok
+                } else {
+                    Response::Err(ErrorCode::RateLimit)
+                }
+            }
+            Request::PairGet { slot } => Response::Blob(self.pair_get(&slot, now)),
+            _ => Response::Err(ErrorCode::Internal),
+        }
+    }
+
     /// Build the §15 `Stored` receipt, signed by the host receipt key when configured ([`with_receipts`];
     /// else all-zero pubkey/signature).
     fn receipt(&self, id: &[u8; 32], arrival_gen: u64, put_epoch: u64, now: u64) -> Response {
@@ -182,14 +252,30 @@ impl Server {
 
     /// Run the §12 pipeline for one request and return the response.
     pub fn handle(&self, inc: Incoming<'_>, now: u64) -> Response {
-        // (1) keyslot existence: the connecting key must be rostered.
+        // (0) Pairing mailbox (§7 invite onboarding): allowed PRE-enrollment (a joining device owns no
+        // keyslot yet), so dispatch it before the keyslot-existence check.
+        if matches!(inc.request, Request::PairPut { .. } | Request::PairGet { .. }) {
+            return self.handle_pair(inc, now);
+        }
+
+        // (1) keyslot existence: the connecting key must be rostered (enrolled), with a
+        // **genesis-bootstrap exception**: the first device creating an *empty* repo has no prior
+        // keyslot, so it may write its own keyslot and the genesis roster entry while the roster is
+        // still empty (`roster_len == 0`). Every other op requires enrollment. (Connection-level
+        // access — e.g. an `authorized_keys` allow-list — is enforced one layer up in `serve`.)
         let device_id = match inc.pubkey.device_id() {
             Ok(d) => d,
             Err(_) => return Response::Err(ErrorCode::BadRequest),
         };
         // keyslot presence only (no decryption) — a store error fails closed.
         if !self.store.keyslot_exists(&device_id).unwrap_or(false) {
-            return Response::Err(ErrorCode::NotEnrolled);
+            let genesis_bootstrap = matches!(
+                inc.request,
+                Request::RosterAppend { .. } | Request::PutKeyslot { .. }
+            ) && self.store.roster_len().map(|n| n == 0).unwrap_or(false);
+            if !genesis_bootstrap {
+                return Response::Err(ErrorCode::NotEnrolled);
+            }
         }
 
         // gc has a state-dependent args_hash (§15 compare-and-swap), so it is authorized separately
@@ -342,6 +428,8 @@ impl Server {
             }
             // gc is dispatched before this match (state-dependent auth, §15); never reached here.
             Request::Gc { .. } => Response::Err(ErrorCode::Internal),
+            // Pairing ops are dispatched at the top of `handle` (pre-enrollment); never reached here.
+            Request::PairPut { .. } | Request::PairGet { .. } => Response::Err(ErrorCode::Internal),
         }
     }
 

@@ -171,6 +171,28 @@ impl Remote for QuicRemote<'_> {
         }
     }
 
+    async fn pair_put(&self, slot: &Id, blob: &[u8]) -> Result<(), RemoteError> {
+        match self
+            .call(Request::PairPut {
+                slot: *slot,
+                blob: blob.to_vec(),
+            })
+            .await?
+        {
+            Response::Ok => Ok(()),
+            Response::Err(c) => Err(RemoteError(format!("pair-put: {c:?}"))),
+            other => Err(RemoteError(format!("pair-put: unexpected {other:?}"))),
+        }
+    }
+
+    async fn pair_get(&self, slot: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
+        match self.call(Request::PairGet { slot: *slot }).await? {
+            Response::Blob(b) => Ok(b),
+            Response::Err(c) => Err(RemoteError(format!("pair-get: {c:?}"))),
+            other => Err(RemoteError(format!("pair-get: unexpected {other:?}"))),
+        }
+    }
+
     async fn gc(
         &self,
         keep_set: Vec<Id>,

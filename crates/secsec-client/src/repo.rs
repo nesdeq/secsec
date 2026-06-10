@@ -278,15 +278,19 @@ pub async fn init_repo_remote<R: Remote>(
     let (entry, rfp) = genesis(device, xwing_pub.clone(), mk.mk_commit(), ts)?;
     let roster_key = mk.roster_key();
     let blob = seal_entry(&roster_key, 1, 0, &encode_entry(&entry));
+
+    // Write the creator's own keyslot FIRST (allowed pre-enrollment only while the roster is empty —
+    // the server's genesis-bootstrap exception), so that by the time the genesis entry is appended the
+    // creator is already enrolled.
+    let device_id = device.device_id()?;
+    let keyslot = wrap_keyslot(&key, 1, &device_id, &xwing_pub)?;
+    remote.put_keyslot(&device_id, 1, &keyslot).await?;
+
     // Genesis CAS: `old_tip` is the all-zero sentinel ("expect empty"); a `false` return means another
     // device already created the repo.
     if !remote.roster_append(&ABSENT_HEAD, &blob).await? {
         return Err(RepoError::AlreadyInitialized);
     }
-
-    let device_id = device.device_id()?;
-    let keyslot = wrap_keyslot(&key, 1, &device_id, &xwing_pub)?;
-    remote.put_keyslot(&device_id, 1, &keyslot).await?;
     Ok(rfp)
 }
 
@@ -662,6 +666,53 @@ pub fn grant_device(
         roster_seq,
         enrollment_nonce,
     )?)
+}
+
+/// §7 `grant` over a [`Remote`] — the network half of enrollment, run by a current member while
+/// completing an invite pairing ([`crate::pair`]). Fetches the sigchain tip, appends an `AddDevice`
+/// entry (publishing D's X-Wing public), and wraps `master_key_g` to D's keyslot, all over the wire
+/// (`roster-append` + `put-keyslot`). D's keys are authenticated by the invite-code MAC, so the §7 SAS
+/// attestation is unnecessary here. On a CAS race the caller re-folds and retries.
+pub async fn grant_device_remote<R: Remote>(
+    remote: &R,
+    device: &DeviceKey,
+    mk: &MasterKey,
+    d_pubkey: &DevicePublic,
+    d_xwing_pub: &[u8],
+    ts: u64,
+) -> Result<(), RepoError> {
+    if d_xwing_pub.is_empty() {
+        return Err(RepoError::Pq);
+    }
+    let g = mk.generation();
+    let mk_commit = mk.mk_commit();
+    let rk = mk.roster_key();
+
+    // Fetch + decrypt the current tip to chain the AddDevice entry onto it.
+    let entries = fetch_roster_entries(remote).await?;
+    let tip_seq = u64::try_from(entries.len().checked_sub(1).ok_or(RepoError::NotInitialized)?)
+        .map_err(|_| RepoError::NotInitialized)?;
+    let tip_blob = entries.last().ok_or(RepoError::NotInitialized)?;
+    let tip_entry = decode_entry(&open_entry(&rk, g, tip_seq, tip_blob)?)?;
+
+    let d_canonical = d_pubkey.to_canonical()?;
+    let op = Op::AddDevice {
+        pubkey: d_canonical,
+        mk_commit,
+        enroll_pub: d_xwing_pub.to_vec(),
+    };
+    let entry = append(&tip_entry, op, device, ts)?;
+    let roster_seq = entry.seq;
+    let blob = seal_entry(&rk, g, roster_seq, &encode_entry(&entry));
+    let old_tip = *blake3::hash(tip_blob).as_bytes();
+    if !remote.roster_append(&old_tip, &blob).await? {
+        return Err(RepoError::RosterCasConflict);
+    }
+
+    let d_id = d_pubkey.device_id()?;
+    let keyslot = wrap_keyslot(mk.expose_secret(), g, &d_id, d_xwing_pub)?;
+    remote.put_keyslot(&d_id, g, &keyslot).await?;
+    Ok(())
 }
 
 /// Fetch a remote's full sigchain (`get-roster` `seq = 0, 1, …` until absent), bounded by the §19

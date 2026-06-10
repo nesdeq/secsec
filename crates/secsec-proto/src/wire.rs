@@ -217,6 +217,21 @@ pub enum Request {
         /// The opaque `algo_id ‖ body` keyslot blob (§8.3).
         blob: Vec<u8>,
     },
+    /// Post an opaque blob to the transient **pairing mailbox** slot `slot` (§7 invite onboarding). The
+    /// slot is `BLAKE3(label ‖ invite_code)`, so only parties holding the code address it; the blob is
+    /// MAC'd under the code, so the server (which never learns the code) only relays it. Allowed
+    /// **pre-enrollment** (a joining device owns no keyslot yet) and aggressively rate-limited + TTL'd.
+    PairPut {
+        /// Mailbox slot id (a hash of the invite code + a direction label).
+        slot: Id,
+        /// The opaque, code-MAC'd pairing message.
+        blob: Vec<u8>,
+    },
+    /// Read the transient pairing mailbox slot `slot` (`None` if empty/expired). Pre-enrollment allowed.
+    PairGet {
+        /// Mailbox slot id.
+        slot: Id,
+    },
 }
 
 const T_GET: u8 = 0;
@@ -231,6 +246,8 @@ const T_GC: u8 = 8;
 const T_GETRKH: u8 = 9;
 const T_GETKH: u8 = 10;
 const T_PUTKEYSLOT: u8 = 11;
+const T_PAIRPUT: u8 = 12;
+const T_PAIRGET: u8 = 13;
 
 impl Request {
     /// Canonical encoding (tag-prefixed).
@@ -298,6 +315,12 @@ impl Request {
             } => {
                 w.u8(T_PUTKEYSLOT).raw(device_id).u32(*gen).bytes(blob);
             }
+            Request::PairPut { slot, blob } => {
+                w.u8(T_PAIRPUT).raw(slot).bytes(blob);
+            }
+            Request::PairGet { slot } => {
+                w.u8(T_PAIRGET).raw(slot);
+            }
         }
         w.finish()
     }
@@ -363,6 +386,13 @@ impl Request {
                 device_id: read32(&mut r)?,
                 gen: r.u32()?,
                 blob: r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec(),
+            },
+            T_PAIRPUT => Request::PairPut {
+                slot: read32(&mut r)?,
+                blob: r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec(),
+            },
+            T_PAIRGET => Request::PairGet {
+                slot: read32(&mut r)?,
             },
             other => return Err(WireError::BadTag(other)),
         };

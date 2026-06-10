@@ -29,6 +29,8 @@ notify = "8"
 blake3 = "1"
 getrandom = "0.3"
 zeroize = "1"
+subtle = "2"
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 tempfile = "3"
