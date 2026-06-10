@@ -5,8 +5,12 @@ Running status of milestones (M), risks (R), and forward-carried debts. Updated 
 
 ## Snapshot
 
-- **20 crates + `secsec` binary** (+ `xtask` tooling, `fuzz/` cargo-fuzz layout) · 252 tests · clippy
+- **20 crates + `secsec` binary** (+ `xtask` tooling, `fuzz/` cargo-fuzz layout) · 255 tests · clippy
   `-D warnings` + fmt clean · spec↔code↔doc consistent.
+- **Full-source audit (2026-06-10):** read all ~18.3k LoC + the spec. Found **one** soundness/conformance
+  defect — `secsec-pq` was non-conformant X-Wing (label-first + two independent seeds, hidden by an
+  ignored KAT). Fixed + KAT-proven against the draft-10 vector. Then closed the §8.2 DATA key-history
+  gap. Everything else is conformant; the rest are unbuilt spec features (below).
 - **The product runs:** `secsec init` / `serve` / `sync` (+ `--watch`) — two devices live-sync a folder through a
   blind server over QUIC, concurrent, no data loss. Verified end-to-end with real processes.
 - **All forward-carried debt (#6–16) closed.** M0–M7 functionally complete for v1 (RSA + WebDAV dropped).
@@ -81,12 +85,20 @@ tests, KATs, proptests, model-based differential fold test, live-QUIC e2e, fuzz-
 full-source audit (2026-06-10) found **one** soundness defect — `secsec-pq` was non-conformant
 X-Wing — now fixed and KAT-proven. The remaining gaps are unimplemented spec features:
 
+- ✅ **§8.2 DATA key-history** (`/keyhist/<g>`) — **done** (kdf `data_keyhist_key`, roster
+  `seal/open/peel_data_keys`, store `KEYHIST`, `GetKeyhist` wire op, `rotate_repo` producer,
+  `data_keyring`/`data_keyring_remote`). A fresh cold-started device peels the keyring and reads
+  pre- *and* post-rotation objects (proven in-process + over live QUIC). **Remaining consumer:**
+  auto-select the per-object generation inside `fetch_closure`/`restore` for full rotation-era LIVE
+  sync (the sync loop still runs at the genesis generation today).
 - **X-Wing `algo_id` integration** — the conformant keyslot exists but no `algo_id` reaches it;
-  `repo.rs` always uses the classical HPKE slot. Needs a FRAME `algo_id` + `SetMinAlgo` path.
-- **§8.2 DATA key-history** (`/keyhist/<g>`) — reading pre-rotation *object* content after a rotate
-  is unimplemented (only the roster-key history is). Cross-rotation history traversal breaks.
-- **§7 SAS rate-limit** (5/hr per D_pubkey), **§16 per-fetch `min_algo`** on keyslots, **§8.1
-  `HistoryReanchor`**, and CLI surfaces `rotate`/`grant`/`recover`/`gc` — all absent.
+  `repo.rs` always uses the classical HPKE slot. Needs a FRAME `algo_id` + a device X-Wing-key
+  enrollment decision (derive the seed from the SSH scalar? publish in `AddDevice`?) + `SetMinAlgo`.
+- **§7 SAS rate-limit** (5/hr per D_pubkey), **§16 per-fetch `min_algo`** on keyslots (keyslots need
+  a FRAME/`algo_id` first), **§8.1 `HistoryReanchor`** (`finalrew.md` flags it as spec-unsound — a
+  fresh device can't decrypt dropped generations to verify succession; needs a signed
+  membership-snapshot baseline), and CLI surfaces `rotate`/`grant`/`recover`/`gc` (cores operate on a
+  local `Store`; wiring to the remote model is real work). All absent.
 - Live `russh` stdio `H`/`K_S` wiring (deployment-only, no security gain over pinned QUIC).
 
 Residual (not debt): §8.5 seal-before-push ordering is conservative (crash-safe via FF retry).
