@@ -1,0 +1,3 @@
+# `cargo xtask <cmd>` → runs the xtask build-tooling binary (finaldesign.md §3/§20).
+[alias]
+xtask = "run --quiet --package xtask --"

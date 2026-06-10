@@ -2555,6 +2555,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "xtask"
+version = "0.0.0"
+dependencies = [
+ "secsec-aead",
+ "secsec-frame",
+ "secsec-kdf",
+ "secsec-object",
+ "secsec-proto",
+ "secsec-roster",
+ "secsec-sync",
+ "secsec-transport",
+]
+
+[[package]]
 name = "yasna"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
