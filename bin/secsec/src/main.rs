@@ -76,10 +76,14 @@ enum Cmd {
         /// Server address (e.g. `127.0.0.1:8899`).
         #[arg(long)]
         remote: SocketAddr,
-        /// The server's host certificate (DER), e.g. `<hostkey_dir>/hostkey.crt` — the pin. (The §11
-        /// `--host-fp` fingerprint form needs a hash-comparing verifier; not yet wired.)
+        /// The server's host certificate (DER), e.g. `<hostkey_dir>/hostkey.crt`. Pins the host by its
+        /// full key. Mutually exclusive with `--host-fp`.
+        #[arg(long, conflicts_with = "host_fp", required_unless_present = "host_fp")]
+        host_cert: Option<PathBuf>,
+        /// The server's host fingerprint (`host_id` hex, from `secsec hostkey`) — pin by fingerprint
+        /// alone, no cert needed (§11). Mutually exclusive with `--host-cert`.
         #[arg(long)]
-        host_cert: PathBuf,
+        host_fp: Option<String>,
         /// This device's OpenSSH private key (the one enrolled at `init`).
         #[arg(long)]
         key: PathBuf,
@@ -217,7 +221,8 @@ fn read_base(path: &Path) -> Result<Option<[u8; 32]>, Box<dyn Error>> {
 #[allow(clippy::too_many_arguments)]
 async fn run_sync(
     remote: SocketAddr,
-    host_cert: PathBuf,
+    host_cert: Option<PathBuf>,
+    host_fp: Option<String>,
     key: PathBuf,
     dir: PathBuf,
     store_path: PathBuf,
@@ -231,7 +236,12 @@ async fn run_sync(
     use std::time::Duration;
 
     let device = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
-    let pin = HostPin::from_cert(&std::fs::read(&host_cert)?)?;
+    // Pin by full cert (--host-cert) or by host_id fingerprint (--host-fp); clap guarantees one.
+    let pin = match (host_cert, host_fp) {
+        (Some(cert), _) => HostPin::from_cert(&std::fs::read(&cert)?)?,
+        (None, Some(fp)) => HostPin::from_host_id(parse_hex32(&fp)?),
+        (None, None) => return Err("one of --host-cert / --host-fp is required".into()),
+    };
     let host_id = pin.host_id();
     let rfp = parse_hex32(&rfp_hex)?;
 
@@ -351,6 +361,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Cmd::Sync {
             remote,
             host_cert,
+            host_fp,
             key,
             dir,
             store,
@@ -365,6 +376,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             rt.block_on(run_sync(
                 remote,
                 host_cert,
+                host_fp,
                 key,
                 dir,
                 store,

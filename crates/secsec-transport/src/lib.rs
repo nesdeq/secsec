@@ -34,38 +34,54 @@ use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 use subtle::ConstantTimeEq;
 use x509_cert::der::{Decode, Encode};
 
-/// The server's pinned identity: its certificate SubjectPublicKeyInfo (SPKI) DER, plus the
-/// derived `host_id` (§11). Construct from a server cert with [`HostPin::from_cert`].
+/// The server's pinned identity, anchored on `host_id = BLAKE3(SPKI)` (§11). A pin can be built from
+/// the full server cert/SPKI (TOFU at `init`) **or** from just the `host_id` fingerprint (`--host-fp`).
+/// The verifier compares `BLAKE3(presented SPKI)` to the pinned `host_id` — equivalent to a full-SPKI
+/// compare (BLAKE3 collision resistance) but pinnable from the 32-byte fingerprint alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostPin {
-    spki: Vec<u8>,
+    host_id: [u8; 32],
+    /// The full SPKI when known (cert/SPKI pins); `None` for a fingerprint-only (`--host-fp`) pin.
+    spki: Option<Vec<u8>>,
 }
 
 impl HostPin {
     /// Pin to a SubjectPublicKeyInfo DER directly (e.g. recovered from a stored pin).
     #[must_use]
     pub fn from_spki(spki: Vec<u8>) -> Self {
-        Self { spki }
+        Self {
+            host_id: *blake3::hash(&spki).as_bytes(),
+            spki: Some(spki),
+        }
     }
 
     /// Extract and pin the SPKI from a server certificate (DER). This is what `init`/TOFU records.
     pub fn from_cert(cert_der: &[u8]) -> Result<Self, PinError> {
-        Ok(Self {
-            spki: spki_of(cert_der)?,
-        })
+        Ok(Self::from_spki(spki_of(cert_der)?))
     }
 
-    /// The pinned SPKI DER bytes.
+    /// Pin to a `host_id` fingerprint directly (§11 `--host-fp`): the BLAKE3 of the server's SPKI,
+    /// obtained out-of-band. No certificate is needed to pin — the verifier hashes the presented SPKI
+    /// and compares to this.
     #[must_use]
-    pub fn spki(&self) -> &[u8] {
-        &self.spki
+    pub fn from_host_id(host_id: [u8; 32]) -> Self {
+        Self {
+            host_id,
+            spki: None,
+        }
+    }
+
+    /// The pinned SPKI DER bytes, if this pin carries them (cert/SPKI pins; `None` for `--host-fp`).
+    #[must_use]
+    pub fn spki(&self) -> Option<&[u8]> {
+        self.spki.as_deref()
     }
 
     /// `host_id = BLAKE3(canonical(server pinned SPKI bytes))` (§11): bound into the connection-auth
     /// signature (§9.6). MUST be computed by the client from this locally-pinned material.
     #[must_use]
     pub fn host_id(&self) -> [u8; 32] {
-        *blake3::hash(&self.spki).as_bytes()
+        self.host_id
     }
 }
 
@@ -118,13 +134,16 @@ impl ServerCertVerifier for PinnedServerVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        // Pin check: the leaf certificate's SPKI must equal the pinned SPKI, compared in constant
-        // time. No chain building, no name verification — the pin *is* the trust anchor (§11).
+        // Pin check: BLAKE3(leaf SPKI) must equal the pinned `host_id`, compared in constant time. No
+        // chain building, no name verification — the pin *is* the trust anchor (§11). Hashing the SPKI
+        // (rather than comparing SPKI bytes) lets a client pin from just the `host_id` fingerprint
+        // (--host-fp) and is equivalent under BLAKE3 collision resistance.
         let presented = spki_of(end_entity)
             .map_err(|_| Error::General("malformed server certificate".into()))?;
-        if presented.len() != self.pin.spki.len() || !bool::from(presented.ct_eq(&self.pin.spki)) {
+        let presented_id = *blake3::hash(&presented).as_bytes();
+        if !bool::from(presented_id.ct_eq(&self.pin.host_id())) {
             return Err(Error::General(
-                "server certificate SPKI does not match the pinned host key".into(),
+                "server certificate host_id does not match the pinned host key".into(),
             ));
         }
         Ok(ServerCertVerified::assertion())
@@ -205,7 +224,24 @@ mod tests {
     #[test]
     fn from_cert_extracts_the_same_spki() {
         let (der, spki) = self_signed();
-        assert_eq!(HostPin::from_cert(&der).unwrap().spki(), &spki[..]);
+        assert_eq!(HostPin::from_cert(&der).unwrap().spki(), Some(&spki[..]));
+    }
+
+    #[test]
+    fn fingerprint_pin_accepts_matching_and_rejects_wrong() {
+        // A client pinning by host_id alone (--host-fp) must accept the real cert and reject another.
+        let (der, spki) = self_signed();
+        let host_id = *blake3::hash(&spki).as_bytes();
+        let fp_pin = HostPin::from_host_id(host_id);
+        assert!(fp_pin.spki().is_none()); // fingerprint-only pin carries no SPKI
+        assert_eq!(fp_pin.host_id(), host_id);
+
+        let v = PinnedServerVerifier::new(fp_pin);
+        assert!(verify_cert(&v, &der).is_ok());
+
+        // a different server cert (different SPKI → different host_id) is rejected.
+        let (other_der, _) = self_signed();
+        assert!(verify_cert(&v, &other_der).is_err());
     }
 
     #[test]
