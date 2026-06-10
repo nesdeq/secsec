@@ -277,10 +277,7 @@ mod tests {
                 .store
                 .put_epoch()
                 .map_err(|e| crate::RemoteError(e.to_string()))?;
-            Ok(crate::Receipt {
-                arrival_gen,
-                put_epoch,
-            })
+            Ok(crate::Receipt::unsigned(arrival_gen, put_epoch))
         }
         async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, crate::RemoteError> {
             self.store

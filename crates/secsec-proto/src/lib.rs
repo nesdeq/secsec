@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod gc;
+pub mod receipt;
 pub mod server;
 pub mod wire;
 

@@ -179,10 +179,7 @@ mod tests {
             self.store
                 .put(id, blob)
                 .map_err(|e| RemoteError(e.to_string()))?;
-            Ok(Receipt {
-                arrival_gen: 1,
-                put_epoch: 1,
-            })
+            Ok(Receipt::unsigned(1, 1))
         }
         async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
             self.store

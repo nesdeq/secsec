@@ -96,16 +96,29 @@ impl ServerState {
 pub struct Server {
     store: Store,
     state: std::sync::Mutex<ServerState>,
+    /// Optional host receipt key + this server's `host_id` (§15 signed receipts). `None` ⇒ receipts
+    /// are returned unsigned (all-zero pubkey/signature).
+    receipts: Option<(ed25519_dalek::SigningKey, [u8; 32])>,
 }
 
 impl Server {
-    /// Build a handler over `store`.
+    /// Build a handler over `store` (receipts unsigned).
     #[must_use]
     pub fn new(store: Store) -> Self {
         Self {
             store,
             state: std::sync::Mutex::new(ServerState::default()),
+            receipts: None,
         }
+    }
+
+    /// Enable §15 **signed arrival receipts**: `receipt_seed` is the host's 32-byte Ed25519 receipt
+    /// key seed, `host_id` is this server's `host_id` (`BLAKE3` of its pinned SPKI). Each `put` then
+    /// returns a receipt signed over `id ‖ host_id ‖ arrival_gen ‖ put_epoch ‖ ts`.
+    #[must_use]
+    pub fn with_receipts(mut self, receipt_seed: &[u8; 32], host_id: [u8; 32]) -> Self {
+        self.receipts = Some((ed25519_dalek::SigningKey::from_bytes(receipt_seed), host_id));
+        self
     }
 
     /// Borrow the underlying object + keyslot store (e.g. for enrollment writes by the orchestration
@@ -146,6 +159,25 @@ impl Server {
 
     fn gc_allow(&self, d: DeviceId, now: u64) -> bool {
         self.state.lock().expect("server state").gc_record(d, now)
+    }
+
+    /// Build the §15 `Stored` receipt, signed by the host receipt key when configured ([`with_receipts`];
+    /// else all-zero pubkey/signature).
+    fn receipt(&self, id: &[u8; 32], arrival_gen: u64, put_epoch: u64, now: u64) -> Response {
+        let (receipt_pubkey, signature) = match &self.receipts {
+            Some((key, host_id)) => (
+                secsec_proto::receipt::receipt_public(key),
+                secsec_proto::receipt::sign_receipt(key, id, host_id, arrival_gen, put_epoch, now),
+            ),
+            None => ([0u8; 32], [0u8; 64]),
+        };
+        Response::Stored {
+            arrival_gen,
+            put_epoch,
+            ts: now,
+            receipt_pubkey,
+            signature,
+        }
     }
 
     /// Run the §12 pipeline for one request and return the response.
@@ -245,10 +277,9 @@ impl Server {
                 // server's current global put_epoch) so the client can derive gc_gen and bind the gc CAS.
                 match self.store.put(&id, &blob) {
                     Ok(_) => match (self.store.arrival_epoch(&id), self.store.put_epoch()) {
-                        (Ok(Some(arrival_gen)), Ok(put_epoch)) => Response::Stored {
-                            arrival_gen,
-                            put_epoch,
-                        },
+                        (Ok(Some(arrival_gen)), Ok(put_epoch)) => {
+                            self.receipt(&id, arrival_gen, put_epoch, now)
+                        }
                         _ => Response::Err(ErrorCode::Internal),
                     },
                     Err(_) => Response::Err(ErrorCode::Internal),

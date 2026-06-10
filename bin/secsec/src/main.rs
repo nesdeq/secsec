@@ -2,10 +2,10 @@
 //!
 //! Subcommands: `init` (repository genesis — §7), `serve` (the blind server), `hostkey` (host-pin
 //! helper), and `sync` (cold-start over the wire, then reconcile a working dir with a ref — §8.1/§10).
-//! `init` writes the genesis roster + this device's keyslot and prints the RFP; `serve` is fully
-//! functional (the server is blind — no master key); `sync` recovers the master key + roster from the
-//! remote, snapshots the dir, and clones/publishes/pulls/merges. The watcher-driven continuous loop
-//! and `--host-fp` fingerprint pinning (vs the current full-cert `--host-cert`) are follow-ups.
+//! `init` writes the genesis roster + this device's keyslot and prints the RFP; `serve` is the blind
+//! server (signs §15 receipts with its host receipt key); `sync` recovers the master key + roster from
+//! the remote, snapshots the dir, and clones/publishes/pulls/merges, optionally `--watch`-ing for
+//! continuous live sync. The host is pinned by `--host-cert` (full cert) or `--host-fp` (fingerprint).
 
 #![allow(missing_docs)] // a binary crate exports no public API
 
@@ -145,6 +145,22 @@ fn load_or_generate_hostkey(dir: &Path) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Er
     Ok((cert, key))
 }
 
+/// Load-or-generate the host's 32-byte Ed25519 receipt-key seed (§15 signed receipts), persisted at
+/// `<dir>/hostkey.receipt`.
+fn load_or_generate_receipt_key(dir: &Path) -> Result<[u8; 32], Box<dyn Error>> {
+    let path = dir.join("hostkey.receipt");
+    if let Ok(bytes) = std::fs::read(&path) {
+        if bytes.len() == 32 {
+            return Ok(bytes.try_into().expect("checked len"));
+        }
+    }
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed)?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(&path, seed)?;
+    Ok(seed)
+}
+
 async fn run_serve(
     store: PathBuf,
     hostkey_dir: PathBuf,
@@ -152,10 +168,12 @@ async fn run_serve(
 ) -> Result<(), Box<dyn Error>> {
     let (cert, key) = load_or_generate_hostkey(&hostkey_dir)?;
     let host_id = HostPin::from_cert(&cert)?.host_id();
+    let receipt_seed = load_or_generate_receipt_key(&hostkey_dir)?;
     let store = Store::open(store)?;
     // Shared via Arc; the store is lock-free (redb-transactional) and only the small replay/rate-limit
-    // state is briefly locked inside handle(), so connections are served CONCURRENTLY.
-    let server = std::sync::Arc::new(Server::new(store));
+    // state is briefly locked inside handle(), so connections are served CONCURRENTLY. Signed §15
+    // receipts are enabled with the host receipt key + host_id.
+    let server = std::sync::Arc::new(Server::new(store).with_receipts(&receipt_seed, host_id));
 
     let endpoint = quinn::Endpoint::server(server_config(&cert, &key)?, listen)?;
     println!("secsec serve — host pin {}", hex(&host_id));

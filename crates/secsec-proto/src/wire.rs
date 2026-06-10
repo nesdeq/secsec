@@ -353,12 +353,21 @@ pub enum Response {
     Ok,
     /// A `put` was accepted, with its **arrival receipt** (§15): `arrival_gen` is the object's arrival
     /// generation (the `put_epoch` it first landed at), `put_epoch` is the server's current global
-    /// counter. The client records these to derive a safe `gc_gen` and to bind the `gc` CAS.
+    /// counter. The client records these to derive a safe `gc_gen` and to bind the `gc` CAS. The
+    /// receipt is **signed** by the host receipt key (§15 defence-in-depth): `receipt_pubkey` is the
+    /// host's Ed25519 receipt key (all-zero if the server signs no receipts) and `signature` covers
+    /// `id ‖ host_id ‖ arrival_gen ‖ put_epoch ‖ ts` (see [`crate::receipt`]).
     Stored {
         /// The object's arrival generation (its first-`put` epoch; idempotent puts keep the original).
         arrival_gen: u64,
         /// The server's current global `put_epoch` after this put.
         put_epoch: u64,
+        /// The server's asserted timestamp (advisory; never used for GC eligibility, §15/§22).
+        ts: u64,
+        /// The host's Ed25519 receipt public key (all-zero if receipts are unsigned).
+        receipt_pubkey: [u8; 32],
+        /// The receipt signature over the §15 message (all-zero if unsigned).
+        signature: [u8; 64],
     },
     /// The op was rejected with this code.
     Err(ErrorCode),
@@ -418,8 +427,16 @@ impl Response {
             Response::Stored {
                 arrival_gen,
                 put_epoch,
+                ts,
+                receipt_pubkey,
+                signature,
             } => {
-                w.u8(R_STORED).u64(*arrival_gen).u64(*put_epoch);
+                w.u8(R_STORED)
+                    .u64(*arrival_gen)
+                    .u64(*put_epoch)
+                    .u64(*ts)
+                    .raw(receipt_pubkey)
+                    .raw(signature);
             }
             Response::Err(c) => {
                 w.u8(R_ERR).u8(code_to_u8(*c));
@@ -452,6 +469,13 @@ impl Response {
             R_STORED => Response::Stored {
                 arrival_gen: r.u64()?,
                 put_epoch: r.u64()?,
+                ts: r.u64()?,
+                receipt_pubkey: read32(&mut r)?,
+                signature: {
+                    let mut s = [0u8; 64];
+                    s.copy_from_slice(r.raw(64)?);
+                    s
+                },
             },
             R_ERR => Response::Err(code_from_u8(r.u8()?)?),
             other => return Err(WireError::BadTag(other)),
@@ -587,6 +611,9 @@ mod tests {
             Response::Stored {
                 arrival_gen: 7,
                 put_epoch: 42,
+                ts: 1234,
+                receipt_pubkey: [0x55; 32],
+                signature: [0x66; 64],
             },
             Response::Err(ErrorCode::CasConflict),
             Response::Err(ErrorCode::NotEnrolled),

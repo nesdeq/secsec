@@ -55,13 +55,51 @@ impl std::error::Error for RemoteError {}
 
 /// A §15 arrival receipt returned on a successful `put`: the object's arrival generation and the
 /// server's current global `put_epoch`. The client records these to choose a safe `gc_gen` (objects
-/// whose `arrival_gen` is old enough) and to bind the `gc` compare-and-swap to `put_epoch`.
+/// whose `arrival_gen` is old enough) and to bind the `gc` compare-and-swap to `put_epoch`. The
+/// receipt is **signed** by the host receipt key (§15 defence-in-depth); `receipt_pubkey`/`signature`
+/// are all-zero when the server signs no receipts (e.g. the in-process backend).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Receipt {
     /// The object's arrival generation (the `put_epoch` it first landed at).
     pub arrival_gen: u64,
     /// The server's current global `put_epoch` after this put.
     pub put_epoch: u64,
+    /// The server's asserted timestamp (advisory; never used for GC eligibility, §15/§22).
+    pub ts: u64,
+    /// The host's Ed25519 receipt public key (all-zero if unsigned).
+    pub receipt_pubkey: [u8; 32],
+    /// The receipt signature over the §15 message (all-zero if unsigned).
+    pub signature: [u8; 64],
+}
+
+impl Receipt {
+    /// An unsigned receipt (all-zero pubkey/signature) — for an in-process backend with no host key.
+    #[must_use]
+    pub fn unsigned(arrival_gen: u64, put_epoch: u64) -> Self {
+        Self {
+            arrival_gen,
+            put_epoch,
+            ts: 0,
+            receipt_pubkey: [0u8; 32],
+            signature: [0u8; 64],
+        }
+    }
+
+    /// Verify this receipt's signature against `host_id` (§15). Returns `false` for an unsigned
+    /// receipt (all-zero pubkey). The caller TOFU-binds `receipt_pubkey` to the pinned `host_id` over
+    /// the host-authenticated connection.
+    #[must_use]
+    pub fn verify(&self, id: &Id, host_id: &[u8; 32]) -> bool {
+        secsec_proto::receipt::verify_receipt(
+            &self.receipt_pubkey,
+            &self.signature,
+            id,
+            host_id,
+            self.arrival_gen,
+            self.put_epoch,
+            self.ts,
+        )
+    }
 }
 
 /// A content-addressed object + mutable-ref store on the far side of a connection (§12, §13). The
@@ -586,10 +624,7 @@ mod tests {
                 .store
                 .put_epoch()
                 .map_err(|e| RemoteError(e.to_string()))?;
-            Ok(Receipt {
-                arrival_gen,
-                put_epoch,
-            })
+            Ok(Receipt::unsigned(arrival_gen, put_epoch))
         }
         async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
             self.store

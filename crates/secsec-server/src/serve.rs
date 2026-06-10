@@ -392,4 +392,97 @@ mod tests {
             conn_b.close(0u32.into(), b"done");
         });
     }
+
+    /// §15 **signed receipts** over live QUIC: a server with `with_receipts` returns a put receipt
+    /// whose signature verifies against the host receipt pubkey + host_id, and a tampered field fails.
+    #[test]
+    fn signed_receipt_verifies_over_live_quic() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ck = generate_simple_self_signed(vec!["secsec.invalid".to_string()]).unwrap();
+            let (cert, key) = (ck.cert.der().to_vec(), ck.key_pair.serialize_der());
+            let pin = HostPin::from_cert(&cert).unwrap();
+            let host_id = pin.host_id();
+
+            let device = DeviceKey::generate().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path().join("s.redb")).unwrap();
+            store
+                .put_keyslot(&device.device_id().unwrap(), 1, b"keyslot")
+                .unwrap();
+            let server = Server::new(store).with_receipts(&[0x5a; 32], host_id);
+
+            let endpoint =
+                quinn::Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                let conn = endpoint.accept().await.unwrap().await.unwrap();
+                let _ = serve_connection(&conn, &server, host_id, || 7_000).await;
+            });
+
+            let mut client = quinn::Endpoint::client(loopback()).unwrap();
+            client.set_default_client_config(client_config(pin).unwrap());
+            let conn = client
+                .connect(addr, "secsec.invalid")
+                .unwrap()
+                .await
+                .unwrap();
+            let sess = client_handshake(&conn, &device, host_id, [0x11; 32])
+                .await
+                .unwrap();
+
+            let id = [0x42; 32];
+            let blob = b"signed-receipt-bytes".to_vec();
+            let resp = request(
+                &conn,
+                sess.transcript,
+                &device,
+                Request::Put {
+                    id,
+                    declared_size: blob.len() as u32,
+                    blob,
+                },
+            )
+            .await
+            .unwrap();
+            let Response::Stored {
+                arrival_gen,
+                put_epoch,
+                ts,
+                receipt_pubkey,
+                signature,
+            } = resp
+            else {
+                panic!("expected Stored, got {resp:?}");
+            };
+            assert_ne!(receipt_pubkey, [0u8; 32], "receipts are signed");
+            assert_eq!(ts, 7_000); // the clock the server was given
+                                   // the receipt verifies against the host receipt pubkey + host_id.
+            assert!(secsec_proto::receipt::verify_receipt(
+                &receipt_pubkey,
+                &signature,
+                &id,
+                &host_id,
+                arrival_gen,
+                put_epoch,
+                ts,
+            ));
+            // a tampered field (wrong host_id) fails verification.
+            assert!(!secsec_proto::receipt::verify_receipt(
+                &receipt_pubkey,
+                &signature,
+                &id,
+                &[0u8; 32],
+                arrival_gen,
+                put_epoch,
+                ts,
+            ));
+
+            conn.close(0u32.into(), b"done");
+            let _ = srv.await;
+        });
+    }
 }

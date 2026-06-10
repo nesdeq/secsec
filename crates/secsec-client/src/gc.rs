@@ -126,10 +126,7 @@ mod tests {
 
     #[test]
     fn put_epoch_is_the_max_receipt() {
-        let r = |p| Receipt {
-            arrival_gen: 1,
-            put_epoch: p,
-        };
+        let r = |p| Receipt::unsigned(1, p);
         let receipts = [([1; 32], r(3)), ([2; 32], r(7)), ([3; 32], r(5))];
         assert_eq!(put_epoch_from_receipts(&receipts), 7);
         assert_eq!(put_epoch_from_receipts(&[]), 0);

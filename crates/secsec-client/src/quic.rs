@@ -65,9 +65,15 @@ impl Remote for QuicRemote<'_> {
             Response::Stored {
                 arrival_gen,
                 put_epoch,
+                ts,
+                receipt_pubkey,
+                signature,
             } => Ok(crate::Receipt {
                 arrival_gen,
                 put_epoch,
+                ts,
+                receipt_pubkey,
+                signature,
             }),
             Response::Err(c) => Err(RemoteError(format!("put: {c:?}"))),
             other => Err(RemoteError(format!("put: unexpected {other:?}"))),
