@@ -332,12 +332,23 @@ fn run_grant(
     device_pub_hex: String,
     xwing_pub_hex: String,
 ) -> Result<(), Box<dyn Error>> {
+    // The §7 grant-attempt log lives beside the store (local-only, not secret).
+    let grantlog = store.with_extension("grantlog");
     let granter = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
     let store = Store::open(store)?;
     let rfp = parse_hex32(&rfp_hex)?;
     let (mk, _st) = open_repo(&store, &granter, &rfp)?;
 
     let d_pub = secsec_sig::DevicePublic::from_canonical(&parse_hex(&device_pub_hex)?)?;
+    let d_id = d_pub.device_id()?;
+
+    // §7 rate limit: at most 5 SAS/grant sessions per D_pubkey per hour, in E's local state.
+    let prior =
+        secsec_client::enroll::parse_log(&std::fs::read_to_string(&grantlog).unwrap_or_default());
+    let updated = secsec_client::enroll::record_grant_attempt(&prior, &d_id, unix_secs())
+        .map_err(|e| e.to_string())?;
+    std::fs::write(&grantlog, secsec_client::enroll::serialize_log(&updated))?;
+
     let d_xwing = parse_hex(&xwing_pub_hex)?;
     let mut enrollment_nonce = [0u8; 32];
     getrandom::fill(&mut enrollment_nonce)?;

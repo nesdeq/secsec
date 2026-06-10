@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod enroll;
 pub mod gc;
 pub mod gossip;
 pub mod multiremote;
