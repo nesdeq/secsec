@@ -1,11 +1,12 @@
 # secsec known-answer test vectors, v1
-# All values hex (lowercase) unless noted. See ../finaldesign.md §5, §8, §9 for the constructions.
+# All values hex (lowercase) unless noted. See ../secsec-Design.md §5, §8, §9 for the constructions.
 #
 # Role of this file: the human-readable / cross-implementation export of the frozen KATs that are
 # asserted by each crate's inline `#[test]` (those tests are the CI-enforced regression guard).
 # Every value below is reproduced by exactly one inline test, named in its section header. A second
-# implementation MUST reproduce these byte-for-byte. (When the `xtask` build tooling lands it will
-# emit this file mechanically from the same code paths, so the two can never drift.)
+# implementation MUST reproduce these byte-for-byte. `cargo xtask vectors --check` recomputes every
+# value from the live code paths and fails if this file differs (also run as the xtask test
+# `committed_vectors_match_live_code`), so the export and the implementation can never drift.
 #
 # Shared input: master_key = 0x11 repeated 32 times, generation g = 1. roster_key[g=1] below is the
 # IKM for the roster-entry / roster-keyhist vectors, chaining the whole file to one root key.

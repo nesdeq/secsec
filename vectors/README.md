@@ -1,16 +1,32 @@
 # secsec — known-answer test vectors
 
-Language-agnostic KATs that pin the canonical outputs of the foundation primitives, so any
+Language-agnostic KATs that pin the canonical outputs of the protocol's primitives, so any
 implementation (or a re-implementation of a primitive) can self-check against the reference.
 
-- `secsec-kat-v1.txt` — hex vectors for `secsec-kdf` (§5/§9.5 derivations) and `secsec-frame`
-  (§9.1 framing). Each value is the exact output of the reference Rust implementation.
+- **`secsec-kat-v1.txt`** — hex vectors chained from one root key (`master_key = 0x11×32`, generation
+  `g = 1`), covering every layer: `[kdf]` (the §5/§9.5 derivations + `mk_commit`), `[frame]` (§9.1),
+  `[aead]` (the §9.4 CTX/CMT-4 committing AEAD), `[object]` (§9.2 content-id + stored blob), `[head]`
+  (§9.8 mutable head blob), `[gc]` (§15 serialization hashes), `[auth]` (§11 session transcript),
+  `[sas]` (§7 enrollment short-auth-string), and `[roster]` (§9.5 per-entry AEAD + §8.2 roster-key
+  history). Each value is the exact output of the reference Rust implementation.
 
-These are currently asserted inline in the crates' unit tests (e.g. `secsec-kdf`'s `kat_frozen`,
-`secsec-frame`'s `frame_encode_kat`). A follow-up will add a loader test that reads this file
-directly so the vectors and the asserts cannot drift.
+## How the vectors are kept honest
 
-Still to add (tracked): `secsec-aead` CTX vectors — AEAD correctness is currently pinned by a
-byte-for-byte cross-check against the audited `chacha20poly1305` reference crate
-(`ciphertext_and_tag_match_reference`); a frozen `(key, ad, pt) → (ctx_tag, ct)` vector will be
-captured here alongside it.
+Every value is pinned **twice** against the live code, so the export can never silently drift:
+
+1. **Inline crate `#[test]`s** — each section names the test that asserts it (e.g. `secsec-kdf`'s
+   `tests::kat_frozen`, `secsec-aead`'s `tests::ctx_kat`, `secsec-sync`'s `tests::head_kat`). These
+   are the per-crate regression guards.
+2. **The loader / anti-drift check** — `xtask` recomputes every value straight from the live code
+   paths and compares it to this file:
+
+   ```sh
+   cargo xtask vectors --check     # recompute + compare; non-zero exit on any drift
+   cargo xtask vectors             # print the live-computed values (to update the file after a change)
+   ```
+
+   The same comparison runs in normal `cargo test` as the xtask test
+   `committed_vectors_match_live_code`, so a drift between this file and the code fails CI without
+   needing the `xtask` invocation.
+
+A second implementation MUST reproduce every value byte-for-byte.
