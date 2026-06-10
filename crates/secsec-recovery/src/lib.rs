@@ -142,17 +142,43 @@ pub fn recover(
     gen: u32,
     expected_mk_commit: &[u8; 32],
 ) -> Result<MasterKey, RecoveryError> {
-    let (_salt, ctx_tag, ct) = parse(blob)?;
-    let ad = ad_recovery(device_pubkey, gen);
-    let pt = secsec_aead::open(recovery_key, &ad, &ctx_tag, ct).map_err(|_| RecoveryError::Aead)?;
-    let mut key = Zeroizing::new([0u8; 32]);
-    key.copy_from_slice(&pt);
+    let key = recover_raw(blob, recovery_key, device_pubkey, gen)?;
     let mk = MasterKey::new(gen, *key);
     // Authenticity (§8.6): the candidate MUST match the RFP-anchored commitment.
     if mk.mk_commit() != *expected_mk_commit {
         return Err(RecoveryError::CommitMismatch);
     }
     Ok(mk)
+}
+
+/// Recover the **raw** generation-`gen` master-key bytes from `blob` + `recovery_key`, **without** the
+/// `mk_commit` check — for a recovery-driven §8.1 cold-start, where the commitment lives inside the
+/// still-encrypted sigchain (the fold verifies it). Every other caller MUST use [`recover`].
+pub fn recover_raw(
+    blob: &[u8],
+    recovery_key: &[u8; 32],
+    device_pubkey: &[u8],
+    gen: u32,
+) -> Result<Zeroizing<[u8; 32]>, RecoveryError> {
+    let (_salt, ctx_tag, ct) = parse(blob)?;
+    let ad = ad_recovery(device_pubkey, gen);
+    let pt = secsec_aead::open(recovery_key, &ad, &ctx_tag, ct).map_err(|_| RecoveryError::Aead)?;
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&pt);
+    Ok(key)
+}
+
+/// Recover the raw master-key bytes using a 256-bit recovery code (derive the key from the blob's
+/// salt, then [`recover_raw`]) — for the recovery cold-start. The fold then verifies `mk_commit`.
+pub fn recover_raw_with_code(
+    blob: &[u8],
+    code: &[u8; 32],
+    device_pubkey: &[u8],
+    gen: u32,
+) -> Result<Zeroizing<[u8; 32]>, RecoveryError> {
+    let (salt, _, _) = parse(blob)?;
+    let recovery_key = recovery_key_from_code(salt, code);
+    recover_raw(blob, &recovery_key, device_pubkey, gen)
 }
 
 /// Recover using a 256-bit recovery code (derives `recovery_key` from the blob's salt, then [`recover`]).

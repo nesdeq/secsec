@@ -1660,6 +1660,7 @@ dependencies = [
  "secsec-object",
  "secsec-pq",
  "secsec-proto",
+ "secsec-recovery",
  "secsec-roster",
  "secsec-server",
  "secsec-sig",

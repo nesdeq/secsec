@@ -19,10 +19,12 @@
 //! cold-start unwrap dispatches by `algo_id` and enforces the §16 `min_algo` floor after folding.
 
 use crate::{Remote, RemoteError};
-use secsec_frame::{Frame, FRAME_LEN};
+use secsec_canon::{Reader, Writer};
+use secsec_frame::{Frame, FRAME_LEN, MAX_ROSTER_ENTRY_SIZE};
 use secsec_kdf::MasterKey;
 use secsec_pq::{XWingPublic, XWingSecret};
 use secsec_proto::server::limits::MAX_TOTAL_SIGCHAIN;
+use secsec_recovery::{recover_raw_with_code, recovery_key_from_code, seal_recovery, SALT_LEN};
 use secsec_roster::{
     append, append_many, cold_start_fold, decode_entry, encode_entry, genesis, open_entry,
     peel_data_keys, revoke_closure, revoke_rotate_ops, seal_data_keyhist, seal_entry,
@@ -136,6 +138,20 @@ pub enum RepoError {
         /// The folded chain's `min_algo` floor.
         floor: u8,
     },
+    /// Sealing / opening the §8.6 recovery keyslot failed (bad code/passphrase, malformed blob).
+    Recovery(secsec_recovery::RecoveryError),
+    /// `recover` was asked to run but no §8.6 recovery keyslot was ever created for this repo.
+    NoRecovery,
+    /// The stored §8.6 recovery record was malformed (truncated / non-canonical framing).
+    BadRecovery,
+    /// The recovery keyslot was created at generation `record` but the repo is now at `cur`: it was
+    /// superseded by a rotation and only recovers the generation it was pinned to. Re-create recovery.
+    RecoveryStale {
+        /// The generation the recovery keyslot was sealed at.
+        record: u32,
+        /// The repo's current tip generation.
+        cur: u32,
+    },
     /// The far side errored, or returned a roster longer than the §19 cap (a misbehaving server).
     Remote(RemoteError),
 }
@@ -179,6 +195,14 @@ impl core::fmt::Display for RepoError {
                     "keyslot algo_id {got} below min_algo floor {floor} (§16)"
                 )
             }
+            RepoError::Recovery(e) => write!(f, "recovery: {e}"),
+            RepoError::NoRecovery => f.write_str("no recovery keyslot for this repo (§8.6)"),
+            RepoError::BadRecovery => f.write_str("malformed recovery record (§8.6)"),
+            RepoError::RecoveryStale { record, cur } => write!(
+                f,
+                "recovery keyslot is at generation {record} but the repo is at {cur}; \
+                 it was superseded by a rotation — re-create recovery (§8.6)"
+            ),
             RepoError::Remote(e) => write!(f, "{e}"),
         }
     }
@@ -202,6 +226,11 @@ impl From<RosterError> for RepoError {
 impl From<secsec_sig::SigError> for RepoError {
     fn from(e: secsec_sig::SigError) -> Self {
         RepoError::Sig(e)
+    }
+}
+impl From<secsec_recovery::RecoveryError> for RepoError {
+    fn from(e: secsec_recovery::RecoveryError) -> Self {
+        RepoError::Recovery(e)
     }
 }
 
@@ -329,6 +358,112 @@ pub async fn data_keyring_remote<R: Remote>(
         hist.insert(g, wrap);
     }
     Ok(peel_data_keys(mk.expose_secret(), g_cur, &hist)?)
+}
+
+/// Encode the §8.6 `/recovery` record: `le32(gen) ‖ bytes(device_pubkey) ‖ raw(blob)`. The pinned
+/// generation + device pubkey let the recoverer recompute the §9.4 AD; `blob` is the keyslot itself.
+fn encode_recovery_record(gen: u32, device_pubkey: &[u8], blob: &[u8]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u32(gen).bytes(device_pubkey).raw(blob);
+    w.finish()
+}
+
+/// Decode an [`encode_recovery_record`] blob into `(gen, device_pubkey, recovery_blob)`.
+fn decode_recovery_record(record: &[u8]) -> Result<(u32, Vec<u8>, Vec<u8>), RepoError> {
+    let mut r = Reader::new(record);
+    let gen = r.u32().map_err(|_| RepoError::BadRecovery)?;
+    let pubkey = r
+        .bytes(MAX_ROSTER_ENTRY_SIZE)
+        .map_err(|_| RepoError::BadRecovery)?
+        .to_vec();
+    let rest = r.remaining();
+    let blob = r.raw(rest).map_err(|_| RepoError::BadRecovery)?.to_vec();
+    r.finish().map_err(|_| RepoError::BadRecovery)?;
+    Ok((gen, pubkey, blob))
+}
+
+/// §8.6 `recovery-init`: create the repo's optional recovery keyslot for `device`, sealing the live
+/// `mk` under a freshly generated 256-bit **recovery code** (returned — show it to the user once; it
+/// is never stored). Writes the `/recovery` record `le32(gen) ‖ bytes(device_pubkey) ‖ blob` so the
+/// recoverer can recompute the §9.4 AD. The recovered candidate is anchored to `mk_commit` at recover
+/// time (§7 step 3), so this is a user-held break-glass key, **not** a server-exploitable backdoor.
+///
+/// The keyslot is pinned to the current generation; a later [`rotate_repo`] supersedes it (the new
+/// master key is not wrapped under the code), so re-run this after a rotation (see [`recover_master`]).
+/// Re-running overwrites any existing recovery keyslot with a fresh code + salt (§19).
+pub fn create_recovery(
+    store: &Store,
+    device: &DeviceKey,
+    mk: &MasterKey,
+) -> Result<Zeroizing<[u8; 32]>, RepoError> {
+    let mut code = Zeroizing::new([0u8; 32]);
+    getrandom::fill(code.as_mut_slice()).map_err(|_| RepoError::Rng)?;
+    let mut salt = [0u8; SALT_LEN];
+    getrandom::fill(&mut salt).map_err(|_| RepoError::Rng)?;
+    let rkey = recovery_key_from_code(&salt, &code);
+
+    let device_pubkey = device.public().to_canonical()?;
+    let gen = mk.generation();
+    let blob = seal_recovery(mk.expose_secret(), gen, &device_pubkey, &rkey, &salt);
+
+    store.put_recovery(&encode_recovery_record(gen, &device_pubkey, &blob))?;
+    Ok(code)
+}
+
+/// §8.6 `recover`: reconstruct the live `(MasterKey, State)` from the recovery `code` alone — the
+/// break-glass path when every enrolled device is lost. Reads the `/recovery` record, recovers the
+/// raw master-key candidate (no commit check here), then folds the RFP-anchored chain, which verifies
+/// the candidate against `mk_commit_g` (§7 step 3) — so a wrong code or a server-forged record is
+/// rejected by the fold, not silently accepted.
+///
+/// Only the generation the keyslot was pinned to is recoverable: if the repo rotated after
+/// `recovery-init`, this returns [`RepoError::RecoveryStale`] (the post-rotation master key is not
+/// wrapped under the code). Recovers **read** access (master key + roster, and thence the §8.2 data
+/// keyring); re-enrolling a fresh device afterward is a normal [`grant_device`] from this identity.
+pub fn recover_master(
+    store: &Store,
+    code: &[u8; 32],
+    rfp: &[u8; 32],
+) -> Result<(MasterKey, State), RepoError> {
+    let record = store.get_recovery()?.ok_or(RepoError::NoRecovery)?;
+    let (rec_gen, device_pubkey, blob) = decode_recovery_record(&record)?;
+
+    // Read the whole sigchain; the tip's gen must equal the keyslot's gen (else the keyslot is stale).
+    let n = store.roster_len()?;
+    if n == 0 {
+        return Err(RepoError::NotInitialized);
+    }
+    let mut entries = Vec::with_capacity(n as usize);
+    for seq in 0..n {
+        entries.push(
+            store
+                .get_roster_entry(seq)?
+                .ok_or(RepoError::MissingEntry(seq))?,
+        );
+    }
+    let g_cur = frame_gen(entries.last().expect("n > 0"))?;
+    if rec_gen != g_cur {
+        return Err(RepoError::RecoveryStale {
+            record: rec_gen,
+            cur: g_cur,
+        });
+    }
+
+    // Recover the raw candidate from the code (no commit check — the fold verifies mk_commit below).
+    let candidate = recover_raw_with_code(&blob, code, &device_pubkey, g_cur)?;
+
+    // Roster-key history (§8.2): peel roster_key_g back to genesis, then fold + verify RFP + mk_commit.
+    // No `enforce_min_algo` here: recovery bypasses the device keyslot entirely, so the §16
+    // keyslot-downgrade floor does not apply.
+    let mut keyhist: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+    for g in 1..g_cur {
+        let wrap = store
+            .get_roster_keyhist(g)?
+            .ok_or(RepoError::MissingRosterKeyhist(g))?;
+        keyhist.insert(g, wrap);
+    }
+    let (state, mk) = cold_start_fold(&candidate, g_cur, rfp, &keyhist, &entries)?;
+    Ok((mk, state))
 }
 
 /// §8.4 rotation: mint `master_key_{g+1}`, extend the never-trimmed roster-key history (§8.2), append
@@ -697,6 +832,61 @@ mod tests {
         assert!(matches!(
             open_repo(&store, &device, &rfp),
             Err(RepoError::UnsupportedAlgo(1))
+        ));
+    }
+
+    #[test]
+    fn recovery_round_trips_and_rejects_wrong_code_and_stale_gen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("s.redb")).unwrap();
+        let device = DeviceKey::generate().unwrap();
+        let rfp = init_repo(&store, &device, 0).unwrap();
+        let (mk, _st) = open_repo(&store, &device, &rfp).unwrap();
+
+        // recovery-init: seal master_key_1 under a fresh 256-bit code.
+        let code = create_recovery(&store, &device, &mk).unwrap();
+
+        // recover from the code alone reconstructs the same live identity (gen + membership), and
+        // its master key opens the SAME data keyring as the original device's.
+        let (mk_r, st_r) = recover_master(&store, &code, &rfp).unwrap();
+        assert_eq!(mk_r.generation(), 1);
+        assert!(st_r.is_member(&device.device_id().unwrap()));
+        assert_eq!(mk_r.mk_commit(), mk.mk_commit());
+
+        // a wrong code fails the CTX AEAD (CMT-4) — not a silent wrong key.
+        assert!(matches!(
+            recover_master(&store, &[0u8; 32], &rfp),
+            Err(RepoError::Recovery(_))
+        ));
+        // a wrong RFP fails the fold's anchor check.
+        assert!(recover_master(&store, &code, &[0xAB; 32]).is_err());
+
+        // after a rotation the keyslot is stale (pinned to gen 1; the repo is at gen 2).
+        let (mk2, st2) = open_repo(&store, &device, &rfp).unwrap();
+        let _ = rotate_repo(&store, &device, &mk2, &st2, &rfp, None, 0).unwrap();
+        assert!(matches!(
+            recover_master(&store, &code, &rfp),
+            Err(RepoError::RecoveryStale { record: 1, cur: 2 })
+        ));
+
+        // re-running recovery-init at the new generation restores recoverability.
+        let (mk_g2, _) = open_repo(&store, &device, &rfp).unwrap();
+        let code2 = create_recovery(&store, &device, &mk_g2).unwrap();
+        let (mk_r2, _) = recover_master(&store, &code2, &rfp).unwrap();
+        assert_eq!(mk_r2.generation(), 2);
+        assert_eq!(mk_r2.mk_commit(), mk_g2.mk_commit());
+    }
+
+    #[test]
+    fn recover_without_keyslot_is_no_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("s.redb")).unwrap();
+        let device = DeviceKey::generate().unwrap();
+        let rfp = init_repo(&store, &device, 0).unwrap();
+        // no recovery-init was run.
+        assert!(matches!(
+            recover_master(&store, &[0u8; 32], &rfp),
+            Err(RepoError::NoRecovery)
         ));
     }
 

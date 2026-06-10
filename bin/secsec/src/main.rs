@@ -1,20 +1,27 @@
 //! `secsec` — the CLI binary (`finaldesign.md` §11, §12).
 //!
-//! Subcommands: `init` (repository genesis — §7), `serve` (the blind server), `hostkey` (host-pin
-//! helper), and `sync` (cold-start over the wire, then reconcile a working dir with a ref — §8.1/§10).
-//! `init` writes the genesis roster + this device's keyslot and prints the RFP; `serve` is the blind
-//! server (signs §15 receipts with its host receipt key); `sync` recovers the master key + roster from
-//! the remote, snapshots the dir, and clones/publishes/pulls/merges, optionally `--watch`-ing for
-//! continuous live sync. The host is pinned by `--host-cert` (full cert) or `--host-fp` (fingerprint).
+//! Subcommands:
+//! - `init` (§7) — repository genesis: write the genesis roster + this device's keyslot, print the RFP.
+//! - `serve` — the blind sync server (signs §15 receipts with its host receipt key).
+//! - `hostkey` — print the server's host pin (the `host_id` clients pin via `--host-fp`).
+//! - `sync` (§8.1/§10) — cold-start over the wire, then reconcile a working dir with a ref (optionally
+//!   `--watch` for continuous live sync). Persists arrival receipts for a later `gc`.
+//! - `rotate` (§8.4), `enroll-pubkey` / `grant` (§7) — local-store membership management.
+//! - `recovery-init` / `recover` (§8.6) — create the recovery keyslot, and break-glass recovery.
+//! - `gc` (§15) — client-driven garbage-collection sweep against the remote.
+//!
+//! The host is pinned by `--host-cert` (full cert) or `--host-fp` (fingerprint). Transport is
+//! QUIC/TLS-only.
 
 #![allow(missing_docs)] // a binary crate exports no public API
 
 use clap::{Parser, Subcommand};
 use secsec_client::quic::QuicRemote;
 use secsec_client::repo::{
-    data_keyring_remote, grant_device, init_repo, open_repo, open_repo_remote, rotate_repo,
+    create_recovery, data_keyring, data_keyring_remote, grant_device, init_repo, open_repo,
+    open_repo_remote, recover_master, rotate_repo,
 };
-use secsec_client::sync::sync_once;
+use secsec_client::sync::{restore_ref_local, sync_once};
 use secsec_client::{load_frontier, save_frontier, FrontierLoad};
 use secsec_server::serve::serve_connection;
 use secsec_server::Server;
@@ -117,6 +124,73 @@ enum Cmd {
         /// The new device's X-Wing public-key hex (from its `enroll-pubkey`, SAS-verified).
         #[arg(long)]
         xwing_pub: String,
+    },
+    /// Create the repo's optional **recovery keyslot** (§8.6): seal the master key under a freshly
+    /// generated 256-bit recovery code and print the code **once** (store it offline — it is never
+    /// kept). A local-store admin op. Re-run after a `rotate` to re-pin recovery to the new generation.
+    RecoveryInit {
+        /// Path to the redb store.
+        #[arg(long)]
+        store: PathBuf,
+        /// A current member's OpenSSH private key (binds the keyslot's AD to this device, §8.6).
+        #[arg(long)]
+        key: PathBuf,
+        /// The repository fingerprint (RFP) hex from `init`.
+        #[arg(long)]
+        rfp: String,
+    },
+    /// Break-glass **recover** (§8.6) when every enrolled device is lost: reconstruct the master key
+    /// from the recovery code alone (anchored to the RFP), then restore a ref's working tree from the
+    /// local store into `--dir`. Runs against a local store copy (recovery has no device key to
+    /// handshake with, so it cannot run over the network). Recovers read access; re-enroll a fresh
+    /// device afterward with a new `init`/`grant`.
+    Recover {
+        /// Path to the redb store (the server's store or a full local copy holding the objects).
+        #[arg(long)]
+        store: PathBuf,
+        /// The repository fingerprint (RFP) hex from `init` — the out-of-band trust anchor.
+        #[arg(long)]
+        rfp: String,
+        /// The 256-bit recovery code hex printed by `recovery-init`.
+        #[arg(long)]
+        code: String,
+        /// The directory to restore the ref's tree into (created if absent).
+        #[arg(long)]
+        dir: PathBuf,
+        /// The ref name to restore.
+        #[arg(long, default_value = "main")]
+        r#ref: String,
+    },
+    /// Run a §15 garbage-collection sweep against the remote. Keeps the reachable closure of the ref's
+    /// head (fetched local first — GC fails safe if any keep-set object is unavailable) and sweeps
+    /// objects whose arrival generation has aged past the grace window. `gc_gen`/`put_epoch` come from
+    /// the local receipt log that `sync` maintains; the sweep is a compare-and-swap the server can only
+    /// run if its mutable state has not moved since (a conflict means: re-`sync`, then `gc` again).
+    Gc {
+        /// Server address (e.g. `127.0.0.1:8899`).
+        #[arg(long)]
+        remote: SocketAddr,
+        /// The server's host certificate (DER). Pins by full key. Mutually exclusive with `--host-fp`.
+        #[arg(long, conflicts_with = "host_fp", required_unless_present = "host_fp")]
+        host_cert: Option<PathBuf>,
+        /// The server's host fingerprint (`host_id` hex). Mutually exclusive with `--host-cert`.
+        #[arg(long)]
+        host_fp: Option<String>,
+        /// This device's OpenSSH private key (a current member).
+        #[arg(long)]
+        key: PathBuf,
+        /// The local object store (must hold the keep-set, populated by prior syncs).
+        #[arg(long)]
+        store: PathBuf,
+        /// Directory holding local sync state (the receipt log `sync` maintains lives here).
+        #[arg(long)]
+        state: PathBuf,
+        /// The repository fingerprint (RFP) hex from `init`.
+        #[arg(long)]
+        rfp: String,
+        /// The ref whose head anchors the keep-set.
+        #[arg(long, default_value = "main")]
+        r#ref: String,
     },
     /// Sync a working directory with a remote ref once (cold-start over the wire, then reconcile).
     Sync {
@@ -373,6 +447,67 @@ fn run_grant(
     Ok(())
 }
 
+/// `recovery-init` (§8.6): a local-store admin op. Open the repo, seal the master key under a fresh
+/// 256-bit recovery code, persist the `/recovery` record, and print the code once (never stored).
+fn run_recovery_init(store: PathBuf, key: PathBuf, rfp_hex: String) -> Result<(), Box<dyn Error>> {
+    let device = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
+    let store = Store::open(store)?;
+    let rfp = parse_hex32(&rfp_hex)?;
+    let (mk, _st) = open_repo(&store, &device, &rfp)?;
+    let code = create_recovery(&store, &device, &mk)?;
+    println!(
+        "recovery keyslot created for device {} at generation {}",
+        hex(&device.device_id()?),
+        mk.generation()
+    );
+    println!(
+        "\nRECOVERY CODE (store this offline NOW — it is shown once and never kept):\n  {}",
+        hex(code.as_slice())
+    );
+    println!(
+        "\nRe-run `recovery-init` after any `rotate` to re-pin recovery to the new generation."
+    );
+    Ok(())
+}
+
+/// `recover` (§8.6): break-glass recovery against a local store. Reconstruct the master key from the
+/// recovery code (anchored to the RFP), peel the data keyring, and restore the ref's tree into `--dir`.
+fn run_recover(
+    store: PathBuf,
+    rfp_hex: String,
+    code_hex: String,
+    dir: PathBuf,
+    ref_name: String,
+) -> Result<(), Box<dyn Error>> {
+    let store = Store::open(store)?;
+    let rfp = parse_hex32(&rfp_hex)?;
+    let code = parse_hex32(&code_hex)?;
+
+    // Reconstruct the live identity from the code alone; the fold verifies the RFP + mk_commit.
+    let (mk, st) = recover_master(&store, &code, &rfp)?;
+    println!(
+        "recovered master key at generation {} — {} member(s) in the roster",
+        mk.generation(),
+        st.members.len()
+    );
+
+    // Peel the §8.2 DATA key-history so objects under any past generation decrypt, then restore.
+    let keyring = data_keyring(&store, &mk)?;
+    match restore_ref_local(&store, &keyring, &st.members, &ref_name, &dir)? {
+        Some(commit_id) => println!(
+            "restored ref '{}' (commit {}) into {}",
+            ref_name,
+            hex(&commit_id),
+            dir.display()
+        ),
+        None => println!(
+            "ref '{}' has no published head — nothing to restore (master key still recovered)",
+            ref_name
+        ),
+    }
+    Ok(())
+}
+
 /// The last-synced base cursor is a commit **content hash** (not secret — the server already stores
 /// objects by id), so it is persisted as plain hex; the anti-rollback frontier beside it IS sealed.
 fn read_base(path: &Path) -> Result<Option<[u8; 32]>, Box<dyn Error>> {
@@ -430,6 +565,7 @@ async fn run_sync(
     std::fs::create_dir_all(&state)?;
     let frontier_path = state.join("frontier");
     let base_path = state.join("base");
+    let receipts_path = state.join("receipts");
     let mut frontier = match load_frontier(&frontier_path, &device)? {
         FrontierLoad::Loaded(f) => f,
         FrontierLoad::Absent => SyncFrontier::default(),
@@ -486,6 +622,18 @@ async fn run_sync(
                 if let Some(b) = outcome.base {
                     std::fs::write(&base_path, hex(&b))?;
                 }
+                // §15: record arrival receipts for any pushed objects into the local receipt log so a
+                // later `gc` can pick a safe gc_gen (aged past the grace window) on the client's clock.
+                if !outcome.receipts.is_empty() {
+                    let mut log = secsec_client::gc::parse_receipt_log(
+                        &std::fs::read_to_string(&receipts_path).unwrap_or_default(),
+                    );
+                    secsec_client::gc::merge_receipts(&mut log, &outcome.receipts, unix_secs());
+                    std::fs::write(
+                        &receipts_path,
+                        secsec_client::gc::serialize_receipt_log(&log),
+                    )?;
+                }
                 // Quiet on a no-op poll; report real work and the first sync.
                 if initial || !matches!(outcome.kind, secsec_client::sync::SyncKind::UpToDate) {
                     println!("sync: {:?}", outcome.kind);
@@ -498,6 +646,98 @@ async fn run_sync(
         initial = false;
         if !watch {
             break;
+        }
+    }
+
+    conn.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+    Ok(())
+}
+
+/// `gc` (§15): client-driven garbage collection. Cold-start the identity over the wire, bring the
+/// ref's head closure local (the keep-set — GC fails safe if any is unavailable), pick a safe `gc_gen`
+/// + `put_epoch` from the local receipt log, and issue the compare-and-swap sweep.
+#[allow(clippy::too_many_arguments)]
+async fn run_gc(
+    remote: SocketAddr,
+    host_cert: Option<PathBuf>,
+    host_fp: Option<String>,
+    key: PathBuf,
+    store_path: PathBuf,
+    state: PathBuf,
+    rfp_hex: String,
+    ref_name: String,
+) -> Result<(), Box<dyn Error>> {
+    let device = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
+    let pin = match (host_cert, host_fp) {
+        (Some(cert), _) => HostPin::from_cert(&std::fs::read(&cert)?)?,
+        (None, Some(fp)) => HostPin::from_host_id(parse_hex32(&fp)?),
+        (None, None) => return Err("one of --host-cert / --host-fp is required".into()),
+    };
+    let host_id = pin.host_id();
+    let rfp = parse_hex32(&rfp_hex)?;
+
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(client_config(pin)?);
+    let conn = endpoint.connect(remote, "secsec.invalid")?.await?;
+    let mut client_nonce = [0u8; 32];
+    getrandom::fill(&mut client_nonce)?;
+    let sess = client_handshake(&conn, &device, host_id, client_nonce).await?;
+    let rem = QuicRemote::new(&conn, sess.transcript, &device);
+
+    // Cold-start the identity + the §8.2 data keyring (the keep-set closure may span generations).
+    let (mk, _st) = open_repo_remote(&rem, &device, &rfp).await?;
+    let keyring = data_keyring_remote(&rem, &mk).await?;
+    let store = Store::open(&store_path)?;
+
+    // Bring the ref's head closure local so the keep-set is fully available (GC fails safe otherwise).
+    if let Some((head, _sig, _blob)) = secsec_client::fetch_head(&rem, &mk, &ref_name).await? {
+        secsec_client::fetch_closure(&rem, &store, &keyring, &head.commit_id).await?;
+    } else {
+        println!("ref '{ref_name}' has no head — nothing to keep; aborting gc");
+        conn.close(0u32.into(), b"done");
+        endpoint.wait_idle().await;
+        return Ok(());
+    }
+
+    // gc_gen + put_epoch from the local receipt log `sync` maintains; roster_seq = the sigchain tip.
+    let log = secsec_client::gc::parse_receipt_log(
+        &std::fs::read_to_string(state.join("receipts")).unwrap_or_default(),
+    );
+    let now = unix_secs();
+    let gc_gen = secsec_client::gc::gc_gen_from_log(&log, now);
+    let put_epoch = secsec_client::gc::put_epoch_from_log(&log);
+    let roster_seq = secsec_client::repo::fetch_roster_entries(&rem)
+        .await?
+        .len()
+        .saturating_sub(1) as u64;
+
+    if gc_gen == 0 {
+        println!(
+            "no generation has aged past the {}h grace window — nothing to sweep",
+            secsec_client::gc::GC_GRACE_WINDOW_SECS / 3600
+        );
+        conn.close(0u32.into(), b"done");
+        endpoint.wait_idle().await;
+        return Ok(());
+    }
+
+    let outcome = secsec_client::gc::gc_collect(
+        &rem,
+        &store,
+        &keyring,
+        &[ref_name.as_str()],
+        gc_gen,
+        roster_seq,
+        put_epoch,
+    )
+    .await?;
+    match outcome {
+        secsec_client::GcOutcome::Swept => {
+            println!("gc: swept (gc_gen={gc_gen}, put_epoch={put_epoch}, roster_seq={roster_seq})");
+        }
+        secsec_client::GcOutcome::CasConflict => {
+            println!("gc: server state moved since last sync (CAS conflict) — run `sync`, then `gc` again");
         }
     }
 
@@ -570,5 +810,28 @@ fn main() -> Result<(), Box<dyn Error>> {
             device_pub,
             xwing_pub,
         } => run_grant(store, key, rfp, device_pub, xwing_pub),
+        Cmd::RecoveryInit { store, key, rfp } => run_recovery_init(store, key, rfp),
+        Cmd::Recover {
+            store,
+            rfp,
+            code,
+            dir,
+            r#ref,
+        } => run_recover(store, rfp, code, dir, r#ref),
+        Cmd::Gc {
+            remote,
+            host_cert,
+            host_fp,
+            key,
+            store,
+            state,
+            rfp,
+            r#ref,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(run_gc(
+                remote, host_cert, host_fp, key, store, state, rfp, r#ref,
+            ))
+        }
     }
 }

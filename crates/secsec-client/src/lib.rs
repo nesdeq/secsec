@@ -471,6 +471,9 @@ pub struct SyncReport {
     pub frontier: SyncFrontier,
     /// The head we wrote, if we advanced the ref (merge or fast-forward-the-remote-to-us).
     pub wrote: Option<(Head, Vec<u8>)>,
+    /// The §15 arrival receipts for any objects we pushed this call (empty if we only adopted a
+    /// remote head). The caller records these toward a future `gc_gen` (§15).
+    pub receipts: Vec<(Id, Receipt)>,
 }
 
 /// Reconcile our local `our_commit` for `ref_name` against the remote, end-to-end (§10):
@@ -505,7 +508,7 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
     let Some((remote_head, remote_sig, remote_blob)) =
         fetch_head(remote, keys.current(), ref_name).await?
     else {
-        push_objects(remote, store, keys, our_commit).await?;
+        let receipts = push_objects(remote, store, keys, our_commit).await?;
         let (head, blob) = push_head(
             remote,
             keys.current(),
@@ -522,6 +525,7 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
             },
             frontier: frontier.clone(),
             wrote: Some((head, blob)),
+            receipts,
         });
     };
 
@@ -548,8 +552,8 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
         SyncAction::FastForward { .. } => None,       // remote is ahead → adopt, nothing to push
     };
 
-    let wrote = if let Some(commit_id) = new_commit {
-        push_objects(remote, store, keys, &commit_id).await?;
+    let (wrote, receipts) = if let Some(commit_id) = new_commit {
+        let receipts = push_objects(remote, store, keys, &commit_id).await?;
         let (head, blob) = push_head(
             remote,
             keys.current(),
@@ -560,15 +564,16 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
             Some((&remote_head, &remote_blob)),
         )
         .await?;
-        Some((head, blob))
+        (Some((head, blob)), receipts)
     } else {
-        None
+        (None, Vec::new())
     };
 
     Ok(SyncReport {
         action: plan.action,
         frontier: plan.frontier,
         wrote,
+        receipts,
     })
 }
 
