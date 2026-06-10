@@ -71,11 +71,10 @@ secsec/
 │   ├── secsec-roster/    §8    sigchain fold/succession, per-entry AEAD, roster-key history, generations, enrollment
 │   ├── secsec-sync/      §10   refs, cas-head, rollback-aware merge (storage-free Node model), fork detection
 │   ├── secsec-engine/    §10   snapshot-tree ↔ merge-node bridge, three-way reconcile to the store
-│   ├── secsec-remote/    §14,§15  multi-remote reconcile, quorum, hardened GC
 │   ├── secsec-transport/ §11   QUIC+TLS pinned verifier, stdio mode, auth, channel binding
-│   ├── secsec-proto/     §12   wire protocol, RPC framing, write/read-auth, rate limits
-│   ├── secsec-client/          orchestration: watcher, commit, sync loop, recovery
-│   └── secsec-server/          serve loop, quota/rate-limit enforcement, GC executor
+│   ├── secsec-proto/     §12   wire protocol, RPC framing, write/read-auth, rate limits, gc serialization (§15)
+│   ├── secsec-client/    §10,§14,§15  orchestration: cold-start, watcher, sync loop, GC driver, multi-remote+quorum, recovery
+│   └── secsec-server/          serve loop, quota/rate-limit + gc CAS enforcement, GC executor
 ├── bin/secsec            thin CLI over the crates
 ├── vectors/              committed KAT / cross-impl test vectors (per §9.5: all 8 derivations, etc.)
 ├── fuzz/                 cargo-fuzz targets, one per decoder
@@ -83,7 +82,7 @@ secsec/
 ```
 
 Dependency direction is strictly downward (canon → aead/kdf/frame → object/sig/chunk →
-snapshot/store/keyslot/roster → sync → engine → remote/transport/proto → client/server). No security-critical
+snapshot/store/keyslot/roster → sync → engine → transport/proto → client/server). No security-critical
 crate depends on a higher layer. (`secsec-object`, `secsec-snapshot`, `secsec-keyslot` were split
 out as their own crates from the original `object`/`roster` grouping, keeping each core small and
 separately reviewable. `secsec-engine` is split from `secsec-sync` on the same principle: §10's
@@ -91,6 +90,14 @@ merge/dag/rollback logic stays **storage-free and purely testable** inside `secs
 bridge that materializes stored trees into the merge model, re-seals the result, and authors the
 signed merge commit — the only §10 code that touches `store`+`snapshot` — lives in `secsec-engine`.
 `secsec-client` orchestrates the watcher, push/pull, and multi-remote loop on top of it.)
+
+> **Deviation (signed off):** the plan listed a separate `secsec-remote` crate (§14/§15) *below*
+> `client`. In implementation, §14 multi-remote/quorum and the §15 GC driver both build **on** the
+> `Remote` trait, which lives in `secsec-client` (the abstraction over an object+ref store, in-process
+> or over QUIC). A crate below `client` therefore cannot host them without inverting the layering.
+> They live in `secsec-client` (`multiremote.rs`, `gc.rs`); the §15 *serialization hashes* are in
+> `secsec-proto::gc` and the *executor + CAS enforcement* in `secsec-store`/`secsec-server`. The
+> `secsec-remote` crate is dropped, not deferred.
 
 ---
 

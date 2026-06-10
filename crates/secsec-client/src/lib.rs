@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod gc;
+pub mod multiremote;
 pub mod quic;
 pub mod repo;
 pub mod sync;
@@ -169,6 +170,13 @@ impl std::error::Error for ClientError {}
 impl From<secsec_engine::EngineError> for ClientError {
     fn from(e: secsec_engine::EngineError) -> Self {
         ClientError::Engine(e)
+    }
+}
+impl From<repo::RepoError> for ClientError {
+    fn from(e: repo::RepoError) -> Self {
+        // Reuse the Remote variant — a RepoError surfaced through multi-remote reconciliation is, from
+        // the orchestration's view, "this remote's repository state was unusable".
+        ClientError::Remote(RemoteError(e.to_string()))
     }
 }
 impl From<std::io::Error> for ClientError {

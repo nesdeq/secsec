@@ -175,6 +175,22 @@ pub fn open_repo(
     Ok((mk, state))
 }
 
+/// Fetch a remote's full sigchain (`get-roster` `seq = 0, 1, …` until absent), bounded by the §19
+/// total-sigchain cap so a misbehaving server cannot stream entries forever. Entries are the stored
+/// (encrypted) blobs; the caller folds/verifies them against the RFP (§8.1).
+pub async fn fetch_roster_entries<R: Remote>(remote: &R) -> Result<Vec<Vec<u8>>, RepoError> {
+    let mut entries: Vec<Vec<u8>> = Vec::new();
+    let mut seq = 0u64;
+    while seq < MAX_TOTAL_SIGCHAIN {
+        match remote.get_roster_entry(seq).await? {
+            Some(blob) => entries.push(blob),
+            None => break,
+        }
+        seq += 1;
+    }
+    Ok(entries)
+}
+
 /// §8.1 cold-start open against a **remote** (the network counterpart of [`open_repo`]). Fetches the
 /// sigchain entries (`seq = 0, 1, … `until absent, bounded by the §19 cap) and this device's keyslot
 /// over the [`Remote`], then runs the same `cold_start_fold` (peel, decrypt, fold, verify RFP +
@@ -185,17 +201,7 @@ pub async fn open_repo_remote<R: Remote>(
     device: &DeviceKey,
     rfp: &[u8; 32],
 ) -> Result<(MasterKey, State), RepoError> {
-    let mut entries: Vec<Vec<u8>> = Vec::new();
-    let mut seq = 0u64;
-    // The server returns absent past the tip; cap the walk at the §19 sigchain limit so a misbehaving
-    // server cannot stream entries forever.
-    while seq < MAX_TOTAL_SIGCHAIN {
-        match remote.get_roster_entry(seq).await? {
-            Some(blob) => entries.push(blob),
-            None => break,
-        }
-        seq += 1;
-    }
+    let entries = fetch_roster_entries(remote).await?;
     if entries.is_empty() {
         return Err(RepoError::NotInitialized);
     }

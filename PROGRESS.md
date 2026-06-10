@@ -28,7 +28,9 @@ Running status of milestones (M), risks (R), and forward-carried debts. Updated 
 - ✅ §8.6 recovery keyslot (`secsec-recovery`: code + passphrase/Argon2id, mk_commit-verified)
 - ✅ §16 min-algo — verified complete for v1 (min_algo folded + compile-time floor; per-fetch algo check is M7)
 - ✅ §15 `all_heads_hash` bug fixed (server-visible head-blob hashes, not encrypted head_version)
-- ⏳ §15 GC orchestration — signed arrival receipts + `gc` wire op + handler + client driver
+- ✅ §15 GC orchestration — arrival receipts + `gc` wire op + CAS-serialized handler + client driver
+  (live-QUIC proven: sweeps garbage, keeps reachable, CAS fails on stale state). **R6 fully closed.**
+  Receipt *signature* (host-key SIG, §15 defence-in-depth) is the one follow-up.
 - ⏳ §14 multi-remote + quorum (`secsec-remote`)
 - ⏳ §10/§14 gossip (head-hash cross-check)
 
