@@ -203,7 +203,7 @@ prove "latest" without prior memory or a peer — §22), never authenticity.
 Entry { seq:u64, prev:hash, op, params, ts, signer:device_id, sig }
   sig = SSHSIG("secsec-roster-v1", canonical(seq‖prev‖op‖params‖ts‖signer))
   prev = BLAKE3(canonical(entry[seq-1]))      // 0 for genesis
-ops: Genesis | AddDevice | RevokeDevice | Rotate | SetMinAlgo | HistoryReanchor
+ops: Genesis | AddDevice | RevokeDevice | Rotate | SetMinAlgo
 ```
 
 - **Succession:** entry `n` is valid iff `signer` is a *current member* of the state folded from
@@ -260,26 +260,6 @@ generation, and `min_algo`. Only after this does the device trust any head or co
 server-visible `FRAME.gen` is not trusted on its own: a wrong `g_cur` makes step 2's `mk_commit`
 check or the RFP match in step 4 fail.
 
-**`HistoryReanchor` op (normative).** Defined in full here; also referenced in §8.2 and §19.
-
-```
-HistoryReanchor {
-  drop_before_gen:         u32,    // oldest generation now peelable (inclusive lower bound)
-  synthetic_genesis_wrap:  bytes,  // wrap_g for gen=drop_before_gen, in §8.2 format
-  mk_commit_at_reanchor:   hash    // the mk_commit_{drop_before_gen} commitment value itself (NOT a hash of it)
-}
-```
-
-- **Succession:** signer MUST be a current member (same rule as all other ops).
-- **Fold semantics:** membership state and generation counter are unchanged. The reanchor trims
-  only the **data** key-history peeling depth (§8.2): enrolling devices need only peel the data
-  history back to `drop_before_gen`. The sigchain remains fully foldable from genesis via the
-  never-trimmed roster-key history (§8.2), so membership verification is unaffected.
-- **Rejection rule:** a client MUST treat a `HistoryReanchor` entry whose
-  `mk_commit_at_reanchor` does not match the `mk_commit_{drop_before_gen}` value from the
-  RFP-anchored chain as a forgery and MUST halt. The `prev` hash chain is unaffected —
-  `HistoryReanchor` is a standard appended entry.
-
 ### 8.2 Master-key generations & history
 
 Each `Rotate` mints `master_key_{g+1}` and records `mk_commit_{g+1}`. So current members can read
@@ -330,14 +310,13 @@ gen 1). The chain is **never trimmed**: at 64 bytes per generation, bounded by t
 cap (§19), its total size is negligible. A revoked device lacking `roster_key_current` cannot peel
 forward, so roster forward secrecy is preserved.
 
-**Maximum data-history depth:** 256 generations of the **data** key-history `/keyhist/<g>`, which
-governs readability of *old file content* only. When a rotation would exceed this depth a
-`HistoryReanchor` sigchain entry is appended (see §8.1 for the full normative definition): the
-oldest *data* generation is dropped and a new synthetic genesis wrap is created, signed by the
-current master key. `HistoryReanchor` trims **only** the data key-history; it never affects sigchain
-foldability, which relies on the never-trimmed roster-key history above. Enrolling devices need only
-peel the *data* history back to the reanchor point, but always peel the roster-key history to
-genesis to verify membership.
+**Data key-history is never trimmed.** Like the roster-key history above, `/keyhist/<g>` keeps a
+forward-wrap of `master_key_g` under `master_key_{g+1}` for **every** generation, so a current member
+can peel back to `master_key_1` and read *old file content* sealed under any past generation. At 64
+bytes per generation, bounded by the sigchain-length cap (§19), the total size is negligible — there
+is no depth limit and no trimming. (An earlier draft trimmed at 256 generations via a `HistoryReanchor`
+op; that was **removed** — it added a fresh-device fold hazard for marginal space savings in a
+single-user repo that will essentially never reach hundreds of rotations.)
 
 ### 8.3 Keyslots — versioned, authenticated by commitment, PQ-ready
 
@@ -1292,7 +1271,7 @@ path only.
 | keep_set_hash canonical encoding | BLAKE3(le64(count) ‖ id[0] ‖ … ‖ id[count-1]), IDs in ascending byte-lexicographic order | normative for gc() args_hash (§15); both client and server MUST use this exact encoding; test vector required |
 | Max sigchain entries per authenticated connection identity per hour | 60 | server enforces by counting roster-append calls per BLAKE3(authenticated_pubkey); server does not decrypt the entry to read the inner signer field; server MUST enforce at roster-append |
 | Max total sigchain length | 10,000 entries (configurable) | server MUST enforce |
-| Max key-history depth (generations) | 256 | beyond this, HistoryReanchor entry required (§8.2) |
+| Key-history depth (generations) | unbounded (never trimmed) | both the data and roster key-histories keep one 64-byte wrap per generation; total is bounded by the sigchain-length cap (§8.2) |
 | Max blob size (any object type) | 16 MiB | decoders reject before allocating |
 | Max tree depth | 64 levels | decoders reject before allocating |
 | Max tree fan-out per node | 65,536 entries | decoders reject before allocating |

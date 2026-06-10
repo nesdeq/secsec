@@ -94,11 +94,14 @@ X-Wing — now fixed and KAT-proven. The remaining gaps are unimplemented spec f
 - **X-Wing `algo_id` integration** — the conformant keyslot exists but no `algo_id` reaches it;
   `repo.rs` always uses the classical HPKE slot. Needs a FRAME `algo_id` + a device X-Wing-key
   enrollment decision (derive the seed from the SSH scalar? publish in `AddDevice`?) + `SetMinAlgo`.
+- ✅ **§8.2 cross-generation reads** — **done.** `open_object` resolves each object's authenticated
+  generation via a `MasterKeys` resolver; every fetch/push/merge/sync path crosses rotation boundaries
+  (single-gen callers unchanged). The CLI builds the data keyring at cold-start. Proven by
+  `reads_across_a_generation_boundary_with_a_key_ring`.
+- ✅ **§8.1 `HistoryReanchor`** — **removed** (was spec-unsound per `finalrew.md`, never in code).
+  Both key-histories are now never-trimmed; no depth cap.
 - **§7 SAS rate-limit** (5/hr per D_pubkey), **§16 per-fetch `min_algo`** on keyslots (keyslots need
-  a FRAME/`algo_id` first), **§8.1 `HistoryReanchor`** (`finalrew.md` flags it as spec-unsound — a
-  fresh device can't decrypt dropped generations to verify succession; needs a signed
-  membership-snapshot baseline), and CLI surfaces `rotate`/`grant`/`recover`/`gc` (cores operate on a
-  local `Store`; wiring to the remote model is real work). All absent.
+  an `algo_id` first), and CLI surfaces `rotate`/`grant`/`recover`/`gc` — all absent.
 - Live `russh` stdio `H`/`K_S` wiring (deployment-only, no security gain over pinned QUIC).
 
 Residual (not debt): §8.5 seal-before-push ordering is conservative (crash-safe via FF retry).
