@@ -11,13 +11,15 @@
 //! the same inputs; it is a thin transport over this logic, not new crypto.
 
 use crate::{fetch_closure, fetch_head, resolve_head_signer, ClientError, Remote};
-use secsec_canon::{Reader, Writer};
+use secsec_canon::{CanonError, Reader, Writer};
 use secsec_kdf::MasterKey;
 use secsec_object::Id;
 use secsec_sig::{DeviceId, DevicePublic};
+use secsec_snapshot::SnapError;
 use secsec_store::Store;
 use secsec_sync::dag::incomparable;
-use std::collections::BTreeMap;
+use secsec_sync::rollback::{fork_check, ForkStatus};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// A provable fork, for the §10 audit log: our head, the divergent (DAG-incomparable) head, the device
@@ -125,6 +127,75 @@ fn read32(r: &mut Reader<'_>) -> Result<Id, secsec_canon::CanonError> {
     let mut out = [0u8; 32];
     out.copy_from_slice(r.raw(32)?);
     Ok(out)
+}
+
+// ---- device-to-device gossip (§10/§14: exchange head ids, run the same fork check) ----
+
+/// A gossip message a device broadcasts to its peers: "for ref `ref_h` my head is `commit_id` at
+/// `head_version`" (§10/§14). The transport (a direct socket, a shared remote, etc.) is orthogonal —
+/// the receiver runs [`check_peer_head`] on `commit_id` exactly as the multi-remote scan does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GossipHead {
+    /// Keyed-hash ref name (§13).
+    pub ref_h: Id,
+    /// The advertised head commit.
+    pub commit_id: Id,
+    /// The advertised per-ref `head_version` (§8.5).
+    pub head_version: u64,
+}
+
+impl GossipHead {
+    /// Canonical fixed-width encoding: `ref_h ‖ commit_id ‖ le64(head_version)`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.raw(&self.ref_h)
+            .raw(&self.commit_id)
+            .u64(self.head_version);
+        w.finish()
+    }
+
+    /// Strictly decode a gossip head (inverse of [`Self::encode`]).
+    pub fn decode(bytes: &[u8]) -> Result<Self, CanonError> {
+        let mut r = Reader::new(bytes);
+        let ref_h = read32(&mut r)?;
+        let commit_id = read32(&mut r)?;
+        let head_version = r.u64()?;
+        r.finish()?;
+        Ok(GossipHead {
+            ref_h,
+            commit_id,
+            head_version,
+        })
+    }
+}
+
+/// Classify a peer-advertised head against ours (§10 fork algorithm). Loads the commit DAG over both
+/// heads from the **local** store:
+/// - if `peer_head`'s closure isn't local → [`ForkStatus::Unknown`] (the caller should fetch it, then
+///   re-check — exactly §10 step 2);
+/// - if it is known and DAG-incomparable to `our_head` → [`ForkStatus::Forked`] (a provable fork);
+/// - otherwise [`ForkStatus::Comparable`] (ancestor/descendant/equal — a fast-forward, not a fork).
+///
+/// This is the device-gossip counterpart of [`cross_remote_fork_scan`]; both reduce to the same
+/// `secsec_sync::rollback::fork_check`.
+pub fn check_peer_head(
+    store: &Store,
+    mk: &MasterKey,
+    our_head: &Id,
+    peer_head: &Id,
+) -> Result<ForkStatus, ClientError> {
+    // A peer head whose objects we don't hold yet is Unknown (§10 step 2: record + fetch).
+    let (parents, _meta) = match secsec_engine::load_commit_dag(&[*our_head, *peer_head], mk, store)
+    {
+        Ok(dag) => dag,
+        Err(secsec_engine::EngineError::Snap(SnapError::Missing(_))) => {
+            return Ok(ForkStatus::Unknown)
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let known: BTreeSet<Id> = parents.keys().copied().collect();
+    Ok(fork_check(&parents, &known, our_head, peer_head))
 }
 
 /// Append fork `events` to the §10-step-3 audit log at `path` (created if absent), each as a
@@ -332,6 +403,31 @@ mod tests {
         assert_eq!(read[0], forks[0]);
         assert_eq!(read[1], extra);
         assert_eq!(read[1].their_device, None); // None device round-trips
+
+        // device-to-device gossip reduces to the same fork check:
+        // B (branch_b, fetched local during the scan above) is incomparable to A → Forked.
+        assert_eq!(
+            check_peer_head(&local, &m, &head_a, &head_b).unwrap(),
+            ForkStatus::Forked
+        );
+        // C descends from A → Comparable (a fast-forward, not a fork).
+        assert_eq!(
+            check_peer_head(&local, &m, &head_a, &head_c).unwrap(),
+            ForkStatus::Comparable
+        );
+        // a head whose objects we don't hold → Unknown (caller fetches, then re-checks).
+        assert_eq!(
+            check_peer_head(&local, &m, &head_a, &[0xEE; 32]).unwrap(),
+            ForkStatus::Unknown
+        );
+
+        // GossipHead message round-trips.
+        let g = GossipHead {
+            ref_h: [1u8; 32],
+            commit_id: head_b,
+            head_version: 4,
+        };
+        assert_eq!(GossipHead::decode(&g.encode()).unwrap(), g);
     }
 
     #[test]
