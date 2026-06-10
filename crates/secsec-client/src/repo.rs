@@ -49,8 +49,9 @@ fn xwing_keypair(device: &DeviceKey) -> Result<(XWingSecret, XWingPublic), RepoE
 
 /// A device's **enrollment public key** for keyslot `algo`: the 32-byte X25519 public (classical —
 /// derivable from the SSH key, so not separately published) or the X-Wing public bytes (hybrid-PQ —
-/// published in the roster so a granter can wrap to it).
-fn enroll_pub_for(device: &DeviceKey, algo: u8) -> Result<Vec<u8>, RepoError> {
+/// published in the roster so a granter can wrap to it). Public so the CLI can print a device's
+/// X-Wing public for the granter during enrollment (§7).
+pub fn enroll_pub_for(device: &DeviceKey, algo: u8) -> Result<Vec<u8>, RepoError> {
     match algo {
         ALGO_CLASSICAL => Ok(device.x25519_public()?.to_vec()),
         ALGO_XWING => Ok(xwing_keypair(device)?.1.to_bytes()),

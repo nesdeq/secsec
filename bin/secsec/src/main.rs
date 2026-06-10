@@ -11,7 +11,9 @@
 
 use clap::{Parser, Subcommand};
 use secsec_client::quic::QuicRemote;
-use secsec_client::repo::{data_keyring_remote, init_repo, open_repo_remote};
+use secsec_client::repo::{
+    data_keyring_remote, grant_device, init_repo, open_repo, open_repo_remote, rotate_repo,
+};
 use secsec_client::sync::sync_once;
 use secsec_client::{load_frontier, save_frontier, FrontierLoad};
 use secsec_server::serve::serve_connection;
@@ -70,6 +72,51 @@ enum Cmd {
         /// Directory holding the self-signed host key.
         #[arg(long)]
         hostkey_dir: PathBuf,
+    },
+    /// Rotate the master-key generation (§8.4), optionally revoking a device first (`revoke ⇒ rotate`,
+    /// forward secrecy P6/P11). A local-store admin operation (like `init`): run it with direct access
+    /// to the repository store (e.g. the server's), not over the network.
+    Rotate {
+        /// Path to the redb store.
+        #[arg(long)]
+        store: PathBuf,
+        /// A current member's OpenSSH private key (signs the rotation entries).
+        #[arg(long)]
+        key: PathBuf,
+        /// The repository fingerprint (RFP) hex from `init`.
+        #[arg(long)]
+        rfp: String,
+        /// Optionally revoke this device id (hex) before rotating — its transitive add-by closure is
+        /// swept too (§8.1) and its keyslot deleted.
+        #[arg(long)]
+        revoke: Option<String>,
+    },
+    /// Print this device's **enrollment public keys** (its SSH public key + X-Wing public key hex), to
+    /// hand to a granter out-of-band during enrollment (§7).
+    EnrollPubkey {
+        /// This device's OpenSSH private key.
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Enroll a new device (§7, record-writing half) whose public keys you have **already verified
+    /// out-of-band via the SAS**. A local-store admin op. Outputs the `enrollment_nonce` + attestation
+    /// to send back to the new device over the same out-of-band channel.
+    Grant {
+        /// Path to the redb store.
+        #[arg(long)]
+        store: PathBuf,
+        /// A current member's OpenSSH private key (the granter).
+        #[arg(long)]
+        key: PathBuf,
+        /// The repository fingerprint (RFP) hex from `init`.
+        #[arg(long)]
+        rfp: String,
+        /// The new device's canonical SSH public-key hex (from its `enroll-pubkey`, SAS-verified).
+        #[arg(long)]
+        device_pub: String,
+        /// The new device's X-Wing public-key hex (from its `enroll-pubkey`, SAS-verified).
+        #[arg(long)]
+        xwing_pub: String,
     },
     /// Sync a working directory with a remote ref once (cold-start over the wire, then reconcile).
     Sync {
@@ -215,15 +262,107 @@ fn run_init(store: PathBuf, key: PathBuf) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn parse_hex32(s: &str) -> Result<[u8; 32], Box<dyn Error>> {
-    let bytes: Vec<u8> = (0..s.len())
+fn parse_hex(s: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    if s.len() % 2 != 0 {
+        return Err("invalid hex (odd length)".into());
+    }
+    (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(s.get(i..i + 2).unwrap_or("zz"), 16))
         .collect::<Result<_, _>>()
-        .map_err(|_| "invalid hex")?;
-    bytes
+        .map_err(|_| "invalid hex".into())
+}
+
+fn parse_hex32(s: &str) -> Result<[u8; 32], Box<dyn Error>> {
+    parse_hex(s)?
         .try_into()
         .map_err(|_| "expected 32 bytes (64 hex chars)".into())
+}
+
+/// `rotate` (§8.4): a local-store admin op. Open the repo, mint the next generation (re-wrapping all
+/// remaining members' keyslots and extending both §8.2 key-histories), optionally revoking a device
+/// (and its transitive add-by closure) first — the `revoke ⇒ rotate` forward-secrecy flow (P6/P11).
+fn run_rotate(
+    store: PathBuf,
+    key: PathBuf,
+    rfp_hex: String,
+    revoke: Option<String>,
+) -> Result<(), Box<dyn Error>> {
+    let device = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
+    let store = Store::open(store)?;
+    let rfp = parse_hex32(&rfp_hex)?;
+    let revoke_id = match revoke {
+        Some(h) => Some(parse_hex32(&h)?),
+        None => None,
+    };
+    let (mk, st) = open_repo(&store, &device, &rfp)?;
+    let (new_mk, new_st) = rotate_repo(&store, &device, &mk, &st, &rfp, revoke_id, unix_secs())?;
+    if let Some(r) = revoke_id {
+        println!("revoked device {} (and its add-by closure)", hex(&r));
+    }
+    println!(
+        "rotated to generation {} — {} members remain",
+        new_mk.generation(),
+        new_st.members.len()
+    );
+    Ok(())
+}
+
+/// `enroll-pubkey`: print this device's enrollment public keys (its canonical SSH public key + its
+/// X-Wing public key, both hex) to hand to a granter out-of-band during enrollment (§7).
+fn run_enroll_pubkey(key: PathBuf) -> Result<(), Box<dyn Error>> {
+    let device = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
+    let xwing = secsec_client::repo::enroll_pub_for(&device, secsec_client::repo::ALGO_XWING)?;
+    println!("device id:      {}", hex(&device.device_id()?));
+    println!("ssh pubkey hex: {}", hex(&device.public().to_canonical()?));
+    println!("xwing pubkey:   {}", hex(&xwing));
+    println!("\nGive the ssh+xwing pubkeys to the granter (confirm them via the SAS first, §7).");
+    Ok(())
+}
+
+/// `grant` (§7, record-writing half): a granter (a current member) enrolls a new device whose public
+/// keys it has **already verified out-of-band via the SAS ceremony**. Writes the `AddDevice` entry +
+/// the new device's keyslot + the grant attestation; prints the `enrollment_nonce` + attestation to
+/// hand back to the new device over the same out-of-band channel. The interactive SAS itself is
+/// human-mediated; this is the persistence step.
+fn run_grant(
+    store: PathBuf,
+    key: PathBuf,
+    rfp_hex: String,
+    device_pub_hex: String,
+    xwing_pub_hex: String,
+) -> Result<(), Box<dyn Error>> {
+    let granter = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
+    let store = Store::open(store)?;
+    let rfp = parse_hex32(&rfp_hex)?;
+    let (mk, st) = open_repo(&store, &granter, &rfp)?;
+
+    let d_pub = secsec_sig::DevicePublic::from_canonical(&parse_hex(&device_pub_hex)?)?;
+    let d_x25519 = d_pub.x25519_public()?;
+    let d_xwing = parse_hex(&xwing_pub_hex)?;
+    let mut enrollment_nonce = [0u8; 32];
+    getrandom::fill(&mut enrollment_nonce)?;
+
+    let attestation = grant_device(
+        &store,
+        &granter,
+        &mk,
+        &st,
+        &d_pub,
+        &d_x25519,
+        &d_xwing,
+        &enrollment_nonce,
+        unix_secs(),
+    )?;
+    println!("enrolled device {}", hex(&d_pub.device_id()?));
+    println!("granter device  {}", hex(&granter.device_id()?));
+    println!("\nSend to the new device over the SAME out-of-band channel as the SAS:");
+    println!("  enrollment_nonce: {}", hex(&enrollment_nonce));
+    println!(
+        "  attestation:\n{}",
+        String::from_utf8_lossy(&attestation).trim_end()
+    );
+    Ok(())
 }
 
 /// The last-synced base cursor is a commit **content hash** (not secret — the server already stores
@@ -409,5 +548,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 poll_secs,
             ))
         }
+        Cmd::Rotate {
+            store,
+            key,
+            rfp,
+            revoke,
+        } => run_rotate(store, key, rfp, revoke),
+        Cmd::EnrollPubkey { key } => run_enroll_pubkey(key),
+        Cmd::Grant {
+            store,
+            key,
+            rfp,
+            device_pub,
+            xwing_pub,
+        } => run_grant(store, key, rfp, device_pub, xwing_pub),
     }
 }
