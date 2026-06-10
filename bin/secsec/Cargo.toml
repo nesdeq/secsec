@@ -23,5 +23,6 @@ secsec-sync = { path = "../../crates/secsec-sync" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 getrandom = "0.3"
+blake3 = "1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rcgen = "0.13"

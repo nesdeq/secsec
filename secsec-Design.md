@@ -19,8 +19,12 @@ The build plan, status, and assurance strategy live in `secsec-Implementation.md
   silent data loss; full version history is a by-product.
 - **Zero-knowledge** against an untrusted server: content **and** metadata encrypted.
 - **Self-hosted, one static binary**, no DB, no user-managed certificates, minimal deps.
-- **SSH public key is the only required configuration.** Device enrollment and key recovery are
-  first-class flows.
+- **SSH key is the only required configuration and the only credential.** The operator lists
+  permitted device public keys in the server's `~/.ssh/authorized_keys` (the mandatory connection
+  gate, §11); each device holds its `~/.ssh/id_ed25519`. Device onboarding is a first-class flow
+  (genesis for the first device, a one-time **invite code** for the rest, §7). There is **no
+  separate recovery secret**: the SSH key is both the credential and the backup — a device that
+  holds it is a full replica and can re-join from any peer via an invite.
 
 ## 2. Non-goals
 
@@ -31,8 +35,13 @@ The build plan, status, and assurance strategy live in `secsec-Implementation.md
 
 Adversaries: a **malicious/compromised server** (the primary one), a **network attacker**, a
 **revoked device**, and a **stolen client**. We assume the device's SSH key and the user's
-out-of-band channel (reading a fingerprint off a screen) are trustworthy; everything else,
-including the server and the network, is hostile.
+out-of-band channel (carrying an invite code or reading a fingerprint off a screen) are
+trustworthy; everything else, including the server and the network, is hostile.
+
+A key not listed in the server's `~/.ssh/authorized_keys` cannot open a connection at all (§11) —
+the mandatory connection gate. This gate is necessary but **not** sufficient for data access:
+even a listed key reads or writes nothing without a valid keyslot (§12), so the security claims
+below never rest on the gate alone.
 
 What the server sees: framed, equal-looking ciphertext; object byte-sizes (bucketed, §9.6);
 the set of device IDs (opaque); access timing. Nothing else.
@@ -48,17 +57,17 @@ Each row is a guarantee and the mechanism that earns it. Residuals in §22.
 | P1 | Server cannot read content or metadata | Per-object fully-committing (CMT-4) AEAD; metadata lives inside encrypted tree/commit blobs (§9); roster entries encrypted per-entry under a per-seq derived key with CTX/CMT-4 as specified in §8.1/§9.5 |
 | P2 | Server cannot alter an object without detection | Content-addressing re-verified on fetch + AEAD tag + key-commitment (§9.2–9.4) |
 | P3 | Server cannot forge a commit/head/roster entry | All signed via SSHSIG with disjoint namespaces; verified against the roster (§9.5, §8) |
-| P4 | Server cannot feed a new/reinstalled device a **forged repository or key** | Out-of-band **RFP** anchor + `mk_commit` verification of any unwrapped master key + SAS with commitment-before-reveal at enrollment (§7) |
-| P5 | A connection ≠ the ability to read or write; unenrolled keys are rejected before any data access | Every repo RPC — including reads — requires a per-op signature from a **keyslot-owning** (rostered) key; server MUST verify keyslot existence at /keyslots/\<device_id\>/\<g\> on every per-op request, not only at connection time (§9.6, §11, §12); a revoked device with an open connection can still issue requests until keyslot deletion is checked — on cooperative servers the re-check window is ≤ the server-nonce TTL (60 s, §19); on a malicious server, keyslot deletion cannot be enforced (residual §22) |
+| P4 | Server cannot feed a new/reinstalled device a **forged repository or key** | Out-of-band **RFP** anchor + `mk_commit` verification of any unwrapped master key (§7); for a *joining* device, a single-use **invite code** authenticates the enrollment key-exchange end-to-end through the blind server (MAC-under-code — the server never learns the code, §7) and the joiner confirms the inviter-vouched `host_id` equals the server it actually connected to |
+| P5 | A connection ≠ the ability to read or write; unlisted keys cannot even connect, and listed-but-unenrolled keys are rejected before any data access | **Two layers:** (a) the server refuses any connection from a key absent from `~/.ssh/authorized_keys`, re-read per connection (§11); (b) every repo RPC — including reads — requires a per-op signature from a **keyslot-owning** (rostered) key; server MUST verify keyslot existence at /keyslots/\<device_id\>/\<g\> on every per-op request, not only at connection time (§9.6, §11, §12). A revoked device with an open connection can still issue requests until keyslot deletion is checked — on cooperative servers the re-check window is ≤ the server-nonce TTL (60 s, §19); on a malicious server, keyslot deletion cannot be enforced (residual §22) |
 | P6 | Revocation removes access to data created after rotation (forward secrecy) | revoke ⇒ rotate: new master-key generation, re-wrap to remaining devices, delete keyslot; pre-rotation ciphertext remains a residual (§8.4, §22) |
 | P7 | Revocations cannot be lost or rolled back **by the untrusted server** | Roster is an append-only, hash-chained, signed sigchain with succession + frontier (§8). (Eviction of the legitimate device by a *compromised, online* peer racing the CAS is a separate adversary — the concurrent mutual-revocation residual, §22.) |
 | P8 | Rollback/replay of sigchain state is detected; cross-remote rollback of per-ref heads and sigchain is alarmed; fork evidence is computed and alarmed when two devices exchange commits with DAG-incomparable last_seen_head values | Monotonic, signed frontiers on every counter; local frontier sealed with a key derived from **private** key material (§8.5, requires device_ed25519_scalar_clamped, not the public key); rollback-aware merge (§8.5, §10); cross-remote head-rollback alarm mirrors sigchain alarm (§14); fork detection algorithm in §10 fires when received last_seen_head is DAG-incomparable to client head |
 | P9 | No cross-protocol signature reuse | Disjoint SSHSIG namespaces; server-chosen nonces confined to `auth`/`write` (§9.5) |
-| P10 | No catastrophic AEAD misuse / key-confusion for object and recovery wraps | Unique per-object key, fixed nonce, CMT-4 committing AEAD via CTX construction (§9.4); recovery wrap uses same CTX pattern (§8.6); key-history wrap (§8.2) uses CTX pattern with ctx_tag_keyhist = BLAKE3::keyed_hash(k_keyhist_g, "secsec-ctx-v1" ‖ AD_keyhist ‖ T), binding master_key_g as plaintext |
+| P10 | No catastrophic AEAD misuse / key-confusion for object, keyslot, and key-history wraps | Unique per-object key, fixed nonce, CMT-4 committing AEAD via CTX construction (§9.4); key-history wrap (§8.2) uses CTX pattern with ctx_tag_keyhist = BLAKE3::keyed_hash(k_keyhist_g, "secsec-ctx-v1" ‖ AD_keyhist ‖ T), binding master_key_g as plaintext |
 | P11 | Forward secrecy after revocation | Post-rotation data uses a new generation the revoked device cannot derive (§8.4) |
-| P12 | Transport is authenticated without a CA; first-init TOFU window is a documented residual | TLS 1.3 to a pinned self-signed host key (TOFU + `--host-fp`), channel-bound auth (§11); when `--host-fp` is not supplied at init, the pin rests on a one-time interactive fingerprint confirmation — this first-init TOFU window is a residual (§22) |
+| P12 | Transport is authenticated without a CA; first-contact TOFU window is a documented residual | TLS 1.3 to a pinned self-signed host key (TOFU on the first `sync`, fingerprint printed for out-of-band confirmation, then persisted in the folder link), channel-bound auth (§11); the pin rests on that one-time confirmation — the first-contact TOFU window is a residual (§22). A *joining* device additionally checks `host_id` under the invite-code MAC (§7) |
 | P13 | No algorithm/format downgrade once a `SetMinAlgo` entry has been received | Pinned TLS & signature algorithms; `SetMinAlgo` floor in the sigchain enforced on every fetched keyslot (not only at creation); compile-time floor (§16); withheld entries detectable via multi-remote cross-check (§14, §22) |
-| P14 | The single user cannot be permanently locked out | Optional recovery keyslot (Argon2id/recovery-code), authenticity-anchored to RFP (§8.6) |
+| P14 | No server-stored recovery blob to crack; lockout is avoided by backing up the SSH key, not a second secret | The SSH key is both credential and backup. A device holding it is a full plaintext replica; a reinstalled one re-joins via an invite from any peer (§7). Losing *every* device **and** the SSH key is unrecoverable by construction — the §22 total-loss residual. (A passphrase-wrapped recovery keyslot on an untrusted server was considered and **removed** as a net liability: it adds an offline-crackable, server-exfiltratable target for a backup the SSH key already provides.) |
 | P15 | Durability despite a hostile server | Content-addressed replication to ≥2 remotes; client retains until quorum-confirmed via put→get→verify round-trip on each remote (§14) |
 
 ---
@@ -88,8 +97,11 @@ Each row is a guarantee and the mechanism that earns it. Residuals in §22.
     single v1 transport).
 - **RFP (Repository FingerPrint)** := `BLAKE3(canonical(genesis sigchain entry))`. The genesis
   transitively commits to device-1's key and to `mk_commit_1`. **RFP is the one out-of-band
-  anchor**: shown at `init`, and required (via SAS) at every enrollment. Everything else can be
-  fetched from the untrusted server and cryptographically checked against RFP.
+  anchor**: established when the first device creates the repo, and delivered to each joining
+  device **inside the invite code's authenticated pairing exchange** (§7) — the inviting member
+  vouches for it under the code's MAC, so the blind server cannot substitute it. Everything else can
+  be fetched from the untrusted server and cryptographically checked against RFP. After enrollment a
+  device persists the RFP in its per-folder link, so subsequent syncs need no out-of-band step.
 
 ---
 ## 6. Object model
@@ -119,64 +131,63 @@ repository** (attacker-chosen files). Possession of a keyslot therefore cannot b
 authenticity. Enrollment instead authenticates the *master key itself* against an out-of-band
 anchor (RFP).
 
-**`init` (device 1):**
-1. Generate `master_key_1`; compute `mk_commit_1`.
-2. Write genesis sigchain entry (seq 0), self-signed, containing device-1 pubkey + `mk_commit_1`.
-3. Compute and **display RFP** ("Repository fingerprint: `BLAKE3:…`" — RFP is `BLAKE3(canonical(genesis))`
-   per §5, so it MUST be labeled/compared as BLAKE3, not SHA256). The user records it.
-4. Optionally create a recovery keyslot (§8.6).
+**Creating the repo (first device).** The first device runs `secsec sync <dir> --server host[:port]`
+with **no** `--invite`. It:
+1. Generates `master_key_1`; computes `mk_commit_1`.
+2. Writes the genesis sigchain entry (seq 0), self-signed, containing device-1's pubkey +
+   `mk_commit_1`, **and** its own X-Wing keyslot wrapping `master_key_1`. Both writes are accepted
+   under the **genesis-bootstrap exception** (§12): the server permits `roster-append`/`put-keyslot`
+   from a not-yet-enrolled key **only while the roster is empty** (`roster_len == 0`). Combined with
+   the `authorized_keys` gate (§11) — only a key the operator listed can reach this path — this
+   closes the "whoever connects first seizes an empty repo" race.
+3. The genesis fixes **RFP** = `BLAKE3(canonical(genesis))` (labeled/compared as BLAKE3, never
+   SHA256). RFP is persisted in the folder's link and later handed to joining devices via the invite
+   exchange below; the user need not transcribe it by hand.
 
-**`grant` (add device D), performed on an already-enrolled device E that holds `master_key`:**
+(On first contact the device prints the server's host fingerprint for out-of-band confirmation,
+then pins it — TOFU, §11.)
 
-The SAS protocol uses a mandatory commitment-before-reveal round. Without it, after learning
-`grant_nonce` in step 2d, a relay could grind `D_pubkey_M` in ~2^SAS_bits BLAKE3 evaluations —
-approximately 30 ms for a 20-bit (6-digit decimal) SAS — to find a key that produces a matching
-SAS, then retroactively substitute it. The commitment `c_E` fixes `grant_nonce` before the relay
-sends `D_pubkey` to E (step 2c before 2d), so the relay must choose `D_pubkey_M` without knowing
-`grant_nonce`, collapsing the relay's advantage to one blind guess per session (probability
-1/1,000,000).
+**Adding a device — invite-code pairing.** Onboarding the second/third/… device needs exactly one
+out-of-band secret: a single-use **invite code**. This replaces the older manual ceremony
+(typing D's fingerprint into E, then comparing a 6-digit SAS by eye): one carried 96-bit code is
+higher-entropy than a 20-bit SAS and authenticates the whole key-exchange *mechanically*, so there
+is no digit-by-digit human comparison to mis-read, and no grinding window to defend against.
 
-E MUST enforce a rate limit of at most 5 SAS sessions per `D_pubkey` per hour, tracked in E's
-local state, independent of sigchain operations. Sessions that abort at any step (including steps
-1–3) count toward the limit. E MUST NOT begin step 2 for a `D_pubkey` that has reached the limit
-within the rolling 1-hour window. Aborted sessions MUST discard `grant_nonce`; E MUST NOT reuse a
-`grant_nonce` across sessions.
+Operator (one-time): add D's SSH **public** key to the server's `~/.ssh/authorized_keys` so D can
+connect at all (§11). On the **inviting** (enrolled, online) device E: `secsec invite <dir>` —
+prints a one-time code and waits. On the **joining** device D:
+`secsec sync <dir> --server host[:port] --invite <code>`.
 
-1. D shows its pubkey fingerprint; the human enters/confirms it on E.
-2. **Commitment round (mandatory):**
-   a. E generates `grant_nonce` (128 bits, OS CSPRNG).
-   b. E computes and sends commitment
-      `c_E = BLAKE3("secsec-sas-commit-v1" ‖ grant_nonce ‖ RFP ‖ D_pubkey)`
-      to D **before** D sends anything beyond its connection request, where `D_pubkey` is the key
-      confirmed by the human in step 1. Including `D_pubkey` in `c_E` means D's verification of
-      `c_E` confirms E committed to exactly that key; a relay substituting `D_pubkey_M` will fail
-      D's check.
-   c. D sends `D_pubkey`.
-   d. E MUST NOT reveal `grant_nonce` until `D_pubkey` has been received. A timeout before
-      receiving `D_pubkey` is an abort — `grant_nonce` MUST never be revealed without a matching
-      `D_pubkey`. E MUST verify that `BLAKE3(canonical(D_pubkey_received))` equals the fingerprint
-      confirmed in step 1; mismatch aborts the session. E then reveals `grant_nonce`.
-   e. D verifies `c_E`: recomputes
-      `BLAKE3("secsec-sas-commit-v1" ‖ grant_nonce ‖ RFP ‖ D_pubkey)` and aborts if the result
-      does not match.
-3. Both compute **SAS** = `BLAKE3("secsec-sas-v1" ‖ RFP ‖ D_pubkey ‖ grant_nonce)`, take the
-   integer value of the first 32 bits, compute mod 1,000,000 to obtain a **6-digit decimal**
-   (000000–999999, zero-padded); effective human-verified entropy: ~20 bits. The human confirms
-   the two displays match out-of-band. A relay that substitutes `D_pubkey_M` must have fixed a
-   grinding target before step 2b and gets at most one blind guess per session (probability
-   1/1,000,000). SAS binds `D_pubkey` **and** RFP, so a server swapping either produces a
-   mismatch → human aborts.
-4. E appends an `AddDevice` sigchain entry (D_pubkey, current `mk_commit_g`), signs it.
-5. E generates a fresh `enrollment_nonce` (32 bytes, OS CSPRNG) and **sends it to D directly over
-   the grant channel** — the same out-of-band-authenticated channel as the SAS ceremony, never via
-   the server — and D records it locally. E then writes D's **keyslot** wrapping `master_key_g`
-   (§8.3) and a `secsec-grant-v1` attestation (§9.5) over that same `enrollment_nonce`. E MUST
-   verify that the selected keyslot `algo_id` satisfies the current `min_algo` from the folded
-   sigchain before writing; if E cannot produce a keyslot at the required `algo_id`, E MUST abort
-   the grant with an error.
+The pairing protocol (every message relayed through the server's transient, TTL'd **pairing
+mailbox** — `pair-put`/`pair-get`, §12 — whose slot ids are `BLAKE3(label ‖ code)` so the server
+cannot reverse them; every message MAC'd under `mac_key = BLAKE3::derive_key("secsec-pair-mac-v1",
+code)`):
 
-**D's first sync (and every reinstall) — authenticity without trusting the server:**
-1. D obtains **RFP** out-of-band (from E's screen / the SAS step / its printed copy).
+1. **D → slot `d`:** `{D_pubkey, D_xwing_pub, tag_d}` with
+   `tag_d = BLAKE3::keyed_hash(mac_key, "d" ‖ D_pubkey ‖ D_xwing_pub)`. Only a code-holder can
+   produce `tag_d`, so the server cannot substitute D's key.
+2. **E** reads slot `d`, verifies `tag_d`, then runs the networked grant (`grant_device_remote`):
+   appends `AddDevice(D_pubkey, mk_commit_g, D_xwing_pub)` onto the sigchain tip (CAS-guarded) and
+   writes D's X-Wing **keyslot** wrapping `master_key_g` (§8.3). E selects a keyslot `algo_id` ≥ the
+   folded `min_algo` (§16). E then posts **slot `e`:** `{RFP, host_id, tag_e}` with
+   `tag_e = BLAKE3::keyed_hash(mac_key, "e" ‖ RFP ‖ host_id)`.
+3. **D** reads slot `e`, verifies `tag_e` → learns the genuine RFP and the `host_id` E vouches for.
+   D **confirms `host_id` equals the server it actually connected to** (the TOFU-captured pin, §11);
+   a mismatch is a possible MITM and aborts. D then cold-starts (below) and unwraps the keyslot E
+   wrote, verifying it against `mk_commit` — a forged keyslot fails.
+
+Why this defeats the blind server: it relays only ciphertext-opaque mailbox blobs and never learns
+the code, so it cannot forge `tag_d`/`tag_e`, cannot swap D's key (P4), and cannot substitute RFP or
+`host_id`. The code is single-use with a bounded mailbox TTL (`PAIR_TTL`, §19); a replayed pairing
+message finds its slot consumed or expired, and the code is never reused. Online code-guessing is
+the only residual attack surface and is infeasible: a 96-bit code, single-use, behind the
+`authorized_keys` connection gate (§11) and the mailbox's per-key write rate limit (§12). The gate
+and the code are complementary layers — the gate keeps unlisted keys off the mailbox entirely; the
+code authenticates the exchange among listed keys; neither alone suffices.
+
+**D's cold-start (and every reinstall) — authenticity without trusting the server:**
+1. D has **RFP** — from the pairing exchange (step 3) on first join, or from its persisted
+   per-folder link on every later sync.
 2. D fetches the sigchain; verifies genesis hashes to **RFP** and the whole chain's succession
    (§8). A server-forged chain fails the RFP match.
 3. D fetches its keyslot, unwraps → candidate `master_key_g`; **verifies
@@ -184,15 +195,16 @@ within the rolling 1-hour window. Aborted sessions MUST discard `grant_nonce`; E
    **highest-seq** `AddDevice` or `Rotate` entry in the RFP-anchored chain (D MUST use the entry
    with the greatest `roster_seq`, not any historical entry — using a stale entry would pass for
    a rolled-back key). A server-forged keyslot (fake key) fails this check → D refuses.
-4. D verifies the `secsec-grant-v1` attestation covers the **`enrollment_nonce` D received
-   directly from E over the grant channel** (step 5) — not a nonce merely read back from the
-   server-fetched attestation, which would make the check vacuous and let the server replay a stale
-   attestation. A nonce mismatch, or an attestation signed by a non-rostered key, aborts enrollment.
-5. Only then does D trust the repo. The server can withhold or stale data (availability) but can
+4. Only then does D trust the repo. The server can withhold or stale data (availability) but can
    never substitute a fake key or fake universe.
 
 This reduces the unavoidable residual to **freshness only** on a state-less reinstall (cannot
 prove "latest" without prior memory or a peer — §22), never authenticity.
+
+> The lower-level `grant_device` primitive (direct, non-mailbox enrollment) additionally signs a
+> `secsec-grant-v1` attestation over an out-of-band `enrollment_nonce` (§9.6) for freshness; the
+> shipped invite-pairing path obtains that freshness from the single-use code + mailbox TTL instead,
+> so it does not carry the attestation.
 
 ---
 ## 8. Roster sigchain & key management
@@ -348,7 +360,10 @@ Ed25519→X25519 conversion is the established one used by `age`/`ssh-to-age`.)
 
 ### 8.4 Rotation & revocation (closes "revoke is a no-op")
 
-Against an untrusted server, `revoke` **always** rotates:
+Revocation runs over the wire from any enrolled device: `secsec devices <dir>` lists the roster
+(short device id + each key's `SHA256:…` SSH fingerprint), and `secsec revoke <device> <dir>`
+removes one by an id prefix (`rotate_repo_remote` with a revoke target). A device may not revoke
+itself. Against an untrusted server, `revoke` **always** rotates:
 1. Append `RevokeDevice(B)`. Compute B's **transitive add-by closure** over the folded roster
    (devices B added, devices they added, …) restricted to grants after the last entry the revoking
    device authored or witnessed; append `RevokeDevice` for each device in that closure (closes the
@@ -433,69 +448,21 @@ the client MUST alarm the user prominently and treat the session as a reinstall 
 residual). Authenticity is not lost (RFP + `mk_commit` still verify), but freshness guarantees
 do not hold until a peer confirms the current head.
 
-### 8.6 Recovery (closes the lock-out gap, without a backdoor)
+### 8.6 Recovery — removed (the SSH key is the backup)
 
-Optional, created at `init` or later:
+Earlier drafts offered an optional **recovery keyslot**: a passphrase- or recovery-code-wrapped copy
+of the master key, stored on the server, recoverable into a fresh device. It was **removed entirely**
+(the `secsec-recovery` crate and the `recover` command deleted).
 
-**Preferred path — 256-bit recovery code:**
-- Generate a 256-bit **recovery code** (24-word/Base32, OS CSPRNG).
-- Derive `recovery_key = BLAKE3::derive_key("secsec-recovery-code-v1", salt ‖ code)` where
-  `salt` is a random 16-byte value generated at keyslot-creation time via OS CSPRNG and stored
-  in the recovery keyslot blob. A fresh salt is generated on each rotation re-wrap. (High
-  entropy → KDF need not be slow; the 16-byte random salt prevents precomputation across
-  installations.)
-
-**Alternative path — passphrase (explicitly weaker; use only if recovery code is infeasible):**
-- The 256-bit recovery code is the default and strongly preferred path. The passphrase path is
-  explicitly weaker because the recovery keyslot is stored on the untrusted server and an
-  exfiltratable blob with a weak passphrase can be cracked offline.
-- Require passphrase ≥ 6 words or ≥ 20 characters. Estimate entropy via `zxcvbn` or equivalent;
-  reject inputs below ~50 bits with an explicit error. Display a prominent warning that this path
-  is weaker and re-require user confirmation before proceeding.
-- Derive `recovery_key = Argon2id(passphrase, salt=random_16B, m=64 MiB, t=3, p=1, len=32)`
-  (see §19 for rationale). The 16-byte salt is generated at keyslot-creation time via OS CSPRNG
-  and stored in the recovery keyslot blob. A fresh salt is generated on each rotation re-wrap.
-  The m=64 MiB, t=3, p=1 floor is calibrated for offline-attack resistance (RFC 9106 second
-  recommended / OWASP high-security), not interactive-login DoS tradeoff.
-
-**Recovery keyslot construction (both paths):**
-- Compute `k_recovery = recovery_key` (as derived above).
-- Apply the §9.4 CTX construction directly:
-  ```
-  AD_recovery         = "secsec-recovery-v1" ‖ device_pubkey ‖ le32(gen)
-  nonce               = 0   // safe: k_recovery is unique per passphrase+salt
-  (ct_recov, T)       = ChaCha20Poly1305_raw(k_recovery, nonce, AD_recovery,
-                                              master_key_current_gen)
-                        // T is the raw 16-byte Poly1305 tag
-  ctx_tag_recov       = BLAKE3::keyed_hash(k_recovery,
-                        "secsec-ctx-v1" ‖ AD_recovery ‖ T)
-                        // 32-byte CTX tag; binds K, N, A, and M (via T) → CMT-4
-  recovery_keyslot    = AD_recovery ‖ salt(16B) ‖ ctx_tag_recov ‖ ct_recov
-                        // no separate raw tag stored; ctx_tag_recov replaces it
-  ```
-  The `device_pubkey` and `gen` in `AD_recovery` bind the keyslot to a specific device and
-  generation; the server cannot swap recovery keyslots across users or generations. The CTX
-  construction (§9.4) achieves CMT-4: `T` in the hash binds the plaintext `M`, closing
-  partitioning-oracle attacks. Decryption: re-derive `k_recovery`; evaluate Poly1305 over
-  `(AD_recovery, ct_recov)` to obtain `T_cand`; compute expected `ctx_tag_recov` =
-  `BLAKE3::keyed_hash(k_recovery, "secsec-ctx-v1" ‖ AD_recovery ‖ T_cand)`; constant-time
-  compare `stored_ctx_tag_recov == expected_ctx_tag_recov`; only if this passes, apply the
-  ChaCha20 keystream to `ct_recov` to obtain the master key. T is not stored in the blob and
-  MUST NOT be looked up there — it is always recomputed via Poly1305 over `(AD, ct)`.
-
-**Recover:** the user keeps `{recovery_code, RFP}` (printed). Derive `recovery_key` →
-apply the §9.4 decryption → candidate master key → **verify against `mk_commit_g`** in the
-RFP-anchored chain → re-enroll a fresh device. The server cannot forge this (it lacks the code;
-the commitment blocks fake keys) → **recovery is not a server-exploitable backdoor**.
-
-**Optional Shamir split of the recovery code:** use **SSKR** (Sharded Secret Key Reconstruction,
-Blockchain Commons) or **SLIP-39** as the normative Shamir implementation. Minimum useful
-configuration: k-of-n where k ≥ 2 and n ≤ 5. Each share is encoded as a word list per the
-chosen scheme's standard encoding. Authentication: each recovered candidate secret MUST be
-verified against `mk_commit_g` from the RFP-anchored chain before accepting — this closes
-silent-wrong-share attacks that would otherwise produce a wrong master key only detectable at
-commitment verification. Implementors MUST NOT write bespoke GF arithmetic; use a vetted
-library implementation of SSKR or SLIP-39.
+Rationale: the SSH key is already both the credential and the backup (§1, P14). Any device holding it
+is a full plaintext replica and can re-join from any peer via an invite (§7); there is nothing a
+server-stored recovery blob recovers that backing up the one SSH key does not. Against that marginal
+benefit, the recovery keyslot was a **net liability** — a second secret for the user to manage and,
+in the passphrase variant, an **offline-crackable, server-exfiltratable** target sitting on the
+untrusted server (precisely the asset the rest of this design works to deny it). Total loss of
+*every* device **and** the SSH key is the information-theoretic §22 residual; the honest mitigation is
+to back up the single credential, not to mint and store a second one. No recovery KDF (Argon2id),
+recovery keyslot, or `/recovery` server path exists in v1.
 
 ---
 ## 9. Cryptography
@@ -680,11 +647,13 @@ normative; §11 cross-references this table rather than defining a separate form
 object IDs requested; `session_transcript` provides per-connection freshness without requiring
 a server-supplied nonce.
 
-`secsec-grant-v1` includes `enrollment_nonce` (32 bytes, OS CSPRNG, generated fresh by E at grant
-time). E transmits the nonce to D **directly over the grant channel** (§7 step 5); D records it and,
-at enrollment (§7 step 4), checks the server-fetched attestation covers exactly that
-directly-received value. Anchoring the reference nonce to the out-of-band channel — not to the
-server-supplied attestation — is what makes the attestation single-session and non-replayable.
+`secsec-grant-v1` is the **direct-grant** primitive's attestation: it includes `enrollment_nonce`
+(32 bytes, OS CSPRNG, generated fresh by the granting device E and transmitted to D over the
+out-of-band grant channel); D checks the server-fetched attestation covers exactly that
+directly-received value, which makes it single-session and non-replayable. The **shipped invite-code
+pairing** path (§7) does not carry this attestation — it obtains the same freshness from the
+single-use code and the pairing mailbox's bounded TTL — so `secsec-grant-v1` applies only when a
+device is enrolled via the lower-level direct grant rather than an invite.
 
 Server-chosen nonces appear **only** in `auth`/`write`. A signature for one purpose is
 cryptographically invalid for any other → the "server sets the challenge to `H(commit)`" forgery
@@ -835,13 +804,25 @@ The §8.5 local sealed-state blob uses this same construction with `key = local_
 
 - **QUIC + TLS 1.3** (`quinn`+`rustls`), udp/8899 (overridable). Fixed ciphersuites (ChaCha20-
   Poly1305 / AES-256-GCM) and X25519 KX — **no negotiation/downgrade**.
+- **`authorized_keys` is the mandatory connection gate.** `secsec serve` reads the operator's
+  `~/.ssh/authorized_keys` (standard OpenSSH format, Ed25519 lines) and **refuses to start** if it
+  is missing or has no usable key. After the handshake, the server computes
+  `device_id = BLAKE3(canonical(authenticated_pubkey))` and rejects the connection unless that id is
+  present in the file — which is **re-read on every connection**, so adding or removing a device
+  takes effect with no restart, and an unreadable file fails **closed** (deny). The authenticating
+  key is proven by the channel-bound `secsec-auth-v1` signature below, so a key cannot be spoofed by
+  client-supplied bytes. This gate is necessary but not sufficient: a listed key still owns no data
+  without a keyslot (§12). The two layers are independent — `authorized_keys` is the operator's coarse
+  allow-list (who may open a socket); the keyslot roster is the cryptographic membership (who may read
+  or write). Revoking a device is therefore two acts: `secsec revoke` (rotate the key away, §8.4) and
+  removing its line from `authorized_keys` (stop it reconnecting).
 - **No managed certs:** the server self-signs a host key on first run (like `sshd`). The client
-  **pins** it (TOFU). `init --host-fp SHA256:…` pre-seeds the pin. When `--host-fp` is absent at
-  `init`, the client MUST display the fingerprint and require an explicit interactive y/N
-  confirmation — the prompt MUST state that this is a one-time verification and that the user
-  should independently verify the fingerprint out-of-band. Accepting without confirmation is NOT
-  permitted. (Residual: §22 TOFU first-init window — a network attacker present at init without
-  `--host-fp` can substitute their host key; always use `--host-fp`.)
+  **pins** it **trust-on-first-use**: the first `secsec sync` to a server captures the host key's
+  SPKI hash, **prints the fingerprint** for the user to verify out-of-band, and persists it as
+  `host_id` in the folder's link; every later connection pins that stored value (a mismatch aborts).
+  v1 ships TOFU only — there is no pre-seed flag — so the first contact is the trust anchor for the
+  host identity. (Residual: §22 first-init TOFU window — a network attacker present at that first
+  contact can substitute their host key; verify the printed fingerprint out-of-band.)
 - **host_id definition:** `host_id = BLAKE3(canonical(server pinned SPKI bytes))`. `host_id` MUST
   be computed by the client from locally-pinned material and MUST NOT be accepted from the server.
 - **Verifier (the top ship-broken risk):** the custom `rustls` `ServerCertVerifier` MUST compare
@@ -894,6 +875,10 @@ The §8.5 local sealed-state blob uses this same construction with `key = local_
 | `put(blob)` | **`secsec-write-v1` sig** | store an object, idempotent by id |
 | `cas-head(old,new,sig)` | **`secsec-write-v1` sig** + valid `secsec-head` | atomic ref CAS |
 | `roster-append(entry)` | **`secsec-write-v1` sig** + valid `secsec-roster` | grant/revoke/rotate/min-algo |
+| `put-keyslot(device_id,gen,blob)` | **`secsec-write-v1` sig** | write a device's keyslot at enrollment/rotation (§8.3); permitted from a not-yet-enrolled key **only** under the genesis-bootstrap exception (`roster_len == 0`) |
+| `delete-keyslot(device_id,gen)` | **`secsec-write-v1` sig** | remove a revoked device's keyslot on rotation (§8.4) |
+| `put-keyhist(gen,blob)` / `put-roster-keyhist(gen,blob)` | **`secsec-write-v1` sig** | store the §8.2 data- and roster-key-history forward-wraps minted by a rotation |
+| `pair-put(slot,blob)` / `pair-get(slot)` | **`secsec-read-v1` sig** | §7 invite-pairing mailbox: a TTL'd relay of code-MAC'd blobs at `slot = BLAKE3(label ‖ code)`. Dispatched **pre-enrollment** (a joining device owns no keyslot yet); the server learns neither the code nor the contents |
 | `gc(keep-set,gen)` | **`secsec-write-v1` sig** | client-driven sweep (§15); max 100,000 IDs per keep-set |
 
 **Every repo operation — including reads — requires a per-op signature from a key that owns a
@@ -907,13 +892,19 @@ into sequential calls. The server returns a `too-many-ids` error before performi
 more live objects the client performs GC in generation-bounded batches.
 
 **Keyslot-existence enforcement (normative).** The server MUST verify, on every per-op request
-(including `get`, `get-ref`, `has`, `put`, `cas-head`, `roster-append`, `gc`), that a keyslot blob exists at
+(including `get`, `get-ref`, `has`, `put`, `cas-head`, `roster-append`, `put-keyslot`,
+`delete-keyslot`, `put-keyhist`, `put-roster-keyhist`, `gc`), that a keyslot blob exists at
 `/keyslots/<device_id>/<any_g>` where `device_id = BLAKE3(canonical(authenticated_pubkey))` from
 the connection auth step. A request from a key with no stored keyslot MUST be rejected with a
 distinct `not-enrolled` error code before any read or write is performed. This check uses
 filesystem presence only and does not require decrypting the sigchain. The server MUST also verify
 that per-op signatures are signed by the same public key that completed the `secsec-auth-v1`
-challenge on the current connection.
+challenge on the current connection. **Two exceptions, both bounded:** (a) `pair-put`/`pair-get` are
+dispatched *before* this check — a joining device owns no keyslot yet — and are authorized by their
+`secsec-read-v1` signature alone (their payload is independently code-MAC'd, §7); (b) the
+**genesis-bootstrap exception** permits `roster-append`/`put-keyslot` from an unenrolled key **only
+while the roster is empty** (`roster_len == 0`), letting the first device create the repo. Every
+other op from an unenrolled key is rejected.
 
 The server SHOULD re-verify keyslot existence on each per-op request and MUST do so at least once
 per `server_nonce` TTL window (60 s, §19), closing the open-connection gap on cooperative
@@ -921,10 +912,12 @@ deployments. (A revoked device cannot authenticate new connections once its keys
 a cooperative server, or obtain new-generation master keys on a malicious server — bounded by the
 gen-g residual, §22.)
 
-The `authorized_keys` allow-list is only a cheap connection gate; a key in it but not granted
-can open a socket and do nothing else. A server-injected key cannot read or write: it owns no
-keyslot, and the server cannot mint a *valid* (commitment-matching) one. The write `args_hash`
-binds the exact blob/op (the client constructs op/args; the server supplies only the nonce).
+The `authorized_keys` allow-list is the **mandatory** connection gate (§11): `secsec serve` refuses
+to start without it and re-reads it per connection, so an unlisted key never reaches any op above. A
+listed-but-unrostered key can open a socket and do nothing else — it owns no keyslot, so every op but
+the two bounded exceptions above is rejected, and the server cannot mint a *valid*
+(commitment-matching) keyslot for an injected key of its own. The write `args_hash` binds the exact
+blob/op (the client constructs op/args; the server supplies only the nonce).
 
 **`put()` declared size (normative).** The `put()` request frame MUST include a `declared_size`
 field (`u32`) preceding the blob bytes. The server MUST reject any `put()` with
@@ -966,7 +959,10 @@ These limits are checked after auth and before object storage. See §19.
 ---
 ## 13. Storage layout
 
-**Server** (all opaque):
+**Server.** All state lives in one file, `repo.secsec` (a `redb` database, not a directory tree — the
+paths below are logical key namespaces inside it), in the directory passed to `secsec serve` (default
+the current dir). Alongside it the server keeps its self-signed host identity (`hostkey/`) and receipt
+key. All repo state is opaque:
 ```
 /objects/<id>            packed encrypted blobs (chunk/tree/commit)
 /keyslots/<device_id>/<g> versioned authenticated keyslots per device per generation
@@ -975,9 +971,10 @@ These limits are checked after auth and before object storage. See §19.
 /roster/<seq>            encrypted, signed sigchain entries
 /keyhist/<g>             data key-history wraps (§8.2)
 /roster-keyhist/<g>      roster-key history wraps (§8.2; never trimmed)
-/recovery                optional recovery keyslot including 16-byte Argon2id salt (§8.6)
 /hostkey                 server self-signed host identity (first run)
 ```
+(There is **no** `/recovery` namespace — recovery was removed, §8.6.) The transient invite-pairing
+mailbox (§7) is **in-memory only**, never persisted: TTL'd slots keyed by `BLAKE3(label ‖ code)`.
 
 The generation component `g` is a **plaintext integer**. Opaquing it (deriving the path component
 from a secret) was considered and **rejected** as unbuildable here: the server API has no `list`
@@ -998,11 +995,21 @@ Path notes:
   `master_key` (§9.5). The head blob is **signed and encrypted** (§9.8): the ref name lives **inside
   the encryption** (recoverable only by a client holding `head_key_g`), so the server sees only the
   hash `H` and ciphertext. This closes the ref-name leak.
-- The `/recovery` blob includes a 16-byte random salt field (before the key_commit) for the
-  Argon2id path (§8.6).
-
 The server-side `redb` index holds **only** `{id, size, generation, pack-offset}` — never
 plaintext-derived metadata. One static binary; no external DB.
+
+**Client.** The synced folder holds **nothing but the user's plaintext files** — no control files
+clutter it. All per-folder client state lives out of tree under
+`~/.local/state/secsec/<BLAKE3(abs_folder_path)>/`:
+```
+link            the repo binding (git-remote analogue): server address, pinned host_id, RFP, ref name
+objects.secsec  the encrypted object cache (so a re-sync need not re-fetch/re-encrypt unchanged data)
+frontier        the §8.5 local sealed state (anti-rollback counters), sealed under the SSH key
+base, receipts  the last-synced root and the §15 arrival-receipt log (for auto-GC)
+```
+The object cache is encrypted (it is the same content-addressed blobs pushed to the server) and is a
+*cache*, not the source of truth — the plaintext folder is. This is why no `redb` file sits in the
+user's working directory.
 
 ---
 ## 14. Multi-remote durability (replicas, not new forks)
@@ -1056,6 +1063,17 @@ per-ref head rollback-detection step).
 
 ---
 ## 15. Garbage collection (hardened)
+
+**GC is automatic and client-driven — there is no `gc` command.** The blind server cannot compute
+reachability (every head/commit/tree is ciphertext to it), so a client must initiate; but *which*
+client and *when* is not a decision to push onto the user. `secsec sync` therefore runs one
+best-effort GC pass per session (after the first sync): it fetches the reachable closure over its
+ref, derives `gc_gen` from its own §15 arrival-receipt log (only generations whose every object has
+aged past the `GC_GRACE_WINDOW`), and issues the compare-and-swap `gc` op below. A failure is
+logged and skipped — never fatal to the sync. Retention is keep-everything until an object both
+falls out of the keep-set and ages past the grace window; nothing is deleted silently. The
+mechanism is unchanged from prior drafts; only the *trigger* moved from a manual command into the
+sync loop.
 
 - **Keep-set** = reachable closure over the heads of **all devices in the RFP-anchored roster**
   (each at `/refs/<H>`), unioned across all remotes — not merely the refs a server volunteers.
@@ -1202,9 +1220,9 @@ later is worthless), so a PQ signature is lower urgency and is added later via t
 keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today.
 ## 18. Implementation hardening
 
-- **Memory:** `master_key`, all derived subkeys, `recovery_key`, SSH private material → `secrecy`
+- **Memory:** `master_key`, all derived subkeys, SSH private material → `secrecy`
   wrappers, `zeroize` on drop, `mlock` where supported; never serialized to disk.
-- **Constant-time:** all tag/commit/MAC/SAS/fingerprint comparisons via `subtle`.
+- **Constant-time:** all tag/commit/MAC/invite-code-MAC/fingerprint comparisons via `subtle`.
 - **RNG:** OS CSPRNG (`getrandom`) only; no userspace PRNGs for keys/nonces.
 - **Parsers:** size/depth/fan-out/length bounds enforced pre-allocation per §19 normative constants;
   `cargo-fuzz` targets for every decoder; reject non-canonical encodings.
@@ -1230,13 +1248,13 @@ keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today.
 | Per-key read rate | 200 MB/s sustained | server MUST enforce after auth; matches 2× write rate to allow sync catch-up without unbounded egress |
 | Connection rate limit | 10 new/s per source IP; 3 concurrent per authenticated key | server MUST enforce |
 | Device key algorithm | **Ed25519 only** | RSA/ECDSA/`sk-*` keys are rejected at parse (v1 scope) |
-| Argon2id (passphrase recovery) | m=64 MiB, t=3, p=1, salt=16 B random | offline-attack floor (RFC 9106 second recommended / OWASP high-security); high-entropy code path uses HKDF |
-| Argon2id salt | 16 bytes, OS CSPRNG, per-keyslot, rotated on re-wrap | RFC 9106 §4 mandatory; stored in /recovery blob |
+| Connection gate | `~/.ssh/authorized_keys`, re-read per connection, fail-closed | mandatory — `secsec serve` refuses to start without a usable key (§11, §12) |
 | Keyslot KEM (mandatory) | **X-Wing** (ML-KEM-768 ⊕ X25519, draft-connolly-cfrg-xwing-kem-10), `algo_id = 2`; CTX AEAD AD = "secsec-keyslot-v1" ‖ canonical(device_id) ‖ le32(gen); device X-Wing seed = `derive_key("secsec-xwing-seed-v1", ed25519_seed)` | post-quantum mandatory — the only keyslot algorithm; classical X25519/HPKE removed (§8.3). Floor enforced at cold-start (§16) |
 | Durability quorum | 2 remotes (put→get→verify round-trip each) | availability under hostile server |
 | Retention | keep-all; prune opt-in | no silent deletion |
-| SAS length | ~20 bits human-verified (6-digit decimal, mod 1,000,000 of 32-bit BLAKE3 truncation) | NIST SP 800-63B-4 floor: ≥20 bits met; the 6-digit decimal encoding conveys log₂(1,000,000) ≈ 19.93 bits of human-verified entropy — the ZRTP 32-bit claim does not apply to this decimal encoding |
-| SAS grant attempt cap | 5 SAS sessions per D_pubkey per hour | E MUST enforce at the SAS protocol layer, tracked in E's local state, independent of sigchain operations; sessions that abort at any step (including steps 1–3) count toward the limit; E MUST NOT begin step 2 for a D_pubkey that has reached the limit within the rolling 1-hour window |
+| Invite code length | 96 bits (12 bytes, OS CSPRNG), single-use; displayed as dash-grouped lowercase hex | the §7 out-of-band pairing secret; single-use + the mailbox TTL + the `authorized_keys` gate bound online guessing. Replaces the older 20-bit human-compared SAS |
+| Pairing mailbox TTL (`PAIR_TTL`) | 600 s | server-side lifetime of an invite-pairing slot; an expired or consumed slot ends the exchange (§7, §12) |
+| Pairing mailbox slot cap / poll | 256 slots / 500 ms poll | bounds mailbox memory; pairing blobs are also charged against the connecting key's write-rate bucket (anti-flood) |
 | Max has() IDs per call | 1,024 | server rejects with too-many-ids before any lookup |
 | Max gc() keep-set IDs per call | 100,000 | server rejects before processing |
 | Max gc() calls per key per hour | 4 | server MUST enforce; prevents disk-scan amplification; 4 calls/hour supports normal operation (daily GC in batches of up to 100,000 IDs each) while blocking sustained scan abuse |
@@ -1253,24 +1271,25 @@ keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today.
 
 1. Object store: framing + canonical serialization + per-object-key committing AEAD (CTX/CMT-4) +
    content-address verify + push/pull/restore.
-2. Roster sigchain + keyslots + enrollment (RFP/SAS with commitment round) + generations/rotation +
-   write-auth gate + read-auth gate (secsec-read-v1).
+2. Roster sigchain + keyslots + enrollment (RFP anchor, `mk_commit` verification) +
+   generations/rotation + write-auth gate + read-auth gate (secsec-read-v1).
 3. Refs (keyed-hash paths) + `cas-head` + rollback-aware three-way merge.
 4. `notify` watcher → live sync; conflict surfacing.
 5. Multi-remote replication + reconciliation (cross-remote sigchain check); hardened GC (receipts +
-   serialization); fork-detection alarms + gossip.
-6. Recovery flow (committing AEAD, Argon2id at raised params). Downgrade/min-algo enforcement
-   (per-fetch check, not creation-only). Local sealed state (SSH-key-derived seal).
-7. Hybrid-PQ keyslot (X-Wing, **mandatory** — §17); recovery keyslot + `recover`; client-driven GC
-   (`secsec gc`).
+   serialization), run automatically inside the sync loop; fork-detection alarms + gossip.
+6. Downgrade/min-algo enforcement (per-fetch check, not creation-only). Local sealed state
+   (SSH-key-derived seal). `authorized_keys` mandatory connection gate (§11).
+7. Hybrid-PQ keyslot (X-Wing, **mandatory** — §17). Networked enrollment over the wire:
+   invite-code pairing (`secsec invite` / `sync --invite`), networked `revoke`, and `devices`.
 
 ## 21. Crates
 
 `quinn`,`rustls` · `ssh-key`(SSHSIG, Ed25519-only),`ed25519-dalek`,`x25519-dalek` · `libcrux-ml-kem`
 (ML-KEM-768 for the X-Wing keyslot),`sha3` · `blake3` · `chacha20`+`poly1305` (the §9.4 CTX
-committing AEAD) · `argon2` · `fastcdc` · `notify` · `redb` · `tokio` · `zeroize`,`subtle`,`getrandom`.
+committing AEAD) · `fastcdc` · `notify` · `redb` · `tokio` · `zeroize`,`subtle`,`getrandom`.
 Transport is **QUIC/TLS-only** (no SSH/stdio mode — it adds nothing over the pinned host key, §11).
-Versions pinned; `cargo-audit`/`cargo-vet` gated.
+(`argon2` was dropped with the recovery keyslot, §8.6.) Versions pinned; `cargo-audit`/`cargo-vet`
+gated.
 
 ## 22. Residuals (proven-minimal)
 
@@ -1287,8 +1306,11 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
 - **Sustained-partition fork detection** is *delayed*, not prevented (SUNDR). Mitigation: gossip +
   replicas; detection is guaranteed on any reconvergence.
 
-- **Total bootstrap/recovery loss.** A user who keeps *neither* another device, RFP, nor the
-  recovery code cannot recover — information-theoretic. Mitigation: printed `{recovery_code, RFP}`.
+- **Total credential loss.** A user who loses *every* enrolled device **and** every backup of the
+  SSH key cannot recover — information-theoretic. Mitigation: back up the SSH private key (the one
+  credential); any device holding it is a full replica and re-joins via an invite (§7). There is
+  deliberately **no** server-stored recovery blob (§8.6) — adding one would create an
+  offline-crackable target on the untrusted server to back up what the SSH key already covers.
 
 - **Compromised client.** Plaintext and `master_key` live on the client by necessity; its
   compromise is total for that device. Mitigation: prompt revoke+rotate; `mlock`/`zeroize` limit
@@ -1391,14 +1413,15 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
   components in those paths reveal the rotation history. These are chosen tradeoffs, not
   impossibilities.
 
-- **First-init TOFU window.** When `secsec init` is run without `--host-fp SHA256:…`, the server
-  host key is accepted on first use based on a one-time human fingerprint comparison that is not
-  mechanically enforced. A network attacker present at init time can substitute their own host key;
-  once accepted, all subsequent connections verify against the attacker's key, giving them a
-  persistent MITM position. Mitigation: always supply `--host-fp` at init; when absent, the client
-  MUST display the fingerprint and require explicit interactive confirmation with a warning that
-  this is a one-time, irrevocable verification. The window is bounded to the init moment — after
-  pinning, no further TOFU exposure exists.
+- **First-init TOFU window.** The first `secsec sync` to a server accepts the host key on first use:
+  it captures the key's SPKI hash and prints the fingerprint for a one-time human comparison that is
+  not mechanically enforced. A network attacker present at that first contact can substitute their
+  own host key; once accepted, all subsequent connections verify against the attacker's key, giving
+  them a persistent MITM position. Mitigation: verify the printed fingerprint out-of-band before
+  continuing. (A joining device additionally re-derives this exposure away: the inviting member
+  vouches for the genuine `host_id` under the invite-code MAC, and the joiner aborts if it does not
+  match the server it connected to — §7.) The window is bounded to the first contact — after the
+  pin is persisted in the folder's link, no further TOFU exposure exists.
 
 ---
 
@@ -1414,9 +1437,13 @@ An independent end-to-end trace of the design (the former `finalrew.md`). These 
   keyed_hash exception is correctly called out.
 - **Signature namespacing (§9.6)** — server-chosen nonces confined to auth/write; cross-protocol
   reuse is genuinely closed.
-- **Enrollment (§7)** — full fingerprint carried out-of-band by the human in step 1,
-  commitment-before-reveal SAS over RFP+D_pubkey, `mk_commit` highest-seq check, in-band
-  `enrollment_nonce`. The fake-universe attack is closed.
+- **Enrollment (§7)** — the shipped path is **invite-code pairing**: a single-use 96-bit code,
+  carried out-of-band, MACs the key-exchange end-to-end through the blind server's TTL'd mailbox
+  (server never learns the code), the joiner confirms the inviter-vouched `host_id` against its
+  TOFU pin, and the `mk_commit` highest-seq check anchors the unwrapped key to RFP. The
+  fake-universe attack is closed without any human digit comparison. Layered under the mandatory
+  `authorized_keys` connection gate (§11). (The lower-level direct-grant primitive's
+  `secsec-grant-v1`/`enrollment_nonce` attestation, §9.6, remains for non-mailbox enrollment.)
 - **X-Wing keyslot (`secsec-pq`)** — draft-10 conformant: single 32-byte seed expanded via
   `SHAKE256(sk,96)` to the ML-KEM `(d,z)` seed + X25519 `sk_X`; **label-LAST** combiner
   `SHA3-256(ss_M‖ss_X‖ct_X‖pk_X‖XWingLabel)`; verified byte-identical to the draft-10 Appendix C
@@ -1455,9 +1482,22 @@ The residuals in §22 are honest and genuinely minimal.
   - Local-state-file rollback by a disk-level attacker is documented as subsumed by "client
     compromise = total" (§22).
 
+**UX redesign (2026-06-10) — security held, ergonomics improved.** The credential model was reworked
+without weakening any §4 claim: (1) `~/.ssh/authorized_keys` became a **mandatory** server-side
+connection gate (§11), closing the "first connector seizes an empty repo" race that a network-only
+model exposed — layered over, never replacing, the keyslot roster; (2) device onboarding moved fully
+over the wire via **invite-code pairing** (§7), replacing the manual fingerprint+SAS ceremony with a
+single carried 96-bit code (higher entropy, no human digit comparison); (3) **recovery was removed**
+entirely (§8.6) as a net liability — the SSH key is credential and backup; (4) **GC became automatic**
+inside the sync loop (§15) rather than a manual command; (5) revocation is now a networked
+`revoke`/`devices` pair (§8.4). The CLI is `serve · sync · invite · devices · revoke`; the client
+keeps no control files in the synced folder (§13). The genesis-bootstrap exception (§12) and the
+invite-code MAC (§7) were the two mechanisms added; both were adversarially traced above.
+
 **Verdict.** Crypto and data-plane: built and tested. Revocation/key-management: the mutual-revocation
 race is documented as a §22 residual (the flat model is intentional); the reanchor/fold hazard was
-removed with the feature. All flagged items are resolved or consciously documented — nothing open.
+removed with the feature. The UX redesign preserved every §4 guarantee. All flagged items are
+resolved or consciously documented — nothing open.
 
 ---
 

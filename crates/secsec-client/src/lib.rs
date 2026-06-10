@@ -157,20 +157,46 @@ pub trait Remote {
         _gen: u32,
         _blob: &[u8],
     ) -> Result<(), RemoteError> {
-        Err(RemoteError("put_keyslot unsupported by this remote".to_string()))
+        Err(RemoteError(
+            "put_keyslot unsupported by this remote".to_string(),
+        ))
     }
     /// Append a sigchain entry CAS-guarded by `old_tip` (§8.1): `Ok(true)` = appended, `Ok(false)` =
     /// CAS conflict (re-fold + retry). Defaults to an error for read-only backends.
     async fn roster_append(&self, _old_tip: &Id, _entry: &[u8]) -> Result<bool, RemoteError> {
-        Err(RemoteError("roster_append unsupported by this remote".to_string()))
+        Err(RemoteError(
+            "roster_append unsupported by this remote".to_string(),
+        ))
     }
     /// Post an opaque blob to the §7 invite-onboarding pairing mailbox slot. Allowed pre-enrollment.
     async fn pair_put(&self, _slot: &Id, _blob: &[u8]) -> Result<(), RemoteError> {
-        Err(RemoteError("pair_put unsupported by this remote".to_string()))
+        Err(RemoteError(
+            "pair_put unsupported by this remote".to_string(),
+        ))
     }
     /// Read a §7 pairing mailbox slot (`None` if empty/expired). Allowed pre-enrollment.
     async fn pair_get(&self, _slot: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
-        Err(RemoteError("pair_get unsupported by this remote".to_string()))
+        Err(RemoteError(
+            "pair_get unsupported by this remote".to_string(),
+        ))
+    }
+    /// Store a DATA key-history wrap for generation `gen` (§8.2) — the network half of rotation.
+    async fn put_keyhist(&self, _gen: u32, _blob: &[u8]) -> Result<(), RemoteError> {
+        Err(RemoteError(
+            "put_keyhist unsupported by this remote".to_string(),
+        ))
+    }
+    /// Store a roster-key-history wrap for generation `gen` (§8.2) — the network half of rotation.
+    async fn put_roster_keyhist(&self, _gen: u32, _blob: &[u8]) -> Result<(), RemoteError> {
+        Err(RemoteError(
+            "put_roster_keyhist unsupported by this remote".to_string(),
+        ))
+    }
+    /// Delete a device's keyslot at generation `gen` (§8.4 revocation, over the wire).
+    async fn delete_keyslot(&self, _device_id: &Id, _gen: u32) -> Result<(), RemoteError> {
+        Err(RemoteError(
+            "delete_keyslot unsupported by this remote".to_string(),
+        ))
     }
 }
 

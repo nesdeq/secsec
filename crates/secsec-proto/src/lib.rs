@@ -54,6 +54,12 @@ pub mod op {
     pub const PAIR_PUT: &str = "pair-put";
     /// Read the transient pairing mailbox (§7 invite onboarding); allowed pre-enrollment.
     pub const PAIR_GET: &str = "pair-get";
+    /// Store a DATA key-history wrap (§8.2) — the network half of rotation.
+    pub const PUT_KEYHIST: &str = "put-keyhist";
+    /// Store a roster-key-history wrap (§8.2) — the network half of rotation.
+    pub const PUT_ROSTER_KEYHIST: &str = "put-roster-keyhist";
+    /// Delete a device's keyslot (§8.4 revocation, over the wire).
+    pub const DELETE_KEYSLOT: &str = "delete-keyslot";
     /// Fetch a roster-key-history wrap (`/roster-keyhist/<g>`, §8.2) — for rotation-era cold-start.
     pub const GET_ROSTER_KEYHIST: &str = "get-roster-keyhist";
     /// Fetch a DATA key-history wrap (`/keyhist/<g>`, §8.2) — peeling `master_key_g` for old objects.
@@ -206,7 +212,32 @@ pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
         // dispatches them before the enrollment check (§7 invite onboarding).
         Request::PairPut { slot, .. } => (op::PAIR_PUT, args_pair(op::PAIR_PUT, slot), false),
         Request::PairGet { slot } => (op::PAIR_GET, args_pair(op::PAIR_GET, slot), false),
+        Request::PutKeyhist { gen, blob } => (
+            op::PUT_KEYHIST,
+            args_keyhist(op::PUT_KEYHIST, *gen, blob),
+            true,
+        ),
+        Request::PutRosterKeyhist { gen, blob } => (
+            op::PUT_ROSTER_KEYHIST,
+            args_keyhist(op::PUT_ROSTER_KEYHIST, *gen, blob),
+            true,
+        ),
+        Request::DeleteKeyslot { device_id, gen } => {
+            let mut w = Writer::new();
+            w.raw(op::DELETE_KEYSLOT.as_bytes())
+                .raw(device_id)
+                .u32(*gen);
+            (op::DELETE_KEYSLOT, blake3_of(&w.finish()), true)
+        }
     }
+}
+
+/// `args_hash` for a key-history write (§8.2): `BLAKE3(canonical(op ‖ le32(gen) ‖ BLAKE3(blob)))`.
+#[must_use]
+pub fn args_keyhist(op_label: &str, gen: u32, blob: &[u8]) -> [u8; 32] {
+    let mut w = Writer::new();
+    w.raw(op_label.as_bytes()).u32(gen).raw(&blake3_of(blob));
+    blake3_of(&w.finish())
 }
 
 /// Errors from per-op authorization.

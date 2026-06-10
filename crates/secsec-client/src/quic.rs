@@ -193,6 +193,50 @@ impl Remote for QuicRemote<'_> {
         }
     }
 
+    async fn put_keyhist(&self, gen: u32, blob: &[u8]) -> Result<(), RemoteError> {
+        match self
+            .call(Request::PutKeyhist {
+                gen,
+                blob: blob.to_vec(),
+            })
+            .await?
+        {
+            Response::Ok => Ok(()),
+            Response::Err(c) => Err(RemoteError(format!("put-keyhist: {c:?}"))),
+            other => Err(RemoteError(format!("put-keyhist: unexpected {other:?}"))),
+        }
+    }
+
+    async fn put_roster_keyhist(&self, gen: u32, blob: &[u8]) -> Result<(), RemoteError> {
+        match self
+            .call(Request::PutRosterKeyhist {
+                gen,
+                blob: blob.to_vec(),
+            })
+            .await?
+        {
+            Response::Ok => Ok(()),
+            Response::Err(c) => Err(RemoteError(format!("put-roster-keyhist: {c:?}"))),
+            other => Err(RemoteError(format!(
+                "put-roster-keyhist: unexpected {other:?}"
+            ))),
+        }
+    }
+
+    async fn delete_keyslot(&self, device_id: &Id, gen: u32) -> Result<(), RemoteError> {
+        match self
+            .call(Request::DeleteKeyslot {
+                device_id: *device_id,
+                gen,
+            })
+            .await?
+        {
+            Response::Ok => Ok(()),
+            Response::Err(c) => Err(RemoteError(format!("delete-keyslot: {c:?}"))),
+            other => Err(RemoteError(format!("delete-keyslot: unexpected {other:?}"))),
+        }
+    }
+
     async fn gc(
         &self,
         keep_set: Vec<Id>,

@@ -122,6 +122,40 @@ pub struct Server {
     /// Optional host receipt key + this server's `host_id` (§15 signed receipts). `None` ⇒ receipts
     /// are returned unsigned (all-zero pubkey/signature).
     receipts: Option<(ed25519_dalek::SigningKey, [u8; 32])>,
+    /// The **mandatory** connection allow-list (the operator's `~/.ssh/authorized_keys`): a connecting
+    /// key not on it cannot open a session at all — including to pair (§7). It is re-read per connection
+    /// ([`Authorized::File`]) so adding a key takes effect with no restart. (Tests use [`Authorized::Any`]
+    /// / [`Authorized::Static`].) This gates *who can talk to the server*; membership/decryption is the
+    /// separate crypto roster + keyslots (§8) — both layers are required.
+    authorized: Authorized,
+}
+
+/// The server's connection allow-list source (§11/§12).
+pub enum Authorized {
+    /// Allow any authenticated key to connect (tests / in-process backends only).
+    Any,
+    /// A fixed set of permitted device ids.
+    Static(BTreeSet<DeviceId>),
+    /// Re-read `~/.ssh/authorized_keys` (the OpenSSH `authorized_keys` file) on every check, so the
+    /// operator can add/remove devices live. Unreadable ⇒ deny (fail closed).
+    File(std::path::PathBuf),
+}
+
+/// Parse an OpenSSH `authorized_keys` file body into the set of permitted Ed25519 device ids
+/// (`device_id = BLAKE3(canonical(pubkey))`). Comment/blank/non-Ed25519 lines are skipped.
+#[must_use]
+pub fn parse_authorized_keys(body: &str) -> BTreeSet<DeviceId> {
+    let mut set = BTreeSet::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Ok(id) = DevicePublic::from_openssh(line).and_then(|pk| pk.device_id()) {
+            set.insert(id);
+        }
+    }
+    set
 }
 
 impl Server {
@@ -132,6 +166,34 @@ impl Server {
             store,
             state: std::sync::Mutex::new(ServerState::default()),
             receipts: None,
+            authorized: Authorized::Any,
+        }
+    }
+
+    /// Restrict connections to a fixed device-id set (for tests / in-process backends).
+    #[must_use]
+    pub fn with_authorized(mut self, authorized: BTreeSet<DeviceId>) -> Self {
+        self.authorized = Authorized::Static(authorized);
+        self
+    }
+
+    /// Gate connections on the operator's `authorized_keys` **file**, re-read per connection so adding
+    /// a device takes effect with no restart. This is the mandatory `secsec serve` configuration.
+    #[must_use]
+    pub fn with_authorized_file(mut self, path: std::path::PathBuf) -> Self {
+        self.authorized = Authorized::File(path);
+        self
+    }
+
+    /// Whether `device_id` is permitted to connect. `File` is re-read on each call (unreadable ⇒ deny).
+    #[must_use]
+    pub fn is_authorized(&self, device_id: &DeviceId) -> bool {
+        match &self.authorized {
+            Authorized::Any => true,
+            Authorized::Static(set) => set.contains(device_id),
+            Authorized::File(path) => std::fs::read_to_string(path)
+                .map(|body| parse_authorized_keys(&body).contains(device_id))
+                .unwrap_or(false),
         }
     }
 
@@ -254,7 +316,10 @@ impl Server {
     pub fn handle(&self, inc: Incoming<'_>, now: u64) -> Response {
         // (0) Pairing mailbox (§7 invite onboarding): allowed PRE-enrollment (a joining device owns no
         // keyslot yet), so dispatch it before the keyslot-existence check.
-        if matches!(inc.request, Request::PairPut { .. } | Request::PairGet { .. }) {
+        if matches!(
+            inc.request,
+            Request::PairPut { .. } | Request::PairGet { .. }
+        ) {
             return self.handle_pair(inc, now);
         }
 
@@ -426,6 +491,33 @@ impl Server {
                     Err(_) => Response::Err(ErrorCode::Internal),
                 }
             }
+            // The network half of rotation (§8.2/§8.4): an enrolled member writes the key-history wraps
+            // and deletes revoked keyslots. All opaque; authenticity rests on the roster fold.
+            Request::PutKeyhist { gen, blob } => {
+                if !self.take_write(device_id, blob.len() as u64, now) {
+                    return Response::Err(ErrorCode::RateLimit);
+                }
+                match self.store.put_keyhist(gen, &blob) {
+                    Ok(()) => Response::Ok,
+                    Err(_) => Response::Err(ErrorCode::Internal),
+                }
+            }
+            Request::PutRosterKeyhist { gen, blob } => {
+                if !self.take_write(device_id, blob.len() as u64, now) {
+                    return Response::Err(ErrorCode::RateLimit);
+                }
+                match self.store.put_roster_keyhist(gen, &blob) {
+                    Ok(()) => Response::Ok,
+                    Err(_) => Response::Err(ErrorCode::Internal),
+                }
+            }
+            Request::DeleteKeyslot {
+                device_id: owner_id,
+                gen,
+            } => match self.store.delete_keyslot(&owner_id, gen) {
+                Ok(_) => Response::Ok,
+                Err(_) => Response::Err(ErrorCode::Internal),
+            },
             // gc is dispatched before this match (state-dependent auth, §15); never reached here.
             Request::Gc { .. } => Response::Err(ErrorCode::Internal),
             // Pairing ops are dispatched at the top of `handle` (pre-enrollment); never reached here.

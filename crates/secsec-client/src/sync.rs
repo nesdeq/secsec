@@ -105,37 +105,6 @@ async fn pull_to<R: Remote, K: MasterKeys>(
     Ok(f)
 }
 
-/// Restore the working tree of `ref_name` from the **local** store (no network) into `dir`, using the
-/// recovered key ring — the local counterpart of [`pull_to`] for §8.6 recovery. Reads the stored head
-/// at `/refs/<H>`, verifies its signer is a current member, opens + verifies the signed commit against
-/// its author, and restores its tree. Returns the restored `commit_id`, or `None` if the ref has no
-/// head locally (an initialized-but-never-published repo — nothing to restore).
-///
-/// Unlike [`pull_to`] this fetches no closure: recovery runs against a store that already holds the
-/// objects (the server's store or a full local copy — recovery has no device key to handshake with, so
-/// it is inherently a local-store operation). Objects are opened across generations via the `keys` ring.
-pub fn restore_ref_local<K: MasterKeys>(
-    store: &Store,
-    keys: &K,
-    members: &BTreeMap<DeviceId, DevicePublic>,
-    ref_name: &str,
-    dir: &Path,
-) -> Result<Option<Id>, ClientError> {
-    let mk = keys.current();
-    let rnk = mk.ref_name_key();
-    let h = secsec_sync::ref_hash(&rnk, ref_name);
-    let Some(blob) = store.get_ref(&h)? else {
-        return Ok(None); // ref initialized but never published — nothing to restore.
-    };
-    let (head, sig) = secsec_sync::open_head(mk, &rnk, ref_name, &blob)?;
-    // The head MUST be signed by a current member (a non-member head is rejected, §10).
-    resolve_head_signer(members, &head, &sig).ok_or(ClientError::HeadNotMember)?;
-    let (commit, csig) = open_signed_commit(&head.commit_id, keys, store)?;
-    verify_commit(author_key(members, &commit)?, &commit, &csig)?;
-    restore_commit_tree(&commit, keys, store, dir)?;
-    Ok(Some(head.commit_id))
-}
-
 /// Reconcile `dir` with `/refs/<ref_name>` once (§10). See the module docs for the four cases. `base`
 /// is the last-synced commit (`None` on a fresh client / new repo); `roster_seq` is the current
 /// sigchain sequence the commit is written under. Returns the action, the new base to persist, and the

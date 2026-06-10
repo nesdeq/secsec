@@ -232,6 +232,27 @@ pub enum Request {
         /// Mailbox slot id.
         slot: Id,
     },
+    /// Store a DATA key-history wrap at `/keyhist/<gen>` (§8.2) — the network half of rotation.
+    PutKeyhist {
+        /// The generation whose wrap is written.
+        gen: u32,
+        /// The opaque wrap blob.
+        blob: Vec<u8>,
+    },
+    /// Store a roster-key-history wrap at `/roster-keyhist/<gen>` (§8.2) — the network half of rotation.
+    PutRosterKeyhist {
+        /// The generation whose wrap is written.
+        gen: u32,
+        /// The opaque wrap blob.
+        blob: Vec<u8>,
+    },
+    /// Delete a device's keyslot at `/keyslots/<device_id>/<gen>` (§8.4 revocation, over the wire).
+    DeleteKeyslot {
+        /// `device_id` of the keyslot to delete.
+        device_id: Id,
+        /// The generation whose keyslot is removed.
+        gen: u32,
+    },
 }
 
 const T_GET: u8 = 0;
@@ -248,6 +269,9 @@ const T_GETKH: u8 = 10;
 const T_PUTKEYSLOT: u8 = 11;
 const T_PAIRPUT: u8 = 12;
 const T_PAIRGET: u8 = 13;
+const T_PUTKEYHIST: u8 = 14;
+const T_PUTRKH: u8 = 15;
+const T_DELKEYSLOT: u8 = 16;
 
 impl Request {
     /// Canonical encoding (tag-prefixed).
@@ -321,6 +345,15 @@ impl Request {
             Request::PairGet { slot } => {
                 w.u8(T_PAIRGET).raw(slot);
             }
+            Request::PutKeyhist { gen, blob } => {
+                w.u8(T_PUTKEYHIST).u32(*gen).bytes(blob);
+            }
+            Request::PutRosterKeyhist { gen, blob } => {
+                w.u8(T_PUTRKH).u32(*gen).bytes(blob);
+            }
+            Request::DeleteKeyslot { device_id, gen } => {
+                w.u8(T_DELKEYSLOT).raw(device_id).u32(*gen);
+            }
         }
         w.finish()
     }
@@ -393,6 +426,18 @@ impl Request {
             },
             T_PAIRGET => Request::PairGet {
                 slot: read32(&mut r)?,
+            },
+            T_PUTKEYHIST => Request::PutKeyhist {
+                gen: r.u32()?,
+                blob: r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec(),
+            },
+            T_PUTRKH => Request::PutRosterKeyhist {
+                gen: r.u32()?,
+                blob: r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec(),
+            },
+            T_DELKEYSLOT => Request::DeleteKeyslot {
+                device_id: read32(&mut r)?,
+                gen: r.u32()?,
             },
             other => return Err(WireError::BadTag(other)),
         };

@@ -1,43 +1,47 @@
 //! `secsec` — the CLI binary (`secsec-Design.md` §11, §12).
 //!
-//! Subcommands:
-//! - `init` (§7) — repository genesis: write the genesis roster + this device's keyslot, print the RFP.
-//! - `serve` — the blind sync server (signs §15 receipts with its host receipt key).
-//! - `hostkey` — print the server's host pin (the `host_id` clients pin via `--host-fp`).
-//! - `sync` (§8.1/§10) — cold-start over the wire, then reconcile a working dir with a ref (optionally
-//!   `--watch` for continuous live sync). Persists arrival receipts for a later `gc`.
-//! - `rotate` (§8.4), `enroll-pubkey` / `grant` (§7) — local-store membership management.
-//! - `recovery-init` / `recover` (§8.6) — create the recovery keyslot, and break-glass recovery.
-//! - `gc` (§15) — client-driven garbage-collection sweep against the remote.
+//! Two everyday commands and one onboarding command:
+//! - `secsec serve [dir] [port]` — the blind server. Reads the operator's `~/.ssh/authorized_keys` as a
+//!   **mandatory** connection gate (re-read per connection); stores ciphertext under `dir`; defaults to
+//!   the current dir and udp/8899. The repository is created lazily by the first authorized device.
+//! - `secsec sync <dir> [--server host[:port]] [--invite code] [--name ref]` — link a folder to a repo
+//!   and keep it in continuous two-way sync. Name the server once (first device creates the repo;
+//!   joining devices pass `--invite`); afterwards just `secsec sync <dir>`. Uses `~/.ssh/id_ed25519`.
+//! - `secsec invite <dir>` — on an enrolled device, print a one-time code and complete the pairing of a
+//!   new device over the wire.
+//! - `secsec devices <dir>` / `secsec revoke <device> <dir>` — list enrolled devices (with SSH
+//!   fingerprints) and revoke one over the wire (§8.4: rotate the key away from a stolen device).
 //!
-//! The host is pinned by `--host-cert` (full cert) or `--host-fp` (fingerprint). Transport is
-//! QUIC/TLS-only.
+//! Garbage collection (§15) runs automatically inside `sync`; there is no manual command.
 
 #![allow(missing_docs)] // a binary crate exports no public API
 
 use clap::{Parser, Subcommand};
+use secsec_client::pair;
 use secsec_client::quic::QuicRemote;
 use secsec_client::repo::{
-    create_recovery, data_keyring, data_keyring_remote, grant_device, init_repo, open_repo,
-    open_repo_remote, recover_master, rotate_repo,
+    data_keyring_remote, fetch_roster_entries, init_repo_remote, open_repo_remote,
 };
-use secsec_client::sync::{restore_ref_local, sync_once};
+use secsec_client::sync::sync_once;
 use secsec_client::{load_frontier, save_frontier, FrontierLoad};
-use secsec_server::serve::serve_connection;
-use secsec_server::Server;
+use secsec_server::{serve::serve_connection, Server};
 use secsec_sig::DeviceKey;
 use secsec_store::Store;
 use secsec_sync::rollback::SyncFrontier;
 use secsec_transport::handshake::client_handshake;
-use secsec_transport::quic::{client_config, server_config};
+use secsec_transport::quic::{client_config, client_config_tofu, server_config};
 use secsec_transport::HostPin;
 use std::error::Error;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Default listen address (§19: udp/8899, overridable).
-const DEFAULT_LISTEN: &str = "0.0.0.0:8899";
+/// Default listen port (§19: udp/8899).
+const DEFAULT_PORT: u16 = 8899;
+/// How long `invite` waits for a device to pair, and `sync --invite` waits for the host, in 500 ms
+/// pairing-poll rounds (§7): the host waits up to the ~10-minute invite lifetime; the joiner ~2 min.
+const PAIR_HOST_ROUNDS: u32 = 1200;
+const PAIR_JOIN_ROUNDS: u32 = 240;
 
 #[derive(Parser)]
 #[command(
@@ -51,289 +55,54 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Initialize a new repository (device 1): write the genesis roster + this device's keyslot into
-    /// the store and print the RFP anchor to record out-of-band (§7).
-    Init {
-        /// Path to the redb store to initialize (created if absent).
-        #[arg(long)]
-        store: PathBuf,
-        /// Path to this device's OpenSSH **private** key (Ed25519).
-        #[arg(long)]
-        key: PathBuf,
-    },
-    /// Run the blind sync server.
+    /// Run the blind sync server. Reads `~/.ssh/authorized_keys` as a mandatory connection gate.
     Serve {
-        /// Path to the redb object store (created if absent).
-        #[arg(long)]
-        store: PathBuf,
-        /// Directory holding the self-signed host key (generated on first run).
-        #[arg(long)]
-        hostkey_dir: PathBuf,
-        /// UDP address to listen on.
-        #[arg(long, default_value = DEFAULT_LISTEN)]
-        listen: SocketAddr,
+        /// Directory to store the encrypted repo + host key (default: current directory).
+        dir: Option<PathBuf>,
+        /// UDP port to listen on (default: 8899).
+        port: Option<u16>,
     },
-    /// Print the server's host pin (the `host_id` clients pin via `--host-fp`), generating the host
-    /// key if absent.
-    Hostkey {
-        /// Directory holding the self-signed host key.
-        #[arg(long)]
-        hostkey_dir: PathBuf,
-    },
-    /// Rotate the master-key generation (§8.4), optionally revoking a device first (`revoke ⇒ rotate`,
-    /// forward secrecy P6/P11). A local-store admin operation (like `init`): run it with direct access
-    /// to the repository store (e.g. the server's), not over the network.
-    Rotate {
-        /// Path to the redb store.
-        #[arg(long)]
-        store: PathBuf,
-        /// A current member's OpenSSH private key (signs the rotation entries).
-        #[arg(long)]
-        key: PathBuf,
-        /// The repository fingerprint (RFP) hex from `init`.
-        #[arg(long)]
-        rfp: String,
-        /// Optionally revoke this device id (hex) before rotating — its transitive add-by closure is
-        /// swept too (§8.1) and its keyslot deleted.
-        #[arg(long)]
-        revoke: Option<String>,
-    },
-    /// Print this device's **enrollment public keys** (its SSH public key + X-Wing public key hex), to
-    /// hand to a granter out-of-band during enrollment (§7).
-    EnrollPubkey {
-        /// This device's OpenSSH private key.
-        #[arg(long)]
-        key: PathBuf,
-    },
-    /// Enroll a new device (§7, record-writing half) whose public keys you have **already verified
-    /// out-of-band via the SAS**. A local-store admin op. Outputs the `enrollment_nonce` + attestation
-    /// to send back to the new device over the same out-of-band channel.
-    Grant {
-        /// Path to the redb store.
-        #[arg(long)]
-        store: PathBuf,
-        /// A current member's OpenSSH private key (the granter).
-        #[arg(long)]
-        key: PathBuf,
-        /// The repository fingerprint (RFP) hex from `init`.
-        #[arg(long)]
-        rfp: String,
-        /// The new device's canonical SSH public-key hex (from its `enroll-pubkey`, SAS-verified).
-        #[arg(long)]
-        device_pub: String,
-        /// The new device's X-Wing public-key hex (from its `enroll-pubkey`, SAS-verified).
-        #[arg(long)]
-        xwing_pub: String,
-    },
-    /// Create the repo's optional **recovery keyslot** (§8.6): seal the master key under a freshly
-    /// generated 256-bit recovery code and print the code **once** (store it offline — it is never
-    /// kept). A local-store admin op. Re-run after a `rotate` to re-pin recovery to the new generation.
-    RecoveryInit {
-        /// Path to the redb store.
-        #[arg(long)]
-        store: PathBuf,
-        /// A current member's OpenSSH private key (binds the keyslot's AD to this device, §8.6).
-        #[arg(long)]
-        key: PathBuf,
-        /// The repository fingerprint (RFP) hex from `init`.
-        #[arg(long)]
-        rfp: String,
-    },
-    /// Break-glass **recover** (§8.6) when every enrolled device is lost: reconstruct the master key
-    /// from the recovery code alone (anchored to the RFP), then restore a ref's working tree from the
-    /// local store into `--dir`. Runs against a local store copy (recovery has no device key to
-    /// handshake with, so it cannot run over the network). Recovers read access; re-enroll a fresh
-    /// device afterward with a new `init`/`grant`.
-    Recover {
-        /// Path to the redb store (the server's store or a full local copy holding the objects).
-        #[arg(long)]
-        store: PathBuf,
-        /// The repository fingerprint (RFP) hex from `init` — the out-of-band trust anchor.
-        #[arg(long)]
-        rfp: String,
-        /// The 256-bit recovery code hex printed by `recovery-init`.
-        #[arg(long)]
-        code: String,
-        /// The directory to restore the ref's tree into (created if absent).
-        #[arg(long)]
-        dir: PathBuf,
-        /// The ref name to restore.
-        #[arg(long, default_value = "main")]
-        r#ref: String,
-    },
-    /// Run a §15 garbage-collection sweep against the remote. Keeps the reachable closure of the ref's
-    /// head (fetched local first — GC fails safe if any keep-set object is unavailable) and sweeps
-    /// objects whose arrival generation has aged past the grace window. `gc_gen`/`put_epoch` come from
-    /// the local receipt log that `sync` maintains; the sweep is a compare-and-swap the server can only
-    /// run if its mutable state has not moved since (a conflict means: re-`sync`, then `gc` again).
-    Gc {
-        /// Server address (e.g. `127.0.0.1:8899`).
-        #[arg(long)]
-        remote: SocketAddr,
-        /// The server's host certificate (DER). Pins by full key. Mutually exclusive with `--host-fp`.
-        #[arg(long, conflicts_with = "host_fp", required_unless_present = "host_fp")]
-        host_cert: Option<PathBuf>,
-        /// The server's host fingerprint (`host_id` hex). Mutually exclusive with `--host-cert`.
-        #[arg(long)]
-        host_fp: Option<String>,
-        /// This device's OpenSSH private key (a current member).
-        #[arg(long)]
-        key: PathBuf,
-        /// The local object store (must hold the keep-set, populated by prior syncs).
-        #[arg(long)]
-        store: PathBuf,
-        /// Directory holding local sync state (the receipt log `sync` maintains lives here).
-        #[arg(long)]
-        state: PathBuf,
-        /// The repository fingerprint (RFP) hex from `init`.
-        #[arg(long)]
-        rfp: String,
-        /// The ref whose head anchors the keep-set.
-        #[arg(long, default_value = "main")]
-        r#ref: String,
-    },
-    /// Sync a working directory with a remote ref once (cold-start over the wire, then reconcile).
+    /// Sync a folder with a repo, continuously. Name the server once; then just `secsec sync <dir>`.
     Sync {
-        /// Server address (e.g. `127.0.0.1:8899`).
+        /// The folder to sync (default: current directory).
+        dir: Option<PathBuf>,
+        /// Server `host[:port]` — required the first time a folder is linked.
         #[arg(long)]
-        remote: SocketAddr,
-        /// The server's host certificate (DER), e.g. `<hostkey_dir>/hostkey.crt`. Pins the host by its
-        /// full key. Mutually exclusive with `--host-fp`.
-        #[arg(long, conflicts_with = "host_fp", required_unless_present = "host_fp")]
-        host_cert: Option<PathBuf>,
-        /// The server's host fingerprint (`host_id` hex, from `secsec hostkey`) — pin by fingerprint
-        /// alone, no cert needed (§11). Mutually exclusive with `--host-cert`.
+        server: Option<String>,
+        /// A one-time invite code from an enrolled device (to join an existing repo).
         #[arg(long)]
-        host_fp: Option<String>,
-        /// This device's OpenSSH private key (the one enrolled at `init`).
+        invite: Option<String>,
+        /// The ref name for this folder (default: "main", so differently-named folders converge).
+        /// Same name = same content across devices; use distinct names to keep several folders in one repo.
         #[arg(long)]
-        key: PathBuf,
-        /// The working directory to sync.
+        name: Option<String>,
+        /// Sync once and exit (default is to keep running and watch for changes).
         #[arg(long)]
-        dir: PathBuf,
-        /// The local object store (created if absent).
-        #[arg(long)]
-        store: PathBuf,
-        /// Directory holding local sync state (sealed frontier + base cursor).
-        #[arg(long)]
-        state: PathBuf,
-        /// The repository fingerprint (RFP) hex from `init` — the out-of-band trust anchor.
-        #[arg(long)]
-        rfp: String,
-        /// The ref name to sync.
-        #[arg(long, default_value = "main")]
-        r#ref: String,
-        /// Keep running: re-sync on every debounced filesystem change and on a periodic remote poll
-        /// (continuous live sync, §10).
-        #[arg(long)]
-        watch: bool,
-        /// Debounce window for coalescing a burst of file changes into one sync, in milliseconds.
-        /// (Snapshot cadence is config, §19; this is the overridable default.)
-        #[arg(long, default_value_t = 1000)]
-        debounce_ms: u64,
-        /// In `--watch` mode, also poll the remote this often (seconds) to pick up other devices'
-        /// pushes. Overridable; mirrors the §19 keepalive-scale cadence.
-        #[arg(long, default_value_t = 15)]
-        poll_secs: u64,
+        once: bool,
+    },
+    /// On an enrolled device, print a one-time invite code and pair a new device over the wire.
+    Invite {
+        /// A folder already linked to the repo (default: current directory).
+        dir: Option<PathBuf>,
+    },
+    /// List the devices enrolled in a linked folder's repo (with their SSH key fingerprints).
+    Devices {
+        /// A folder already linked to the repo (default: current directory).
+        dir: Option<PathBuf>,
+    },
+    /// Revoke a device (e.g. a stolen one): rotate the key away from it so it can't read new data.
+    Revoke {
+        /// The device id (a unique prefix is enough) — from `secsec devices`.
+        device: String,
+        /// A folder already linked to the repo (default: current directory).
+        dir: Option<PathBuf>,
     },
 }
+
+// ---- small helpers ----
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Load the persisted self-signed host key from `dir`, generating + persisting one on first run
-/// (TOFU host identity, §11). Returns `(cert_der, key_der)`.
-fn load_or_generate_hostkey(dir: &Path) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
-    let cert_path = dir.join("hostkey.crt");
-    let key_path = dir.join("hostkey.key");
-    if cert_path.exists() && key_path.exists() {
-        return Ok((std::fs::read(cert_path)?, std::fs::read(key_path)?));
-    }
-    let ck = rcgen::generate_simple_self_signed(vec!["secsec.invalid".to_string()])?;
-    let cert = ck.cert.der().to_vec();
-    let key = ck.key_pair.serialize_der();
-    std::fs::create_dir_all(dir)?;
-    std::fs::write(&cert_path, &cert)?;
-    std::fs::write(&key_path, &key)?;
-    Ok((cert, key))
-}
-
-/// Load-or-generate the host's 32-byte Ed25519 receipt-key seed (§15 signed receipts), persisted at
-/// `<dir>/hostkey.receipt`.
-fn load_or_generate_receipt_key(dir: &Path) -> Result<[u8; 32], Box<dyn Error>> {
-    let path = dir.join("hostkey.receipt");
-    if let Ok(bytes) = std::fs::read(&path) {
-        if bytes.len() == 32 {
-            return Ok(bytes.try_into().expect("checked len"));
-        }
-    }
-    let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed)?;
-    std::fs::create_dir_all(dir)?;
-    std::fs::write(&path, seed)?;
-    Ok(seed)
-}
-
-async fn run_serve(
-    store: PathBuf,
-    hostkey_dir: PathBuf,
-    listen: SocketAddr,
-) -> Result<(), Box<dyn Error>> {
-    let (cert, key) = load_or_generate_hostkey(&hostkey_dir)?;
-    let host_id = HostPin::from_cert(&cert)?.host_id();
-    let receipt_seed = load_or_generate_receipt_key(&hostkey_dir)?;
-    let store = Store::open(store)?;
-    // Shared via Arc; the store is lock-free (redb-transactional) and only the small replay/rate-limit
-    // state is briefly locked inside handle(), so connections are served CONCURRENTLY. Signed §15
-    // receipts are enabled with the host receipt key + host_id.
-    let server = std::sync::Arc::new(Server::new(store).with_receipts(&receipt_seed, host_id));
-
-    let endpoint = quinn::Endpoint::server(server_config(&cert, &key)?, listen)?;
-    println!("secsec serve — host pin {}", hex(&host_id));
-    println!("listening on {}", endpoint.local_addr()?);
-
-    while let Some(incoming) = endpoint.accept().await {
-        let server = server.clone();
-        tokio::spawn(async move {
-            let conn = match incoming.await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("accept failed: {e}");
-                    return;
-                }
-            };
-            if let Err(e) = serve_connection(&conn, &server, host_id, unix_secs).await {
-                eprintln!("connection closed: {e}");
-            }
-        });
-    }
-    Ok(())
-}
-
-fn run_init(store: PathBuf, key: PathBuf) -> Result<(), Box<dyn Error>> {
-    let pem = std::fs::read_to_string(&key)?;
-    let device = DeviceKey::from_openssh(&pem)?;
-    let store = Store::open(store)?;
-    let rfp = init_repo(&store, &device, unix_secs())?;
-    println!(
-        "repository initialized for device {}",
-        hex(&device.device_id()?)
-    );
-    // RFP = BLAKE3(canonical(genesis)) (§5) — labeled as such, NOT "SHA256:", so an out-of-band
-    // fingerprint comparison uses the right algorithm.
-    println!(
-        "RFP (BLAKE3; record this out-of-band, share at every enrollment): {}",
-        hex(&rfp)
-    );
-    Ok(())
 }
 
 fn parse_hex(s: &str) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -348,260 +117,346 @@ fn parse_hex(s: &str) -> Result<Vec<u8>, Box<dyn Error>> {
 }
 
 fn parse_hex32(s: &str) -> Result<[u8; 32], Box<dyn Error>> {
-    parse_hex(s)?
+    parse_hex(s.trim())?
         .try_into()
         .map_err(|_| "expected 32 bytes (64 hex chars)".into())
 }
 
-/// `rotate` (§8.4): a local-store admin op. Open the repo, mint the next generation (re-wrapping all
-/// remaining members' keyslots and extending both §8.2 key-histories), optionally revoking a device
-/// (and its transitive add-by closure) first — the `revoke ⇒ rotate` forward-secrecy flow (P6/P11).
-fn run_rotate(
-    store: PathBuf,
-    key: PathBuf,
-    rfp_hex: String,
-    revoke: Option<String>,
-) -> Result<(), Box<dyn Error>> {
-    let device = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
-    let store = Store::open(store)?;
-    let rfp = parse_hex32(&rfp_hex)?;
-    let revoke_id = match revoke {
-        Some(h) => Some(parse_hex32(&h)?),
-        None => None,
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn rand32() -> Result<[u8; 32], Box<dyn Error>> {
+    let mut n = [0u8; 32];
+    getrandom::fill(&mut n)?;
+    Ok(n)
+}
+
+fn home() -> Result<PathBuf, Box<dyn Error>> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set".into())
+}
+
+/// Load this device's SSH key from `~/.ssh/id_ed25519`.
+fn default_device() -> Result<DeviceKey, Box<dyn Error>> {
+    let path = home()?.join(".ssh/id_ed25519");
+    let pem = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read device key {}: {e}", path.display()))?;
+    Ok(DeviceKey::from_openssh(&pem)?)
+}
+
+/// The out-of-tree state directory for a synced folder: `~/.local/state/secsec/<hash(abspath)>/`
+/// (created if absent). Holds the per-folder link, the sealed cursor, the receipt log, and the object
+/// cache — so the synced folder itself stays nothing but the user's files.
+fn state_dir_for(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let abs = std::fs::canonicalize(dir)?;
+    let h = blake3::hash(abs.to_string_lossy().as_bytes());
+    let sdir = home()?.join(".local/state/secsec").join(hex(h.as_bytes()));
+    std::fs::create_dir_all(&sdir)?;
+    Ok(sdir)
+}
+
+/// Resolve `host[:port]` (default port 8899) to a socket address.
+fn resolve_server(s: &str) -> Result<SocketAddr, Box<dyn Error>> {
+    let with_port = if s
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .is_some()
+        && s.contains(':')
+    {
+        s.to_string()
+    } else {
+        format!("{s}:{DEFAULT_PORT}")
     };
-    let (mk, st) = open_repo(&store, &device, &rfp)?;
-    let (new_mk, new_st) = rotate_repo(&store, &device, &mk, &st, &rfp, revoke_id, unix_secs())?;
-    if let Some(r) = revoke_id {
-        println!("revoked device {} (and its add-by closure)", hex(&r));
-    }
-    println!(
-        "rotated to generation {} — {} members remain",
-        new_mk.generation(),
-        new_st.members.len()
-    );
-    Ok(())
+    with_port
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| format!("cannot resolve server address '{s}'").into())
 }
 
-/// `enroll-pubkey`: print this device's enrollment public keys (its canonical SSH public key + its
-/// X-Wing public key, both hex) to hand to a granter out-of-band during enrollment (§7).
-fn run_enroll_pubkey(key: PathBuf) -> Result<(), Box<dyn Error>> {
-    let device = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
-    let xwing = secsec_client::repo::device_xwing_pub(&device)?;
-    println!("device id:      {}", hex(&device.device_id()?));
-    println!("ssh pubkey hex: {}", hex(&device.public().to_canonical()?));
-    println!("xwing pubkey:   {}", hex(&xwing));
-    println!("\nGive the ssh+xwing pubkeys to the granter (confirm them via the SAS first, §7).");
-    Ok(())
-}
-
-/// `grant` (§7, record-writing half): a granter (a current member) enrolls a new device whose public
-/// keys it has **already verified out-of-band via the SAS ceremony**. Writes the `AddDevice` entry +
-/// the new device's keyslot + the grant attestation; prints the `enrollment_nonce` + attestation to
-/// hand back to the new device over the same out-of-band channel. The interactive SAS itself is
-/// human-mediated; this is the persistence step.
-fn run_grant(
-    store: PathBuf,
-    key: PathBuf,
-    rfp_hex: String,
-    device_pub_hex: String,
-    xwing_pub_hex: String,
-) -> Result<(), Box<dyn Error>> {
-    // The §7 grant-attempt log lives beside the store (local-only, not secret).
-    let grantlog = store.with_extension("grantlog");
-    let granter = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
-    let store = Store::open(store)?;
-    let rfp = parse_hex32(&rfp_hex)?;
-    let (mk, _st) = open_repo(&store, &granter, &rfp)?;
-
-    let d_pub = secsec_sig::DevicePublic::from_canonical(&parse_hex(&device_pub_hex)?)?;
-    let d_id = d_pub.device_id()?;
-
-    // §7 rate limit: at most 5 SAS/grant sessions per D_pubkey per hour, in E's local state.
-    let prior =
-        secsec_client::enroll::parse_log(&std::fs::read_to_string(&grantlog).unwrap_or_default());
-    let updated = secsec_client::enroll::record_grant_attempt(&prior, &d_id, unix_secs())
-        .map_err(|e| e.to_string())?;
-    std::fs::write(&grantlog, secsec_client::enroll::serialize_log(&updated))?;
-
-    let d_xwing = parse_hex(&xwing_pub_hex)?;
-    let mut enrollment_nonce = [0u8; 32];
-    getrandom::fill(&mut enrollment_nonce)?;
-
-    let attestation = grant_device(
-        &store,
-        &granter,
-        &mk,
-        &d_pub,
-        &d_xwing,
-        &enrollment_nonce,
-        unix_secs(),
-    )?;
-    println!("enrolled device {}", hex(&d_pub.device_id()?));
-    println!("granter device  {}", hex(&granter.device_id()?));
-    println!("\nSend to the new device over the SAME out-of-band channel as the SAS:");
-    println!("  enrollment_nonce: {}", hex(&enrollment_nonce));
-    println!(
-        "  attestation:\n{}",
-        String::from_utf8_lossy(&attestation).trim_end()
-    );
-    Ok(())
-}
-
-/// `recovery-init` (§8.6): a local-store admin op. Open the repo, seal the master key under a fresh
-/// 256-bit recovery code, persist the `/recovery` record, and print the code once (never stored).
-fn run_recovery_init(store: PathBuf, key: PathBuf, rfp_hex: String) -> Result<(), Box<dyn Error>> {
-    let device = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
-    let store = Store::open(store)?;
-    let rfp = parse_hex32(&rfp_hex)?;
-    let (mk, _st) = open_repo(&store, &device, &rfp)?;
-    let code = create_recovery(&store, &device, &mk)?;
-    println!(
-        "recovery keyslot created for device {} at generation {}",
-        hex(&device.device_id()?),
-        mk.generation()
-    );
-    println!(
-        "\nRECOVERY CODE (store this offline NOW — it is shown once and never kept):\n  {}",
-        hex(code.as_slice())
-    );
-    println!(
-        "\nRe-run `recovery-init` after any `rotate` to re-pin recovery to the new generation."
-    );
-    Ok(())
-}
-
-/// `recover` (§8.6): break-glass recovery against a local store. Reconstruct the master key from the
-/// recovery code (anchored to the RFP), peel the data keyring, and restore the ref's tree into `--dir`.
-fn run_recover(
-    store: PathBuf,
-    rfp_hex: String,
-    code_hex: String,
-    dir: PathBuf,
+/// A folder's link to its repo (the git-remote analogue): server address, pinned host id, RFP anchor,
+/// and ref name. Stored at `<state>/link`; the synced folder stays clean.
+struct Link {
+    server: String,
+    host_id: [u8; 32],
+    rfp: [u8; 32],
     ref_name: String,
-) -> Result<(), Box<dyn Error>> {
-    let store = Store::open(store)?;
-    let rfp = parse_hex32(&rfp_hex)?;
-    let code = parse_hex32(&code_hex)?;
+}
 
-    // Reconstruct the live identity from the code alone; the fold verifies the RFP + mk_commit.
-    let (mk, st) = recover_master(&store, &code, &rfp)?;
-    println!(
-        "recovered master key at generation {} — {} member(s) in the roster",
-        mk.generation(),
-        st.members.len()
+fn read_link(sdir: &Path) -> Option<Link> {
+    let s = std::fs::read_to_string(sdir.join("link")).ok()?;
+    let (mut server, mut host_id, mut rfp, mut ref_name) = (None, None, None, None);
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("server=") {
+            server = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("host_id=") {
+            host_id = parse_hex32(v).ok();
+        } else if let Some(v) = line.strip_prefix("rfp=") {
+            rfp = parse_hex32(v).ok();
+        } else if let Some(v) = line.strip_prefix("ref=") {
+            ref_name = Some(v.to_string());
+        }
+    }
+    Some(Link {
+        server: server?,
+        host_id: host_id?,
+        rfp: rfp?,
+        ref_name: ref_name?,
+    })
+}
+
+fn write_link(sdir: &Path, l: &Link) -> Result<(), Box<dyn Error>> {
+    let body = format!(
+        "server={}\nhost_id={}\nrfp={}\nref={}\n",
+        l.server,
+        hex(&l.host_id),
+        hex(&l.rfp),
+        l.ref_name
+    );
+    std::fs::write(sdir.join("link"), body)?;
+    Ok(())
+}
+
+/// Connect to `addr`, pinning a known `host_id` or capturing it on first use (TOFU). Returns the
+/// endpoint, connection, and the pinned/captured `host_id`.
+async fn connect(
+    addr: SocketAddr,
+    pinned: Option<[u8; 32]>,
+) -> Result<(quinn::Endpoint, quinn::Connection, [u8; 32]), Box<dyn Error>> {
+    let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    let captured = match pinned {
+        Some(h) => {
+            ep.set_default_client_config(client_config(HostPin::from_host_id(h))?);
+            None
+        }
+        None => {
+            let (cfg, cap) = client_config_tofu()?;
+            ep.set_default_client_config(cfg);
+            Some(cap)
+        }
+    };
+    let conn = ep.connect(addr, "secsec.invalid")?.await?;
+    let host_id = match (pinned, captured) {
+        (Some(h), _) => h,
+        (None, Some(cap)) => {
+            (*cap.lock().expect("tofu cell")).ok_or("server presented no host key during TOFU")?
+        }
+        _ => unreachable!(),
+    };
+    Ok((ep, conn, host_id))
+}
+
+// ---- host key (server) ----
+
+fn load_or_generate_hostkey(dir: &Path) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
+    let cert_path = dir.join("hostkey.crt");
+    let key_path = dir.join("hostkey.key");
+    if cert_path.exists() && key_path.exists() {
+        return Ok((std::fs::read(cert_path)?, std::fs::read(key_path)?));
+    }
+    let ck = rcgen::generate_simple_self_signed(vec!["secsec.invalid".to_string()])?;
+    let (cert, key) = (ck.cert.der().to_vec(), ck.key_pair.serialize_der());
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(&cert_path, &cert)?;
+    std::fs::write(&key_path, &key)?;
+    Ok((cert, key))
+}
+
+fn load_or_generate_receipt_key(dir: &Path) -> Result<[u8; 32], Box<dyn Error>> {
+    let path = dir.join("hostkey.receipt");
+    if let Ok(bytes) = std::fs::read(&path) {
+        if bytes.len() == 32 {
+            return Ok(bytes.try_into().expect("checked len"));
+        }
+    }
+    let seed = rand32()?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(&path, seed)?;
+    Ok(seed)
+}
+
+// ---- serve ----
+
+async fn run_serve(dir: PathBuf, port: u16) -> Result<(), Box<dyn Error>> {
+    std::fs::create_dir_all(&dir)?;
+    let store_path = dir.join("repo.secsec");
+    let hostkey_dir = dir.join("hostkey");
+    let auth_path = home()?.join(".ssh/authorized_keys");
+
+    // authorized_keys is MANDATORY (the connection gate for all comms). Refuse to start without it.
+    let body = std::fs::read_to_string(&auth_path).map_err(|e| {
+        format!("authorized_keys is required: cannot read {} ({e}). secsec serve gates every connection on it.", auth_path.display())
+    })?;
+    let authorized = secsec_server::parse_authorized_keys(&body);
+    if authorized.is_empty() {
+        return Err(format!(
+            "{} has no usable Ed25519 keys — add at least your own device's public key",
+            auth_path.display()
+        )
+        .into());
+    }
+
+    let (cert, key) = load_or_generate_hostkey(&hostkey_dir)?;
+    let host_id = HostPin::from_cert(&cert)?.host_id();
+    let receipt_seed = load_or_generate_receipt_key(&hostkey_dir)?;
+    let store = Store::open(&store_path)?;
+    let server = std::sync::Arc::new(
+        Server::new(store)
+            .with_receipts(&receipt_seed, host_id)
+            .with_authorized_file(auth_path.clone()), // re-read per connection (live add/remove)
     );
 
-    // Peel the §8.2 DATA key-history so objects under any past generation decrypt, then restore.
-    let keyring = data_keyring(&store, &mk)?;
-    match restore_ref_local(&store, &keyring, &st.members, &ref_name, &dir)? {
-        Some(commit_id) => println!(
-            "restored ref '{}' (commit {}) into {}",
-            ref_name,
-            hex(&commit_id),
-            dir.display()
-        ),
-        None => println!(
-            "ref '{}' has no published head — nothing to restore (master key still recovered)",
-            ref_name
-        ),
+    let listen: SocketAddr = (Ipv4Addr::UNSPECIFIED, port).into();
+    let endpoint = quinn::Endpoint::server(server_config(&cert, &key)?, listen)?;
+    println!(
+        "secsec serve — store {} · host pin {}",
+        store_path.display(),
+        hex(&host_id)
+    );
+    println!(
+        "authorized_keys: {} ({} key(s)) · listening on {}",
+        auth_path.display(),
+        authorized.len(),
+        endpoint.local_addr()?
+    );
+    while let Some(incoming) = endpoint.accept().await {
+        let server = server.clone();
+        tokio::spawn(async move {
+            match incoming.await {
+                Ok(conn) => {
+                    if let Err(e) = serve_connection(&conn, &server, host_id, unix_secs).await {
+                        eprintln!("connection closed: {e}");
+                    }
+                }
+                Err(e) => eprintln!("accept failed: {e}"),
+            }
+        });
     }
     Ok(())
 }
 
-/// The last-synced base cursor is a commit **content hash** (not secret — the server already stores
-/// objects by id), so it is persisted as plain hex; the anti-rollback frontier beside it IS sealed.
-fn read_base(path: &Path) -> Result<Option<[u8; 32]>, Box<dyn Error>> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => Ok(Some(parse_hex32(s.trim())?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
+// ---- sync ----
 
-#[allow(clippy::too_many_arguments)]
 async fn run_sync(
-    remote: SocketAddr,
-    host_cert: Option<PathBuf>,
-    host_fp: Option<String>,
-    key: PathBuf,
     dir: PathBuf,
-    store_path: PathBuf,
-    state: PathBuf,
-    rfp_hex: String,
-    ref_name: String,
-    watch: bool,
-    debounce_ms: u64,
-    poll_secs: u64,
+    server_opt: Option<String>,
+    invite_opt: Option<String>,
+    name_opt: Option<String>,
+    once: bool,
 ) -> Result<(), Box<dyn Error>> {
-    use std::time::Duration;
+    std::fs::create_dir_all(&dir)?;
+    let sdir = state_dir_for(&dir)?;
+    let device = default_device()?;
+    let link = read_link(&sdir);
 
-    let device = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
-    // Pin by full cert (--host-cert) or by host_id fingerprint (--host-fp); clap guarantees one.
-    let pin = match (host_cert, host_fp) {
-        (Some(cert), _) => HostPin::from_cert(&std::fs::read(&cert)?)?,
-        (None, Some(fp)) => HostPin::from_host_id(parse_hex32(&fp)?),
-        (None, None) => return Err("one of --host-cert / --host-fp is required".into()),
-    };
-    let host_id = pin.host_id();
-    let rfp = parse_hex32(&rfp_hex)?;
+    let server_str = server_opt
+        .clone()
+        .or_else(|| link.as_ref().map(|l| l.server.clone()))
+        .ok_or("no server for this folder — pass --server host[:port] the first time")?;
+    let addr = resolve_server(&server_str)?;
+    // The ref defaults to "main", so two devices syncing their (locally differently-named) folders to
+    // the same repo converge with zero flags. Use --name to keep several distinct folders in one repo.
+    let ref_name = name_opt
+        .or_else(|| link.as_ref().map(|l| l.ref_name.clone()))
+        .unwrap_or_else(|| "main".to_string());
 
-    // connect + §11 handshake.
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_config(pin)?);
-    let conn = endpoint.connect(remote, "secsec.invalid")?.await?;
-    let mut client_nonce = [0u8; 32];
-    getrandom::fill(&mut client_nonce)?;
-    let sess = client_handshake(&conn, &device, host_id, client_nonce).await?;
+    // Connect: pin the saved host key, or TOFU on first contact.
+    let pinned = link.as_ref().map(|l| l.host_id);
+    let (endpoint, conn, host_id) = connect(addr, pinned).await?;
+    let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
 
-    // cold-start: recover the master key + roster over the wire, anchored to the RFP.
-    let (mk, st) = open_repo_remote(&rem, &device, &rfp).await?;
-    // §8.2 DATA key-history keyring: peel `master_key_g` for every past generation so reads work across
-    // any rotation (a genesis-generation repo yields just `{1: mk}`; writes use the current generation).
-    let keyring = data_keyring_remote(&rem, &mk).await?;
+    // Establish the RFP: join via invite, reuse the link, or create the repo (first device).
+    let rfp = if let Some(code_str) = invite_opt {
+        let code = pair::decode_code(&code_str)?;
+        println!("pairing with an enrolled device…");
+        pair::run_join(&rem, &device, &code, &host_id, PAIR_JOIN_ROUNDS).await?
+    } else if let Some(l) = &link {
+        l.rfp
+    } else {
+        // First device: attempt to create the repo. The genesis bootstrap is permitted only while the
+        // roster is empty, so if the repo already exists this fails — and an unenrolled device must
+        // instead join with an invite. (We can't pre-probe: reads require enrollment, which we don't
+        // have yet.)
+        if pinned.is_none() {
+            println!(
+                "server host fingerprint (verify out-of-band): {}",
+                hex(&host_id)
+            );
+        }
+        match init_repo_remote(&rem, &device, unix_secs()).await {
+            Ok(rfp) => {
+                println!("created new repository");
+                rfp
+            }
+            Err(e) => {
+                return Err(format!(
+                    "could not create the repository (it likely already exists) — to join it, get an invite from an enrolled device and pass --invite <code>. ({e})"
+                )
+                .into());
+            }
+        }
+    };
 
-    // local state.
-    let store = Store::open(&store_path)?;
-    std::fs::create_dir_all(&state)?;
-    let frontier_path = state.join("frontier");
-    let base_path = state.join("base");
-    let receipts_path = state.join("receipts");
+    write_link(
+        &sdir,
+        &Link {
+            server: server_str,
+            host_id,
+            rfp,
+            ref_name: ref_name.clone(),
+        },
+    )?;
+
+    // Cold-start over the wire, then the continuous sync loop.
+    let (mk, st) = open_repo_remote(&rem, &device, &rfp).await?;
+    let keyring = data_keyring_remote(&rem, &mk).await?;
+    let store = Store::open(sdir.join("objects.secsec"))?;
+    let frontier_path = sdir.join("frontier");
+    let base_path = sdir.join("base");
+    let receipts_path = sdir.join("receipts");
     let mut frontier = match load_frontier(&frontier_path, &device)? {
         FrontierLoad::Loaded(f) => f,
         FrontierLoad::Absent => SyncFrontier::default(),
     };
-    let mut base = read_base(&base_path)?;
+    let mut base = match std::fs::read_to_string(&base_path) {
+        Ok(s) => Some(parse_hex32(&s)?),
+        Err(_) => None,
+    };
+    println!(
+        "synced '{}' (generation {}, {} member(s)) ↔ {}",
+        ref_name,
+        mk.generation(),
+        st.members.len(),
+        dir.display()
+    );
 
-    // In --watch mode, a background thread feeds debounced file-change ticks; a periodic timer feeds
-    // remote-poll ticks (to pick up other devices' pushes). Either triggers a re-sync.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    if watch {
+    if !once {
         let wdir = dir.clone();
         std::thread::spawn(move || {
-            let _ = secsec_client::watcher::watch_dir(
-                &wdir,
-                Duration::from_millis(debounce_ms),
-                || tx.send(()).is_ok(),
-            );
+            let _ = secsec_client::watcher::watch_dir(&wdir, Duration::from_millis(1000), || {
+                tx.send(()).is_ok()
+            });
         });
-        println!(
-            "watching {} (debounce {debounce_ms}ms, poll {poll_secs}s) — Ctrl-C to stop",
-            dir.display()
-        );
+        println!("watching {} — Ctrl-C to stop", dir.display());
     }
-    let mut poll = tokio::time::interval(Duration::from_secs(poll_secs.max(1)));
-    poll.tick().await; // consume the immediate first tick
+    let mut poll = tokio::time::interval(Duration::from_secs(15));
+    poll.tick().await;
 
     let mut initial = true;
     loop {
         if !initial {
-            // Wait for a file-change or poll tick (watch mode only; one-shot breaks below).
             tokio::select! {
                 ev = rx.recv() => { if ev.is_none() { break; } }
                 _ = poll.tick() => {}
             }
         }
-        // genesis-generation repos sit at roster_seq 0 (rotation-era sync is a later milestone).
         match sync_once(
             &rem,
             &store,
@@ -622,8 +477,6 @@ async fn run_sync(
                 if let Some(b) = outcome.base {
                     std::fs::write(&base_path, hex(&b))?;
                 }
-                // §15: record arrival receipts for any pushed objects into the local receipt log so a
-                // later `gc` can pick a safe gc_gen (aged past the grace window) on the client's clock.
                 if !outcome.receipts.is_empty() {
                     let mut log = secsec_client::gc::parse_receipt_log(
                         &std::fs::read_to_string(&receipts_path).unwrap_or_default(),
@@ -634,204 +487,207 @@ async fn run_sync(
                         secsec_client::gc::serialize_receipt_log(&log),
                     )?;
                 }
-                // Quiet on a no-op poll; report real work and the first sync.
                 if initial || !matches!(outcome.kind, secsec_client::sync::SyncKind::UpToDate) {
                     println!("sync: {:?}", outcome.kind);
                 }
                 frontier = outcome.frontier;
                 base = outcome.base;
+
+                // Auto-GC once per session (best-effort, §15): prune server objects aged past the 48h
+                // grace window so the store stays lean — the user never runs a gc command.
+                if initial {
+                    let gc = async {
+                        if let Some((head, _, _)) =
+                            secsec_client::fetch_head(&rem, &mk, &ref_name).await?
+                        {
+                            secsec_client::fetch_closure(&rem, &store, &keyring, &head.commit_id)
+                                .await?;
+                            let log = secsec_client::gc::parse_receipt_log(
+                                &std::fs::read_to_string(&receipts_path).unwrap_or_default(),
+                            );
+                            let gc_gen = secsec_client::gc::gc_gen_from_log(&log, unix_secs());
+                            if gc_gen != 0 {
+                                let put_epoch = secsec_client::gc::put_epoch_from_log(&log);
+                                let roster_seq =
+                                    fetch_roster_entries(&rem).await?.len().saturating_sub(1)
+                                        as u64;
+                                secsec_client::gc::gc_collect(
+                                    &rem,
+                                    &store,
+                                    &keyring,
+                                    &[ref_name.as_str()],
+                                    gc_gen,
+                                    roster_seq,
+                                    put_epoch,
+                                )
+                                .await?;
+                            }
+                        }
+                        Ok::<(), Box<dyn Error>>(())
+                    }
+                    .await;
+                    if let Err(e) = gc {
+                        eprintln!("auto-gc skipped: {e}");
+                    }
+                }
             }
             Err(e) => eprintln!("sync error: {e}"),
         }
         initial = false;
-        if !watch {
+        if once {
             break;
         }
     }
-
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
     Ok(())
 }
 
-/// `gc` (§15): client-driven garbage collection. Cold-start the identity over the wire, bring the
-/// ref's head closure local (the keep-set — GC fails safe if any is unavailable), pick a safe `gc_gen`
-/// + `put_epoch` from the local receipt log, and issue the compare-and-swap sweep.
-#[allow(clippy::too_many_arguments)]
-async fn run_gc(
-    remote: SocketAddr,
-    host_cert: Option<PathBuf>,
-    host_fp: Option<String>,
-    key: PathBuf,
-    store_path: PathBuf,
-    state: PathBuf,
-    rfp_hex: String,
-    ref_name: String,
-) -> Result<(), Box<dyn Error>> {
-    let device = DeviceKey::from_openssh(&std::fs::read_to_string(&key)?)?;
-    let pin = match (host_cert, host_fp) {
-        (Some(cert), _) => HostPin::from_cert(&std::fs::read(&cert)?)?,
-        (None, Some(fp)) => HostPin::from_host_id(parse_hex32(&fp)?),
-        (None, None) => return Err("one of --host-cert / --host-fp is required".into()),
-    };
-    let host_id = pin.host_id();
-    let rfp = parse_hex32(&rfp_hex)?;
+// ---- invite ----
 
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_config(pin)?);
-    let conn = endpoint.connect(remote, "secsec.invalid")?.await?;
-    let mut client_nonce = [0u8; 32];
-    getrandom::fill(&mut client_nonce)?;
-    let sess = client_handshake(&conn, &device, host_id, client_nonce).await?;
+async fn run_invite(dir: PathBuf) -> Result<(), Box<dyn Error>> {
+    let sdir = state_dir_for(&dir)?;
+    let link = read_link(&sdir)
+        .ok_or("this folder isn't linked to a repo yet — run `secsec sync` on it first")?;
+    let device = default_device()?;
+    let addr = resolve_server(&link.server)?;
+    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
+    let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
+    let (mk, _st) = open_repo_remote(&rem, &device, &link.rfp).await?;
 
-    // Cold-start the identity + the §8.2 data keyring (the keep-set closure may span generations).
-    let (mk, _st) = open_repo_remote(&rem, &device, &rfp).await?;
-    let keyring = data_keyring_remote(&rem, &mk).await?;
-    let store = Store::open(&store_path)?;
-
-    // Bring the ref's head closure local so the keep-set is fully available (GC fails safe otherwise).
-    if let Some((head, _sig, _blob)) = secsec_client::fetch_head(&rem, &mk, &ref_name).await? {
-        secsec_client::fetch_closure(&rem, &store, &keyring, &head.commit_id).await?;
-    } else {
-        println!("ref '{ref_name}' has no head — nothing to keep; aborting gc");
-        conn.close(0u32.into(), b"done");
-        endpoint.wait_idle().await;
-        return Ok(());
-    }
-
-    // gc_gen + put_epoch from the local receipt log `sync` maintains; roster_seq = the sigchain tip.
-    let log = secsec_client::gc::parse_receipt_log(
-        &std::fs::read_to_string(state.join("receipts")).unwrap_or_default(),
+    let (code, disp) = pair::new_invite()?;
+    println!("INVITE CODE: {disp}");
+    println!(
+        "on the new device (add its key to the server's authorized_keys first):\n  secsec sync <dir> --server {} --invite {disp}",
+        link.server
     );
-    let now = unix_secs();
-    let gc_gen = secsec_client::gc::gc_gen_from_log(&log, now);
-    let put_epoch = secsec_client::gc::put_epoch_from_log(&log);
-    let roster_seq = secsec_client::repo::fetch_roster_entries(&rem)
-        .await?
-        .len()
-        .saturating_sub(1) as u64;
-
-    if gc_gen == 0 {
-        println!(
-            "no generation has aged past the {}h grace window — nothing to sweep",
-            secsec_client::gc::GC_GRACE_WINDOW_SECS / 3600
-        );
-        conn.close(0u32.into(), b"done");
-        endpoint.wait_idle().await;
-        return Ok(());
-    }
-
-    let outcome = secsec_client::gc::gc_collect(
+    println!("waiting for the device to pair — Ctrl-C to cancel…");
+    let enrolled = pair::run_host(
         &rem,
-        &store,
-        &keyring,
-        &[ref_name.as_str()],
-        gc_gen,
-        roster_seq,
-        put_epoch,
+        &device,
+        &mk,
+        &link.rfp,
+        &host_id,
+        &code,
+        PAIR_HOST_ROUNDS,
+        unix_secs(),
     )
     .await?;
-    match outcome {
-        secsec_client::GcOutcome::Swept => {
-            println!("gc: swept (gc_gen={gc_gen}, put_epoch={put_epoch}, roster_seq={roster_seq})");
-        }
-        secsec_client::GcOutcome::CasConflict => {
-            println!("gc: server state moved since last sync (CAS conflict) — run `sync`, then `gc` again");
-        }
-    }
-
+    println!("paired device {}", hex(&enrolled));
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
     Ok(())
 }
 
-fn run_hostkey(hostkey_dir: PathBuf) -> Result<(), Box<dyn Error>> {
-    let (cert, _key) = load_or_generate_hostkey(&hostkey_dir)?;
-    let host_id = HostPin::from_cert(&cert)?.host_id();
-    println!("host pin (give clients --host-fp): {}", hex(&host_id));
+// ---- devices / revoke ----
+
+/// List the repo's enrolled devices: a short device id, the device's SSH key fingerprint (the
+/// `SHA256:…` string `ssh-keygen -lf` prints, so you can match it to a physical device), and a marker
+/// for the current device.
+async fn run_devices(dir: PathBuf) -> Result<(), Box<dyn Error>> {
+    let sdir = state_dir_for(&dir)?;
+    let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
+    let device = default_device()?;
+    let me = device.device_id()?;
+    let addr = resolve_server(&link.server)?;
+    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
+    let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
+    let rem = QuicRemote::new(&conn, sess.transcript, &device);
+    let (_mk, st) = open_repo_remote(&rem, &device, &link.rfp).await?;
+    println!("{} device(s) in this repo:", st.members.len());
+    for (id, pubkey) in &st.members {
+        let fp = pubkey
+            .ssh_fingerprint()
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        let mark = if *id == me { "  ← this device" } else { "" };
+        println!("  {}  {}{}", &hex(id)[..12], fp, mark);
+    }
+    conn.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+    Ok(())
+}
+
+/// Revoke a device by a (prefix of its) device id: rotate the master key away from it (and its
+/// add-by closure) over the wire, so it can't decrypt anything written afterward. Also reminds the
+/// operator to remove its key from the server's `authorized_keys`.
+async fn run_revoke(device_prefix: String, dir: PathBuf) -> Result<(), Box<dyn Error>> {
+    let sdir = state_dir_for(&dir)?;
+    let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
+    let device = default_device()?;
+    let addr = resolve_server(&link.server)?;
+    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
+    let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
+    let rem = QuicRemote::new(&conn, sess.transcript, &device);
+    let (mk, st) = open_repo_remote(&rem, &device, &link.rfp).await?;
+
+    // Resolve the device-id prefix against the roster (must be unique).
+    let prefix = device_prefix.to_lowercase();
+    let matches: Vec<_> = st
+        .members
+        .keys()
+        .filter(|id| hex(&id[..]).starts_with(&prefix))
+        .collect();
+    let target = match matches.as_slice() {
+        [id] => **id,
+        [] => return Err(format!("no enrolled device matches '{device_prefix}'").into()),
+        _ => {
+            return Err(format!(
+                "'{device_prefix}' matches more than one device — use a longer prefix"
+            )
+            .into())
+        }
+    };
+    if target == device.device_id()? {
+        return Err("refusing to revoke the device you're running this from".into());
+    }
+
+    secsec_client::repo::rotate_repo_remote(
+        &rem,
+        &device,
+        &mk,
+        &st,
+        &link.rfp,
+        Some(target),
+        unix_secs(),
+    )
+    .await?;
+    println!(
+        "revoked device {} — rotated to a new key generation",
+        hex(&target)
+    );
+    println!(
+        "now remove its public key from the server's ~/.ssh/authorized_keys so it can't reconnect."
+    );
+    conn.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    let rt = || tokio::runtime::Runtime::new();
+    let cwd = || PathBuf::from(".");
     match cli.cmd {
-        Cmd::Init { store, key } => run_init(store, key),
-        Cmd::Serve {
-            store,
-            hostkey_dir,
-            listen,
-        } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run_serve(store, hostkey_dir, listen))
-        }
-        Cmd::Hostkey { hostkey_dir } => run_hostkey(hostkey_dir),
+        Cmd::Serve { dir, port } => rt()?.block_on(run_serve(
+            dir.unwrap_or_else(cwd),
+            port.unwrap_or(DEFAULT_PORT),
+        )),
         Cmd::Sync {
-            remote,
-            host_cert,
-            host_fp,
-            key,
             dir,
-            store,
-            state,
-            rfp,
-            r#ref,
-            watch,
-            debounce_ms,
-            poll_secs,
-        } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run_sync(
-                remote,
-                host_cert,
-                host_fp,
-                key,
-                dir,
-                store,
-                state,
-                rfp,
-                r#ref,
-                watch,
-                debounce_ms,
-                poll_secs,
-            ))
-        }
-        Cmd::Rotate {
-            store,
-            key,
-            rfp,
-            revoke,
-        } => run_rotate(store, key, rfp, revoke),
-        Cmd::EnrollPubkey { key } => run_enroll_pubkey(key),
-        Cmd::Grant {
-            store,
-            key,
-            rfp,
-            device_pub,
-            xwing_pub,
-        } => run_grant(store, key, rfp, device_pub, xwing_pub),
-        Cmd::RecoveryInit { store, key, rfp } => run_recovery_init(store, key, rfp),
-        Cmd::Recover {
-            store,
-            rfp,
-            code,
-            dir,
-            r#ref,
-        } => run_recover(store, rfp, code, dir, r#ref),
-        Cmd::Gc {
-            remote,
-            host_cert,
-            host_fp,
-            key,
-            store,
-            state,
-            rfp,
-            r#ref,
-        } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run_gc(
-                remote, host_cert, host_fp, key, store, state, rfp, r#ref,
-            ))
-        }
+            server,
+            invite,
+            name,
+            once,
+        } => rt()?.block_on(run_sync(
+            dir.unwrap_or_else(cwd),
+            server,
+            invite,
+            name,
+            once,
+        )),
+        Cmd::Invite { dir } => rt()?.block_on(run_invite(dir.unwrap_or_else(cwd))),
+        Cmd::Devices { dir } => rt()?.block_on(run_devices(dir.unwrap_or_else(cwd))),
+        Cmd::Revoke { device, dir } => rt()?.block_on(run_revoke(device, dir.unwrap_or_else(cwd))),
     }
 }

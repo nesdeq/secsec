@@ -64,8 +64,12 @@ pub enum PairError {
 impl core::fmt::Display for PairError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            PairError::BadMac => f.write_str("pairing message failed its code authentication (wrong invite code?)"),
-            PairError::Timeout => f.write_str("pairing timed out (the other device never completed it)"),
+            PairError::BadMac => {
+                f.write_str("pairing message failed its code authentication (wrong invite code?)")
+            }
+            PairError::Timeout => {
+                f.write_str("pairing timed out (the other device never completed it)")
+            }
             PairError::Decode(e) => write!(f, "malformed pairing message: {e}"),
             PairError::BadCode => f.write_str("invalid invite code"),
             PairError::Sig(e) => write!(f, "sig: {e}"),

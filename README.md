@@ -11,8 +11,12 @@ contents, names, structure, or sizes beyond a bounded, documented residual. The 
   rollback-gated three-way merge with **no silent data loss**; full version history is a by-product.
 - **Post-quantum by default** — the harvestable keyslot wrap is **X-Wing** (ML-KEM-768 ⊕ X25519); the
   symmetric data plane is already PQ-safe. PQ is mandatory, not opt-in.
+- **`authorized_keys` is the gate** — the server lists permitted device keys in `~/.ssh/authorized_keys`
+  (re-read per connection) and refuses to start without it; only listed keys can connect at all. New
+  devices join with a single-use **invite code**. There is no separate recovery secret — the SSH key
+  is both credential and backup.
 - **One binary, no CA, no database** — the server self-signs a host key (pinned TOFU, like `sshd`);
-  storage is a single embedded `redb` file.
+  storage is a single embedded `repo.secsec` file, and the synced folder holds nothing but your files.
 
 The authoritative specification is [`secsec-Design.md`](secsec-Design.md); the build plan, crate
 layout, risk register, and status are in [`secsec-Implementation.md`](secsec-Implementation.md).
@@ -30,9 +34,11 @@ Files are split with **keyed FastCDC**, each chunk/tree/commit sealed with a per
 on every fetch). Membership is an append-only, hash-chained, **SSHSIG-signed roster sigchain** anchored
 out-of-band by the repository fingerprint (**RFP**); the master key is wrapped to each device's X-Wing
 keyslot and authenticated against a commitment in that chain, so the server can never feed a device a
-forged key or a fake repository. The per-ref **head** is signed *and* encrypted; the blind server only
-ever does a compare-and-swap on the hash of an opaque blob. Transport is QUIC + TLS 1.3 to a **pinned**
-self-signed host key, with every per-op request individually signed by a rostered key.
+forged key or a fake repository. New devices enrol over the wire via a single-use **invite code** that
+MACs the key-exchange end-to-end through the blind server (which never learns the code). The per-ref
+**head** is signed *and* encrypted; the blind server only ever does a compare-and-swap on the hash of
+an opaque blob. Transport is QUIC + TLS 1.3 to a **pinned** self-signed host key; connections are
+gated on `~/.ssh/authorized_keys`, and every per-op request is individually signed by a rostered key.
 
 ## Quickstart
 
@@ -42,57 +48,56 @@ Build the binary:
 cargo build --release      # target/release/secsec
 ```
 
-**Owner — create the repository (device 1, on a *trusted* machine).** `init` is a client/owner
-operation, not a server one: it generates `master_key_1` in RAM (dropped immediately — it is never
-written), self-signs the **genesis** roster entry with *your* SSH key, wraps the master key to your
-own keyslot, and prints the **RFP** anchor. `--key` is your device key. Run it where you trust the
-machine — the master key must never touch the server box.
+The whole CLI is five commands: `serve · sync · invite · devices · revoke`.
+
+**Server — run the blind server.** Its only configuration is `~/.ssh/authorized_keys`: list the
+**public** key of every device allowed to connect (standard OpenSSH format, one per line). The server
+re-reads the file on every connection and **refuses to start without it** — it is the mandatory
+connection gate. The server holds no SSH key and no master key; it stores only opaque ciphertext in a
+single `repo.secsec` file.
 
 ```sh
-secsec init --store ./repo.redb --key ~/.ssh/id_ed25519   # prints the RFP — record it out-of-band
+cat device1.pub device2.pub >> ~/.ssh/authorized_keys   # who may connect
+secsec serve /srv/data 8899        # dir defaults to the current dir, port to 8899
+# prints the host pin (verify it out-of-band) and the authorized_keys path it is gating on
 ```
 
-In this build `init` / `grant` / `rotate` write the store file **directly** (they are local admin
-ops, not network calls), so the resulting `repo.redb` *is* the repository. Place it on the server to
-serve (e.g. `scp repo.redb server:/srv/`); the server only ever stores opaque blobs.
-
-**Server — serve the store (no SSH key, no master key — it is blind).** Its only identity is a
-self-signed TLS **host key**, like `sshd`'s; clients pin it. Membership ("which keys are allowed") is
-the encrypted, signed roster *inside* the store — the server can neither read nor forge it; it just
-gates each request on whether the connecting key owns a keyslot.
+**Device 1 — create the repository and sync.** The first device to sync a folder *creates* the repo
+(genesis). It uses `~/.ssh/id_ed25519`. Name the server once; afterwards just `secsec sync <dir>`.
 
 ```sh
-secsec hostkey --hostkey-dir /srv/hostkey                       # prints the host pin (host_id)
-secsec serve   --store /srv/repo.redb --hostkey-dir /srv/hostkey --listen 0.0.0.0:8899
+secsec sync ~/Sync --server server.example:8899
+# "created new repository" → then continuous two-way sync (watches for changes); Ctrl-C to stop
 ```
 
-**Device** — sync a directory, pinning the host by its fingerprint and anchoring trust to the RFP:
+**Device 2+ — join with a one-time invite.** Add the new device's public key to the server's
+`authorized_keys` first (above). Then, on an already-enrolled device, print an invite; on the new
+device, sync with it:
 
 ```sh
-secsec sync \
-  --remote server.example:8899 --host-fp <host_id-hex> \
-  --key ~/.ssh/id_ed25519 --rfp <RFP-hex> \
-  --dir ~/Sync --store ~/.secsec/objects.redb --state ~/.secsec/state \
-  --watch        # optional: keep running, re-sync on file changes + a periodic poll
+# on device 1 (enrolled, online):
+secsec invite ~/Sync                       # prints a one-time INVITE CODE, then waits
+# on device 2:
+secsec sync ~/Sync --server server.example:8899 --invite <code>
+# "sync: Cloned" → device 2 converges with device 1
 ```
 
-**Enroll another device.** `grant` is run by an existing **member** (it needs that member's key to
-unwrap and re-wrap the master key to the new device's keyslot), against the repo store, after
-verifying the new device's keys out-of-band via the SAS ceremony — again on a trusted machine, not
-the blind server. The updated store is then served as before.
+Both devices sync to the same repo under the default ref (`main`), so they converge even if the local
+folders are named differently. The invite code authenticates the join end-to-end through the blind
+server (which never learns it), so the server cannot substitute the new device's key or feed it a fake
+repository.
+
+**Manage devices.** List the enrolled devices (with their SSH fingerprints, so you can tell which is
+which) and revoke a lost one over the wire from any enrolled device:
 
 ```sh
-# on the new device:
-secsec enroll-pubkey --key ~/.ssh/id_ed25519     # prints its ssh + X-Wing public keys
-# on a current member's machine, against the repo store:
-secsec grant --store ./repo.redb --key ~/.ssh/id_ed25519 --rfp <RFP-hex> \
-             --device-pub <ssh-hex> --xwing-pub <xwing-hex>
+secsec devices ~/Sync                       # short id + SHA256:… SSH fingerprint per device
+secsec revoke <device-id-prefix> ~/Sync     # rotate the key away from it (forward secrecy)
+# then remove its line from the server's ~/.ssh/authorized_keys so it can't reconnect
 ```
 
-Other member-side admin ops (same model — they hold the master key, so run on a trusted device):
-`rotate [--revoke <device-id>]` (mint a new key generation; `revoke ⇒ rotate` for forward secrecy),
-`recovery-init` / `recover` (break-glass 256-bit recovery code, §8.6). `gc` (client-driven,
-grace-windowed garbage collection, §15) runs over the network like `sync`. Run
+Revocation mints a new key generation the revoked device cannot derive, so it can read nothing written
+afterward. Garbage collection runs **automatically** inside `sync` — there is no `gc` command. Run
 `secsec <command> --help` for flags.
 
 ## Architecture
@@ -104,7 +109,7 @@ A Cargo workspace of small, separately reviewable crates, layered strictly downw
 |---|---|
 | Foundation | [`secsec-canon`](crates/secsec-canon) · [`secsec-aead`](crates/secsec-aead) · [`secsec-kdf`](crates/secsec-kdf) · [`secsec-frame`](crates/secsec-frame) |
 | Object plane | [`secsec-object`](crates/secsec-object) · [`secsec-chunk`](crates/secsec-chunk) · [`secsec-snapshot`](crates/secsec-snapshot) · [`secsec-store`](crates/secsec-store) |
-| Identity & keys | [`secsec-sig`](crates/secsec-sig) · [`secsec-pq`](crates/secsec-pq) · [`secsec-recovery`](crates/secsec-recovery) · [`secsec-roster`](crates/secsec-roster) |
+| Identity & keys | [`secsec-sig`](crates/secsec-sig) · [`secsec-pq`](crates/secsec-pq) · [`secsec-roster`](crates/secsec-roster) |
 | Sync plane | [`secsec-sync`](crates/secsec-sync) · [`secsec-engine`](crates/secsec-engine) |
 | Transport & wire | [`secsec-transport`](crates/secsec-transport) · [`secsec-proto`](crates/secsec-proto) |
 | Orchestration | [`secsec-client`](crates/secsec-client) · [`secsec-server`](crates/secsec-server) |
@@ -130,7 +135,8 @@ scan on every push.
 
 The adversary is a **malicious/compromised server** (primary), a **network attacker**, a **revoked
 device**, and a **stolen client**. We trust only the device's SSH key and the user's out-of-band
-channel (reading a fingerprint off a screen). Each security property in `secsec-Design.md` §4 (P1–P15)
+channel (carrying an invite code, or reading a fingerprint off a screen). Each security property in
+`secsec-Design.md` §4 (P1–P15)
 is paired with the exact mechanism that earns it; the bounded, proven-minimal residuals (availability,
 reinstall freshness, pre-rotation data for a colluding revoked device, the concurrent
 mutual-revocation race, metadata leakage within padding/timing bounds) are enumerated in §22.

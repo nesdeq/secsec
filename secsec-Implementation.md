@@ -36,7 +36,6 @@ Versions are pinned at implementation start; the **capability** column is what w
 | Hash / KDF | `blake3` | ✓ `keyed_hash` + `derive_key` (context-string KDF). | Backbone of §9.5; one `keyed_hash` exception (`mk_commit`). |
 | ECDH / sign keys | `x25519-dalek`, `ed25519-dalek` | ✓ mature. | Ed25519→X25519 birational map (age/ssh-to-age precedent); the X25519 half of the X-Wing keyslot derives from the Ed25519 seed. ⚠ enforce low-order-point rejection (see the Keyslot KEM row). |
 | Keyslot KEM (the only one) | ML-KEM: `libcrux-ml-kem`; X-Wing in-crate (`secsec-pq`) + `x25519-dalek` | ✓ `libcrux-ml-kem` 0.0.9 is **formally verified** (FIPS 203 final, all sizes). X-Wing built directly on it (no third-party X-Wing crate). | **Done + mandatory.** `secsec-pq` implements draft-connolly-cfrg-xwing-kem-**10** exactly: single-seed `SHAKE256(sk,96)` key expansion, **label-LAST** combiner, derand encaps, FIPS 203 §7.1 PCT. `xwing_kat` asserts byte-identity vs the draft-10 Appendix C vector. **Wired + mandatory:** keyslots are `algo_id ‖ body` with X-Wing (`algo_id = 2`) the only algorithm; init/grant/rotate wrap it; cold-start enforces the §16 floor. The classical X25519/HPKE keyslot and the RSA-OAEP variant were **removed** (a pre-quantum keyslot is the one harvestable asymmetric exposure, §17) — so no `hpke` or `rsa` crate is used. |
-| Passphrase KDF | `argon2` | ✓ Argon2id, params configurable (§19: m=64 MiB, t=3, p=1). | Recovery path only. |
 | Chunking | `fastcdc` | ⚠ **verify gear-table seeding** from `cdc_seed[gen]` (§9.7 keyed CDC). | If the crate doesn't expose a custom/keyed gear table, fork or implement keyed FastCDC. Material risk — check early. |
 | Index / store | `redb` | ⚠ verify current stable; embedded, no external DB. | Server index holds only `{id,size,gen,pack-offset}` (§13). |
 | FS watch | `notify` | ✓ inotify/FSEvents/ReadDirectoryChangesW. | Drives commit-on-change (§10). |
@@ -66,13 +65,12 @@ secsec/
 │   ├── secsec-store/     §13   redb content-addressed blob store (server side)
 │   ├── secsec-sig/       §9.6  SSHSIG namespaces, verifier (alg pinning, negative tests)
 │   ├── secsec-pq/        §8.3,§17  X-Wing keyslot (ML-KEM-768 ⊕ X25519, the only keyslot), mk_commit authenticity, draft-10 KAT
-│   ├── secsec-recovery/  §8.6  recovery-code / passphrase (Argon2id) master-key wrap; RFP-anchored
 │   ├── secsec-roster/    §8    sigchain fold/succession, per-entry AEAD, roster-key history, generations, enrollment
 │   ├── secsec-sync/      §10   refs, cas-head, rollback-aware merge (storage-free Node model), fork detection
 │   ├── secsec-engine/    §10   snapshot-tree ↔ merge-node bridge, three-way reconcile to the store
 │   ├── secsec-transport/ §11   QUIC+TLS pinned verifier, auth, channel binding
 │   ├── secsec-proto/     §12   wire protocol, RPC framing, write/read-auth, rate limits, gc serialization (§15)
-│   ├── secsec-client/    §10,§14,§15  orchestration: cold-start, watcher, sync loop, GC driver, multi-remote+quorum, recovery
+│   ├── secsec-client/    §7,§10,§14,§15  orchestration: cold-start, watcher, sync loop, auto-GC driver, multi-remote+quorum, invite-pairing
 │   └── secsec-server/          serve loop, quota/rate-limit + gc CAS enforcement, GC executor
 ├── bin/secsec            thin CLI over the crates
 ├── vectors/              committed KAT / cross-impl test vectors (per §9.5: all 8 derivations, etc.)
@@ -107,8 +105,9 @@ signed merge commit — the only §10 code that touches `store`+`snapshot` — l
 Per security-critical crate, **before it is built upon**:
 
 - **Known-answer vectors** committed in `vectors/`: every §9.5 derivation (all 8), CTX
-  encrypt/decrypt, `mk_commit`, SAS, X-Wing keyslot wrap/unwrap, content-ids. Where an external
-  standard exists (X-Wing draft-10 Appendix C), test against **its** published vectors.
+  encrypt/decrypt, `mk_commit`, the §7 invite-code pairing MAC, X-Wing keyslot wrap/unwrap,
+  content-ids. Where an external standard exists (X-Wing draft-10 Appendix C), test against **its**
+  published vectors.
 - **Property tests** (`proptest`): AEAD round-trips; tamper-any-byte ⇒ reject; CTX commitment —
   *no ciphertext opens under two distinct (key, AD) pairs*; canonical encode/decode is a bijection
   and rejects non-canonical input; merge is commutative/associative where the spec says so.
@@ -154,9 +153,10 @@ No OpenSSL anywhere.
 - **M1 — Object plane.** `secsec-object`, `secsec-chunk`, `secsec-store`; push/pull/restore
   against a local in-process fake server. **Exit:** round-trip a real directory tree; fetch
   re-verifies every id; keyed-CDC decision resolved (R8).
-- **M2 — Identity & roster.** `secsec-roster`: keyslots (X-Wing, §8.3), enrollment (RFP/SAS
-  commitment), generations/rotation, roster-key history, fold/succession, write/read-auth gate.
-  **Exit:** model-based fold tests; enrollment MITM negative tests; revoke⇒rotate works.
+- **M2 — Identity & roster.** `secsec-roster`: keyslots (X-Wing, §8.3), enrollment (RFP anchor +
+  `mk_commit` verification), generations/rotation, roster-key history, fold/succession,
+  write/read-auth gate. **Exit:** model-based fold tests; enrollment MITM negative tests;
+  revoke⇒rotate works.
 - **M3 — Sync.** `secsec-sync`: refs, `cas-head`, rollback-aware three-way merge, fork detection.
   **Exit:** adversarial replay/rollback tests; conflict keep-both verified.
 - **M4 — Transport.** `secsec-transport` + `secsec-proto`: QUIC + pinned verifier, channel-bound
@@ -166,8 +166,9 @@ No OpenSSL anywhere.
   signed two-parent merge commits); head push/pull wiring (`build_head` → `cas-head`, fetch → verify
   → `merge_heads` → push); `notify` watcher → commit-on-change; the `secsec-client`/`secsec-server`
   orchestration end-to-end on one machine, then two.
-- **M6 — Durability & recovery.** Multi-remote reconcile + quorum, hardened GC, recovery flow,
-  downgrade/min-algo enforcement, gossip. **Exit:** multi-writer GC sim; quorum put→get→verify.
+- **M6 — Durability.** Multi-remote reconcile + quorum, hardened GC (run automatically in the sync
+  loop), downgrade/min-algo enforcement, gossip. **Exit:** multi-writer GC sim; quorum
+  put→get→verify.
 - **M7 — Hybrid-PQ keyslot (done).** X-Wing (draft-10 conformant) is **mandatory** — the only keyslot
   algorithm, fully wired through `algo_id`/init/grant/rotate and the §16 floor. **(RSA device keys,
   WebDAV browse, and the stdio/SSH transport are dropped from scope — cut from code *and* spec, not
@@ -204,6 +205,13 @@ No OpenSSL anywhere.
    FUSE/WebDAV; reproducible static build is Linux/`musl`, with signed binaries on macOS/Windows.
 4. **Keyslot KEM:** **X-Wing** (`libcrux-ml-kem`, formally verified, + `x25519-dalek`) — mandatory,
    the only keyslot algorithm. No `hpke`/`rsa` (the classical and RSA keyslots were removed).
+5. **Credential & onboarding model (2026-06-10):** the SSH key is the sole credential **and** the
+   backup. The server gates every connection on `~/.ssh/authorized_keys` (mandatory, re-read per
+   connection); the client uses `~/.ssh/id_ed25519`. Onboarding is genesis (first device) + a
+   single-use **invite code** (the rest, §7); **recovery was removed** (`secsec-recovery` + `argon2`
+   deleted — a server-stored recovery blob is a net liability, §8.6); **GC is automatic** in the sync
+   loop. CLI surface: `serve · sync · invite · devices · revoke`. The client keeps no control files in
+   the synced folder (all per-folder state lives under `~/.local/state/secsec/`).
 
 **Open:**
 5. **Audit sourcing** — an independent cryptographic review of the cores before production data
@@ -215,17 +223,22 @@ No OpenSSL anywhere.
 
 ### Snapshot
 
-- **19 crates + `secsec` binary** (+ `xtask` tooling, `fuzz/` cargo-fuzz layout) · **257 tests** ·
-  clippy `-D warnings` + fmt clean · spec ↔ code ↔ doc consistent.
+- **18 crates + `secsec` binary** (+ `xtask` tooling, `fuzz/` cargo-fuzz layout) · **253 tests** ·
+  clippy `-D warnings` + fmt clean · spec ↔ code ↔ doc consistent. (The `secsec-recovery` crate was
+  removed in the 2026-06-10 UX redesign.)
 - **Transport is QUIC/TLS-only.** RSA device keys, WebDAV, and the stdio/SSH transport were **dropped
   from scope** (cut from code *and* spec): stdio adds nothing over the pinned QUIC host key, and RSA
   is superseded by the Ed25519-only device key. The spec describes exactly what ships.
 - **Post-quantum is mandatory.** X-Wing (ML-KEM-768 ⊕ X25519, draft-10) is the **only** keyslot
   algorithm; there is no classical keyslot to downgrade to.
-- **The product runs end-to-end** with real processes over QUIC: `init` / `serve` / `sync`
-  (+ `--watch`) / `rotate` / `enroll-pubkey` / `grant` / `recovery-init` / `recover` / `gc`. Verified
-  with 4 clients converging through a blind server (linear edits + a concurrent-edit three-way merge,
-  byte-identical trees) and a zero-plaintext-leak check over the server store.
+- **The product runs end-to-end** with real processes over QUIC. The whole CLI is five commands:
+  `serve` (blind server, `authorized_keys`-gated) · `sync <dir>` (continuous two-way sync; first
+  device creates the repo, others join with `--invite`) · `invite` (print a one-time code + pair a
+  device) · `devices` (list the roster with SSH fingerprints) · `revoke` (rotate a device's access
+  away over the wire). Verified live: device-1 create+publish → device-2 join by invite (Cloned) →
+  byte-identical convergence → zero-plaintext-leak check over the server store → `devices` → `revoke`
+  → the revoked device can no longer read (`NotEnrolled`). A separate run converged 4 clients through
+  the blind server (linear edits + a concurrent-edit three-way merge).
 
 ### Milestones — all done
 
@@ -233,11 +246,11 @@ No OpenSSL anywhere.
 |---|---|---|
 | M0 Foundation | canon/aead/kdf/frame | ✅ done |
 | M1 Object plane | object/chunk/store, snapshot/restore | ✅ done |
-| M2 Identity & roster | sigchain, keyslots, generations, rotate/revoke, SAS | ✅ done |
+| M2 Identity & roster | sigchain, keyslots, generations, rotate/revoke, invite-pairing enrollment | ✅ done |
 | M3 Sync | head, dag, merge, rollback gates, fork detection | ✅ done |
-| M4 Transport | QUIC pinned verifier, §12 wire + server pipeline, limits | ✅ done |
-| M5 Live sync | watcher, concurrent multi-client, clone/publish/pull/merge, init, frontier seal, `--watch` | ✅ done |
-| M6 Durability & recovery | frontier seal, recovery keyslot + `recover`, min-algo, GC, multi-remote, gossip | ✅ done |
+| M4 Transport | QUIC pinned verifier, §12 wire + server pipeline, `authorized_keys` gate, limits | ✅ done |
+| M5 Live sync | watcher, concurrent multi-client, clone/publish/pull/merge, genesis create, frontier seal, continuous `sync` | ✅ done |
+| M6 Durability | frontier seal, min-algo, automatic GC, multi-remote, gossip | ✅ done |
 | M7 PQ keyslot | X-Wing (mandatory), full algo_id/keyslot integration | ✅ done |
 
 ### Risks — all closed
@@ -253,25 +266,49 @@ fold/cold-start · R6 GC · R7 canonical encoding · R8 keyed-CDC.
   seed is `derive_key("secsec-xwing-seed-v1", ed25519_seed)` — derived from the raw Ed25519 **seed**,
   not the clamped scalar, so a quantum adversary cannot reconstruct it from the public Ed25519 key (§8.3).
 - **PQ-mandatory keyslot integration (`repo.rs`):** keyslots are `algo_id ‖ body` with X-Wing
-  (`algo_id = 2`) the only algorithm; `init`/`grant`/`rotate` wrap to each member's roster-published
-  X-Wing public; cold-start dispatches by `algo_id` and enforces the §16 floor (`min_algo.max(X-Wing)`).
+  (`algo_id = 2`) the only algorithm; genesis/grant/rotate (`init_repo_remote` / `grant_device_remote`
+  / `rotate_repo_remote`) wrap to each member's roster-published X-Wing public; cold-start dispatches
+  by `algo_id` and enforces the §16 floor (`min_algo.max(X-Wing)`).
 - **§8.2 DATA key-history:** the cross-generation read path — `open_object` resolves each object's
   generation via a `MasterKeys` resolver, so fetch/push/merge/sync cross rotation boundaries; the CLI
   builds the keyring at cold-start. Proven in-process, over live QUIC, and across a rotation.
-- **§8.6 recovery (`secsec-recovery` + `repo.rs` + CLI):** `recovery-init` seals the master key under
-  a fresh 256-bit code (CTX/CMT-4); `recover` reconstructs the key from the code alone (anchored to the
-  RFP via the chain fold) and restores the ref's tree locally (`restore_ref_local`). Round-trip,
-  wrong-code, stale-after-rotation, and byte-identical-restore tests pass.
-- **§15 GC end-to-end:** `sync` surfaces arrival receipts and persists them to a local receipt log;
-  `gc` reads the log, picks a grace-aged `gc_gen` + `put_epoch`, fetches the keep-set local
-  (fail-safe), and issues the CAS sweep. The sweep + CAS-conflict path are proven over live QUIC.
-- **§7 SAS grant rate-limit (`enroll.rs`):** the granter caps SAS/grant sessions at 5 per `D_pubkey`
-  per rolling hour in local state; the `grant` CLI enforces it against a log beside the store.
+- **§7 invite-code pairing (`pair.rs` + `repo.rs`):** a new device joins by carrying one single-use
+  96-bit code. The protocol MACs `{D_pubkey, D_xwing}` → host and `{RFP, host_id}` → joiner under
+  `derive_key("secsec-pair-mac-v1", code)`, relayed through the server's transient mailbox at slots
+  `BLAKE3(label ‖ code)`; the joiner confirms `host_id` against its TOFU pin and `mk_commit` at
+  cold-start. The host runs the networked grant (`grant_device_remote`). Proven over live QUIC
+  (`network_enroll`, plus the end-to-end CLI smoke). The server's mailbox (`pair_put`/`pair_get`) is
+  in-memory, TTL'd, rate-limited, and dispatched pre-enrollment.
+- **`authorized_keys` gate (`secsec-server`):** `parse_authorized_keys` + `with_authorized_file`
+  re-read `~/.ssh/authorized_keys` per connection (fail-closed); `serve_connection` rejects any key
+  not listed after the handshake. `secsec serve` refuses to start without a usable key.
+- **`devices` / `revoke` (CLI + `rotate_repo_remote`):** `devices` lists the folded roster with each
+  device's `SHA256:…` SSH fingerprint and a self-marker; `revoke <prefix>` resolves the id, refuses
+  self-revocation, and rotates the key away from the target (and its transitive add-by closure) over
+  the wire, deleting its keyslots. Proven live: the revoked device drops to `NotEnrolled`.
+- **§15 GC — automatic (`gc.rs`):** there is no `gc` command. `sync` surfaces arrival receipts to a
+  local receipt log and runs one best-effort pass per session: pick a grace-aged `gc_gen` + `put_epoch`,
+  fetch the keep-set local (fail-safe), issue the CAS sweep. Failures are logged, never fatal. The
+  sweep + CAS-conflict path are proven over live QUIC.
 - **§14/§10 multi-remote + gossip:** quorum put→get→verify, cross-remote sigchain reconciliation
   (longest valid chain + rollback alarms), DAG-incomparable fork detection → audit records.
 
 ### Log (most recent first)
 
+- **UX redesign (2026-06-10) — credential model reworked, security preserved.** Closed the
+  network-enrollment hole (enrollment was local-store-only) and reshaped the whole user surface:
+  (1) `~/.ssh/authorized_keys` is now a **mandatory** server-side connection gate, re-read per
+  connection (`serve` refuses to start without it), with a genesis-bootstrap exception so the first
+  device can create an empty repo; (2) onboarding moved over the wire — **invite-code pairing**
+  (`secsec invite` / `sync --invite`, `pair.rs`) replaces the manual fingerprint+SAS ceremony; new
+  wire ops `PutKeyslot`/`PairPut`/`PairGet`/`PutKeyhist`/`PutRosterKeyhist`/`DeleteKeyslot`;
+  (3) **recovery removed entirely** (`secsec-recovery` crate, `recover` command, and `argon2`
+  deleted — net liability, §8.6); (4) **GC made automatic** inside the sync loop (no `gc` command);
+  (5) `rotate` → networked **`revoke <device>`** + a **`devices`** listing (SSH fingerprints);
+  (6) repo store renamed `.redb` → `.secsec`; client keeps no control files in the synced folder
+  (per-folder state under `~/.local/state/secsec/`). New CLI: `serve · sync · invite · devices ·
+  revoke`. Verified live end-to-end (create → invite-join → converge → blind-server check → devices
+  → revoke → revoked device cut off). Full workspace: **253 tests**, clippy `-D warnings`, fmt clean.
 - **Final push — project complete.** PQ made mandatory (X-Wing the only keyslot; classical removed).
   `recovery-init`/`recover` finished end-to-end (creation → recover → local restore). GC finished
   end-to-end (sync persists arrival receipts → `gc` consumes them → CAS sweep). §7 grant rate-limit

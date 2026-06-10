@@ -56,7 +56,11 @@ async fn three_devices_enroll_over_the_wire() {
 
     // --- Device A: create the repo entirely over the wire ---
     let dev_a = DeviceKey::generate().unwrap();
-    let conn_a = client.connect(addr, "secsec.invalid").unwrap().await.unwrap();
+    let conn_a = client
+        .connect(addr, "secsec.invalid")
+        .unwrap()
+        .await
+        .unwrap();
     let sess_a = client_handshake(&conn_a, &dev_a, host_id, [0x0a; 32])
         .await
         .unwrap();
@@ -70,7 +74,11 @@ async fn three_devices_enroll_over_the_wire() {
 
     // --- Device B: join by invite pairing (host=A) ---
     let dev_b = DeviceKey::generate().unwrap();
-    let conn_b = client.connect(addr, "secsec.invalid").unwrap().await.unwrap();
+    let conn_b = client
+        .connect(addr, "secsec.invalid")
+        .unwrap()
+        .await
+        .unwrap();
     let sess_b = client_handshake(&conn_b, &dev_b, host_id, [0x0b; 32])
         .await
         .unwrap();
@@ -82,7 +90,11 @@ async fn three_devices_enroll_over_the_wire() {
         pair::run_join(&rem_b, &dev_b, &code_b, &host_id, ROUNDS),
     );
     assert_eq!(host_res.unwrap(), dev_b.device_id().unwrap());
-    assert_eq!(join_res.unwrap(), rfp, "B learns the genuine RFP through the code");
+    assert_eq!(
+        join_res.unwrap(),
+        rfp,
+        "B learns the genuine RFP through the code"
+    );
 
     let (mk_b, st_b) = open_repo_remote(&rem_b, &dev_b, &rfp).await.unwrap();
     assert_eq!(
@@ -96,7 +108,11 @@ async fn three_devices_enroll_over_the_wire() {
 
     // --- Device C: join by invite pairing, this time hosted by B ---
     let dev_c = DeviceKey::generate().unwrap();
-    let conn_c = client.connect(addr, "secsec.invalid").unwrap().await.unwrap();
+    let conn_c = client
+        .connect(addr, "secsec.invalid")
+        .unwrap()
+        .await
+        .unwrap();
     let sess_c = client_handshake(&conn_c, &dev_c, host_id, [0x0c; 32])
         .await
         .unwrap();
@@ -117,7 +133,11 @@ async fn three_devices_enroll_over_the_wire() {
 
     // A wrong invite code must fail to pair (the code-MAC rejects it).
     let dev_x = DeviceKey::generate().unwrap();
-    let conn_x = client.connect(addr, "secsec.invalid").unwrap().await.unwrap();
+    let conn_x = client
+        .connect(addr, "secsec.invalid")
+        .unwrap()
+        .await
+        .unwrap();
     let sess_x = client_handshake(&conn_x, &dev_x, host_id, [0x0e; 32])
         .await
         .unwrap();
@@ -130,5 +150,8 @@ async fn three_devices_enroll_over_the_wire() {
         pair::run_host(&rem_a, &dev_a, &mk_a, &rfp, &host_id, &good, 6, 0),
         pair::run_join(&rem_x, &dev_x, &wrong, &host_id, 6),
     );
-    assert!(host_res.is_err(), "a mismatched invite code does not enroll");
+    assert!(
+        host_res.is_err(),
+        "a mismatched invite code does not enroll"
+    );
 }

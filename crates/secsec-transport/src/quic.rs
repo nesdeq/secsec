@@ -82,6 +82,27 @@ pub fn client_config(pin: HostPin) -> Result<ClientConfig, ConfigError> {
     Ok(cfg)
 }
 
+/// Shared cell into which a TOFU handshake records the server's captured `host_id` (§11).
+pub type CapturedHostPin = Arc<std::sync::Mutex<Option<[u8; 32]>>>;
+
+/// Build a **trust-on-first-use** `quinn::ClientConfig` for the first contact with a not-yet-pinned
+/// server (§11): it accepts any host key and records its `host_id` into the returned cell. After the
+/// handshake the caller reads the cell, confirms the fingerprint out-of-band, and pins it. Use
+/// [`client_config`] for every subsequent connection.
+pub fn client_config_tofu() -> Result<(ClientConfig, CapturedHostPin), ConfigError> {
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let rcc = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 supported")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(crate::TofuVerifier::new(captured.clone())))
+        .with_no_client_auth();
+    let qcc = QuicClientConfig::try_from(rcc).map_err(|e| ConfigError(e.to_string()))?;
+    let mut cfg = ClientConfig::new(Arc::new(qcc));
+    cfg.transport_config(Arc::new(transport_config()));
+    Ok((cfg, captured))
+}
+
 /// Build a `quinn::ServerConfig` presenting the self-signed host key `cert_der` / `key_der`.
 pub fn server_config(cert_der: &[u8], key_der: &[u8]) -> Result<ServerConfig, ConfigError> {
     let qsc = QuicServerConfig::try_from(rustls_server_config(cert_der, key_der)?)

@@ -216,6 +216,12 @@ impl DevicePublic {
         device_id_of(&self.key)
     }
 
+    /// The OpenSSH SHA-256 key fingerprint (`SHA256:…`, exactly what `ssh-keygen -lf key.pub` prints),
+    /// for identifying a device to a human (e.g. in `secsec devices`).
+    pub fn ssh_fingerprint(&self) -> Result<String, SigError> {
+        Ok(self.key.fingerprint(HashAlg::Sha256).to_string())
+    }
+
     fn ed25519_public_bytes(&self) -> Result<[u8; 32], SigError> {
         match self.key.key_data() {
             KeyData::Ed25519(pk) => Ok(pk.0),

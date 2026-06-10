@@ -178,6 +178,71 @@ impl ServerCertVerifier for PinnedServerVerifier {
     }
 }
 
+/// A **trust-on-first-use** verifier (§11): it accepts *any* server certificate and **captures** its
+/// `host_id = BLAKE3(SPKI)` into a shared cell, for the very first connection to a not-yet-pinned
+/// server. The caller reads the captured `host_id` afterward, shows the user its fingerprint to
+/// confirm, and pins it (via [`HostPin::from_host_id`]) for every future connection. Used only when no
+/// pin is known yet — exactly the `ssh` `known_hosts` first-contact model, with the same one-time risk.
+#[derive(Debug)]
+pub struct TofuVerifier {
+    captured: std::sync::Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+    supported: WebPkiSupportedAlgorithms,
+}
+
+impl TofuVerifier {
+    /// Build a TOFU verifier that writes the presented server's `host_id` into `captured`.
+    #[must_use]
+    pub fn new(captured: std::sync::Arc<std::sync::Mutex<Option<[u8; 32]>>>) -> Self {
+        Self {
+            captured,
+            supported: default_provider().signature_verification_algorithms,
+        }
+    }
+}
+
+impl ServerCertVerifier for TofuVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        // First-use: accept and record the host_id. Authenticity of *this* contact is the caller's
+        // out-of-band fingerprint confirmation; from then on the recorded pin is enforced.
+        let spki = spki_of(end_entity)
+            .map_err(|_| Error::General("malformed server certificate".into()))?;
+        *self.captured.lock().expect("tofu cell") = Some(*blake3::hash(&spki).as_bytes());
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        Err(Error::PeerIncompatible(
+            rustls::PeerIncompatible::Tls12NotOffered,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        // Still never stubbed: the handshake signature must verify against the presented leaf (R1).
+        verify_tls13_signature(message, cert, dss, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.supported.supported_schemes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

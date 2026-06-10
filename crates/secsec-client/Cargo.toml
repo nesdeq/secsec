@@ -19,7 +19,6 @@ secsec-canon = { path = "../secsec-canon" }
 secsec-sync = { path = "../secsec-sync" }
 secsec-engine = { path = "../secsec-engine" }
 secsec-roster = { path = "../secsec-roster" }
-secsec-recovery = { path = "../secsec-recovery" }
 secsec-pq = { path = "../secsec-pq" }
 secsec-sig = { path = "../secsec-sig" }
 secsec-transport = { path = "../secsec-transport" }

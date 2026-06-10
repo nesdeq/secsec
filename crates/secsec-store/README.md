@@ -6,9 +6,9 @@ Objects are opaque, content-addressed ciphertext blobs keyed by their 32-byte id
 embedded `redb` database (its B-tree *is* the packing — the server is never flooded with tiny files).
 The store holds opaque blobs (`{id, blob, arrival put_epoch}`), the per-device **keyslots**
 (`/keyslots/<device_id>/<g>`), the sigchain (`/roster/<seq>` + the CAS-guarded `/roster-head`), the
-two never-trimmed key-histories (`/keyhist/<g>`, `/roster-keyhist/<g>`), the encrypted per-ref heads
-(`/refs/<H>`), and the optional recovery keyslot. It never sees plaintext or plaintext-derived
-metadata — device_ids and every blob are opaque.
+two never-trimmed key-histories (`/keyhist/<g>`, `/roster-keyhist/<g>`), and the encrypted per-ref
+heads (`/refs/<H>`). It never sees plaintext or plaintext-derived metadata — device_ids and every blob
+are opaque.
 
 ## Public API
 
@@ -20,7 +20,6 @@ metadata — device_ids and every blob are opaque.
   `ref_blob_hashes`, `ABSENT_HEAD`.
 - Sigchain: `append_roster`, `get_roster_entry`, `roster_len`.
 - Key-histories: `put_keyhist` / `get_keyhist`, `put_roster_keyhist` / `get_roster_keyhist`.
-- Recovery: `put_recovery` / `get_recovery`.
 - `Store`, `StoreError`, `RefBlobHash`.
 
 The store is lock-free (redb-transactional), so a `serve` loop can share one `Store` across

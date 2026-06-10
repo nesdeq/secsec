@@ -12,8 +12,10 @@ per-seq under `roster_key_g`) nor forge succession.
 
 Beyond the plaintext sigchain it also holds the layers that wrap it: the per-entry CTX/CMT-4 AEAD
 (§9.5), the never-trimmed roster-key and data key-histories and their peel (§8.2), the cold-start
-bootstrap fold (§8.1), the enrollment primitives (SAS + grant attestation, §7/§9.6), and the
-revoke⇒rotate op builder (§8.4).
+bootstrap fold (§8.1), the enrollment primitives (SAS commitment + grant attestation, §7/§9.6), and
+the revoke⇒rotate op builder (§8.4). The SAS primitives back the lower-level **direct grant**; the
+shipped CLI enrolls via **invite-code pairing** (`secsec-client::pair`), which layers on the same
+`AddDevice` op + keyslot wrap without a human SAS comparison (§7).
 
 ## Public API
 

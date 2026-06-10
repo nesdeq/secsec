@@ -4,8 +4,10 @@ QUIC + TLS 1.3 transport (`secsec-Design.md` §11) — the **only** transport (Q
 on the **pinned host-key verifier** (risk **R1**, "the top ship-broken risk").
 
 The server self-signs a host key on first run (like `sshd`); there is **no CA**. The client pins the
-server's SubjectPublicKeyInfo (SPKI) — TOFU, or `--host-fp` at init — and `host_id = BLAKE3(SPKI)` is
-bound into the connection-auth signature (§9.6). The verifier follows the **safe pattern**:
+server's SubjectPublicKeyInfo (SPKI) trust-on-first-use on the first `sync` (the fingerprint is
+printed for out-of-band confirmation, then persisted in the per-folder link), and
+`host_id = BLAKE3(SPKI)` is bound into the connection-auth signature (§9.6). The verifier follows the
+**safe pattern**:
 
 - `verify_server_cert` compares the leaf SPKI to the pin in constant time and asserts nothing else
   (no CA chain, no name check — identity rests on the pin);
@@ -16,7 +18,8 @@ The mandatory negative tests (wrong pin fails; tampered/garbage handshake fails)
 
 ## Public API
 
-- `HostPin` — `from_cert` / `from_spki` / `from_host_id` (`--host-fp`); `host_id()`, `spki()`.
+- `HostPin` — `from_cert` / `from_spki` / `from_host_id` (re-pin a stored `host_id`); `host_id()`, `spki()`.
+- `client_config_tofu` — a first-contact client config that captures the server's `host_id` for pinning.
 - `PinnedServerVerifier` — the custom `rustls` `ServerCertVerifier`.
 - `client_config` / `server_config` — `quinn` configs wired to the pin.
 - `handshake` — `client_handshake` / `server_handshake` → `ClientSession` / `ServerSession`.

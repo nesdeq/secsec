@@ -37,11 +37,8 @@ const ROSTER_KEYHIST: TableDefinition<'static, u32, &[u8]> = TableDefinition::ne
 /// `master_key_{g+1}` so a current member can peel old master keys and read pre-rotation **object**
 /// content (distinct from `ROSTER_KEYHIST`, which is only for sigchain folding).
 const KEYHIST: TableDefinition<'static, u32, &[u8]> = TableDefinition::new("keyhist");
-/// `"recovery"` → the optional recovery keyslot record (§8.6 `/recovery`): one per repo.
-const RECOVERY: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("recovery");
 
 const PUT_EPOCH: &str = "put_epoch";
-const RECOVERY_KEY: &str = "recovery";
 
 /// `old_head_id` sentinel meaning "expect the ref to be absent" — a first `cas-head` (§12).
 pub const ABSENT_HEAD: [u8; 32] = [0u8; 32];
@@ -111,7 +108,6 @@ impl Store {
             wtx.open_table(ROSTER)?;
             wtx.open_table(ROSTER_KEYHIST)?;
             wtx.open_table(KEYHIST)?;
-            wtx.open_table(RECOVERY)?;
         }
         wtx.commit()?;
         Ok(Self { db })
@@ -166,24 +162,6 @@ impl Store {
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(KEYHIST)?;
         Ok(t.get(g)?.map(|v| v.value().to_vec()))
-    }
-
-    /// Store the optional recovery keyslot record (§8.6 `/recovery`; one per repo, overwrites).
-    pub fn put_recovery(&self, record: &[u8]) -> Result<(), StoreError> {
-        let wtx = self.db.begin_write()?;
-        {
-            let mut t = wtx.open_table(RECOVERY)?;
-            t.insert(RECOVERY_KEY, record)?;
-        }
-        wtx.commit()?;
-        Ok(())
-    }
-
-    /// The recovery keyslot record, or `None` if none was created (§8.6).
-    pub fn get_recovery(&self) -> Result<Option<Vec<u8>>, StoreError> {
-        let rtx = self.db.begin_read()?;
-        let t = rtx.open_table(RECOVERY)?;
-        Ok(t.get(RECOVERY_KEY)?.map(|v| v.value().to_vec()))
     }
 
     /// Append a sigchain entry, CAS-guarded by the `/roster-head` tip (§8.1). In one write
