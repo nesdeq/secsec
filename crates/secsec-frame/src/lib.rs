@@ -68,8 +68,6 @@ pub enum ObjType {
     Keyhist = 6,
     /// Roster-key history wrap (§8.2).
     RosterKeyhist = 7,
-    /// Recovery keyslot (§8.6).
-    Recovery = 8,
 }
 
 impl ObjType {
@@ -91,7 +89,6 @@ impl ObjType {
             5 => Self::Keyslot,
             6 => Self::Keyhist,
             7 => Self::RosterKeyhist,
-            8 => Self::Recovery,
             _ => return None,
         })
     }
@@ -283,7 +280,6 @@ mod tests {
             ObjType::Keyslot,
             ObjType::Keyhist,
             ObjType::RosterKeyhist,
-            ObjType::Recovery,
         ] {
             let f = Frame::v1(42, t);
             assert_eq!(Frame::decode(&f.encode()).unwrap(), f);

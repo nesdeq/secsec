@@ -52,7 +52,7 @@ The build plan, status, and assurance strategy live in `secsec-Implementation.md
 > Rows and sections below that depend on these are tagged "**(not wired — see §2)**".
 > The **single-remote** guarantees — zero-knowledge (P1–P3), authentication/authorization (P4–P5),
 > revocation + forward secrecy (P6/P11), **single-remote anti-rollback** (P7/P8, wired and tested),
-> PQ keyslots (P17/§17), and channel-bound transport (P9/P12) — all hold for the binary user.
+> PQ keyslots (§17), and channel-bound transport (P9/P12) — all hold for the binary user.
 
 ## 3. Threat model
 

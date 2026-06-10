@@ -370,7 +370,9 @@ impl Request {
                 if n > MAX_HAS_IDS {
                     return Err(WireError::TooLarge);
                 }
-                let mut ids = Vec::with_capacity(n);
+                // Pre-allocate no more than the remaining input can hold (each id is 32 bytes), so a
+                // lying count cannot force a large allocation ahead of a truncated body.
+                let mut ids = Vec::with_capacity(n.min(r.remaining() / 32));
                 for _ in 0..n {
                     ids.push(read32(&mut r)?);
                 }
@@ -404,7 +406,9 @@ impl Request {
                 if n > crate::server::limits::MAX_GC_KEEP_SET_IDS {
                     return Err(WireError::TooLarge);
                 }
-                let mut keep_set = Vec::with_capacity(n);
+                // Cap the pre-allocation to what the remaining input can actually hold (32 bytes per
+                // id), so a lying count (claims 100k, sends a short body) can't force a ~3 MiB alloc.
+                let mut keep_set = Vec::with_capacity(n.min(r.remaining() / 32));
                 for _ in 0..n {
                     keep_set.push(read32(&mut r)?);
                 }
