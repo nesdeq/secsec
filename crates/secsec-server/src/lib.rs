@@ -61,8 +61,11 @@ pub struct Incoming<'a> {
 struct ServerState {
     nonces: NonceStore,
     write_buckets: HashMap<DeviceId, TokenBucket>,
+    read_buckets: HashMap<DeviceId, TokenBucket>,
     quotas: HashMap<DeviceId, StorageQuota>,
     gc_calls: HashMap<DeviceId, WindowCounter>,
+    /// Per-connection-identity sigchain-append counter (§8.1: ≤ 60 roster-appends per key per hour).
+    sigchain_calls: HashMap<DeviceId, WindowCounter>,
     /// §7 invite-onboarding mailbox: `slot → (blob, expiry)`. Transient, never persisted, TTL-evicted.
     pairing: HashMap<[u8; 32], (Vec<u8>, u64)>,
 }
@@ -102,6 +105,34 @@ impl ServerState {
                 )
             })
             .try_take(n, now)
+    }
+
+    /// Per-key read byte-rate (§19: 200 MB/s sustained). The burst reuses the §19 write-burst
+    /// constant (1 GiB) so an initial clone is never starved; only sustained egress is bounded.
+    fn take_read(&mut self, d: DeviceId, n: u64, now: u64) -> bool {
+        self.read_buckets
+            .entry(d)
+            .or_insert_with(|| {
+                TokenBucket::new(
+                    limits::WRITE_BURST_BYTES,
+                    limits::READ_RATE_BYTES_PER_SEC,
+                    now,
+                )
+            })
+            .try_take(n, now)
+    }
+
+    /// Record a roster-append for the per-connection-identity hourly cap (§8.1: ≤ 60/key/hour).
+    fn sigchain_record(&mut self, d: DeviceId, now: u64) -> bool {
+        self.sigchain_calls
+            .entry(d)
+            .or_insert_with(|| {
+                WindowCounter::new(
+                    GC_WINDOW_SECS,
+                    limits::MAX_SIGCHAIN_ENTRIES_PER_CONN_PER_HOUR,
+                )
+            })
+            .try_record(now)
     }
 
     fn add_quota(&mut self, d: DeviceId, n: u64) -> bool {
@@ -246,6 +277,41 @@ impl Server {
         self.state.lock().expect("server state").gc_record(d, now)
     }
 
+    fn take_read(&self, d: DeviceId, n: u64, now: u64) -> bool {
+        self.state
+            .lock()
+            .expect("server state")
+            .take_read(d, n, now)
+    }
+
+    fn sigchain_allow(&self, d: DeviceId, now: u64) -> bool {
+        self.state
+            .lock()
+            .expect("server state")
+            .sigchain_record(d, now)
+    }
+
+    /// Charge a read against the §19 per-key read byte-rate, returning the blob response or a
+    /// `RateLimit` error when the bucket is exhausted (the cheap store lookup has already run; the
+    /// bucket simply gates sustained egress).
+    fn read_charged(
+        &self,
+        d: DeviceId,
+        blob: Result<Option<Vec<u8>>, secsec_store::StoreError>,
+        now: u64,
+    ) -> Response {
+        match blob {
+            Ok(b) => {
+                let n = b.as_ref().map_or(0, Vec::len) as u64;
+                if !self.take_read(d, n, now) {
+                    return Response::Err(ErrorCode::RateLimit);
+                }
+                Response::Blob(b)
+            }
+            Err(_) => Response::Err(ErrorCode::Internal),
+        }
+    }
+
     fn pair_put(&self, slot: [u8; 32], blob: Vec<u8>, now: u64) -> bool {
         self.state
             .lock()
@@ -381,34 +447,30 @@ impl Server {
 
         // (4 + 5) limits + execute.
         match inc.request {
-            Request::Get { id } => match self.store.get(&id) {
-                Ok(blob) => Response::Blob(blob),
-                Err(_) => Response::Err(ErrorCode::Internal),
-            },
-            Request::GetRef { ref_h } => match self.store.get_ref(&ref_h) {
-                Ok(blob) => Response::Blob(blob),
-                Err(_) => Response::Err(ErrorCode::Internal),
-            },
-            Request::GetRosterEntry { seq } => match self.store.get_roster_entry(seq) {
-                Ok(blob) => Response::Blob(blob),
-                Err(_) => Response::Err(ErrorCode::Internal),
-            },
-            Request::GetKeyslot { device_id, gen } => match self.store.get_keyslot(&device_id, gen)
-            {
-                Ok(blob) => Response::Blob(blob),
-                Err(_) => Response::Err(ErrorCode::Internal),
-            },
-            Request::GetRosterKeyhist { gen } => match self.store.get_roster_keyhist(gen) {
-                Ok(blob) => Response::Blob(blob),
-                Err(_) => Response::Err(ErrorCode::Internal),
-            },
-            Request::GetKeyhist { gen } => match self.store.get_keyhist(gen) {
-                Ok(blob) => Response::Blob(blob),
-                Err(_) => Response::Err(ErrorCode::Internal),
-            },
+            // Reads are charged against the §19 per-key read byte-rate (200 MB/s sustained).
+            Request::Get { id } => self.read_charged(device_id, self.store.get(&id), now),
+            Request::GetRef { ref_h } => {
+                self.read_charged(device_id, self.store.get_ref(&ref_h), now)
+            }
+            Request::GetRosterEntry { seq } => {
+                self.read_charged(device_id, self.store.get_roster_entry(seq), now)
+            }
+            Request::GetKeyslot {
+                device_id: owner,
+                gen,
+            } => self.read_charged(device_id, self.store.get_keyslot(&owner, gen), now),
+            Request::GetRosterKeyhist { gen } => {
+                self.read_charged(device_id, self.store.get_roster_keyhist(gen), now)
+            }
+            Request::GetKeyhist { gen } => {
+                self.read_charged(device_id, self.store.get_keyhist(gen), now)
+            }
             Request::Has { ids } => {
                 if ids.len() > limits::MAX_HAS_IDS {
                     return Response::Err(ErrorCode::TooManyIds);
+                }
+                if !self.take_read(device_id, (ids.len() * 32) as u64, now) {
+                    return Response::Err(ErrorCode::RateLimit);
                 }
                 match self.store.has(&ids) {
                     Ok(bits) => Response::Exists(bits),
@@ -467,6 +529,19 @@ impl Server {
             Request::RosterAppend { old_tip, entry } => {
                 if !self.take_write(device_id, entry.len() as u64, now) {
                     return Response::Err(ErrorCode::RateLimit);
+                }
+                // §8.1 sigchain volume limits (server MUST enforce): ≤ 60 appends per connection
+                // identity per hour, and a hard cap on total chain length. Both bound abuse without
+                // weakening anti-rollback (retried revocations still succeed within the window).
+                if !self.sigchain_allow(device_id, now) {
+                    return Response::Err(ErrorCode::RateLimit);
+                }
+                match self.store.roster_len() {
+                    Ok(n) if n >= limits::MAX_TOTAL_SIGCHAIN => {
+                        return Response::Err(ErrorCode::RateLimit);
+                    }
+                    Ok(_) => {}
+                    Err(_) => return Response::Err(ErrorCode::Internal),
                 }
                 // Append CAS-guarded by the /roster-head tip (§8.1): a racing append loses.
                 match self.store.append_roster(&old_tip, &entry) {

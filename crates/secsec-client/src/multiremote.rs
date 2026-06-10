@@ -106,7 +106,7 @@ pub async fn reconcile_roster_tips<R: Remote>(
             continue;
         }
         // open_repo_remote folds the chain and verifies the RFP anchor + mk_commit; Ok ⇒ trustworthy.
-        match open_repo_remote(*remote, device, rfp).await {
+        match open_repo_remote(*remote, device, rfp, None).await {
             Ok(_) => valid.push((idx, (entries.len() as u64) - 1)),
             // A chain that doesn't fold to the RFP (forged), or that this device can't open, is flagged.
             Err(RepoError::Roster(_)) => invalid.push(idx),

@@ -127,6 +127,9 @@ pub enum RepoError {
     UnsupportedAlgo(u8),
     /// A stored keyslot blob was empty / missing its `algo_id` prefix.
     BadKeyslot,
+    /// The fetched sigchain is shorter than — or re-forked below — the persisted anti-rollback anchor
+    /// (§8.1, P7): the server tried to roll the roster back, e.g. to drop a revocation. Refuse.
+    Rollback,
     /// An X-Wing keyslot operation failed (malformed public/ciphertext or AEAD).
     Pq,
     /// §16 downgrade floor: a fetched keyslot's `algo_id` was below the chain's `min_algo`.
@@ -172,6 +175,9 @@ impl core::fmt::Display for RepoError {
             RepoError::RosterCasConflict => f.write_str("roster CAS conflict during rotate; retry"),
             RepoError::UnsupportedAlgo(a) => write!(f, "unsupported keyslot algo_id {a}"),
             RepoError::BadKeyslot => f.write_str("malformed keyslot (missing algo_id prefix)"),
+            RepoError::Rollback => f.write_str(
+                "the server served a rolled-back sigchain (below the persisted anchor, §8.1)",
+            ),
             RepoError::Pq => f.write_str("X-Wing keyslot operation failed"),
             RepoError::AlgoTooWeak { got, floor } => {
                 write!(
@@ -260,6 +266,11 @@ pub async fn init_repo_remote<R: Remote>(
     // Genesis CAS: `old_tip` is the all-zero sentinel ("expect empty"); a `false` return means another
     // device already created the repo.
     if !remote.roster_append(&ABSENT_HEAD, &blob).await? {
+        // We lost the genesis race. The keyslot we just wrote (under the empty-roster bootstrap
+        // exception) is now an orphan — it wraps *our* master_key_1, which has nothing to do with the
+        // winner's genesis, so it fails the winner's `mk_commit` at cold-start. Delete it (best-effort)
+        // so it neither accumulates on retry nor lingers as a gate-passing keyslot for a non-member.
+        let _ = remote.delete_keyslot(&device_id, 1).await;
         return Err(RepoError::AlreadyInitialized);
     }
     Ok(rfp)
@@ -552,7 +563,11 @@ pub async fn rotate_repo_remote<R: Remote>(
         remote.put_keyslot(id, g1, &ks).await?;
     }
 
-    open_repo_remote(remote, device, rfp).await
+    // Re-fold to return the fresh (mk, state) at the new generation. No anchor is checked here (this
+    // device just authored the extension — the caller persists the advanced anchor on its next open).
+    open_repo_remote(remote, device, rfp, None)
+        .await
+        .map(|(mk, st, _)| (mk, st))
 }
 
 /// §7 `grant` (record-writing half): enroll device `d_pubkey` into the repo. The granter `device` (a
@@ -690,20 +705,51 @@ pub async fn fetch_roster_entries<R: Remote>(remote: &R) -> Result<Vec<Vec<u8>>,
     Ok(entries)
 }
 
+/// A persisted **anti-rollback anchor** for a folder's sigchain (§8.1, P7): the highest roster `seq`
+/// this device has accepted and the BLAKE3 of the *stored* (sealed) entry blob at that seq. The sealed
+/// blob is deterministic (nonce=0 under a key-committing AEAD with a derived key), so its hash is a
+/// stable per-seq token re-derivable **without** decrypting. Every cold-start MUST extend this anchor;
+/// a shorter or re-forked chain is a server rollback (e.g. dropping a `RevokeDevice`+`Rotate`) and is
+/// refused. Persisted per folder; the returned anchor is saved after each successful open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RosterAnchor {
+    /// Highest accepted sequence number (`= entries.len() - 1`).
+    pub max_seq: u64,
+    /// BLAKE3 of the stored (sealed) entry blob at `max_seq`.
+    pub tip_hash: [u8; 32],
+}
+
 /// §8.1 cold-start open against a **remote** (the network counterpart of [`open_repo`]). Fetches the
 /// sigchain entries (`seq = 0, 1, … `until absent, bounded by the §19 cap), this device's keyslot, and
 /// the §8.2 roster-key history over the [`Remote`], then runs the same `cold_start_fold` (peel,
-/// decrypt, fold, verify RFP + `mk_commit`). Recovers the **identity** (master key + roster); objects
-/// are fetched separately by the sync loop.
+/// decrypt, fold, verify RFP + `mk_commit`). `prev` is the persisted [`RosterAnchor`] (`None` on a
+/// fresh link); the fetched chain is rejected with [`RepoError::Rollback`] if it does not extend it
+/// (P7 anti-rollback). Recovers the **identity** (master key + roster) and the new anchor to persist;
+/// objects are fetched separately by the sync loop.
 pub async fn open_repo_remote<R: Remote>(
     remote: &R,
     device: &DeviceKey,
     rfp: &[u8; 32],
-) -> Result<(MasterKey, State), RepoError> {
+    prev: Option<RosterAnchor>,
+) -> Result<(MasterKey, State, RosterAnchor), RepoError> {
     let entries = fetch_roster_entries(remote).await?;
     if entries.is_empty() {
         return Err(RepoError::NotInitialized);
     }
+    // §8.1 anti-rollback (P7): the fetched chain MUST extend the persisted anchor — at least as long,
+    // and the stored blob at the anchor's seq must still hash to the recorded tip (the tip-hash
+    // consistency check catches a chain re-forked from an earlier point). This refuses a server that
+    // truncates or re-forks the sigchain to undo a revocation. No decryption needed for the check.
+    if let Some(p) = prev {
+        let idx = p.max_seq as usize;
+        if entries.len() <= idx || *blake3::hash(&entries[idx]).as_bytes() != p.tip_hash {
+            return Err(RepoError::Rollback);
+        }
+    }
+    let anchor = RosterAnchor {
+        max_seq: (entries.len() - 1) as u64,
+        tip_hash: *blake3::hash(entries.last().expect("non-empty")).as_bytes(),
+    };
     let g_cur = frame_gen(entries.last().expect("non-empty"))?;
 
     let device_id = device.device_id()?;
@@ -726,7 +772,7 @@ pub async fn open_repo_remote<R: Remote>(
     }
     let (state, mk) = cold_start_fold(&candidate, g_cur, rfp, &keyhist, &entries)?;
     enforce_min_algo(&keyslot, &state)?;
-    Ok((mk, state))
+    Ok((mk, state, anchor))
 }
 
 #[cfg(test)]

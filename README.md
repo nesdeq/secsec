@@ -23,9 +23,10 @@ layout, risk register, and status are in [`secsec-Implementation.md`](secsec-Imp
 
 > **Status / maturity.** Feature-complete for v1 and exercised end-to-end with real processes
 > (multiple clients converging through a blind server, including a concurrent-edit three-way merge,
-> with a zero-plaintext-leak check on the server store). It has **not** had an independent professional
-> cryptographic review — do not trust it with irreplaceable data until it has (see
-> `secsec-Implementation.md` §8).
+> with a zero-plaintext-leak check on the server store). The v1 CLI is **single-remote**: multi-remote
+> quorum durability and gossip fork-detection exist in library code but are not surfaced by any command
+> (see the Design §2 scope note). It has **not** had an independent professional cryptographic review —
+> do not trust it with irreplaceable data until it has (see `secsec-Implementation.md` §8).
 
 ## How it works (one paragraph)
 

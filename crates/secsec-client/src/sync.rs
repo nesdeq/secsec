@@ -61,6 +61,10 @@ pub struct SyncOutcome {
     /// The §15 arrival receipts for objects pushed this sync (empty on a pure pull/clone/no-op). The
     /// caller merges these into its persisted receipt log to drive a later [`crate::gc::gc_collect`].
     pub receipts: Vec<(Id, crate::Receipt)>,
+    /// Keep-both conflict paths produced by a three-way merge this sync (§10), so the caller can
+    /// surface them to the user. Empty unless `kind == Merged` with genuine conflicts; the conflicting
+    /// content is preserved on disk as `name.conflict-<device>-<id>.ext` (no data is lost).
+    pub conflicts: Vec<String>,
 }
 
 /// Resolve a commit's author key from the folded roster (a commit by a non-member is rejected).
@@ -137,6 +141,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                 base: Some(h.commit_id),
                 frontier,
                 receipts: Vec::new(),
+                conflicts: Vec::new(),
             });
         }
     }
@@ -167,6 +172,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                     base: Some(h.commit_id),
                     frontier,
                     receipts: Vec::new(),
+                    conflicts: Vec::new(),
                 })
             }
             _ => Ok(SyncOutcome {
@@ -174,6 +180,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                 base,
                 frontier: frontier.clone(),
                 receipts: Vec::new(),
+                conflicts: Vec::new(),
             }),
         };
     }
@@ -220,6 +227,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                 base: Some(our_commit),
                 frontier: f,
                 receipts,
+                conflicts: Vec::new(),
             })
         }
         // Reconcile our commit against the remote head (push if we're ahead, else merge).
@@ -244,21 +252,25 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
             .await?;
             let receipts = report.receipts;
             let mut frontier = report.frontier;
-            let (kind, base) = match report.action {
+            let (kind, base, conflicts) = match report.action {
                 SyncAction::AlreadyHave => {
                     frontier.commit_version_hwm.insert(device_id, version);
-                    (SyncKind::Pushed, our_commit)
+                    (SyncKind::Pushed, our_commit, Vec::new())
                 }
-                SyncAction::Merged { commit_id, .. } => {
+                SyncAction::Merged {
+                    commit_id,
+                    conflicts,
+                } => {
                     frontier.commit_version_hwm.insert(device_id, version + 1);
                     let (mc, _) = open_signed_commit(&commit_id, keys, store)?;
                     restore_commit_tree(&mc, keys, store, dir)?;
-                    (SyncKind::Merged, commit_id)
+                    let paths = conflicts.into_iter().map(|c| c.path).collect();
+                    (SyncKind::Merged, commit_id, paths)
                 }
                 SyncAction::FastForward { commit_id } => {
                     let (c, _) = open_signed_commit(&commit_id, keys, store)?;
                     restore_commit_tree(&c, keys, store, dir)?;
-                    (SyncKind::Pulled, commit_id)
+                    (SyncKind::Pulled, commit_id, Vec::new())
                 }
             };
             Ok(SyncOutcome {
@@ -266,6 +278,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                 base: Some(base),
                 frontier,
                 receipts,
+                conflicts,
             })
         }
     }

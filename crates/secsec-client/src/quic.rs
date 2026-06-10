@@ -436,16 +436,18 @@ mod tests {
             let remote = QuicRemote::new(&conn, sess.transcript, &device);
 
             // recover identity over the wire, anchored to the out-of-band RFP.
-            let (mk, state) = crate::repo::open_repo_remote(&remote, &device, &rfp)
+            let (mk, state, _) = crate::repo::open_repo_remote(&remote, &device, &rfp, None)
                 .await
                 .unwrap();
             assert_eq!(mk.generation(), 1);
             assert!(state.is_member(&device.device_id().unwrap()));
 
             // a wrong RFP fails the fold (the genesis anchor must match).
-            assert!(crate::repo::open_repo_remote(&remote, &device, &[0xAB; 32])
-                .await
-                .is_err());
+            assert!(
+                crate::repo::open_repo_remote(&remote, &device, &[0xAB; 32], None)
+                    .await
+                    .is_err()
+            );
 
             conn.close(0u32.into(), b"done");
             let _ = srv.await;
@@ -500,7 +502,7 @@ mod tests {
             let remote = QuicRemote::new(&conn, sess.transcript, &device);
 
             // cold-start over the wire recovers generation 2 (peeling roster-keyhist to genesis).
-            let (mk_cs, state) = crate::repo::open_repo_remote(&remote, &device, &rfp)
+            let (mk_cs, state, _) = crate::repo::open_repo_remote(&remote, &device, &rfp, None)
                 .await
                 .unwrap();
             assert_eq!(

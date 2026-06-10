@@ -225,7 +225,9 @@ No OpenSSL anywhere.
 
 - **18 crates + `secsec` binary** (+ `xtask` tooling, `fuzz/` cargo-fuzz layout) · **253 tests** ·
   clippy `-D warnings` + fmt clean · spec ↔ code ↔ doc consistent. (The `secsec-recovery` crate was
-  removed in the 2026-06-10 UX redesign.)
+  removed in the 2026-06-10 UX redesign.) The v1 CLI is **single-remote**; multi-remote/quorum and
+  gossip are library-complete but not surfaced (Design §2 scope note) — this is the *only* place the
+  library exceeds the CLI, and it is now explicitly tagged everywhere in the spec.
 - **Transport is QUIC/TLS-only.** RSA device keys, WebDAV, and the stdio/SSH transport were **dropped
   from scope** (cut from code *and* spec): stdio adds nothing over the pinned QUIC host key, and RSA
   is superseded by the Ed25519-only device key. The spec describes exactly what ships.
@@ -250,7 +252,8 @@ No OpenSSL anywhere.
 | M3 Sync | head, dag, merge, rollback gates, fork detection | ✅ done |
 | M4 Transport | QUIC pinned verifier, §12 wire + server pipeline, `authorized_keys` gate, limits | ✅ done |
 | M5 Live sync | watcher, concurrent multi-client, clone/publish/pull/merge, genesis create, frontier seal, continuous `sync` | ✅ done |
-| M6 Durability | frontier seal, min-algo, automatic GC, multi-remote, gossip | ✅ done |
+| M6 Durability | frontier seal, sigchain anti-rollback (wired), min-algo enforce, automatic GC | ✅ done (single-remote) |
+| M6′ Multi-remote | quorum, cross-remote reconcile, gossip fork-detect | ⚠️ library-complete, **not surfaced in v1 CLI** (single `--server`; see Design §2 scope note) |
 | M7 PQ keyslot | X-Wing (mandatory), full algo_id/keyslot integration | ✅ done |
 
 ### Risks — all closed
@@ -290,11 +293,40 @@ fold/cold-start · R6 GC · R7 canonical encoding · R8 keyed-CDC.
   local receipt log and runs one best-effort pass per session: pick a grace-aged `gc_gen` + `put_epoch`,
   fetch the keep-set local (fail-safe), issue the CAS sweep. Failures are logged, never fatal. The
   sweep + CAS-conflict path are proven over live QUIC.
-- **§14/§10 multi-remote + gossip:** quorum put→get→verify, cross-remote sigchain reconciliation
-  (longest valid chain + rollback alarms), DAG-incomparable fork detection → audit records.
+- **§8.1 anti-rollback (wired, P7):** `open_repo_remote` carries a persisted `RosterAnchor` (highest
+  seq + BLAKE3 of the stored tip blob) in the per-folder link and refuses a fetched chain that does not
+  extend it — closing sigchain rollback by a malicious server. Tested in `network_enroll`
+  (truncation + tip-tamper both rejected).
+- **§14/§10 multi-remote + gossip — ⚠️ library-only, NOT surfaced in v1:** quorum put→get→verify,
+  cross-remote sigchain reconciliation, gossip fork detection all exist in `multiremote.rs` / `gossip.rs`
+  and pass their unit tests, but **no CLI command invokes them** (`secsec sync` is single-remote). A v1
+  binary user gets single-remote durability + the same-server DAG fork check, not quorum/gossip. This
+  is the one place where library capability exceeds the shipped CLI surface (Design §2 scope note).
 
 ### Log (most recent first)
 
+- **Full audit + fixes (2026-06-10, tag `rc1` is the pre-audit snapshot).** Ruthless line-by-line
+  security + CLI-reachability audit (4 parallel auditors over all 18 crates + manual review of the
+  network attack surface). Crypto cores (aead/kdf/sig/pq/object/frame/canon) and transport
+  (channel-binding, alg-pinning) audited **clean**. Fixed:
+  - **A1 (HIGH, P7):** sigchain anti-rollback was implemented (`check_frontier`) but **never wired** —
+    cold-start verified RFP + `mk_commit` but not chain length/tip. Now `open_repo_remote` carries a
+    persisted `RosterAnchor` in the link and refuses a rolled-back/re-forked chain. Tested.
+  - **BUG-5 (HIGH):** `sync_once` was passed `roster_seq = 0` hardcoded, silently disabling §10 gate 1
+    (membership-epoch rollback) on any rotated repo. Now passes the real tip seq.
+  - **BUG-3:** genesis CAS-race left an orphan keyslot — now deleted on the lost race.
+  - **BUG-2 / §8.5:** a lost (absent) sealed frontier on an already-linked folder is now alarmed as a
+    reinstall instead of silently resetting.
+  - **WIRING-3 / §10:** keep-both merge conflicts were produced but never surfaced — `sync` now lists
+    the conflicting files.
+  - **Server DoS (§19/§8.1 "MUST enforce", were unwired):** per-key read byte-rate, the 60/hr
+    sigchain-append-per-connection cap, and the 10 000-entry total-sigchain cap are now enforced.
+  - **Docs honesty:** added the Design §2 **v1 CLI scope note** and tagged every multi-remote (§14,
+    P15), gossip (§10, P8 cross-remote), and `SetMinAlgo`-creation (§16, P13) claim as
+    "**v1: library-only**" — these are built + tested but unreachable from the 5-command CLI.
+  - Investigated + **dismissed** as non-issues: BUG-1 (receipt sig unverified) is defeated by the
+    existing local-receipt-time GC gating; the X-Wing PCT non-CT compare is over the device's own keys.
+  Gate after fixes: **253 tests, clippy `-D warnings`, fmt** all green.
 - **UX redesign (2026-06-10) — credential model reworked, security preserved.** Closed the
   network-enrollment hole (enrollment was local-store-only) and reshaped the whole user surface:
   (1) `~/.ssh/authorized_keys` is now a **mandatory** server-side connection gate, re-read per

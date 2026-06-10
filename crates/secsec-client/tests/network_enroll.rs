@@ -67,10 +67,33 @@ async fn three_devices_enroll_over_the_wire() {
     let rem_a = QuicRemote::new(&conn_a, sess_a.transcript, &dev_a);
 
     let rfp = init_repo_remote(&rem_a, &dev_a, 0).await.unwrap();
-    let (mk_a, st_a) = open_repo_remote(&rem_a, &dev_a, &rfp).await.unwrap();
+    let (mk_a, st_a, anchor_a) = open_repo_remote(&rem_a, &dev_a, &rfp, None).await.unwrap();
     assert_eq!(mk_a.generation(), 1);
     assert!(st_a.is_member(&dev_a.device_id().unwrap()));
     assert_eq!(st_a.members.len(), 1);
+
+    // §8.1 anti-rollback (P7): re-opening must accept a chain that extends the persisted anchor,
+    // and refuse one that doesn't (a server truncating/re-forking the roster, e.g. to drop a revoke).
+    use secsec_client::repo::{RepoError, RosterAnchor};
+    assert!(open_repo_remote(&rem_a, &dev_a, &rfp, Some(anchor_a))
+        .await
+        .is_ok());
+    let tampered_tip = RosterAnchor {
+        max_seq: anchor_a.max_seq,
+        tip_hash: [0xFF; 32],
+    };
+    assert!(matches!(
+        open_repo_remote(&rem_a, &dev_a, &rfp, Some(tampered_tip)).await,
+        Err(RepoError::Rollback)
+    ));
+    let beyond_chain = RosterAnchor {
+        max_seq: anchor_a.max_seq + 5,
+        tip_hash: anchor_a.tip_hash,
+    };
+    assert!(matches!(
+        open_repo_remote(&rem_a, &dev_a, &rfp, Some(beyond_chain)).await,
+        Err(RepoError::Rollback)
+    ));
 
     // --- Device B: join by invite pairing (host=A) ---
     let dev_b = DeviceKey::generate().unwrap();
@@ -96,7 +119,7 @@ async fn three_devices_enroll_over_the_wire() {
         "B learns the genuine RFP through the code"
     );
 
-    let (mk_b, st_b) = open_repo_remote(&rem_b, &dev_b, &rfp).await.unwrap();
+    let (mk_b, st_b, _) = open_repo_remote(&rem_b, &dev_b, &rfp, None).await.unwrap();
     assert_eq!(
         mk_b.mk_commit(),
         mk_a.mk_commit(),
@@ -126,7 +149,7 @@ async fn three_devices_enroll_over_the_wire() {
     host_res.unwrap();
     assert_eq!(join_res.unwrap(), rfp);
 
-    let (mk_c, st_c) = open_repo_remote(&rem_c, &dev_c, &rfp).await.unwrap();
+    let (mk_c, st_c, _) = open_repo_remote(&rem_c, &dev_c, &rfp, None).await.unwrap();
     assert_eq!(mk_c.mk_commit(), mk_a.mk_commit());
     assert_eq!(st_c.members.len(), 3, "all three devices are rostered");
     assert!(st_c.is_member(&dev_c.device_id().unwrap()));

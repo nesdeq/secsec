@@ -20,7 +20,7 @@ use clap::{Parser, Subcommand};
 use secsec_client::pair;
 use secsec_client::quic::QuicRemote;
 use secsec_client::repo::{
-    data_keyring_remote, fetch_roster_entries, init_repo_remote, open_repo_remote,
+    data_keyring_remote, fetch_roster_entries, init_repo_remote, open_repo_remote, RosterAnchor,
 };
 use secsec_client::sync::sync_once;
 use secsec_client::{load_frontier, save_frontier, FrontierLoad};
@@ -180,17 +180,21 @@ fn resolve_server(s: &str) -> Result<SocketAddr, Box<dyn Error>> {
 }
 
 /// A folder's link to its repo (the git-remote analogue): server address, pinned host id, RFP anchor,
-/// and ref name. Stored at `<state>/link`; the synced folder stays clean.
+/// ref name, and the §8.1 sigchain anti-rollback anchor (`roster_seq` + tip hash, P7). Stored at
+/// `<state>/link`; the synced folder stays clean. The anchor lives client-side so a malicious **server**
+/// cannot roll the roster back (a disk-level rewrite is the §22 client-compromise residual).
 struct Link {
     server: String,
     host_id: [u8; 32],
     rfp: [u8; 32],
     ref_name: String,
+    anchor: Option<RosterAnchor>,
 }
 
 fn read_link(sdir: &Path) -> Option<Link> {
     let s = std::fs::read_to_string(sdir.join("link")).ok()?;
     let (mut server, mut host_id, mut rfp, mut ref_name) = (None, None, None, None);
+    let (mut rseq, mut rtip) = (None, None);
     for line in s.lines() {
         if let Some(v) = line.strip_prefix("server=") {
             server = Some(v.to_string());
@@ -200,24 +204,41 @@ fn read_link(sdir: &Path) -> Option<Link> {
             rfp = parse_hex32(v).ok();
         } else if let Some(v) = line.strip_prefix("ref=") {
             ref_name = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("roster_seq=") {
+            rseq = v.parse::<u64>().ok();
+        } else if let Some(v) = line.strip_prefix("roster_tip=") {
+            rtip = parse_hex32(v).ok();
         }
     }
+    // The anchor is present only once a successful open has recorded it (older links omit it → None).
+    let anchor = match (rseq, rtip) {
+        (Some(max_seq), Some(tip_hash)) => Some(RosterAnchor { max_seq, tip_hash }),
+        _ => None,
+    };
     Some(Link {
         server: server?,
         host_id: host_id?,
         rfp: rfp?,
         ref_name: ref_name?,
+        anchor,
     })
 }
 
 fn write_link(sdir: &Path, l: &Link) -> Result<(), Box<dyn Error>> {
-    let body = format!(
+    let mut body = format!(
         "server={}\nhost_id={}\nrfp={}\nref={}\n",
         l.server,
         hex(&l.host_id),
         hex(&l.rfp),
         l.ref_name
     );
+    if let Some(a) = &l.anchor {
+        body.push_str(&format!(
+            "roster_seq={}\nroster_tip={}\n",
+            a.max_seq,
+            hex(&a.tip_hash)
+        ));
+    }
     std::fs::write(sdir.join("link"), body)?;
     Ok(())
 }
@@ -403,6 +424,11 @@ async fn run_sync(
         }
     };
 
+    // Cold-start over the wire (P7 anti-rollback: the fetched chain must extend the persisted anchor).
+    let prev_anchor = link.as_ref().and_then(|l| l.anchor);
+    let was_linked = link.is_some();
+    let (mk, st, anchor) = open_repo_remote(&rem, &device, &rfp, prev_anchor).await?;
+    // Persist the link with the advanced anti-rollback anchor.
     write_link(
         &sdir,
         &Link {
@@ -410,11 +436,12 @@ async fn run_sync(
             host_id,
             rfp,
             ref_name: ref_name.clone(),
+            anchor: Some(anchor),
         },
     )?;
+    // The roster_seq stamped on commits/heads is the current sigchain tip (drives §10 gate 1).
+    let roster_seq = anchor.max_seq;
 
-    // Cold-start over the wire, then the continuous sync loop.
-    let (mk, st) = open_repo_remote(&rem, &device, &rfp).await?;
     let keyring = data_keyring_remote(&rem, &mk).await?;
     let store = Store::open(sdir.join("objects.secsec"))?;
     let frontier_path = sdir.join("frontier");
@@ -422,7 +449,18 @@ async fn run_sync(
     let receipts_path = sdir.join("receipts");
     let mut frontier = match load_frontier(&frontier_path, &device)? {
         FrontierLoad::Loaded(f) => f,
-        FrontierLoad::Absent => SyncFrontier::default(),
+        FrontierLoad::Absent => {
+            // §8.5 lost-frontier event: a folder already linked to a repo whose sealed frontier is
+            // gone (disk loss, deletion) is a reinstall — authenticity still holds (RFP + mk_commit),
+            // but freshness/rollback gating does not until a peer reconfirms. Alarm prominently.
+            if was_linked {
+                eprintln!(
+                    "warning: local sync state for this folder is missing — treating as a reinstall.\n\
+                     anti-rollback freshness is not guaranteed for this session until it reconverges (§8.5)."
+                );
+            }
+            SyncFrontier::default()
+        }
     };
     let mut base = match std::fs::read_to_string(&base_path) {
         Ok(s) => Some(parse_hex32(&s)?),
@@ -466,7 +504,7 @@ async fn run_sync(
             &st.members,
             &frontier,
             &ref_name,
-            0,
+            roster_seq,
             base,
             unix_secs(),
         )
@@ -489,6 +527,17 @@ async fn run_sync(
                 }
                 if initial || !matches!(outcome.kind, secsec_client::sync::SyncKind::UpToDate) {
                     println!("sync: {:?}", outcome.kind);
+                }
+                // Surface keep-both merge conflicts (§10): the conflicting versions are preserved on
+                // disk as `name.conflict-<device>-<id>.ext` (no data lost), but the user must be told.
+                if !outcome.conflicts.is_empty() {
+                    eprintln!(
+                        "merge: {} file(s) conflicted and were kept on both sides — review:",
+                        outcome.conflicts.len()
+                    );
+                    for p in &outcome.conflicts {
+                        eprintln!("  {p}  →  see the name.conflict-* copy alongside it");
+                    }
                 }
                 frontier = outcome.frontier;
                 base = outcome.base;
@@ -554,7 +603,7 @@ async fn run_invite(dir: PathBuf) -> Result<(), Box<dyn Error>> {
     let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
-    let (mk, _st) = open_repo_remote(&rem, &device, &link.rfp).await?;
+    let (mk, _st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
 
     let (code, disp) = pair::new_invite()?;
     println!("INVITE CODE: {disp}");
@@ -594,7 +643,7 @@ async fn run_devices(dir: PathBuf) -> Result<(), Box<dyn Error>> {
     let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
-    let (_mk, st) = open_repo_remote(&rem, &device, &link.rfp).await?;
+    let (_mk, st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
     println!("{} device(s) in this repo:", st.members.len());
     for (id, pubkey) in &st.members {
         let fp = pubkey
@@ -619,7 +668,7 @@ async fn run_revoke(device_prefix: String, dir: PathBuf) -> Result<(), Box<dyn E
     let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
-    let (mk, st) = open_repo_remote(&rem, &device, &link.rfp).await?;
+    let (mk, st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
 
     // Resolve the device-id prefix against the roster (must be unique).
     let prefix = device_prefix.to_lowercase();
