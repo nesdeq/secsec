@@ -1595,6 +1595,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "secsec-fuzz"
+version = "0.0.0"
+dependencies = [
+ "secsec-canon",
+ "secsec-frame",
+ "secsec-kdf",
+ "secsec-object",
+ "secsec-proto",
+ "secsec-roster",
+ "secsec-snapshot",
+ "secsec-sync",
+]
+
+[[package]]
 name = "secsec-kdf"
 version = "0.0.0"
 dependencies = [

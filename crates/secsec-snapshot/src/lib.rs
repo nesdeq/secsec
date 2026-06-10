@@ -355,6 +355,19 @@ fn decode_signed_commit(bytes: &[u8]) -> Result<(Commit, Vec<u8>), SnapError> {
     Ok((c, sig))
 }
 
+/// Fuzz-only hook: drive [`decode_tree`] on arbitrary bytes (must never panic / OOM, §18). Not part
+/// of the public API.
+#[doc(hidden)]
+pub fn __fuzz_decode_tree(bytes: &[u8]) {
+    let _ = decode_tree(bytes);
+}
+
+/// Fuzz-only hook: drive [`decode_signed_commit`] on arbitrary bytes (must never panic / OOM, §18).
+#[doc(hidden)]
+pub fn __fuzz_decode_signed_commit(bytes: &[u8]) {
+    let _ = decode_signed_commit(bytes);
+}
+
 // ---- commit signing (§9.6 secsec-commit-v1) ----
 
 impl Commit {

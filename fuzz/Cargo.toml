@@ -1,0 +1,58 @@
+# cargo-fuzz harness (run with `cargo +nightly fuzz run <target>`). Deliberately NOT a workspace
+# member — libfuzzer-sys needs nightly + LLVM sanitizers, so it builds out-of-band from the main
+# workspace. Each target is a thin wrapper over a `secsec_fuzz::fuzz_*` function, which is itself
+# exercised on stable by `secsec-fuzz`'s `every_decoder_survives_arbitrary_input` test.
+[package]
+name = "secsec-fuzz-targets"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+secsec-fuzz = { path = "../crates/secsec-fuzz" }
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "roster_entry"
+path = "fuzz_targets/roster_entry.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "object"
+path = "fuzz_targets/object.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "head"
+path = "fuzz_targets/head.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "tree"
+path = "fuzz_targets/tree.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "commit"
+path = "fuzz_targets/commit.rs"
+test = false
+doc = false
