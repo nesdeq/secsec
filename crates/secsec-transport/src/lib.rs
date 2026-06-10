@@ -25,6 +25,7 @@ pub mod frame;
 pub mod handshake;
 pub mod quic;
 pub mod rpc;
+pub mod stream;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring::default_provider;

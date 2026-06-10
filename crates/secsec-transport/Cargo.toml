@@ -19,7 +19,8 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 x509-cert = "0.2"
 blake3 = "1"
 subtle = "2"
+tokio = { version = "1", default-features = false, features = ["io-util"] }
 
 [dev-dependencies]
 rcgen = "0.13"
-tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "net", "io-util"] }

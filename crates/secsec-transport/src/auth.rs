@@ -35,11 +35,24 @@ pub struct SessionTranscript {
 }
 
 impl SessionTranscript {
-    /// A fresh, empty transcript (QUIC mode). (Stdio mode pre-feeds the SSH exchange hash `H`; not
-    /// part of v1.)
+    /// A fresh, empty transcript (QUIC mode).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A fresh transcript for **stdio/SSH mode** (§11): the SSH exchange hash `H` is fed as the first
+    /// length-prefixed input (`le32(H.len()) ‖ H`) before the hellos. This binds the whole
+    /// application transcript — and thus every per-op signature that includes it — to the specific SSH
+    /// host key + session, so a relay in the stdio pipe cannot forward a per-op signature to a
+    /// different SSH session.
+    #[must_use]
+    pub fn new_stdio(h: &[u8]) -> Self {
+        let mut t = Self::default();
+        let mut w = Writer::new();
+        w.u32(h.len() as u32).raw(h);
+        t.hasher.update(&w.finish());
+        t
     }
 
     /// Feed the **client hello** (§11): `le32(2 + 32) ‖ version(u16 le) ‖ client_nonce(32)`.
