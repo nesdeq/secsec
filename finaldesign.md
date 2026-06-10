@@ -64,9 +64,10 @@ Each row is a guarantee and the mechanism that earns it. Residuals in §22.
 ---
 ## 5. Identifiers & trust anchor
 
-- **Device key** — an SSH keypair per device. Ed25519 (preferred) or RSA ≥3072. Roles:
-  *sign* (SSHSIG; agent/hardware OK) and *unwrap* (X25519/RSA-OAEP; needs the private key as a
-  file — agent/FIDO cannot do ECDH). `ecdsa`/`sk-*` keys are sign-only → enrollment-incapable.
+- **Device key** — an **Ed25519** SSH keypair per device (v1 is Ed25519-only; RSA was dropped from
+  scope). Roles: *sign* (SSHSIG; agent/hardware OK) and *unwrap* (the X-Wing keyslot's X25519 half
+  is derived from the Ed25519 key — §8.3 — so unwrap needs the private key as a file; agent/FIDO
+  cannot do it). `ecdsa`/`sk-*`/RSA keys do not parse → enrollment-incapable.
 - **`device_id`** := `BLAKE3(canonical(device_pubkey))`. Cryptographically bound to the key;
   every commit/head/roster entry is verified by checking its signature against the pubkey that
   the roster maps this id to. A signer can never act under another device's id.
@@ -82,10 +83,9 @@ Each row is a guarantee and the mechanism that earns it. Residuals in §22.
 - **`host_id`** — server identity token bound into connection auth blobs and the session
   transcript. Computed by the client from locally-pinned material; MUST NOT be accepted from the
   server.
-  - **QUIC / TLS mode:** `host_id = BLAKE3(canonical(server pinned SPKI bytes))`, where the SPKI
-    bytes are the SubjectPublicKeyInfo DER encoding of the pinned server certificate public key.
-  - **stdio / SSH mode:** `host_id = BLAKE3(canonical(K_S))`, where `K_S` is the server host key
-    extracted from the SSH exchange hash `H` (RFC 4253 §8).
+  - `host_id = BLAKE3(canonical(server pinned SPKI bytes))`, where the SPKI bytes are the
+    SubjectPublicKeyInfo DER encoding of the pinned server certificate public key (QUIC/TLS — the
+    single v1 transport).
 - **RFP (Repository FingerPrint)** := `BLAKE3(canonical(genesis sigchain entry))`. The genesis
   transitively commits to device-1's key and to `mk_commit_1`. **RFP is the one out-of-band
   anchor**: shown at `init`, and required (via SAS) at every enrollment. Everything else can be
@@ -403,12 +403,9 @@ stored encrypted in a local state file, sealed under a key derived solely from t
 private key — no server contact required to unseal:
 
 ```
-// Ed25519 devices: derive from the private scalar (never published)
+// Ed25519 device key (v1 is Ed25519-only): derive from the private scalar (never published)
 local_seal_key = BLAKE3::derive_key("secsec-local-seal-v1",
                                     device_ed25519_scalar_clamped)
-// RSA devices: derive from the private key bytes
-local_seal_key = BLAKE3::derive_key("secsec-local-seal-v1",
-                                    SHA-256(rsa_private_key_der))
 ```
 
 The `device_ed25519_scalar_clamped` is the clamped scalar from the Ed25519 private key (the
@@ -661,10 +658,9 @@ cold-start fold (§8.1 step 1) reads to learn `g_cur`.
 ### 9.6 Signatures & domain separation
 
 Every signature is an SSHSIG with a **disjoint namespace**; the client never signs server-supplied
-bytes raw. Algorithm pinned to `ssh-ed25519` (or `rsa-sha2-512` for RSA) — no alg downgrade.
-**The verifier MUST reject any SSHSIG blob in which the `sig_algorithm` field is not exactly
-`ssh-ed25519` (for Ed25519 keys) or `rsa-sha2-512` (for RSA keys). Any other algorithm field —
-including `rsa-sha2-256` — MUST cause verification failure regardless of cryptographic validity.**
+bytes raw. Algorithm pinned to `ssh-ed25519` (v1 is Ed25519-only) — no alg downgrade. **The
+verifier MUST reject any SSHSIG blob whose `sig_algorithm` field is not exactly `ssh-ed25519`. Any
+other algorithm field MUST cause verification failure regardless of cryptographic validity.**
 
 | Purpose | Namespace | Message |
 |---|---|---|
@@ -675,11 +671,10 @@ including `rsa-sha2-256` — MUST cause verification failure regardless of crypt
 | Head update | `secsec-head-v1` | `ref ‖ commit_id ‖ head_version ‖ roster_seq ‖ prev_head` |
 | Roster entry | `secsec-roster-v1` | canonical sigchain entry |
 | Grant attestation | `secsec-grant-v1` | `device_pubkey ‖ mk_commit_g ‖ roster_seq ‖ enrollment_nonce` |
-| RSA keyslot OAEP label | L = `b"secsec-keyslot-v1"` (OAEP hash = SHA-256; MGF1 hash = SHA-256) | (OAEP label parameter, not an SSHSIG; OAEP computes `lHash = SHA-256(b"secsec-keyslot-v1")` internally per RFC 8017) |
 
 **Connection auth field order (canonical):** `channel_binding ‖ host_id ‖ session_transcript ‖
-server_nonce`. In stdio mode `channel_binding = H` (the SSH exchange hash, RFC 4252 §7). This
-order is normative; §11 cross-references this table rather than defining a separate formula.
+server_nonce`, where `channel_binding` is the TLS 1.3 keying-material exporter (§11). This order is
+normative; §11 cross-references this table rather than defining a separate formula.
 
 `secsec-read-v1` provides per-op authorization for `get` and `has`: `args_hash` binds the exact
 object IDs requested; `session_transcript` provides per-connection freshness without requiring
@@ -847,59 +842,33 @@ The §8.5 local sealed-state blob uses this same construction with `key = local_
   should independently verify the fingerprint out-of-band. Accepting without confirmation is NOT
   permitted. (Residual: §22 TOFU first-init window — a network attacker present at init without
   `--host-fp` can substitute their host key; always use `--host-fp`.)
-- **host_id definition:** `host_id = BLAKE3(canonical(server pinned SPKI bytes))` (QUIC mode).
-  In stdio mode, `host_id = BLAKE3(canonical(K_S))` where `K_S` is the server host key
-  extracted from the SSH exchange hash `H` (RFC 4253 §8). `host_id` MUST be computed by the
-  client from locally-pinned material and MUST NOT be accepted from the server.
+- **host_id definition:** `host_id = BLAKE3(canonical(server pinned SPKI bytes))`. `host_id` MUST
+  be computed by the client from locally-pinned material and MUST NOT be accepted from the server.
 - **Verifier (the top ship-broken risk):** the custom `rustls` `ServerCertVerifier` MUST compare
   leaf SPKI to the pin **and** fully implement `verify_tls13_signature` (never stub). Mandatory
-  negative tests: wrong key fails; tampered handshake fails. Additionally, the verifier MUST
-  reject any SSHSIG blob in which the `sig_algorithm` field is not exactly `ssh-ed25519` (for
-  Ed25519 keys) or `rsa-sha2-512` (for RSA keys). Any other algorithm field — including
-  `rsa-sha2-256` — MUST cause verification failure regardless of cryptographic validity. This is
-  a mandatory negative test: a valid `rsa-sha2-256` signature MUST fail verification.
+  negative tests: wrong key fails; tampered handshake fails. Device keys are **Ed25519-only**:
+  the verifier MUST reject any SSHSIG blob whose `sig_algorithm` field is not exactly
+  `ssh-ed25519`. Any other algorithm field MUST cause verification failure regardless of
+  cryptographic validity (a mandatory negative test).
 - **Session transcript:** both ends maintain `session_transcript` = running BLAKE3 over the
-  ordered, length-prefixed handshake messages, defined byte-exactly per mode below. Binds the
-  whole exchange against splicing/downgrade in **both** modes.
-  - **stdio-mode session_transcript initialization:** In stdio mode, the `session_transcript`
-    hasher MUST be initialized by feeding `H` (the SSH exchange hash, RFC 4252 §7) as its first
-    length-prefixed input. Following `H`, the application-layer handshake messages are fed in
-    this fixed order:
-    1. Client hello: `secsec_version: u16 ‖ client_nonce: [u8; 32]` where `client_nonce` is
-       drawn from the OS CSPRNG. Length-prefix: `le32(2 + 32)`.
-    2. Server hello: `secsec_version: u16 ‖ server_nonce: [u8; 32] ‖ host_id: [u8; 32]`.
-       Length-prefix: `le32(2 + 32 + 32)`.
-    Both client and server maintain identical running hashers over these inputs in this order.
-    `H` as the first input makes the transcript session-specific to the SSH channel even if
-    application-level nonces collide. This ensures all per-op signatures (`secsec-write-v1` and
-    `secsec-read-v1`) that include `session_transcript` are transitively bound to the SSH host
-    key and session.
-  - **QUIC-mode session_transcript:** byte-exact, mirroring the stdio handshake but without `H`
-    (channel binding is the TLS exporter, defined under *Client→server auth* below). The hasher is
-    fed, in this fixed order:
+  ordered, length-prefixed handshake messages, defined byte-exactly below. Binds the whole
+  exchange against splicing/downgrade. The hasher is fed, in this fixed order:
     1. Client hello: `secsec_version: u16 ‖ client_nonce: [u8; 32]` (OS CSPRNG). Length-prefix
        `le32(2 + 32)`.
     2. Server hello: `secsec_version: u16 ‖ server_nonce: [u8; 32] ‖ host_id: [u8; 32]`.
        Length-prefix `le32(2 + 32 + 32)`.
-    No other inputs are hashed; raw "pubkeys" are NOT injected — the server identity is bound via
-    `host_id` and the channel via the TLS exporter. The client-contributed `client_nonce` ensures
-    transcript uniqueness is not solely under server control.
+  No other inputs are hashed; raw "pubkeys" are NOT injected — the server identity is bound via
+  `host_id` and the channel via the TLS exporter. The client-contributed `client_nonce` ensures
+  transcript uniqueness is not solely under server control.
 - **Client→server auth:** the client signs (`secsec-auth-v1`) the canonical payload defined in
-  §9.6: `channel_binding ‖ host_id ‖ session_transcript ‖ server_nonce`. In stdio mode
-  `channel_binding = H`; in QUIC mode `channel_binding` is the TLS exporter value below. The
-  signed payload field order is authoritative in §9.6; this section cross-references it.
-  - **QUIC mode:** `channel_binding` = TLS 1.3 keying material exporter computed via
-    `quinn`/`rustls`'s `exported_keying_material` API: `HKDF-Expand-Label(exporter_master_secret,
+  §9.6: `channel_binding ‖ host_id ‖ session_transcript ‖ server_nonce`. The signed payload field
+  order is authoritative in §9.6; this section cross-references it.
+  - `channel_binding` = TLS 1.3 keying material exporter computed via `quinn`/`rustls`'s
+    `exported_keying_material` API: `HKDF-Expand-Label(exporter_master_secret,
     "EXPORTER-Channel-Binding", "", 32)` per RFC 9266 §3 / RFC 8446 §7.5. Note: RFC 9266 does not
     formally define `tls-exporter` for QUIC transports (an acknowledged open gap); this usage is
     intentional and documented here. The `session_transcript` provides an additional application-
     layer binding; both are included.
-  - **stdio mode:** `channel_binding` = the SSH exchange hash `H` extracted from `russh`'s
-    `session_id()` API (ref: RFC 4252 §7). `H` covers `V_C ‖ V_S ‖ I_C ‖ I_S ‖ K_S ‖ e ‖ f ‖ K`
-    and is cryptographically bound to the server's host key and the specific SSH session. Including
-    `H` prevents a relay in the stdio pipe (compromised sshd, ProxyJump, middlebox) from forwarding
-    the auth blob to a different SSH session. The claim "we do not depend on an SSH session id" is
-    **removed**; the subsystem CAN obtain `H` via the embedded `russh` library and MUST do so.
   - `server_nonce` is fresh & single-use. The server verifies against a **keyslot-owning** pubkey
     and checks nonce freshness. The server MUST also verify that all subsequent per-op signatures
     on the connection are signed by the same public key that completed the `secsec-auth-v1`
@@ -1260,7 +1229,7 @@ keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today.
 | Per-key write rate | 100 MB/s sustained, burst 1 GiB | server MUST enforce after auth |
 | Per-key read rate | 200 MB/s sustained | server MUST enforce after auth; matches 2× write rate to allow sync catch-up without unbounded egress |
 | Connection rate limit | 10 new/s per source IP; 3 concurrent per authenticated key | server MUST enforce |
-| Min RSA / preferred | 3072 / Ed25519 | reject weak RSA |
+| Device key algorithm | **Ed25519 only** | RSA/ECDSA/`sk-*` keys are rejected at parse (v1 scope) |
 | Argon2id (passphrase recovery) | m=64 MiB, t=3, p=1, salt=16 B random | offline-attack floor (RFC 9106 second recommended / OWASP high-security); high-entropy code path uses HKDF |
 | Argon2id salt | 16 bytes, OS CSPRNG, per-keyslot, rotated on re-wrap | RFC 9106 §4 mandatory; stored in /recovery blob |
 | Keyslot KEM (mandatory) | **X-Wing** (ML-KEM-768 ⊕ X25519, draft-connolly-cfrg-xwing-kem-10), `algo_id = 2`; CTX AEAD AD = "secsec-keyslot-v1" ‖ canonical(device_id) ‖ le32(gen); device X-Wing seed = `derive_key("secsec-xwing-seed-v1", ed25519_seed)` | post-quantum mandatory — the only keyslot algorithm; classical X25519/HPKE removed (§8.3). Floor enforced at cold-start (§16) |
@@ -1292,11 +1261,16 @@ keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today.
    serialization); fork-detection alarms + gossip.
 6. Recovery flow (committing AEAD, Argon2id at raised params). Downgrade/min-algo enforcement
    (per-fetch check, not creation-only). Local sealed state (SSH-key-derived seal).
-7. *(later)* Hybrid-PQ keyslot (X-Wing); WebDAV browse (not FUSE — read-only, no Windows).
+7. Hybrid-PQ keyslot (X-Wing, **mandatory** — §17); recovery keyslot + `recover`; client-driven GC
+   (`secsec gc`).
 
-## 21. Candidate crates
+## 21. Crates
 
-`quinn`,`rustls` · `ssh-key`(SSHSIG),`ed25519-dalek`,`x25519-dalek`,`rsa` · `blake3` · `chacha20poly1305` · `hpke`/hybrid-KEM crate · `argon2` · `fastcdc` · `notify` · `redb` · `tokio`,`serde`+`postcard`(canonical) · `zeroize`,`secrecy`,`subtle`,`getrandom` · `russh` (for SSH exchange hash `H` in stdio mode) · *(future)* an audited ML-KEM crate (FIPS 203 seed-form storage required). Versions pinned at implementation; `cargo-audit`/`cargo-vet` gated.
+`quinn`,`rustls` · `ssh-key`(SSHSIG, Ed25519-only),`ed25519-dalek`,`x25519-dalek` · `libcrux-ml-kem`
+(ML-KEM-768 for the X-Wing keyslot),`sha3` · `blake3` · `chacha20`+`poly1305` (the §9.4 CTX
+committing AEAD) · `argon2` · `fastcdc` · `notify` · `redb` · `tokio` · `zeroize`,`subtle`,`getrandom`.
+Transport is **QUIC/TLS-only** (no SSH/stdio mode — it adds nothing over the pinned host key, §11).
+Versions pinned; `cargo-audit`/`cargo-vet` gated.
 
 ## 22. Residuals (proven-minimal)
 

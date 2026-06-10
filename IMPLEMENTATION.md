@@ -12,14 +12,14 @@ design — read `finaldesign.md` for *what*; this is *how*.
 > implementation gets an **independent professional cryptographic review before it touches real
 > data**. This plan gets us to audit-*ready*; it does not replace the audit.
 
-**v1 scope (locked 2026-06-09; RSA/WebDAV dropped 2026-06-10):** transport is **QUIC-only** for v1
-(stdio/SSH is post-v1, M7); device keys are **Ed25519-only** (RSA **dropped from scope**, not
-deferred); targets are **Linux, macOS, Windows**. **WebDAV browse is dropped from scope.** Implications:
-the custom QUIC verifier (R1) is the *sole* transport-auth path and thus top priority; `host_id` =
-pinned-SPKI hash; the `rsa` crate drops out entirely; `russh` enters only at M7 (stdio); key-memory
-locking needs a cross-platform shim (`mlock` / `VirtualLock`). `finaldesign.md` still *describes* RSA
-and WebDAV as part of the original design, but they are no longer planned work — Ed25519 is strictly
-better for a greenfield tool, and WebDAV is a convenience the core sync does not need.
+**v1 scope (locked 2026-06-09; RSA/WebDAV/stdio dropped 2026-06-10):** transport is **QUIC/TLS-only**
+— the stdio/SSH mode was cut from code *and* spec (it adds nothing over the pinned QUIC host key, §11).
+Device keys are **Ed25519-only** (RSA dropped from scope); targets are **Linux, macOS, Windows**.
+**WebDAV browse is dropped.** Implications: the custom QUIC verifier (R1) is the *sole* transport-auth
+path and thus top priority; `host_id` = pinned-SPKI hash; the `rsa` and `russh` crates drop out
+entirely; key-memory locking needs a cross-platform shim (`mlock` / `VirtualLock`). `finaldesign.md`
+describes exactly what ships — QUIC-only, Ed25519-only, X-Wing-mandatory; the dropped paths are gone
+from the spec, not merely demoted.
 
 ---
 
@@ -34,15 +34,13 @@ Versions are pinned at implementation start; the **capability** column is what w
 | Transport | `quinn` + `rustls` 0.23 | ✓ Custom `ServerCertVerifier` lives in `rustls::client::danger`; must impl `verify_server_cert` + `verify_tls12/tls13_signature` + `supported_verify_schemes`. | **H2 hotspot.** Use the safe pattern: compare leaf SPKI to the pin, **delegate** `verify_tls13_signature` to the provider helper (never stub). ⚠ verify current `quinn` exposes `export_keying_material` on `Connection` (was historically a plumbing gap) — else the §11 TLS-exporter channel binding needs the documented fallback. |
 | Committing AEAD (CTX) | `chacha20poly1305` + `poly1305` (+ `chacha20`) | ✓ Detached-tag API exists; standalone `poly1305` crate exists. | **CTX hotspot.** No drop-in committing-AEAD crate. We build `secsec-aead`: derive one-time Poly1305 key from ChaCha20 block 0, recompute `T` over `(AD, ct)`, then `ctx_tag = BLAKE3::keyed_hash(...)`. `T` is never stored (§9.4). Fiddly; gets the most tests. |
 | Hash / KDF | `blake3` | ✓ `keyed_hash` + `derive_key` (context-string KDF). | Backbone of §9.5; one `keyed_hash` exception (`mk_commit`). |
-| ECDH / sign keys | `x25519-dalek`, `ed25519-dalek` | ✓ mature. | Ed25519→X25519 birational map (age/ssh-to-age precedent). ⚠ enforce low-order-point rejection (see HPKE row). |
-| Classical keyslot KEM | `hpke` (rozbb/rust-hpke) | ✓ RFC 9180 base mode, custom `info`, `X25519HkdfSha256` + `ChaCha20Poly1305`; Cloudflare-reviewed v0.8. | **Prefer `hpke` over `hpke-rs`:** `hpke-rs` had **two CVEs disclosed May 2026** — missing RFC 9180 §7.1.4 zero-shared-secret check (low-order point → all-zero SS) and a `u32` seq-counter nonce wrap. Whatever we pick MUST do the zero-SS check; add a low-order-point negative test. |
-| PQ KEM | ML-KEM: `libcrux-ml-kem`; X-Wing implemented in-crate (`secsec-pq`) | ✓ `libcrux-ml-kem` 0.0.9 is **formally verified** (FIPS 203 final, all sizes). X-Wing is built directly on it + `x25519-dalek` (no third-party X-Wing crate). | **Resolved.** `secsec-pq` implements draft-connolly-cfrg-xwing-kem-**10** exactly: single-seed `SHAKE256(sk,96)` key expansion, **label-LAST** combiner, derand encaps. `xwing_kat` asserts byte-identity vs the draft-10 Appendix C vector (libcrux 0.0.9 confirmed FIPS-203-final by that match). The earlier "label-first" note here and in §17 was wrong (draft-02 order) and is fixed. Keyslot is built but **not yet wired** into the `algo_id`/keyslot flow (reachable via a future `SetMinAlgo` bump). |
-| RSA keyslot | `rsa` | **Deferred (post-v1)** — Ed25519-only for v1. | When added: OAEP, label `b"secsec-keyslot-v1"`, SHA-256, MGF1-SHA-256. |
+| ECDH / sign keys | `x25519-dalek`, `ed25519-dalek` | ✓ mature. | Ed25519→X25519 birational map (age/ssh-to-age precedent); the X25519 half of the X-Wing keyslot derives from the Ed25519 seed. ⚠ enforce low-order-point rejection (see the Keyslot KEM row). |
+| Keyslot KEM (the only one) | ML-KEM: `libcrux-ml-kem`; X-Wing in-crate (`secsec-pq`) + `x25519-dalek` | ✓ `libcrux-ml-kem` 0.0.9 is **formally verified** (FIPS 203 final, all sizes). X-Wing built directly on it (no third-party X-Wing crate). | **Done + mandatory.** `secsec-pq` implements draft-connolly-cfrg-xwing-kem-**10** exactly: single-seed `SHAKE256(sk,96)` key expansion, **label-LAST** combiner, derand encaps, FIPS 203 §7.1 PCT. `xwing_kat` asserts byte-identity vs the draft-10 Appendix C vector. **Wired + mandatory:** keyslots are `algo_id ‖ body` with X-Wing (`algo_id = 2`) the only algorithm; init/grant/rotate wrap it; cold-start enforces the §16 floor. The classical X25519/HPKE keyslot and the RSA-OAEP variant were **removed** (a pre-quantum keyslot is the one harvestable asymmetric exposure, §17) — so no `hpke` or `rsa` crate is used. |
 | Passphrase KDF | `argon2` | ✓ Argon2id, params configurable (§19: m=64 MiB, t=3, p=1). | Recovery path only. |
 | Chunking | `fastcdc` | ⚠ **verify gear-table seeding** from `cdc_seed[gen]` (§9.7 keyed CDC). | If the crate doesn't expose a custom/keyed gear table, fork or implement keyed FastCDC. Material risk — check early. |
 | Index / store | `redb` | ⚠ verify current stable; embedded, no external DB. | Server index holds only `{id,size,gen,pack-offset}` (§13). |
 | FS watch | `notify` | ✓ inotify/FSEvents/ReadDirectoryChangesW. | Drives commit-on-change (§10). |
-| stdio/SSH mode | `russh` | **Deferred (post-v1)** — QUIC-only for v1. | When added: verify `session_id()`/exchange hash `H` is reachable from a subsystem (§11 binding depends on it). |
+| stdio/SSH mode | — | **Dropped from scope** — QUIC/TLS is the sole transport. | No `russh`. stdio adds nothing over the pinned QUIC host key (§11); cut from code and spec. |
 | Serialization | `serde` + `postcard` | ⚠ canonical profile / **verify-over-received-bytes** discipline. | §9.3 canonicality is load-bearing for ids & signatures. Verify signatures over the exact received bytes; reject trailing/non-canonical input. Fuzz the decoder. |
 | Async | `tokio` | ✓ | — |
 | Key hygiene | `zeroize`, `secrecy`, `subtle`, `getrandom`, `region` | ✓ (`region` = cross-platform lock) | §18: zeroize + cross-platform lock (`mlock`/`VirtualLock` via `region`), constant-time via `subtle`, OS CSPRNG only. |
@@ -67,13 +65,12 @@ secsec/
 │   ├── secsec-snapshot/  §6    Tree/Commit object graph + directory snapshot/restore
 │   ├── secsec-store/     §13   redb content-addressed blob store (server side)
 │   ├── secsec-sig/       §9.6  SSHSIG namespaces, verifier (alg pinning, negative tests)
-│   ├── secsec-keyslot/   §8.3  HPKE master-key wrap, mk_commit authenticity
-│   ├── secsec-pq/        §17   hybrid-PQ X-Wing keyslot (ML-KEM-768 + X25519); ⚠ pending ePrint §A KAT
+│   ├── secsec-pq/        §8.3,§17  X-Wing keyslot (ML-KEM-768 ⊕ X25519, the only keyslot), mk_commit authenticity, draft-10 KAT
 │   ├── secsec-recovery/  §8.6  recovery-code / passphrase (Argon2id) master-key wrap; RFP-anchored
 │   ├── secsec-roster/    §8    sigchain fold/succession, per-entry AEAD, roster-key history, generations, enrollment
 │   ├── secsec-sync/      §10   refs, cas-head, rollback-aware merge (storage-free Node model), fork detection
 │   ├── secsec-engine/    §10   snapshot-tree ↔ merge-node bridge, three-way reconcile to the store
-│   ├── secsec-transport/ §11   QUIC+TLS pinned verifier, stdio mode, auth, channel binding
+│   ├── secsec-transport/ §11   QUIC+TLS pinned verifier, auth, channel binding
 │   ├── secsec-proto/     §12   wire protocol, RPC framing, write/read-auth, rate limits, gc serialization (§15)
 │   ├── secsec-client/    §10,§14,§15  orchestration: cold-start, watcher, sync loop, GC driver, multi-remote+quorum, recovery
 │   └── secsec-server/          serve loop, quota/rate-limit + gc CAS enforcement, GC executor
@@ -108,14 +105,15 @@ signed merge commit — the only §10 code that touches `store`+`snapshot` — l
 Per security-critical crate, **before it is built upon**:
 
 - **Known-answer vectors** committed in `vectors/`: every §9.5 derivation (all 8), CTX
-  encrypt/decrypt, `mk_commit`, SAS, HPKE seal/open, content-ids. Where an external standard
-  exists (HPKE RFC 9180 §A, X-Wing draft §A), test against **its** published vectors.
+  encrypt/decrypt, `mk_commit`, SAS, X-Wing keyslot wrap/unwrap, content-ids. Where an external
+  standard exists (X-Wing draft-10 Appendix C), test against **its** published vectors.
 - **Property tests** (`proptest`): AEAD round-trips; tamper-any-byte ⇒ reject; CTX commitment —
   *no ciphertext opens under two distinct (key, AD) pairs*; canonical encode/decode is a bijection
   and rejects non-canonical input; merge is commutative/associative where the spec says so.
 - **Mandatory negative tests** (these are the ship-broken spots):
-  - rustls verifier: wrong pinned key fails; tampered handshake fails; `rsa-sha2-256` sig fails.
-  - HPKE: low-order / identity public key ⇒ rejected (the `hpke-rs` 2026 bug class).
+  - rustls verifier: wrong pinned key fails; tampered handshake fails; any non-`ssh-ed25519` sig
+    algorithm fails (device keys are Ed25519-only).
+  - X-Wing keyslot: a non-X-Wing `algo_id` ⇒ rejected; a keyslot below `min_algo` ⇒ rejected (§16).
   - SSHSIG: wrong namespace fails; cross-namespace reuse fails.
   - rollback merge: stale sibling below frontier ⇒ rejected & alarmed.
 - **Fuzzing** (`cargo-fuzz`): one target per decoder (frame, object, sigchain entry, wire RPC);
@@ -137,7 +135,7 @@ No OpenSSL anywhere.
 |---|---|---|---|
 | R1 | Custom rustls verifier (§11) | `return Ok(())` / stubbed sig check silently disables auth | Safe pattern (SPKI pin + delegated `verify_tls13_signature`); negative tests gate CI |
 | R2 | CTX from raw Poly1305 (§9.4) | wrong T recomputation; using high-level open; non-constant-time | `secsec-aead` isolated; KATs; committing property test; `subtle` compares |
-| R3 | HPKE keyslot seal (§8.3) | low-order point → zero shared secret; nonce wrap | crate with §7.1.4 check; low-order-point negative test; single-shot only |
+| R3 | X-Wing keyslot seal (§8.3/§17) | non-conformant combiner/seed handling; low-order X25519 point | draft-10 KAT (byte-identity); FIPS 203 §7.1 PCT; X-Wing seed from the Ed25519 seed (not the scalar); CTX-committing AEAD over the wrap |
 | R4 | Rollback-aware merge (§10) | replayed old commit steers merge; lost write | frontier/version/HWM gates; adversarial replay property tests; keep-both default |
 | R5 | Sigchain fold + cold-start + roster-key peel (§8) | mis-fold → wrong membership; bootstrap deadlock | model-based tests; explicit cold-start order; RFP-anchor + mk_commit checks |
 | R6 | Hardened GC (§15) | deletes live data under concurrency / ref-hiding | fail-safe-on-missing; serialization CAS (all_heads_hash/roster_seq/put_epoch); keep-everything default; multi-writer sim |
@@ -168,9 +166,11 @@ No OpenSSL anywhere.
   orchestration end-to-end on one machine, then two.
 - **M6 — Durability & recovery.** Multi-remote reconcile + quorum, hardened GC, recovery flow,
   downgrade/min-algo enforcement, gossip. **Exit:** multi-writer GC sim; quorum put→get→verify.
-- **M7 — Later.** Hybrid-PQ keyslot (resolve X-Wing draft mismatch first) and stdio/SSH transport.
-  **(RSA device keys and WebDAV browse are dropped from scope — not deferred. Ed25519 is strictly
-  better than RSA for a greenfield tool; WebDAV is a convenience the core sync does not need.)**
+- **M7 — Hybrid-PQ keyslot (done).** X-Wing (draft-10 conformant) is **mandatory** — the only keyslot
+  algorithm, fully wired through `algo_id`/init/grant/rotate and the §16 floor. **(RSA device keys,
+  WebDAV browse, and the stdio/SSH transport are dropped from scope — cut from code *and* spec, not
+  deferred. Ed25519 is strictly better than RSA; WebDAV is a convenience the core sync does not need;
+  stdio adds nothing over the pinned QUIC host key.)**
 - **Audit gate.** Independent cryptographic review of the implementation before any production
   data. Treat its findings like §22 was treated: fix or consciously document.
 
@@ -192,18 +192,16 @@ No OpenSSL anywhere.
 
 ## 7. Decisions
 
-**Locked (2026-06-09):**
-1. **Transport:** **QUIC-only** for v1 (stdio/SSH deferred). The custom verifier (R1) is the sole
+**Locked:**
+1. **Transport:** **QUIC/TLS-only** — stdio/SSH cut from scope. The custom verifier (R1) is the sole
    transport-auth path → top scrutiny.
-2. **Device keys:** **Ed25519-only** for v1 (RSA/OAEP deferred). Keyslots seal via HPKE over the
-   Ed25519→X25519 key; signing is `ssh-ed25519` only; the verifier rejects every other algorithm.
+2. **Device keys:** **Ed25519-only** (RSA dropped). The keyslot seals via **X-Wing** over the
+   Ed25519-derived X25519 half + ML-KEM-768; signing is `ssh-ed25519` only; the verifier rejects
+   every other algorithm.
 3. **Platforms:** **Linux, macOS, Windows.** Cross-platform `notify`; key-lock via `region`; no
-   FUSE (WebDAV is the later browse path); reproducible static build is Linux/`musl`, with
-   signed binaries on macOS/Windows.
-
-**Recommended defaults (accepted unless you object):**
-4. **HPKE crate:** `hpke` (rozbb, typed, Cloudflare-reviewed) — *not* pre-fix `hpke-rs`.
-5. **ML-KEM crate (M7):** `libcrux-ml-kem` (formally verified); X-Wing draft mismatch resolved at M7.
+   FUSE/WebDAV; reproducible static build is Linux/`musl`, with signed binaries on macOS/Windows.
+4. **Keyslot KEM:** **X-Wing** (`libcrux-ml-kem`, formally verified, + `x25519-dalek`) — mandatory,
+   the only keyslot algorithm. No `hpke`/`rsa` (the classical and RSA keyslots were removed).
 
 **Still open (not blocking M0):**
 6. **Audit sourcing** — who reviews the cores and when (per-milestone vs final gate).

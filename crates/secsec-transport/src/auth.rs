@@ -5,8 +5,7 @@
 //! After the TLS 1.3 handshake (verified by the pinned [`crate::PinnedServerVerifier`]), the client
 //! signs, under [`secsec_sig::NS_AUTH`], the §9.6 payload
 //! `channel_binding ‖ host_id ‖ session_transcript ‖ server_nonce`, where:
-//! - `channel_binding` is the TLS keying-material exporter (QUIC mode) or the SSH exchange hash `H`
-//!   (stdio mode) — supplied by the transport at runtime;
+//! - `channel_binding` is the TLS keying-material exporter — supplied by the transport at runtime;
 //! - `host_id = BLAKE3(SPKI)` ([`crate::HostPin::host_id`]) — pins the server identity;
 //! - `session_transcript` is the running BLAKE3 over the ordered handshake messages ([`SessionTranscript`]);
 //! - `server_nonce` is the server's fresh single-use challenge.
@@ -24,8 +23,8 @@ pub const SECSEC_VERSION: u16 = 1;
 pub const NONCE_LEN: usize = 32;
 
 /// The §11 **session transcript**: a running BLAKE3 over the ordered, length-prefixed handshake
-/// messages. In QUIC mode it covers exactly the client hello and the server hello (no raw pubkeys
-/// are injected — server identity is bound via `host_id`, the channel via the TLS exporter).
+/// messages — exactly the client hello and the server hello (no raw pubkeys are injected — server
+/// identity is bound via `host_id`, the channel via the TLS exporter).
 ///
 /// Both ends MUST feed identical bytes in this fixed order; [`Self::finalize`] yields the 32-byte
 /// transcript bound into the connection-auth signature.
@@ -39,20 +38,6 @@ impl SessionTranscript {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// A fresh transcript for **stdio/SSH mode** (§11): the SSH exchange hash `H` is fed as the first
-    /// length-prefixed input (`le32(H.len()) ‖ H`) before the hellos. This binds the whole
-    /// application transcript — and thus every per-op signature that includes it — to the specific SSH
-    /// host key + session, so a relay in the stdio pipe cannot forward a per-op signature to a
-    /// different SSH session.
-    #[must_use]
-    pub fn new_stdio(h: &[u8]) -> Self {
-        let mut t = Self::default();
-        let mut w = Writer::new();
-        w.u32(h.len() as u32).raw(h);
-        t.hasher.update(&w.finish());
-        t
     }
 
     /// Feed the **client hello** (§11): `le32(2 + 32) ‖ version(u16 le) ‖ client_nonce(32)`.
