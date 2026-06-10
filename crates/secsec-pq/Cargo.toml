@@ -1,0 +1,21 @@
+[package]
+name = "secsec-pq"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hybrid post-quantum keyslot: X-Wing (ML-KEM-768 + X25519) master-key wrap (finaldesign.md §17)."
+
+[lints]
+workspace = true
+
+[dependencies]
+secsec-aead = { path = "../secsec-aead" }
+secsec-kdf = { path = "../secsec-kdf" }
+secsec-canon = { path = "../secsec-canon" }
+libcrux-ml-kem = "0.0.9"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+sha3 = "0.10"
+blake3 = "1"
+zeroize = "1"
+getrandom = "0.3"
