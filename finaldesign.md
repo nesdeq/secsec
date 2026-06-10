@@ -339,7 +339,16 @@ A keyslot wraps `master_key_g` to a device key. Format is `algo_id`-versioned:
   keyslot-unwrap path and the SSHSIG signing path (which share the same RSA private key). RSA
   private key material is required on disk for OAEP unwrap; agent/FIDO cannot perform it.
 - **hybrid-PQ:** wrap via **X-Wing** (§17); keyslot ciphertext = `ct_MLKEM(1088 B) ‖ ct_X(32 B)`.
-  ML-KEM-768 key pairs stored exclusively in `(d, z)` seed form (§17, §8.3 note).
+  ML-KEM-768 key pairs stored exclusively in `(d, z)` seed form (§17, §8.3 note). The device's X-Wing
+  decapsulation seed is `BLAKE3::derive_key("secsec-xwing-seed-v1", ed25519_private_seed)` — derived
+  from the raw 32-byte Ed25519 **seed**, **NOT** the clamped scalar `a = clamp(SHA-512(seed)[..32])`.
+  This is load-bearing for the post-quantum property: a quantum adversary recovers `a` from the
+  device's *public* Ed25519 key via Shor (discrete log), so deriving the X-Wing seed from `a` would let
+  that adversary reconstruct the whole X-Wing secret — including the ML-KEM half — from public data and
+  break the harvested keyslot. The Ed25519 seed is quantum-hard to recover from the public key (SHA-512
+  preimage), so the ML-KEM private key stays secret against a quantum attacker. The X25519 half may be
+  broken by Shor (its public is birationally derivable from the Ed25519 public), but X-Wing remains
+  IND-CCA on the ML-KEM half alone — that is exactly what hybrid buys.
 
 Authenticity does **not** rest on the wrap (a wrap-to-pubkey is forgeable by anyone): it rests on
 the **`mk_commit` check** in §7 step 3. A forged keyslot decrypts to a key that fails the

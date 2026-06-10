@@ -154,17 +154,22 @@ impl DeviceKey {
     }
 
     /// The device's **X-Wing decapsulation-key seed** (§8.3/§17): `BLAKE3::derive_key(
-    /// "secsec-xwing-seed-v1", device_ed25519_scalar_clamped)`. Derived from the **private** clamped
-    /// scalar — never the public key — so under "the SSH key is the only credential" (§1) the device's
-    /// hybrid-PQ keypair needs **no extra stored material**: it is re-derived at runtime, exactly like
-    /// [`Self::local_seal_key`]. The caller builds `secsec_pq::XWingSecret::from_seed(seed)`; the
-    /// resulting X-Wing public key is published in the roster (`AddDevice`/`Genesis`, §8.3) so a
-    /// granter can wrap `master_key_g` to it.
+    /// "secsec-xwing-seed-v1", ed25519_private_seed)`. Under "the SSH key is the only credential" (§1)
+    /// the device's hybrid-PQ keypair needs **no extra stored material** — re-derived at runtime.
+    ///
+    /// **Critically, this derives from the raw 32-byte Ed25519 *seed*, NOT the clamped scalar
+    /// `a = clamp(SHA-512(seed)[..32])`** ([`Self::x25519_secret`]). The scalar is what a quantum
+    /// adversary recovers from the device's *public* Ed25519 key via Shor (discrete log), so deriving
+    /// the PQ keyslot key from it would let that adversary reconstruct the X-Wing secret from public
+    /// data alone — voiding the post-quantum property. The seed is not recoverable from the public key
+    /// (SHA-512 preimage resistance, quantum-hard), so the ML-KEM half of X-Wing stays secret against a
+    /// quantum attacker. The caller builds `secsec_pq::XWingSecret::from_seed(seed)`; the X-Wing public
+    /// key is published in the roster (`AddDevice`/`Genesis`, §8.3) so a granter can wrap to it.
     pub fn xwing_seed(&self) -> Result<Zeroizing<[u8; 32]>, SigError> {
-        let scalar = self.x25519_secret()?;
+        let seed = self.ed25519_seed()?;
         Ok(Zeroizing::new(blake3::derive_key(
             "secsec-xwing-seed-v1",
-            scalar.as_slice(),
+            seed.as_slice(),
         )))
     }
 
