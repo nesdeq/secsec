@@ -25,10 +25,21 @@ the QUIC adapter (`quic.rs`, over `secsec-transport`) is a thin layer on top.
 - **`gc`** (§15) — `gc_collect`, the arrival-receipt log (`parse_receipt_log` / `serialize_receipt_log`
   / `merge_receipts`), `gc_gen_from_log` / `gc_gen_from_receipts`, `put_epoch_from_log`,
   `GC_GRACE_WINDOW_SECS`, `GcOutcome`. (Driven automatically from the `sync` loop — no `gc` command.)
-- **`multiremote`** (§14) — `quorum_put_objects`, `reconcile_roster_tips`, `detect_head_rollback`.
-- **`gossip`** (§10) — `cross_remote_fork_scan`, `check_peer_head`, the fork-event log.
-- **`enroll`** (§7/§9.6) — the rate-limit for the lower-level **direct-grant** primitive
-  (`record_grant_attempt`, `MAX_GRANT_SESSIONS_PER_HOUR`); the shipped invite-pairing path in `pair`
-  bounds online guessing by the single-use code + mailbox TTL instead.
 - **`watcher`** — `notify`-driven debounced change ticks for live sync.
 - Frontier persistence: `load_frontier` / `save_frontier` (§8.5), `Receipt`, `Remote`, `ClientError`.
+
+### ⚠️ NOT WIRED — built, tested, no CLI caller
+
+These three modules are complete and unit-tested but **no `secsec` command invokes them** (each carries
+a `NOT WIRED` banner at the top of its source). They are kept as the intended next surface, not deleted.
+
+- **`multiremote`** (§14, P15) — `quorum_put_objects`, `reconcile_roster_tips`, `detect_head_rollback`.
+  **Purpose:** durability against a *malicious* server — replicate to ≥2 servers, retain until a quorum
+  passes put→get→verify, and cross-check sigchain/head across remotes to expose one hiding a revocation.
+  `secsec sync` is single-remote, so none of it runs; wiring needs a multi-server CLI/link.
+- **`gossip`** (§10) — `cross_remote_fork_scan`, `check_peer_head`, the fork-event log. **Purpose:**
+  shrink the fork-detection window across remotes/peers. The *same-server* DAG fork check IS wired (in
+  the merge path); this is the cross-remote/device extension on top.
+- **`enroll`** (§7/§9.6) — `record_grant_attempt`, `MAX_GRANT_SESSIONS_PER_HOUR`. **Purpose:** the rate
+  limit for the lower-level **direct SAS grant** (`repo::grant_device` + `secsec-roster::sas_*`), which
+  invite-code pairing superseded; pairing's single-use code + mailbox TTL need no such limit.

@@ -210,7 +210,8 @@ fn read_link(sdir: &Path) -> Option<Link> {
             rtip = parse_hex32(v).ok();
         }
     }
-    // The anchor is present only once a successful open has recorded it (older links omit it → None).
+    // None until the first successful cold-start records one (there is nothing to roll back against
+    // on the very first open of a folder — the create/join itself establishes the anchor).
     let anchor = match (rseq, rtip) {
         (Some(max_seq), Some(tip_hash)) => Some(RosterAnchor { max_seq, tip_hash }),
         _ => None,

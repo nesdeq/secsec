@@ -1,5 +1,18 @@
 //! §7 enrollment rate-limiting — the grant-attempt log (`secsec-Design.md` §7, §19).
 //!
+//! ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+//! │ **NOT WIRED.** No `secsec` CLI command calls this. It is the rate limit for the *direct*      │
+//! │ SAS grant ([`secsec_roster::sas_commit`] + [`crate::repo::grant_device`]), which the shipped   │
+//! │ enrollment path — **invite-code pairing** ([`crate::pair`]) — superseded. Pairing needs no     │
+//! │ such limit: the invite is a single-use 96-bit code behind the mailbox TTL and the              │
+//! │ `authorized_keys` gate, so there is no ~20-bit SAS to grind.                                   │
+//! │                                                                                             │
+//! │ **Purpose (Design §7/§19):** if a deployment ever uses the direct SAS grant instead of an      │
+//! │ invite, the granter MUST cap attempts per joining key to bound a relay's blind guesses at the  │
+//! │ ~20-bit SAS. Kept as the primitive for that path; the SAS crypto itself lives in              │
+//! │ `secsec-roster`. Delete both together if the direct-grant path is ever dropped.               │
+//! └──────────────────────────────────────────────────────────────────────────────────────────┘
+//!
 //! The granting device E MUST allow at most [`MAX_GRANT_SESSIONS_PER_HOUR`] SAS/grant sessions per
 //! `D_pubkey` per rolling hour, tracked in **E's local state**, independent of sigchain operations
 //! (§7). This bounds a relay's blind-guess attempts against the ~20-bit SAS: without it, a relay that

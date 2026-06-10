@@ -21,9 +21,9 @@ contents, names, structure, or sizes beyond a bounded, documented residual. The 
 The authoritative specification is [`secsec-Design.md`](secsec-Design.md); the build plan, crate
 layout, risk register, and status are in [`secsec-Implementation.md`](secsec-Implementation.md).
 
-> **Status / maturity.** Feature-complete for v1 and exercised end-to-end with real processes
+> **Status / maturity.** Feature-complete and exercised end-to-end with real processes
 > (multiple clients converging through a blind server, including a concurrent-edit three-way merge,
-> with a zero-plaintext-leak check on the server store). The v1 CLI is **single-remote**: multi-remote
+> with a zero-plaintext-leak check on the server store). The CLI is **single-remote**: multi-remote
 > quorum durability and gossip fork-detection exist in library code but are not surfaced by any command
 > (see the Design §2 scope note). It has **not** had an independent professional cryptographic review —
 > do not trust it with irreplaceable data until it has (see `secsec-Implementation.md` §8).

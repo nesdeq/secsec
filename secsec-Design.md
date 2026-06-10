@@ -31,24 +31,25 @@ The build plan, status, and assurance strategy live in `secsec-Implementation.md
 - Multi-tenant hosting; provider-side search/indexing.
 - Hiding the bounded metadata of §4.3 (sizes/timing/equality) — reduced, not eliminated.
 
-> **v1 CLI surface — what the shipped binary exercises (normative scope).** This spec describes the
-> full protocol; the v1 `secsec` binary exercises a **single-remote** subset of it. Three families of
-> mechanism are implemented in library code and unit-tested but are **NOT reachable from any of the
-> five CLI commands** (`serve · sync · invite · devices · revoke`), so a binary user does **not** get
-> the guarantees that rest on them:
+> **CLI surface — what the shipped binary exercises (normative scope).** This spec describes the
+> full protocol; the `secsec` binary exercises a **single-remote** subset of it. Three families of
+> mechanism are implemented in library code and unit-tested but are **NOT WIRED — no CLI command calls
+> them** (`serve · sync · invite · devices · revoke`), so a user of the binary does **not** get the
+> guarantees that rest on them. They are kept (not deleted) because they are correct, tested, and the
+> intended next surface; each is labelled `NOT WIRED` in its module and its purpose is below:
 > - **Multi-remote durability & cross-remote checks (§14; P15; the cross-remote halves of P8/P13).**
 >   `secsec sync` takes one `--server`; quorum `put→get→verify`, cross-remote sigchain reconciliation,
 >   and cross-remote head-rollback alarms (`secsec-client::multiremote`) have no CLI surface. Durability
->   for a v1 user is "one server + local retention," not a ≥2-remote quorum.
+>   for a user of the binary is "one server + local retention," not a ≥2-remote quorum.
 > - **Gossip / device-to-device fork detection (§10).** The `gossip` module is unwired; fork detection
->   for a v1 user is the **same-server** DAG-incomparable check in the merge path (which *is* wired),
+>   for a user of the binary is the **same-server** DAG-incomparable check in the merge path (which *is* wired),
 >   not the gossip/multi-remote window-shrinking the prose describes.
 > - **Raising the algorithm floor via `SetMinAlgo` (§16; the upgrade clause of P13).** The sigchain can
 >   *fold* a `SetMinAlgo` entry and the cold-start floor *is* enforced, but no CLI command *creates*
->   one. This is intentional for v1: X-Wing is the only keyslot algorithm, so there is nothing to raise
+>   one. This is intentional for now: X-Wing is the only keyslot algorithm, so there is nothing to raise
 >   the floor *to* until a second PQ KEM ships.
 >
-> Rows and sections below that depend on these are tagged "**(v1: library-only — see scope note)**".
+> Rows and sections below that depend on these are tagged "**(not wired — see §2)**".
 > The **single-remote** guarantees — zero-knowledge (P1–P3), authentication/authorization (P4–P5),
 > revocation + forward secrecy (P6/P11), **single-remote anti-rollback** (P7/P8, wired and tested),
 > PQ keyslots (P17/§17), and channel-bound transport (P9/P12) — all hold for the binary user.
@@ -83,19 +84,19 @@ Each row is a guarantee and the mechanism that earns it. Residuals in §22.
 | P5 | A connection ≠ the ability to read or write; unlisted keys cannot even connect, and listed-but-unenrolled keys are rejected before any data access | **Two layers:** (a) the server refuses any connection from a key absent from `~/.ssh/authorized_keys`, re-read per connection (§11); (b) every repo RPC — including reads — requires a per-op signature from a **keyslot-owning** (rostered) key; server MUST verify keyslot existence at /keyslots/\<device_id\>/\<g\> on every per-op request, not only at connection time (§9.6, §11, §12). A revoked device with an open connection can still issue requests until keyslot deletion is checked — on cooperative servers the re-check window is ≤ the server-nonce TTL (60 s, §19); on a malicious server, keyslot deletion cannot be enforced (residual §22) |
 | P6 | Revocation removes access to data created after rotation (forward secrecy) | revoke ⇒ rotate: new master-key generation, re-wrap to remaining devices, delete keyslot; pre-rotation ciphertext remains a residual (§8.4, §22) |
 | P7 | Revocations cannot be lost or rolled back **by the untrusted server** | Roster is an append-only, hash-chained, signed sigchain with succession + frontier (§8). (Eviction of the legitimate device by a *compromised, online* peer racing the CAS is a separate adversary — the concurrent mutual-revocation residual, §22.) |
-| P8 | Rollback/replay of sigchain state is detected; cross-remote rollback of per-ref heads and sigchain is alarmed; fork evidence is computed and alarmed when two devices exchange commits with DAG-incomparable last_seen_head values | Monotonic, signed frontiers on every counter; local frontier sealed with a key derived from **private** key material (§8.5, requires device_ed25519_scalar_clamped, not the public key); rollback-aware merge (§8.5, §10); the same-server sigchain anti-rollback (persisted seq + tip-hash anchor, §8.1) is **wired and tested** in the v1 CLI; the cross-remote head-rollback alarm (§14) is **v1: library-only — see scope note**; fork detection algorithm in §10 fires when received last_seen_head is DAG-incomparable to client head (the same-server DAG check is wired; gossip-based window-shrinking is library-only) |
+| P8 | Rollback/replay of sigchain state is detected; cross-remote rollback of per-ref heads and sigchain is alarmed; fork evidence is computed and alarmed when two devices exchange commits with DAG-incomparable last_seen_head values | Monotonic, signed frontiers on every counter; local frontier sealed with a key derived from **private** key material (§8.5, requires device_ed25519_scalar_clamped, not the public key); rollback-aware merge (§8.5, §10); the same-server sigchain anti-rollback (persisted seq + tip-hash anchor, §8.1) is **wired and tested** in the CLI; the cross-remote head-rollback alarm (§14) is **not wired to the CLI — see §2**; fork detection algorithm in §10 fires when received last_seen_head is DAG-incomparable to client head (the same-server DAG check is wired; gossip-based window-shrinking is library-only) |
 | P9 | No cross-protocol signature reuse | Disjoint SSHSIG namespaces; server-chosen nonces confined to `auth`/`write` (§9.5) |
 | P10 | No catastrophic AEAD misuse / key-confusion for object, keyslot, and key-history wraps | Unique per-object key, fixed nonce, CMT-4 committing AEAD via CTX construction (§9.4); key-history wrap (§8.2) uses CTX pattern with ctx_tag_keyhist = BLAKE3::keyed_hash(k_keyhist_g, "secsec-ctx-v1" ‖ AD_keyhist ‖ T), binding master_key_g as plaintext |
 | P11 | Forward secrecy after revocation | Post-rotation data uses a new generation the revoked device cannot derive (§8.4) |
 | P12 | Transport is authenticated without a CA; first-contact TOFU window is a documented residual | TLS 1.3 to a pinned self-signed host key (TOFU on the first `sync`, fingerprint printed for out-of-band confirmation, then persisted in the folder link), channel-bound auth (§11); the pin rests on that one-time confirmation — the first-contact TOFU window is a residual (§22). A *joining* device additionally checks `host_id` under the invite-code MAC (§7) |
-| P13 | No algorithm/format downgrade once a `SetMinAlgo` entry has been received | Pinned TLS & signature algorithms; `SetMinAlgo` floor in the sigchain enforced on every fetched keyslot (not only at creation) **[wired]**; compile-time floor (§16) **[wired]**; withheld-entry detection via multi-remote cross-check (§14, §22) is **v1: library-only — see scope note**. (No v1 CLI command *creates* a `SetMinAlgo` entry — intentional while X-Wing is the only algorithm, §16.) |
+| P13 | No algorithm/format downgrade once a `SetMinAlgo` entry has been received | Pinned TLS & signature algorithms; `SetMinAlgo` floor in the sigchain enforced on every fetched keyslot (not only at creation) **[wired]**; compile-time floor (§16) **[wired]**; withheld-entry detection via multi-remote cross-check (§14, §22) is **not wired to the CLI — see §2**. (No the CLI command *creates* a `SetMinAlgo` entry — intentional while X-Wing is the only algorithm, §16.) |
 | P14 | No server-stored recovery blob to crack; lockout is avoided by backing up the SSH key, not a second secret | The SSH key is both credential and backup. A device holding it is a full plaintext replica; a reinstalled one re-joins via an invite from any peer (§7). Losing *every* device **and** the SSH key is unrecoverable by construction — the §22 total-loss residual. (A passphrase-wrapped recovery keyslot on an untrusted server was considered and **removed** as a net liability: it adds an offline-crackable, server-exfiltratable target for a backup the SSH key already provides.) |
-| P15 | Durability despite a hostile server **(v1: library-only — see scope note)** | Content-addressed replication to ≥2 remotes; client retains until quorum-confirmed via put→get→verify round-trip on each remote (§14). **The v1 CLI is single-remote**, so a binary user's durability is local retention against one server, not a ≥2-remote quorum |
+| P15 | Durability despite a hostile server **(not wired — see §2)** | Content-addressed replication to ≥2 remotes; client retains until quorum-confirmed via put→get→verify round-trip on each remote (§14). **The the CLI is single-remote**, so a binary user's durability is local retention against one server, not a ≥2-remote quorum |
 
 ---
 ## 5. Identifiers & trust anchor
 
-- **Device key** — an **Ed25519** SSH keypair per device (v1 is Ed25519-only; RSA was dropped from
+- **Device key** — an **Ed25519** SSH keypair per device (Ed25519-only; RSA was dropped from
   scope). Roles: *sign* (SSHSIG; agent/hardware OK) and *unwrap* (the X-Wing keyslot's X25519 half
   is derived from the Ed25519 key — §8.3 — so unwrap needs the private key as a file; agent/FIDO
   cannot do it). `ecdsa`/`sk-*`/RSA keys do not parse → enrollment-incapable.
@@ -116,7 +117,7 @@ Each row is a guarantee and the mechanism that earns it. Residuals in §22.
   server.
   - `host_id = BLAKE3(canonical(server pinned SPKI bytes))`, where the SPKI bytes are the
     SubjectPublicKeyInfo DER encoding of the pinned server certificate public key (QUIC/TLS — the
-    single v1 transport).
+    the only transport).
 - **RFP (Repository FingerPrint)** := `BLAKE3(canonical(genesis sigchain entry))`. The genesis
   transitively commits to device-1's key and to `mk_commit_1`. **RFP is the one out-of-band
   anchor**: established when the first device creates the repo, and delivered to each joining
@@ -264,7 +265,7 @@ ops: Genesis | AddDevice | RevokeDevice | Rotate | SetMinAlgo
   under prior trust, so it is out of scope; a child grant trivially post-dates its parent and is
   always in scope.)
 - **Anti-rollback:** clients persist `(max seq, tip hash)` and reject any chain shorter than
-  their frontier or whose genesis ≠ pinned RFP. **(Wired in the v1 CLI:** the cold-start
+  their frontier or whose genesis ≠ pinned RFP. **(Wired in the CLI:** the cold-start
   (`open_repo_remote`) carries a persisted [`RosterAnchor`] — the highest accepted seq and the BLAKE3
   of the *stored* (deterministic, sealed) entry blob at that seq — in the per-folder link, and refuses
   a fetched chain that does not extend it. The stored-blob hash is used instead of the decoded
@@ -446,7 +447,7 @@ stored encrypted in a local state file, sealed under a key derived solely from t
 private key — no server contact required to unseal:
 
 ```
-// Ed25519 device key (v1 is Ed25519-only): derive from the private scalar (never published)
+// Ed25519 device key (Ed25519-only): derive from the private scalar (never published)
 local_seal_key = BLAKE3::derive_key("secsec-local-seal-v1",
                                     device_ed25519_scalar_clamped)
 ```
@@ -653,7 +654,7 @@ cold-start fold (§8.1 step 1) reads to learn `g_cur`.
 ### 9.6 Signatures & domain separation
 
 Every signature is an SSHSIG with a **disjoint namespace**; the client never signs server-supplied
-bytes raw. Algorithm pinned to `ssh-ed25519` (v1 is Ed25519-only) — no alg downgrade. **The
+bytes raw. Algorithm pinned to `ssh-ed25519` (Ed25519-only) — no alg downgrade. **The
 verifier MUST reject any SSHSIG blob whose `sig_algorithm` field is not exactly `ssh-ed25519`. Any
 other algorithm field MUST cause verification failure regardless of cryptographic validity.**
 
@@ -822,10 +823,10 @@ The §8.5 local sealed-state blob uses this same construction with `key = local_
       as above.
   (3) The tuple (H_A, H_B, C_B.device_id, wall-clock timestamp of detection) MUST be persisted
       in the local event log for user review regardless of whether the user has yet acknowledged.
-  The same-server DAG-incomparable check above **is wired** in the v1 merge path. **Gossip** of head
+  The same-server DAG-incomparable check above **is wired** in the merge path. **Gossip** of head
   hashes (when devices can reach each other, and via multi-remote cross-check, §14) would shrink the
-  detection window further but is **v1: library-only — see the §2 scope note** (the `gossip` module is
-  not invoked by any CLI command), so a v1 user's fork detection is the same-server check, not gossip.
+  detection window further but is **not wired to the CLI — see §2** (the `gossip` module is
+  not invoked by any CLI command), so a user of the binary's fork detection is the same-server check, not gossip.
 - **Live trigger:** `notify` (inotify/FSEvents/ReadDirectoryChangesW) drives commit-on-change;
   periodic commits set the snapshot cadence.
 
@@ -1044,12 +1045,12 @@ user's working directory.
 ---
 ## 14. Multi-remote durability (replicas, not new forks)
 
-> **v1: library-only — see the §2 scope note.** The whole of §14 is implemented in
-> `secsec-client::multiremote` and unit-tested, but **no v1 CLI command exercises it**: `secsec sync`
+> **not wired to the CLI — see §2.** The whole of §14 is implemented in
+> `secsec-client::multiremote` and unit-tested, but **no the CLI command exercises it**: `secsec sync`
 > takes a single `--server`. Every "the client MUST query ALL reachable remotes" requirement below is
-> therefore normative for the *library* and for a future multi-remote CLI, not for the v1 binary, whose
+> therefore normative for the *library* and for a future multi-remote CLI, not for the binary, whose
 > durability is local retention against one server (P15). This section is retained in full because the
-> mechanism is built and is the intended v1.x surface.
+> mechanism is built and is the intended next surface.
 
 Remotes are pure **content-addressed replicas**. Objects are immutable & content-addressed →
 pushing the same object to N remotes is idempotent and safe; only the mutable refs need
@@ -1185,7 +1186,7 @@ sync loop.
 - TLS ciphersuites/KX and SSHSIG signature algorithm are **fixed**, not negotiated.
 - A **compile-time absolute floor** rejects any `algo_id`/`format_version` below the minimum the
   build supports.
-- A **`SetMinAlgo` sigchain entry** raises the floor repo-wide after an upgrade. **(v1: library-only —
+- A **`SetMinAlgo` sigchain entry** raises the floor repo-wide after an upgrade. **(not wired to the CLI —
   the fold and the per-fetch floor enforcement are wired, but no CLI command creates a `SetMinAlgo`
   entry; intentional while X-Wing is the only keyslot algorithm — see the §2 scope note.)** `min_algo` is
   checked against the `algo_id` of **every fetched keyslot**, not only at keyslot creation time.
@@ -1286,10 +1287,10 @@ keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today.
 | Per-key write rate | 100 MB/s sustained, burst 1 GiB | server MUST enforce after auth |
 | Per-key read rate | 200 MB/s sustained | server MUST enforce after auth; matches 2× write rate to allow sync catch-up without unbounded egress |
 | Connection rate limit | 10 new/s per source IP; 3 concurrent per authenticated key | server MUST enforce |
-| Device key algorithm | **Ed25519 only** | RSA/ECDSA/`sk-*` keys are rejected at parse (v1 scope) |
+| Device key algorithm | **Ed25519 only** | RSA/ECDSA/`sk-*` keys are rejected at parse (scope) |
 | Connection gate | `~/.ssh/authorized_keys`, re-read per connection, fail-closed | mandatory — `secsec serve` refuses to start without a usable key (§11, §12) |
 | Keyslot KEM (mandatory) | **X-Wing** (ML-KEM-768 ⊕ X25519, draft-connolly-cfrg-xwing-kem-10), `algo_id = 2`; CTX AEAD AD = "secsec-keyslot-v1" ‖ canonical(device_id) ‖ le32(gen); device X-Wing seed = `derive_key("secsec-xwing-seed-v1", ed25519_seed)` | post-quantum mandatory — the only keyslot algorithm; classical X25519/HPKE removed (§8.3). Floor enforced at cold-start (§16) |
-| Durability quorum | 2 remotes (put→get→verify round-trip each) | availability under hostile server. **v1: library-only** — the CLI is single-remote (§2 scope note) |
+| Durability quorum | 2 remotes (put→get→verify round-trip each) | availability under hostile server. **not wired** — the CLI is single-remote (§2 scope note) |
 | Retention | keep-all; prune opt-in | no silent deletion |
 | Invite code length | 96 bits (12 bytes, OS CSPRNG), single-use; displayed as dash-grouped lowercase hex | the §7 out-of-band pairing secret; single-use + the mailbox TTL + the `authorized_keys` gate bound online guessing. Replaces the older 20-bit human-compared SAS |
 | Pairing mailbox TTL (`PAIR_TTL`) | 600 s | server-side lifetime of an invite-pairing slot; an expired or consumed slot ends the exchange (§7, §12) |
@@ -1339,14 +1340,14 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
 
 - **Reinstall freshness.** A device that loses *all* local frontier state can still verify
   **authenticity** (RFP + `mk_commit`, §7) but cannot alone prove it was served the *latest* head.
-  Mitigation: gossip / multi-remote cross-check (§10, §14) — **but both are v1: library-only (§2 scope
-  note)**, so for a v1 binary user this residual applies on every reinstall until another device
+  Mitigation: gossip / multi-remote cross-check (§10, §14) — **but both are not wired to the CLI (§2 scope
+  note)**, so for a user of the binary this residual applies on every reinstall until another device
   reconverges on the same server, not only to a sole-device-no-peer case. (A reinstall is also surfaced
   to the user as the §8.5 lost-frontier alarm.) The SUNDR lower bound is the floor either way.
 
 - **Sustained-partition fork detection** is *delayed*, not prevented (SUNDR). Mitigation: the
   same-server DAG check (wired) detects on reconvergence; gossip + replicas would shrink the window but
-  are **v1: library-only (§2 scope note)**. Detection is still guaranteed on any reconvergence.
+  are **not wired to the CLI (§2 scope note)**. Detection is still guaranteed on any reconvergence.
 
 - **Total credential loss.** A user who loses *every* enrolled device **and** every backup of the
   SSH key cannot recover — information-theoretic. Mitigation: back up the SSH private key (the one

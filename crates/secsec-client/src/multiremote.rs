@@ -1,5 +1,20 @@
 //! Multi-remote durability & reconciliation (`secsec-Design.md` §14, security property P15).
 //!
+//! ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+//! │ **NOT WIRED.** No `secsec` CLI command calls anything in this module — `secsec sync` takes  │
+//! │ a single `--server`. This is a complete, tested implementation with no caller.              │
+//! │                                                                                             │
+//! │ **Purpose (Design §14 / P15):** durability against a *malicious* server (the primary        │
+//! │ adversary). A server can refuse or delete; the defence is replicating to ≥2 independent      │
+//! │ servers and retaining local objects until a quorum has each passed put→get→verify, plus      │
+//! │ cross-remote checks that expose a server hiding a revocation (shorter sigchain) or serving a  │
+//! │ stale head. Until this is wired, durability is "your one server + your backups of it."       │
+//! │                                                                                             │
+//! │ **To wire it:** let the CLI take N servers (link + `--server` repeatable), connect to each,   │
+//! │ and in the sync loop call [`reconcile_roster_tips`] / [`detect_head_rollback`] before         │
+//! │ adopting state and [`quorum_put_objects`] on push. The primitives below are ready for that.   │
+//! └──────────────────────────────────────────────────────────────────────────────────────────┘
+//!
 //! Remotes are pure content-addressed **replicas**; the client is the sole reconciler. This module
 //! provides the three §14 primitives, built on the [`Remote`] abstraction:
 //!

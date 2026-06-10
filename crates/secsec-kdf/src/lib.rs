@@ -319,8 +319,8 @@ mod tests {
 
     /// Frozen known-answer vectors for `master_key = [0x11; 32]`. These pin the exact derivation
     /// outputs so any future change to labels/encodings is caught (the §9.5 "test vectors must be
-    /// provided" requirement). Captured from this implementation; will migrate to `vectors/` at
-    /// M0 wrap, and serve as cross-impl vectors thereafter.
+    /// provided" requirement). Exported to `vectors/secsec-kat-v1.txt [kdf]` and cross-checked by
+    /// `cargo xtask vectors --check`, so the inline test and the committed export can never drift.
     #[test]
     fn kat_frozen() {
         let g1 = MasterKey::new(1, MK);

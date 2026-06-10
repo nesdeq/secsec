@@ -1,5 +1,19 @@
 //! Cross-remote fork detection (`secsec-Design.md` §10 fork algorithm, §14 multi-remote cross-check).
 //!
+//! ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+//! │ **NOT WIRED.** No `secsec` CLI command calls anything in this module. The fork *detection*   │
+//! │ a single-server user gets is the **same-server DAG-incomparable check** in the merge path     │
+//! │ ([`secsec_sync::rollback::fork_check`] via [`crate::sync_ref`]), which IS wired. This module   │
+//! │ adds the **cross-remote / device-to-device** scan and the §10 step-3 audit log on top.        │
+//! │                                                                                             │
+//! │ **Purpose (Design §10):** shrink the fork-detection window. A fork (two devices writing       │
+//! │ DAG-incomparable heads while partitioned) is *resolved* by the wired three-way merge          │
+//! │ regardless; this would *detect + log* it sooner by comparing heads across remotes/peers.       │
+//! │                                                                                             │
+//! │ **To wire it:** call [`cross_remote_fork_scan`] in the sync loop (needs multi-remote, above)   │
+//! │ or [`check_peer_head`] over a device-to-device channel, and persist [`ForkEvent`]s for review. │
+//! └──────────────────────────────────────────────────────────────────────────────────────────┘
+//!
 //! "Gossip" of head hashes shrinks the fork-detection window: when two devices write to different
 //! remotes while partitioned, their per-ref heads become **DAG-incomparable** (neither an ancestor of
 //! the other). [`cross_remote_fork_scan`] fetches each remote's head for a ref, brings its commit

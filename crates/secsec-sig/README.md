@@ -8,7 +8,7 @@ public-key encoding, so the id is cryptographically bound to the key (§5). All 
 and checked on verify, so a signature for one purpose is invalid for any other — the
 "server-sets-the-challenge" forgery is impossible.
 
-v1 is **Ed25519-only**: this crate enables only `ssh-key`'s `ed25519` feature, so non-Ed25519 keys do
+**Ed25519-only**: this crate enables only `ssh-key`'s `ed25519` feature, so non-Ed25519 keys do
 not parse, and `DevicePublic::verify` additionally rejects any non-Ed25519 key or signature algorithm
 (the §9.6 downgrade guard).
 

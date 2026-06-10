@@ -5,7 +5,7 @@
 //! OpenSSH "sshsig" with a **distinct namespace** per purpose (§9.6); the namespace is carried in
 //! the signature and checked on verify, so a signature for one purpose is invalid for any other.
 //!
-//! v1 is **Ed25519-only**: this crate enables only `ssh-key`'s `ed25519` feature, so non-Ed25519
+//! **Ed25519-only**: this crate enables only `ssh-key`'s `ed25519` feature, so non-Ed25519
 //! keys do not parse, and [`DevicePublic::verify`] additionally rejects any non-Ed25519 key or
 //! signature algorithm (the §9.6 downgrade guard).
 
@@ -42,7 +42,7 @@ const SIG_HASH: HashAlg = HashAlg::Sha512;
 pub enum SigError {
     /// Underlying `ssh-key` error.
     Ssh(ssh_key::Error),
-    /// The key or signature is not Ed25519 (v1 is Ed25519-only; §9.6 downgrade guard).
+    /// The key or signature is not Ed25519 (Ed25519-only; §9.6 downgrade guard).
     NotEd25519,
     /// Signature verification failed (bad signature, wrong key, or wrong namespace).
     VerifyFailed,

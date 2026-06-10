@@ -12,7 +12,7 @@ cores, phased milestones, and the current build status. It does not restate the 
 > implementation gets an **independent professional cryptographic review before it touches real
 > data**. This plan gets us to audit-*ready*; it does not replace the audit.
 
-**v1 scope (locked 2026-06-09; RSA/WebDAV/stdio dropped 2026-06-10):** transport is **QUIC/TLS-only**
+**Scope (locked 2026-06-09; RSA/WebDAV/stdio dropped 2026-06-10):** transport is **QUIC/TLS-only**
 — the stdio/SSH mode was cut from code *and* spec (it adds nothing over the pinned QUIC host key, §11).
 Device keys are **Ed25519-only** (RSA dropped from scope); targets are **Linux, macOS, Windows**.
 **WebDAV browse is dropped.** Implications: the custom QUIC verifier (R1) is the *sole* transport-auth
@@ -225,7 +225,7 @@ No OpenSSL anywhere.
 
 - **18 crates + `secsec` binary** (+ `xtask` tooling, `fuzz/` cargo-fuzz layout) · **253 tests** ·
   clippy `-D warnings` + fmt clean · spec ↔ code ↔ doc consistent. (The `secsec-recovery` crate was
-  removed in the 2026-06-10 UX redesign.) The v1 CLI is **single-remote**; multi-remote/quorum and
+  removed in the 2026-06-10 UX redesign.) The the CLI is **single-remote**; multi-remote/quorum and
   gossip are library-complete but not surfaced (Design §2 scope note) — this is the *only* place the
   library exceeds the CLI, and it is now explicitly tagged everywhere in the spec.
 - **Transport is QUIC/TLS-only.** RSA device keys, WebDAV, and the stdio/SSH transport were **dropped
@@ -253,7 +253,7 @@ No OpenSSL anywhere.
 | M4 Transport | QUIC pinned verifier, §12 wire + server pipeline, `authorized_keys` gate, limits | ✅ done |
 | M5 Live sync | watcher, concurrent multi-client, clone/publish/pull/merge, genesis create, frontier seal, continuous `sync` | ✅ done |
 | M6 Durability | frontier seal, sigchain anti-rollback (wired), min-algo enforce, automatic GC | ✅ done (single-remote) |
-| M6′ Multi-remote | quorum, cross-remote reconcile, gossip fork-detect | ⚠️ library-complete, **not surfaced in v1 CLI** (single `--server`; see Design §2 scope note) |
+| M6′ Multi-remote | quorum, cross-remote reconcile, gossip fork-detect | ⚠️ library-complete, **not surfaced in the CLI** (single `--server`; see Design §2 scope note) |
 | M7 PQ keyslot | X-Wing (mandatory), full algo_id/keyslot integration | ✅ done |
 
 ### Risks — all closed
@@ -297,7 +297,7 @@ fold/cold-start · R6 GC · R7 canonical encoding · R8 keyed-CDC.
   seq + BLAKE3 of the stored tip blob) in the per-folder link and refuses a fetched chain that does not
   extend it — closing sigchain rollback by a malicious server. Tested in `network_enroll`
   (truncation + tip-tamper both rejected).
-- **§14/§10 multi-remote + gossip — ⚠️ library-only, NOT surfaced in v1:** quorum put→get→verify,
+- **§14/§10 multi-remote + gossip — ⚠️ NOT WIRED (built, no CLI caller):** quorum put→get→verify,
   cross-remote sigchain reconciliation, gossip fork detection all exist in `multiremote.rs` / `gossip.rs`
   and pass their unit tests, but **no CLI command invokes them** (`secsec sync` is single-remote). A v1
   binary user gets single-remote durability + the same-server DAG fork check, not quorum/gossip. This
@@ -321,9 +321,9 @@ fold/cold-start · R6 GC · R7 canonical encoding · R8 keyed-CDC.
     the conflicting files.
   - **Server DoS (§19/§8.1 "MUST enforce", were unwired):** per-key read byte-rate, the 60/hr
     sigchain-append-per-connection cap, and the 10 000-entry total-sigchain cap are now enforced.
-  - **Docs honesty:** added the Design §2 **v1 CLI scope note** and tagged every multi-remote (§14,
+  - **Docs honesty:** added the Design §2 **CLI scope note** and tagged every multi-remote (§14,
     P15), gossip (§10, P8 cross-remote), and `SetMinAlgo`-creation (§16, P13) claim as
-    "**v1: library-only**" — these are built + tested but unreachable from the 5-command CLI.
+    "**not wired**" — these are built + tested but unreachable from the 5-command CLI.
   - Investigated + **dismissed** as non-issues: BUG-1 (receipt sig unverified) is defeated by the
     existing local-receipt-time GC gating; the X-Wing PCT non-CT compare is over the device's own keys.
   Gate after fixes: **253 tests, clippy `-D warnings`, fmt** all green.
