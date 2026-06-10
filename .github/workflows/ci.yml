@@ -2,6 +2,7 @@ name: ci
 
 on:
   push:
+    branches: ['**']   # all branches, but NOT tags — tag builds are release.yml's job
   pull_request:
 
 env:
