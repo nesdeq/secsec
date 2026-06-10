@@ -27,7 +27,7 @@ pub mod watcher;
 
 use secsec_engine::{merge_heads, CommitAuthor, MergeError, SyncAction};
 use secsec_frame::ObjType;
-use secsec_kdf::MasterKey;
+use secsec_kdf::{MasterKey, MasterKeys};
 use secsec_object::{open_object, Id, ObjError, PathSalt};
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
 use secsec_snapshot::{Entry, SnapError};
@@ -276,13 +276,13 @@ impl From<HeadError> for ClientError {
 /// The id set is the §15 keep-set closure (commit + ancestors + trees + chunks); each blob is read
 /// from the local store and `put`. Returns the per-object arrival [`Receipt`]s (for the caller to
 /// record toward `gc_gen`).
-pub async fn push_objects<R: Remote>(
+pub async fn push_objects<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
-    mk: &MasterKey,
+    keys: &K,
     commit_id: &Id,
 ) -> Result<Vec<(Id, Receipt)>, ClientError> {
-    let ids = secsec_snapshot::reachable_objects(mk, store, &[*commit_id])?;
+    let ids = secsec_snapshot::reachable_objects(keys, store, &[*commit_id])?;
     let mut receipts = Vec::with_capacity(ids.len());
     for id in &ids {
         let blob = store.get(id)?.ok_or(ClientError::MissingLocal(*id))?;
@@ -352,10 +352,10 @@ enum Work {
 /// discover its children, and each chunk is opened under its file's `path_salt`. A missing object is
 /// [`ClientError::MissingRemote`]. Idempotent: already-present objects are skipped. Returns the count
 /// fetched this call.
-pub async fn fetch_closure<R: Remote>(
+pub async fn fetch_closure<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
-    mk: &MasterKey,
+    keys: &K,
     commit_id: &Id,
 ) -> Result<usize, ClientError> {
     let mut seen: BTreeSet<Id> = BTreeSet::new();
@@ -381,14 +381,14 @@ pub async fn fetch_closure<R: Remote>(
         match item {
             Work::Commit(_) => {
                 // open_signed_commit re-verifies the content address and decodes (§9.2).
-                let (commit, _sig) = secsec_snapshot::open_signed_commit(&id, mk, store)?;
+                let (commit, _sig) = secsec_snapshot::open_signed_commit(&id, keys, store)?;
                 for p in &commit.parents {
                     work.push(Work::Commit(*p));
                 }
                 work.push(Work::Tree(commit.root_tree, commit.root_salt));
             }
             Work::Tree(_, salt) => {
-                let tree = secsec_snapshot::load_tree(&id, &salt, mk, store)?;
+                let tree = secsec_snapshot::load_tree(&id, &salt, keys, store)?;
                 for e in tree.entries {
                     match e {
                         Entry::File {
@@ -407,9 +407,11 @@ pub async fn fetch_closure<R: Remote>(
                 }
             }
             Work::Chunk(_, salt) => {
-                // Verify the chunk's content address (§9.2); leaf, no children.
+                // Verify the chunk's content address (§9.2); leaf, no children. `open_object` resolves
+                // the chunk's own generation from `keys` (§8.2), so a history that spans a rotation
+                // verifies under each object's authoring key.
                 let blob = store.get(&id)?.ok_or(ClientError::MissingLocal(id))?;
-                open_object(mk, ObjType::Chunk, &salt, &id, &blob)?;
+                open_object(keys, ObjType::Chunk, &salt, &id, &blob)?;
             }
         }
     }
@@ -420,22 +422,24 @@ pub async fn fetch_closure<R: Remote>(
 /// caller resolves the signer key), fetch the commit's object closure (verifying each object), verify
 /// the commit signature against `signer`, and restore the working tree to `dest`. Returns the head, or
 /// `None` if the ref is absent. (Cross-device merge of a divergent head is the next slice.)
-pub async fn pull_restore<R: Remote>(
+pub async fn pull_restore<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
-    mk: &MasterKey,
+    keys: &K,
     signer: &DevicePublic,
     ref_name: &str,
     dest: &Path,
 ) -> Result<Option<Head>, ClientError> {
-    let Some((head, sig, _blob)) = fetch_head(remote, mk, ref_name).await? else {
+    // The head is always at the current generation (its blob is sealed under the current `head_key_g`);
+    // the commit closure it points at may span generations, so reads route through `keys` (§8.2).
+    let Some((head, sig, _blob)) = fetch_head(remote, keys.current(), ref_name).await? else {
         return Ok(None);
     };
     verify_head(signer, &head, &sig)?;
-    fetch_closure(remote, store, mk, &head.commit_id).await?;
-    let (commit, csig) = secsec_snapshot::open_signed_commit(&head.commit_id, mk, store)?;
+    fetch_closure(remote, store, keys, &head.commit_id).await?;
+    let (commit, csig) = secsec_snapshot::open_signed_commit(&head.commit_id, keys, store)?;
     secsec_snapshot::verify_commit(signer, &commit, &csig)?;
-    secsec_snapshot::restore_commit_tree(&commit, mk, store, dest)?;
+    secsec_snapshot::restore_commit_tree(&commit, keys, store, dest)?;
     Ok(Some(head))
 }
 
@@ -483,10 +487,10 @@ pub struct SyncReport {
 // frontier / ref / commit / authorship) with no cohesive subgroup; a parameter object here would
 // only exist to satisfy the lint.
 #[allow(clippy::too_many_arguments)]
-pub async fn sync_ref<R: Remote>(
+pub async fn sync_ref<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
-    mk: &MasterKey,
+    keys: &K,
     members: &BTreeMap<DeviceId, DevicePublic>,
     frontier: &SyncFrontier,
     ref_name: &str,
@@ -496,12 +500,21 @@ pub async fn sync_ref<R: Remote>(
     let device: &DeviceKey = author.device;
     let roster_seq = author.roster_seq;
 
-    // 1. Fetch the remote head. Absent → we are the first writer for this ref.
-    let Some((remote_head, remote_sig, remote_blob)) = fetch_head(remote, mk, ref_name).await?
+    // 1. Fetch the remote head (current generation). Absent → we are the first writer for this ref.
+    let Some((remote_head, remote_sig, remote_blob)) =
+        fetch_head(remote, keys.current(), ref_name).await?
     else {
-        push_objects(remote, store, mk, our_commit).await?;
-        let (head, blob) =
-            push_head(remote, mk, device, ref_name, *our_commit, roster_seq, None).await?;
+        push_objects(remote, store, keys, our_commit).await?;
+        let (head, blob) = push_head(
+            remote,
+            keys.current(),
+            device,
+            ref_name,
+            *our_commit,
+            roster_seq,
+            None,
+        )
+        .await?;
         return Ok(SyncReport {
             action: SyncAction::FastForward {
                 commit_id: *our_commit,
@@ -512,10 +525,10 @@ pub async fn sync_ref<R: Remote>(
     };
 
     // 2. Resolve the signer (and thereby verify the head against a member key) and bring its closure
-    //    local so the DAG/merge can read both histories.
+    //    local so the DAG/merge can read both histories (across generations via `keys`, §8.2).
     let signer = resolve_head_signer(members, &remote_head, &remote_sig)
         .ok_or(ClientError::HeadNotMember)?;
-    fetch_closure(remote, store, mk, &remote_head.commit_id).await?;
+    fetch_closure(remote, store, keys, &remote_head.commit_id).await?;
 
     let sibling = SiblingHead {
         device_id: signer,
@@ -524,8 +537,8 @@ pub async fn sync_ref<R: Remote>(
         commit_id: remote_head.commit_id,
     };
 
-    // 3. Rollback-gated merge decision.
-    let plan = merge_heads(frontier, our_commit, &sibling, author, mk, store)?;
+    // 3. Rollback-gated merge decision (reads cross-generation, seals the merge under current gen).
+    let plan = merge_heads(frontier, our_commit, &sibling, author, keys, store)?;
 
     // 4. Apply: push whatever we authored and advance the ref (or fast-forward to the remote).
     let new_commit = match &plan.action {
@@ -535,10 +548,10 @@ pub async fn sync_ref<R: Remote>(
     };
 
     let wrote = if let Some(commit_id) = new_commit {
-        push_objects(remote, store, mk, &commit_id).await?;
+        push_objects(remote, store, keys, &commit_id).await?;
         let (head, blob) = push_head(
             remote,
-            mk,
+            keys.current(),
             device,
             ref_name,
             commit_id,

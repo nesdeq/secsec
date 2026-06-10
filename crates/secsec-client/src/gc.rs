@@ -9,7 +9,7 @@
 //! and no sweep is issued.
 
 use crate::{fetch_head, ClientError, GcOutcome, Receipt, Remote};
-use secsec_kdf::MasterKey;
+use secsec_kdf::MasterKeys;
 use secsec_object::Id;
 use secsec_proto::gc::all_heads_hash;
 use secsec_snapshot::reachable_objects;
@@ -61,30 +61,31 @@ pub fn put_epoch_from_receipts(receipts: &[(Id, Receipt)]) -> u64 {
 /// CAS). Fetches each head, builds the keep-set from the local store (**fail-safe** on a missing
 /// object), computes `all_heads_hash` from the fetched head blobs, and issues the sweep. Returns the
 /// [`GcOutcome`] ([`GcOutcome::CasConflict`] if the server's state moved — re-read and retry).
-pub async fn gc_collect<R: Remote>(
+pub async fn gc_collect<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
-    mk: &MasterKey,
+    keys: &K,
     ref_names: &[&str],
     gc_gen: u64,
     roster_seq: u64,
     put_epoch: u64,
 ) -> Result<GcOutcome, ClientError> {
-    let rnk = mk.ref_name_key();
+    // Heads + ref names are current-generation; the keep-set closure may span generations (§8.2).
+    let rnk = keys.current().ref_name_key();
     let mut head_commits: Vec<Id> = Vec::new();
     let mut heads: Vec<(Id, [u8; 32])> = Vec::new();
 
     for name in ref_names {
         let ref_h = ref_hash(&rnk, name);
         // Fetch the raw head blob (for the all_heads_hash token) and open it (for its commit).
-        if let Some((head, _sig, blob)) = fetch_head(remote, mk, name).await? {
+        if let Some((head, _sig, blob)) = fetch_head(remote, keys.current(), name).await? {
             head_commits.push(head.commit_id);
             heads.push((ref_h, *blake3::hash(&blob).as_bytes()));
         }
     }
 
     // Keep-set = reachable closure over all rostered heads (fail-safe on a missing object, §15).
-    let keep = reachable_objects(mk, store, &head_commits)?;
+    let keep = reachable_objects(keys, store, &head_commits)?;
     let keep_vec: Vec<Id> = keep.into_iter().collect();
     let ahh = all_heads_hash(&heads);
 

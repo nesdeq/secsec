@@ -14,7 +14,7 @@
 
 use crate::repo::{fetch_roster_entries, open_repo_remote, RepoError};
 use crate::{ClientError, Remote};
-use secsec_kdf::MasterKey;
+use secsec_kdf::MasterKeys;
 use secsec_object::Id;
 use secsec_sig::DeviceKey;
 use secsec_snapshot::reachable_objects;
@@ -35,14 +35,14 @@ pub struct QuorumResult {
 /// for every object, `put` then `get` and byte-check the returned blob against what was stored. A
 /// remote that fails any object's verification does not count. Returns the [`QuorumResult`]; the
 /// caller retains local objects until `met` (a configured `quorum`, ≥2, §14/§19).
-pub async fn quorum_put_objects<R: Remote>(
+pub async fn quorum_put_objects<R: Remote, K: MasterKeys>(
     remotes: &[&R],
     store: &Store,
-    mk: &MasterKey,
+    keys: &K,
     commit_id: &Id,
     quorum: usize,
 ) -> Result<QuorumResult, ClientError> {
-    let ids = reachable_objects(mk, store, &[*commit_id])?;
+    let ids = reachable_objects(keys, store, &[*commit_id])?;
     let mut confirmed_remotes = Vec::new();
 
     for (idx, remote) in remotes.iter().enumerate() {
@@ -153,6 +153,7 @@ pub fn detect_head_rollback(observations: &[(usize, u64)], hwm: u64) -> Vec<usiz
 mod tests {
     use super::*;
     use crate::{repo::init_repo, GcOutcome, Receipt, RemoteError};
+    use secsec_kdf::MasterKey;
 
     /// In-process [`Remote`] over a real [`Store`]; `lie_on_get` makes it serve garbage on `get_blob`
     /// (an acks-put-but-returns-garbage remote, for the P15 quorum test).

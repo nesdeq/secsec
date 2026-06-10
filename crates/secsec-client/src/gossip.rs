@@ -12,7 +12,7 @@
 
 use crate::{fetch_closure, fetch_head, resolve_head_signer, ClientError, Remote};
 use secsec_canon::{CanonError, Reader, Writer};
-use secsec_kdf::MasterKey;
+use secsec_kdf::MasterKeys;
 use secsec_object::Id;
 use secsec_sig::{DeviceId, DevicePublic};
 use secsec_snapshot::SnapError;
@@ -47,10 +47,10 @@ pub struct ForkEvent {
 ///
 /// This is detection only; the caller resolves a fork via [`crate::sync::sync_once`] /
 /// [`crate::sync_ref`] (rollback-gated three-way merge) and SHOULD persist the events (§10 step 3).
-pub async fn cross_remote_fork_scan<R: Remote>(
+pub async fn cross_remote_fork_scan<R: Remote, K: MasterKeys>(
     remotes: &[&R],
     store: &Store,
-    mk: &MasterKey,
+    keys: &K,
     members: &BTreeMap<DeviceId, DevicePublic>,
     our_head_commit: &Id,
     ref_name: &str,
@@ -59,7 +59,7 @@ pub async fn cross_remote_fork_scan<R: Remote>(
     let mut forks = Vec::new();
 
     for (idx, remote) in remotes.iter().enumerate() {
-        let Some((head, sig, _blob)) = fetch_head(*remote, mk, ref_name).await? else {
+        let Some((head, sig, _blob)) = fetch_head(*remote, keys.current(), ref_name).await? else {
             continue; // remote has no head for this ref
         };
         if head.commit_id == *our_head_commit {
@@ -67,10 +67,11 @@ pub async fn cross_remote_fork_scan<R: Remote>(
         }
         let their_device = resolve_head_signer(members, &head, &sig);
 
-        // Bring the remote head's closure local so both histories are in the DAG, then compare.
-        fetch_closure(*remote, store, mk, &head.commit_id).await?;
+        // Bring the remote head's closure local so both histories are in the DAG, then compare. The
+        // closure may span generations after a rotation, so reads route through `keys` (§8.2).
+        fetch_closure(*remote, store, keys, &head.commit_id).await?;
         let (parents, _meta) =
-            secsec_engine::load_commit_dag(&[*our_head_commit, head.commit_id], mk, store)?;
+            secsec_engine::load_commit_dag(&[*our_head_commit, head.commit_id], keys, store)?;
 
         if incomparable(&parents, our_head_commit, &head.commit_id) {
             forks.push(ForkEvent {
@@ -179,21 +180,21 @@ impl GossipHead {
 ///
 /// This is the device-gossip counterpart of [`cross_remote_fork_scan`]; both reduce to the same
 /// `secsec_sync::rollback::fork_check`.
-pub fn check_peer_head(
+pub fn check_peer_head<K: MasterKeys>(
     store: &Store,
-    mk: &MasterKey,
+    keys: &K,
     our_head: &Id,
     peer_head: &Id,
 ) -> Result<ForkStatus, ClientError> {
     // A peer head whose objects we don't hold yet is Unknown (§10 step 2: record + fetch).
-    let (parents, _meta) = match secsec_engine::load_commit_dag(&[*our_head, *peer_head], mk, store)
-    {
-        Ok(dag) => dag,
-        Err(secsec_engine::EngineError::Snap(SnapError::Missing(_))) => {
-            return Ok(ForkStatus::Unknown)
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let (parents, _meta) =
+        match secsec_engine::load_commit_dag(&[*our_head, *peer_head], keys, store) {
+            Ok(dag) => dag,
+            Err(secsec_engine::EngineError::Snap(SnapError::Missing(_))) => {
+                return Ok(ForkStatus::Unknown)
+            }
+            Err(e) => return Err(e.into()),
+        };
     let known: BTreeSet<Id> = parents.keys().copied().collect();
     Ok(fork_check(&parents, &known, our_head, peer_head))
 }
@@ -251,6 +252,7 @@ pub fn read_fork_log(path: &Path) -> Result<Vec<ForkEvent>, ClientError> {
 mod tests {
     use super::*;
     use crate::{push_head, push_objects, GcOutcome, Receipt, RemoteError};
+    use secsec_kdf::MasterKey;
     use secsec_sig::DeviceKey;
 
     struct MemRemote {

@@ -11,7 +11,7 @@
 
 use clap::{Parser, Subcommand};
 use secsec_client::quic::QuicRemote;
-use secsec_client::repo::{init_repo, open_repo_remote};
+use secsec_client::repo::{data_keyring_remote, init_repo, open_repo_remote};
 use secsec_client::sync::sync_once;
 use secsec_client::{load_frontier, save_frontier, FrontierLoad};
 use secsec_server::serve::serve_connection;
@@ -274,6 +274,9 @@ async fn run_sync(
 
     // cold-start: recover the master key + roster over the wire, anchored to the RFP.
     let (mk, st) = open_repo_remote(&rem, &device, &rfp).await?;
+    // §8.2 DATA key-history keyring: peel `master_key_g` for every past generation so reads work across
+    // any rotation (a genesis-generation repo yields just `{1: mk}`; writes use the current generation).
+    let keyring = data_keyring_remote(&rem, &mk).await?;
 
     // local state.
     let store = Store::open(&store_path)?;
@@ -320,7 +323,7 @@ async fn run_sync(
             &rem,
             &store,
             &dir,
-            &mk,
+            &keyring,
             &device,
             &st.members,
             &frontier,

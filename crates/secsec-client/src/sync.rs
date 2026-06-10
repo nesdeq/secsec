@@ -18,7 +18,7 @@ use crate::{
     fetch_closure, fetch_head, push_head, push_objects, resolve_head_signer, sync_ref, ClientError,
     CommitAuthor, Remote, SyncAction,
 };
-use secsec_kdf::MasterKey;
+use secsec_kdf::MasterKeys;
 use secsec_object::Id;
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
 use secsec_snapshot::{
@@ -73,10 +73,10 @@ fn author_key<'a>(
 /// Pull a verified head into the working dir: resolve+verify the head signer, fetch its closure,
 /// verify the commit against its author, restore, and observe the head into the frontier.
 #[allow(clippy::too_many_arguments)]
-async fn pull_to<R: Remote>(
+async fn pull_to<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
-    mk: &MasterKey,
+    keys: &K,
     frontier: &SyncFrontier,
     members: &BTreeMap<DeviceId, DevicePublic>,
     head: &Head,
@@ -84,13 +84,13 @@ async fn pull_to<R: Remote>(
     dir: &Path,
 ) -> Result<SyncFrontier, ClientError> {
     let signer = resolve_head_signer(members, head, head_sig).ok_or(ClientError::HeadNotMember)?;
-    fetch_closure(remote, store, mk, &head.commit_id).await?;
-    let (commit, csig) = open_signed_commit(&head.commit_id, mk, store)?;
+    fetch_closure(remote, store, keys, &head.commit_id).await?;
+    let (commit, csig) = open_signed_commit(&head.commit_id, keys, store)?;
     verify_commit(author_key(members, &commit)?, &commit, &csig)?;
-    restore_commit_tree(&commit, mk, store, dir)?;
+    restore_commit_tree(&commit, keys, store, dir)?;
 
     // Observe the head into the frontier so later syncs gate against it (§8.5/§10).
-    let (parents, meta) = secsec_engine::load_commit_dag(&[head.commit_id], mk, store)?;
+    let (parents, meta) = secsec_engine::load_commit_dag(&[head.commit_id], keys, store)?;
     let sibling = SiblingHead {
         device_id: signer,
         head_version: head.head_version,
@@ -107,11 +107,11 @@ async fn pull_to<R: Remote>(
 /// sigchain sequence the commit is written under. Returns the action, the new base to persist, and the
 /// advanced frontier.
 #[allow(clippy::too_many_arguments)]
-pub async fn sync_once<R: Remote>(
+pub async fn sync_once<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
     dir: &Path,
-    mk: &MasterKey,
+    keys: &K,
     device: &DeviceKey,
     members: &BTreeMap<DeviceId, DevicePublic>,
     frontier: &SyncFrontier,
@@ -120,13 +120,15 @@ pub async fn sync_once<R: Remote>(
     base: Option<Id>,
     ts: u64,
 ) -> Result<SyncOutcome, ClientError> {
+    // Writes (snapshot, commit, head) use the current generation; reads (closures, old commits) route
+    // through `keys`, which resolves any past generation after a rotation (§8.2).
     let device_id = device.device_id()?;
-    let head = fetch_head(remote, mk, ref_name).await?;
+    let head = fetch_head(remote, keys.current(), ref_name).await?;
 
     // Fresh client with an existing repo → clone (never commit our unsynced dir).
     if base.is_none() {
         if let Some((h, sig, _)) = &head {
-            let frontier = pull_to(remote, store, mk, frontier, members, h, sig, dir).await?;
+            let frontier = pull_to(remote, store, keys, frontier, members, h, sig, dir).await?;
             return Ok(SyncOutcome {
                 kind: SyncKind::Cloned,
                 base: Some(h.commit_id),
@@ -138,19 +140,24 @@ pub async fn sync_once<R: Remote>(
     // Snapshot the working dir incrementally on the base's tree (so salts/ids are stable, §9.7).
     let prev = match base {
         Some(b) => {
-            let (c, _) = open_signed_commit(&b, mk, store)?;
+            let (c, _) = open_signed_commit(&b, keys, store)?;
             Some((c.root_tree, c.root_salt))
         }
         None => None,
     };
-    let (our_tree, our_salt) = snapshot_tree(dir, mk, store, prev.as_ref().map(|(t, s)| (t, s)))?;
+    let (our_tree, our_salt) = snapshot_tree(
+        dir,
+        keys.current(),
+        store,
+        prev.as_ref().map(|(t, s)| (t, s)),
+    )?;
     let unchanged = prev.as_ref().is_some_and(|(t, _)| *t == our_tree);
 
     // No local changes: pull a newer head, or we are already up to date.
     if unchanged {
         return match &head {
             Some((h, sig, _)) if Some(h.commit_id) != base => {
-                let frontier = pull_to(remote, store, mk, frontier, members, h, sig, dir).await?;
+                let frontier = pull_to(remote, store, keys, frontier, members, h, sig, dir).await?;
                 Ok(SyncOutcome {
                     kind: SyncKind::Pulled,
                     base: Some(h.commit_id),
@@ -184,15 +191,24 @@ pub async fn sync_once<R: Remote>(
         last_seen_head: last_seen,
         ts,
     };
-    let our_commit = seal_signed_commit(mk, store, device, &commit)?;
+    let our_commit = seal_signed_commit(keys.current(), store, device, &commit)?;
     let mut f = frontier.clone();
     f.commit_version_hwm.insert(device_id, version);
 
     match head {
         // First publish: no remote head yet.
         None => {
-            push_objects(remote, store, mk, &our_commit).await?;
-            push_head(remote, mk, device, ref_name, our_commit, roster_seq, None).await?;
+            push_objects(remote, store, keys, &our_commit).await?;
+            push_head(
+                remote,
+                keys.current(),
+                device,
+                ref_name,
+                our_commit,
+                roster_seq,
+                None,
+            )
+            .await?;
             Ok(SyncOutcome {
                 kind: SyncKind::Published,
                 base: Some(our_commit),
@@ -211,7 +227,7 @@ pub async fn sync_once<R: Remote>(
             let report = sync_ref(
                 remote,
                 store,
-                mk,
+                keys,
                 members,
                 &f,
                 ref_name,
@@ -227,13 +243,13 @@ pub async fn sync_once<R: Remote>(
                 }
                 SyncAction::Merged { commit_id, .. } => {
                     frontier.commit_version_hwm.insert(device_id, version + 1);
-                    let (mc, _) = open_signed_commit(&commit_id, mk, store)?;
-                    restore_commit_tree(&mc, mk, store, dir)?;
+                    let (mc, _) = open_signed_commit(&commit_id, keys, store)?;
+                    restore_commit_tree(&mc, keys, store, dir)?;
                     (SyncKind::Merged, commit_id)
                 }
                 SyncAction::FastForward { commit_id } => {
-                    let (c, _) = open_signed_commit(&commit_id, mk, store)?;
-                    restore_commit_tree(&c, mk, store, dir)?;
+                    let (c, _) = open_signed_commit(&commit_id, keys, store)?;
+                    restore_commit_tree(&c, keys, store, dir)?;
                     (SyncKind::Pulled, commit_id)
                 }
             };
@@ -249,6 +265,7 @@ pub async fn sync_once<R: Remote>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secsec_kdf::MasterKey;
     use secsec_store::Store;
 
     struct MemRemote {

@@ -137,6 +137,42 @@ impl MasterKey {
     }
 }
 
+/// A resolver from a master-key **generation** to the [`MasterKey`] for it — the read-side key ring
+/// that lets a current member open objects sealed under any past generation (§8.2 cross-rotation
+/// reads). Implemented for a single [`MasterKey`] (resolves only its own generation — the
+/// genesis/no-rotation case) and for a `BTreeMap<u32, MasterKey>` (the peeled DATA key-history), so
+/// read/traversal paths stay generic and single-generation call sites pass `&mk` unchanged.
+pub trait MasterKeys {
+    /// The master key for generation `g`, or `None` if this resolver does not hold it.
+    fn for_gen(&self, g: u32) -> Option<&MasterKey>;
+    /// The **current** (highest) generation's master key — what new objects are sealed under (writes
+    /// always use the current generation). For a single key this is itself; for a key ring it is the
+    /// entry with the greatest generation.
+    fn current(&self) -> &MasterKey;
+}
+
+impl MasterKeys for MasterKey {
+    fn for_gen(&self, g: u32) -> Option<&MasterKey> {
+        (self.generation == g).then_some(self)
+    }
+    fn current(&self) -> &MasterKey {
+        self
+    }
+}
+
+impl MasterKeys for std::collections::BTreeMap<u32, MasterKey> {
+    fn for_gen(&self, g: u32) -> Option<&MasterKey> {
+        self.get(&g)
+    }
+    fn current(&self) -> &MasterKey {
+        // BTreeMap iterates in ascending key order; the last value is the highest generation. A key
+        // ring is never empty (it always holds at least the current generation).
+        self.values()
+            .next_back()
+            .expect("master-key ring is never empty")
+    }
+}
+
 /// `k_obj` — the unique per-object AEAD key (§9.4): `derive_key("secsec-obj-key-v1", enc_key ‖ id)`.
 ///
 /// Because `id` is the content address (collision-resistant over the plaintext), `k_obj` is unique

@@ -24,7 +24,7 @@
 
 use secsec_canon::{CanonError, Reader, Writer};
 use secsec_frame::{ObjType, MAX_LIST_ELEMENTS, MAX_TREE_DEPTH, MAX_TREE_FANOUT};
-use secsec_kdf::MasterKey;
+use secsec_kdf::{MasterKey, MasterKeys};
 use secsec_object::{
     open_object, seal_object, unpad_chunk, Id, ObjError, Padding, PathSalt, ZERO_SALT,
 };
@@ -475,25 +475,32 @@ pub fn seal_signed_commit(
 /// Fetch and open the signed-commit object `commit_id` from `store`, returning the decoded commit and
 /// its signature. The content id is re-verified by [`open_object`]; the caller still must
 /// [`verify_commit`] the signature against the author's roster key before trusting the commit (§9.6).
-pub fn open_signed_commit(
+pub fn open_signed_commit<K: MasterKeys>(
     commit_id: &Id,
-    mk: &MasterKey,
+    keys: &K,
     store: &Store,
 ) -> Result<(Commit, Vec<u8>), SnapError> {
-    let bytes = fetch_open(mk, ObjType::Commit, &ZERO_SALT, commit_id, store)?;
-    decode_signed_commit(&bytes)
+    // `fetch_open` resolves the commit's own generation (§8.2): a single `&MasterKey` resolves only
+    // its generation (no-rotation case); a peeled key ring resolves any past generation.
+    decode_signed_commit(&fetch_open(
+        keys,
+        ObjType::Commit,
+        &ZERO_SALT,
+        commit_id,
+        store,
+    )?)
 }
 
 /// Restore the tree named by `commit` (its `root_tree`/`root_salt`) into `dest` (created if absent).
 /// The caller is expected to have already [`verify_commit`]-ed the commit (§9.6).
-pub fn restore_commit_tree(
+pub fn restore_commit_tree<K: MasterKeys>(
     commit: &Commit,
-    mk: &MasterKey,
+    keys: &K,
     store: &Store,
     dest: &Path,
 ) -> Result<(), SnapError> {
     std::fs::create_dir_all(dest)?;
-    restore_tree(&commit.root_tree, &commit.root_salt, mk, store, dest, 0)
+    restore_tree(&commit.root_tree, &commit.root_salt, keys, store, dest, 0)
 }
 
 fn snapshot_dir(
@@ -587,21 +594,23 @@ fn snapshot_dir(
 
 // ---- restore ----
 
-fn fetch_open(
-    mk: &MasterKey,
+fn fetch_open<K: MasterKeys>(
+    keys: &K,
     obj_type: ObjType,
     salt: &PathSalt,
     id: &Id,
     store: &Store,
 ) -> Result<Vec<u8>, SnapError> {
     let blob = store.get(id)?.ok_or(SnapError::Missing(*id))?;
-    Ok(open_object(mk, obj_type, salt, id, &blob)?)
+    // `open_object` resolves this object's authenticated generation against `keys` (§8.2): a single
+    // `&MasterKey` resolves only its own generation; a peeled key ring resolves any.
+    Ok(open_object(keys, obj_type, salt, id, &blob)?)
 }
 
-fn restore_tree(
+fn restore_tree<K: MasterKeys>(
     tree_id: &Id,
     tree_salt: &PathSalt,
-    mk: &MasterKey,
+    keys: &K,
     store: &Store,
     dir: &Path,
     depth: usize,
@@ -609,7 +618,7 @@ fn restore_tree(
     if depth > MAX_TREE_DEPTH {
         return Err(SnapError::DepthExceeded);
     }
-    let tree = decode_tree(&fetch_open(mk, ObjType::Tree, tree_salt, tree_id, store)?)?;
+    let tree = decode_tree(&fetch_open(keys, ObjType::Tree, tree_salt, tree_id, store)?)?;
     std::fs::create_dir_all(dir)?;
     for entry in &tree.entries {
         match entry {
@@ -623,7 +632,7 @@ fn restore_tree(
             } => {
                 let mut data = Vec::new();
                 for cid in chunks {
-                    let padded = fetch_open(mk, ObjType::Chunk, path_salt, cid, store)?;
+                    let padded = fetch_open(keys, ObjType::Chunk, path_salt, cid, store)?;
                     data.extend_from_slice(unpad_chunk(&padded, Padding::PowerOfTwo)?);
                 }
                 if data.len() as u64 != *size {
@@ -641,7 +650,7 @@ fn restore_tree(
                 subtree_salt,
             } => {
                 let path = dir.join(name);
-                restore_tree(subtree, subtree_salt, mk, store, &path, depth + 1)?;
+                restore_tree(subtree, subtree_salt, keys, store, &path, depth + 1)?;
                 // Set the dir's metadata AFTER populating it (writing children bumps its mtime).
                 apply_metadata(&path, *mode, *mtime)?;
             }
@@ -675,13 +684,13 @@ fn apply_metadata(path: &Path, mode: u32, mtime: u64) -> Result<(), SnapError> {
 
 /// Fetch, open (re-verifying the content address, §9.2), and decode a single `Tree` object. Used by
 /// the merge engine to materialize one directory level; it recurses on `Entry::Dir` children itself.
-pub fn load_tree(
+pub fn load_tree<K: MasterKeys>(
     tree_id: &Id,
     tree_salt: &PathSalt,
-    mk: &MasterKey,
+    keys: &K,
     store: &Store,
 ) -> Result<Tree, SnapError> {
-    decode_tree(&fetch_open(mk, ObjType::Tree, tree_salt, tree_id, store)?)
+    decode_tree(&fetch_open(keys, ObjType::Tree, tree_salt, tree_id, store)?)
 }
 
 /// Seal a single `Tree` object under a fresh random salt, store it, and return its `(id, salt)`. The
@@ -695,15 +704,15 @@ pub fn seal_tree(tree: &Tree, mk: &MasterKey, store: &Store) -> Result<(Id, Path
 
 /// Restore the tree named by `(tree_id, tree_salt)` into `dest` (created if absent). Like [`restore`]
 /// but starting from a bare tree id rather than a commit — used to materialize a merged tree.
-pub fn restore_tree_into(
+pub fn restore_tree_into<K: MasterKeys>(
     tree_id: &Id,
     tree_salt: &PathSalt,
-    mk: &MasterKey,
+    keys: &K,
     store: &Store,
     dest: &Path,
 ) -> Result<(), SnapError> {
     std::fs::create_dir_all(dest)?;
-    restore_tree(tree_id, tree_salt, mk, store, dest, 0)
+    restore_tree(tree_id, tree_salt, keys, store, dest, 0)
 }
 
 // ---- reachable closure (GC keep-set, §15) ----
@@ -713,8 +722,8 @@ pub fn restore_tree_into(
 /// (so §9.2 content-addressing is re-verified), and decoded; a **missing** object anywhere in the
 /// closure returns [`SnapError::Missing`] so GC **fails safe** (never deletes when the keep-set is
 /// incomplete, §15). The caller hashes the result with `secsec_proto::gc::keep_set_hash`.
-pub fn reachable_objects(
-    mk: &MasterKey,
+pub fn reachable_objects<K: MasterKeys>(
+    keys: &K,
     store: &Store,
     heads: &[Id],
 ) -> Result<std::collections::BTreeSet<Id>, SnapError> {
@@ -728,11 +737,13 @@ pub fn reachable_objects(
             continue;
         }
         reachable.insert(cid);
-        // Commits are the signed form (§6); we only need parents + root tree to traverse.
+        // A chain that spans a rotation has parents under older generations; `fetch_open`/`collect_tree`
+        // resolve each object's generation against `keys` (§8.2). A single-generation member resolves
+        // to its own key throughout.
         let (commit, _sig) =
-            decode_signed_commit(&fetch_open(mk, ObjType::Commit, &ZERO_SALT, &cid, store)?)?;
+            decode_signed_commit(&fetch_open(keys, ObjType::Commit, &ZERO_SALT, &cid, store)?)?;
         collect_tree(
-            mk,
+            keys,
             store,
             &commit.root_tree,
             &commit.root_salt,
@@ -746,8 +757,8 @@ pub fn reachable_objects(
     Ok(reachable)
 }
 
-fn collect_tree(
-    mk: &MasterKey,
+fn collect_tree<K: MasterKeys>(
+    keys: &K,
     store: &Store,
     tree_id: &Id,
     tree_salt: &PathSalt,
@@ -760,7 +771,7 @@ fn collect_tree(
     if !reachable.insert(*tree_id) {
         return Ok(()); // shared subtree already walked
     }
-    let tree = decode_tree(&fetch_open(mk, ObjType::Tree, tree_salt, tree_id, store)?)?;
+    let tree = decode_tree(&fetch_open(keys, ObjType::Tree, tree_salt, tree_id, store)?)?;
     for entry in &tree.entries {
         match entry {
             Entry::File { chunks, .. } => {
@@ -772,7 +783,7 @@ fn collect_tree(
                 subtree,
                 subtree_salt,
                 ..
-            } => collect_tree(mk, store, subtree, subtree_salt, depth + 1, reachable)?,
+            } => collect_tree(keys, store, subtree, subtree_salt, depth + 1, reachable)?,
         }
     }
     Ok(())
@@ -1075,6 +1086,69 @@ mod tests {
             open_signed_commit(&commit_id, &m, &empty),
             Err(SnapError::Missing(_))
         ));
+    }
+
+    /// §8.2 cross-rotation reads: a history whose parent commit predates a rotation is reachable and
+    /// restorable with the peeled key ring, but NOT with a single generation's key.
+    #[test]
+    fn reads_across_a_generation_boundary_with_a_key_ring() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let dev = secsec_sig::DeviceKey::generate().unwrap();
+        let mk1 = MasterKey::new(1, [0x11; 32]);
+        let mk2 = MasterKey::new(2, [0x22; 32]);
+
+        // gen-1 commit C1 over a dir; gen-2 commit C2 (parent C1) over another, sealed under mk2.
+        let src1 = tempfile::tempdir().unwrap();
+        std::fs::write(src1.path().join("old.txt"), b"gen1 file").unwrap();
+        let (rt1, rs1) = snapshot_tree(src1.path(), &mk1, &store, None).unwrap();
+        let c1 = Commit {
+            root_tree: rt1,
+            root_salt: rs1,
+            parents: vec![],
+            device_id: dev.device_id().unwrap(),
+            version: 1,
+            roster_seq: 0,
+            last_seen_head: [0u8; 32],
+            ts: 0,
+        };
+        let c1_id = seal_signed_commit(&mk1, &store, &dev, &c1).unwrap();
+
+        let src2 = tempfile::tempdir().unwrap();
+        std::fs::write(src2.path().join("new.txt"), b"gen2 file").unwrap();
+        let (rt2, rs2) = snapshot_tree(src2.path(), &mk2, &store, None).unwrap();
+        let c2 = Commit {
+            root_tree: rt2,
+            root_salt: rs2,
+            parents: vec![c1_id],
+            device_id: dev.device_id().unwrap(),
+            version: 2,
+            roster_seq: 0,
+            last_seen_head: c1_id,
+            ts: 0,
+        };
+        let c2_id = seal_signed_commit(&mk2, &store, &dev, &c2).unwrap();
+
+        // A single-generation key cannot walk across the rotation boundary: traversing from C2 hits
+        // C1 (gen 1) and fails to resolve its key.
+        assert!(matches!(
+            reachable_objects(&mk2, &store, &[c2_id]),
+            Err(SnapError::Object(ObjError::UnknownGeneration(1)))
+        ));
+
+        // The peeled key ring {1: mk1, 2: mk2} reads the whole history and restores either commit.
+        let keyring: std::collections::BTreeMap<u32, MasterKey> =
+            [(1u32, mk1), (2u32, mk2)].into_iter().collect();
+        let reachable = reachable_objects(&keyring, &store, &[c2_id]).unwrap();
+        assert!(reachable.contains(&c1_id) && reachable.contains(&c2_id));
+
+        let (got_c1, _) = open_signed_commit(&c1_id, &keyring, &store).unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        restore_commit_tree(&got_c1, &keyring, &store, dst.path()).unwrap();
+        assert_eq!(
+            std::fs::read(dst.path().join("old.txt")).unwrap(),
+            b"gen1 file"
+        );
     }
 
     /// Snapshot `src` and seal a signed commit (a throwaway device) — the production commit form.

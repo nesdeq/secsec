@@ -16,8 +16,8 @@
 
 #![forbid(unsafe_code)]
 
-use secsec_frame::{aead_ad, assemble_blob, parse_blob, Frame, FrameError, ObjType};
-use secsec_kdf::{obj_key, MasterKey};
+use secsec_frame::{aead_ad, assemble_blob, parse_blob, Frame, FrameError, ObjType, FRAME_LEN};
+use secsec_kdf::{obj_key, MasterKey, MasterKeys};
 use subtle::ConstantTimeEq;
 
 /// A 256-bit content address.
@@ -54,6 +54,9 @@ pub enum ObjError {
     IdMismatch,
     /// Reversible chunk padding was malformed.
     BadPadding,
+    /// The object's authenticated `FRAME.gen` had no master key in the resolver — the caller lacks
+    /// that generation's key (peel the §8.2 DATA key-history), or it is a forged generation.
+    UnknownGeneration(u32),
 }
 
 impl core::fmt::Display for ObjError {
@@ -63,6 +66,12 @@ impl core::fmt::Display for ObjError {
             ObjError::Auth => f.write_str("authentication failed"),
             ObjError::IdMismatch => f.write_str("content-address mismatch"),
             ObjError::BadPadding => f.write_str("malformed chunk padding"),
+            ObjError::UnknownGeneration(g) => {
+                write!(
+                    f,
+                    "no master key for object generation {g} (peel §8.2 keyhist)"
+                )
+            }
         }
     }
 }
@@ -114,13 +123,21 @@ pub fn seal_object(
 /// tag under the per-object key derived from `requested_id`, and (3) the id re-derived from the
 /// recovered plaintext equals `requested_id` (§9.2). `path_salt` must be the salt the client holds
 /// for this object (from the parent tree, or [`ZERO_SALT`] for non-path objects).
-pub fn open_object(
-    mk: &MasterKey,
+pub fn open_object<K: MasterKeys>(
+    keys: &K,
     obj_type: ObjType,
     path_salt: &PathSalt,
     requested_id: &Id,
     blob: &[u8],
 ) -> Result<Vec<u8>, ObjError> {
+    // (0) Resolve the object's authenticated generation (§8.2): a single `&MasterKey` resolves only
+    // its own generation (no-rotation case); a peeled key ring resolves any past generation. The
+    // `parse_blob` FRAME check below still rejects any blob whose generation differs from `mk`'s.
+    let head = blob
+        .get(..FRAME_LEN)
+        .ok_or(ObjError::Frame(FrameError::ShortBlob))?;
+    let g = Frame::decode(head)?.gen;
+    let mk = keys.for_gen(g).ok_or(ObjError::UnknownGeneration(g))?;
     let frame = Frame::v1(mk.generation(), obj_type);
     let (ctx_tag, ct) = parse_blob(blob, &frame)?; // (1) FRAME == expected, bounds
 
@@ -276,11 +293,12 @@ mod tests {
             Err(ObjError::Auth)
         );
 
-        // a blob whose FRAME claims a different generation -> FRAME mismatch (§18)
+        // a blob whose FRAME claims a different generation -> the resolver has no key for it (§8.2);
+        // a member who *did* hold gen 1 would pass a key ring containing it and read it fine.
         let m2 = MasterKey::new(2, [0x44; 32]);
         assert!(matches!(
             open_object(&m2, ObjType::Chunk, &salt, &id, &blob),
-            Err(ObjError::Frame(_))
+            Err(ObjError::UnknownGeneration(1))
         ));
     }
 

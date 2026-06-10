@@ -14,7 +14,7 @@
 
 #![forbid(unsafe_code)]
 
-use secsec_kdf::MasterKey;
+use secsec_kdf::{MasterKey, MasterKeys};
 use secsec_object::Id;
 use secsec_sig::{DeviceKey, SigError};
 use secsec_snapshot::{Commit, Entry, SnapError, Tree};
@@ -62,26 +62,26 @@ impl From<SnapError> for EngineError {
 /// model), recursing into subtrees. Each level is fetched, opened (content address re-verified,
 /// §9.2), and decoded by [`secsec_snapshot::load_tree`]. A missing object surfaces as
 /// [`SnapError::Missing`]; the engine adds only the depth bound.
-pub fn load_nodes(
+pub fn load_nodes<K: MasterKeys>(
     tree_id: &Id,
     tree_salt: &PathSalt,
-    mk: &MasterKey,
+    keys: &K,
     store: &Store,
 ) -> Result<BTreeMap<String, Node>, EngineError> {
-    load_nodes_inner(tree_id, tree_salt, mk, store, 0)
+    load_nodes_inner(tree_id, tree_salt, keys, store, 0)
 }
 
-fn load_nodes_inner(
+fn load_nodes_inner<K: MasterKeys>(
     tree_id: &Id,
     tree_salt: &PathSalt,
-    mk: &MasterKey,
+    keys: &K,
     store: &Store,
     depth: usize,
 ) -> Result<BTreeMap<String, Node>, EngineError> {
     if depth > MAX_TREE_DEPTH {
         return Err(EngineError::DepthExceeded);
     }
-    let tree = secsec_snapshot::load_tree(tree_id, tree_salt, mk, store)?;
+    let tree = secsec_snapshot::load_tree(tree_id, tree_salt, keys, store)?;
     let mut out = BTreeMap::new();
     for entry in tree.entries {
         match entry {
@@ -111,7 +111,7 @@ fn load_nodes_inner(
                 subtree,
                 subtree_salt,
             } => {
-                let children = load_nodes_inner(&subtree, &subtree_salt, mk, store, depth + 1)?;
+                let children = load_nodes_inner(&subtree, &subtree_salt, keys, store, depth + 1)?;
                 out.insert(
                     name,
                     Node::Dir {
@@ -189,31 +189,34 @@ pub struct Reconciled {
 /// merged tree into `store`. `base`/`ours`/`theirs` are `(root_tree_id, root_salt)` of the merge-base
 /// commit and the two heads; `their_label` is the keep-both suffix for the incoming side
 /// (`<device>-<commit_id_hex12>`, §10). The chunks of both sides must already be present in `store`.
-pub fn reconcile(
+pub fn reconcile<K: MasterKeys>(
     base: (&Id, &PathSalt),
     ours: (&Id, &PathSalt),
     theirs: (&Id, &PathSalt),
     their_label: &str,
-    mk: &MasterKey,
+    keys: &K,
     store: &Store,
 ) -> Result<Reconciled, EngineError> {
-    let b = load_nodes(base.0, base.1, mk, store)?;
-    let o = load_nodes(ours.0, ours.1, mk, store)?;
-    let t = load_nodes(theirs.0, theirs.1, mk, store)?;
-    merge_node_maps(&b, &o, &t, their_label, mk, store)
+    // Reads resolve each input tree's own generation (§8.2 — `base` may predate a rotation); the merged
+    // result is sealed under the current generation (`keys.current()`).
+    let b = load_nodes(base.0, base.1, keys, store)?;
+    let o = load_nodes(ours.0, ours.1, keys, store)?;
+    let t = load_nodes(theirs.0, theirs.1, keys, store)?;
+    merge_node_maps(&b, &o, &t, their_label, keys, store)
 }
 
-/// The merge core over already-materialized node maps: three-way merge then re-seal to the store.
-fn merge_node_maps(
+/// The merge core over already-materialized node maps: three-way merge then re-seal under the current
+/// generation.
+fn merge_node_maps<K: MasterKeys>(
     base: &BTreeMap<String, Node>,
     ours: &BTreeMap<String, Node>,
     theirs: &BTreeMap<String, Node>,
     their_label: &str,
-    mk: &MasterKey,
+    keys: &K,
     store: &Store,
 ) -> Result<Reconciled, EngineError> {
     let merged = three_way_merge(base, ours, theirs, their_label);
-    let (root_tree, root_salt) = seal_nodes(&merged.tree, mk, store)?;
+    let (root_tree, root_salt) = seal_nodes(&merged.tree, keys.current(), store)?;
     Ok(Reconciled {
         root_tree,
         root_salt,
@@ -265,9 +268,9 @@ impl From<SigError> for MergeError {
 /// error, so the rollback gates never run on a truncated history (fail-safe). The caller is
 /// responsible for having verified each head/commit signature against the roster (§9.6) — this builds
 /// the structural inputs the gates need.
-pub fn load_commit_dag(
+pub fn load_commit_dag<K: MasterKeys>(
     heads: &[Id],
-    mk: &MasterKey,
+    keys: &K,
     store: &Store,
 ) -> Result<(ParentMap, BTreeMap<Id, CommitMeta>), EngineError> {
     let mut parents = ParentMap::new();
@@ -277,7 +280,7 @@ pub fn load_commit_dag(
         if parents.contains_key(&c) {
             continue;
         }
-        let (commit, _sig) = secsec_snapshot::open_signed_commit(&c, mk, store)?;
+        let (commit, _sig) = secsec_snapshot::open_signed_commit(&c, keys, store)?;
         meta.insert(
             c,
             CommitMeta {
@@ -349,15 +352,15 @@ fn hex12(b: &[u8; 32]) -> String {
 ///
 /// Precondition: the caller has signature-verified `sibling` and the reachable commits against the
 /// roster (§9.6); this enforces content addressing and the rollback frontier, not authorship.
-pub fn merge_heads(
+pub fn merge_heads<K: MasterKeys>(
     frontier: &SyncFrontier,
     our_head_commit: &Id,
     sibling: &SiblingHead,
     author: CommitAuthor<'_>,
-    mk: &MasterKey,
+    keys: &K,
     store: &Store,
 ) -> Result<SyncPlan, MergeError> {
-    let (parents, meta) = load_commit_dag(&[*our_head_commit, sibling.commit_id], mk, store)?;
+    let (parents, meta) = load_commit_dag(&[*our_head_commit, sibling.commit_id], keys, store)?;
     let decision = evaluate_merge(frontier, our_head_commit, sibling, &parents, &meta)
         .map_err(MergeError::Rollback)?;
 
@@ -376,22 +379,22 @@ pub fn merge_heads(
             let lcas = lowest_common_ancestors(&parents, our_head_commit, &sibling.commit_id);
             let base_map = match lcas.iter().next() {
                 Some(base_id) => {
-                    let (bc, _) = secsec_snapshot::open_signed_commit(base_id, mk, store)?;
-                    load_nodes(&bc.root_tree, &bc.root_salt, mk, store)?
+                    let (bc, _) = secsec_snapshot::open_signed_commit(base_id, keys, store)?;
+                    load_nodes(&bc.root_tree, &bc.root_salt, keys, store)?
                 }
                 None => BTreeMap::new(),
             };
-            let (oc, _) = secsec_snapshot::open_signed_commit(our_head_commit, mk, store)?;
-            let (tc, _) = secsec_snapshot::open_signed_commit(&sibling.commit_id, mk, store)?;
-            let ours_map = load_nodes(&oc.root_tree, &oc.root_salt, mk, store)?;
-            let theirs_map = load_nodes(&tc.root_tree, &tc.root_salt, mk, store)?;
+            let (oc, _) = secsec_snapshot::open_signed_commit(our_head_commit, keys, store)?;
+            let (tc, _) = secsec_snapshot::open_signed_commit(&sibling.commit_id, keys, store)?;
+            let ours_map = load_nodes(&oc.root_tree, &oc.root_salt, keys, store)?;
+            let theirs_map = load_nodes(&tc.root_tree, &tc.root_salt, keys, store)?;
 
             let label = format!(
                 "{}-{}",
                 hex12(&sibling.device_id),
                 hex12(&sibling.commit_id)
             );
-            let rec = merge_node_maps(&base_map, &ours_map, &theirs_map, &label, mk, store)?;
+            let rec = merge_node_maps(&base_map, &ours_map, &theirs_map, &label, keys, store)?;
 
             // Author the merge commit: two parents (ours, theirs), our device, our next version, and
             // last_seen_head = the sibling we merged (§10).
@@ -405,7 +408,8 @@ pub fn merge_heads(
                 last_seen_head: sibling.commit_id,
                 ts: author.ts,
             };
-            let commit_id = secsec_snapshot::seal_signed_commit(mk, store, author.device, &commit)?;
+            let commit_id =
+                secsec_snapshot::seal_signed_commit(keys.current(), store, author.device, &commit)?;
             SyncAction::Merged {
                 commit_id,
                 conflicts: rec.conflicts,
