@@ -324,6 +324,22 @@ impl Server {
                     Err(_) => Response::Err(ErrorCode::Internal),
                 }
             }
+            // The network half of enrollment (§7/§8.4): an authorized member writes another device's
+            // keyslot. The blob is opaque; its authenticity rests on the recipient's `mk_commit` check
+            // (§7), so the blind server only stores it (a forged keyslot fails that check, not here).
+            Request::PutKeyslot {
+                device_id: owner_id,
+                gen,
+                blob,
+            } => {
+                if !self.take_write(device_id, blob.len() as u64, now) {
+                    return Response::Err(ErrorCode::RateLimit);
+                }
+                match self.store.put_keyslot(&owner_id, gen, &blob) {
+                    Ok(()) => Response::Ok,
+                    Err(_) => Response::Err(ErrorCode::Internal),
+                }
+            }
             // gc is dispatched before this match (state-dependent auth, §15); never reached here.
             Request::Gc { .. } => Response::Err(ErrorCode::Internal),
         }

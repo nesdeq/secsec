@@ -141,6 +141,36 @@ impl Remote for QuicRemote<'_> {
         }
     }
 
+    async fn put_keyslot(&self, device_id: &Id, gen: u32, blob: &[u8]) -> Result<(), RemoteError> {
+        match self
+            .call(Request::PutKeyslot {
+                device_id: *device_id,
+                gen,
+                blob: blob.to_vec(),
+            })
+            .await?
+        {
+            Response::Ok => Ok(()),
+            Response::Err(c) => Err(RemoteError(format!("put-keyslot: {c:?}"))),
+            other => Err(RemoteError(format!("put-keyslot: unexpected {other:?}"))),
+        }
+    }
+
+    async fn roster_append(&self, old_tip: &Id, entry: &[u8]) -> Result<bool, RemoteError> {
+        match self
+            .call(Request::RosterAppend {
+                old_tip: *old_tip,
+                entry: entry.to_vec(),
+            })
+            .await?
+        {
+            Response::Ok => Ok(true),
+            Response::Err(ErrorCode::CasConflict) => Ok(false),
+            Response::Err(c) => Err(RemoteError(format!("roster-append: {c:?}"))),
+            other => Err(RemoteError(format!("roster-append: unexpected {other:?}"))),
+        }
+    }
+
     async fn gc(
         &self,
         keep_set: Vec<Id>,

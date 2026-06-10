@@ -148,6 +148,21 @@ pub trait Remote {
         roster_seq: u64,
         put_epoch: u64,
     ) -> Result<GcOutcome, RemoteError>;
+    /// Store a device's keyslot blob (§13) — the network half of enrollment (§7/§8.4). Defaults to an
+    /// error so read-only / in-process backends need not implement it.
+    async fn put_keyslot(
+        &self,
+        _device_id: &Id,
+        _gen: u32,
+        _blob: &[u8],
+    ) -> Result<(), RemoteError> {
+        Err(RemoteError("put_keyslot unsupported by this remote".to_string()))
+    }
+    /// Append a sigchain entry CAS-guarded by `old_tip` (§8.1): `Ok(true)` = appended, `Ok(false)` =
+    /// CAS conflict (re-fold + retry). Defaults to an error for read-only backends.
+    async fn roster_append(&self, _old_tip: &Id, _entry: &[u8]) -> Result<bool, RemoteError> {
+        Err(RemoteError("roster_append unsupported by this remote".to_string()))
+    }
 }
 
 /// The result of a [`Remote::gc`] request.

@@ -48,6 +48,8 @@ pub mod op {
     pub const GET_ROSTER: &str = "get-roster";
     /// Fetch a device's keyslot blob (`/keyslots/<device_id>/<g>`, §13) — for cold-start unwrap (§8.1).
     pub const GET_KEYSLOT: &str = "get-keyslot";
+    /// Store a device's keyslot blob (`/keyslots/<device_id>/<g>`, §13) — the network half of enrollment.
+    pub const PUT_KEYSLOT: &str = "put-keyslot";
     /// Fetch a roster-key-history wrap (`/roster-keyhist/<g>`, §8.2) — for rotation-era cold-start.
     pub const GET_ROSTER_KEYHIST: &str = "get-roster-keyhist";
     /// Fetch a DATA key-history wrap (`/keyhist/<g>`, §8.2) — peeling `master_key_g` for old objects.
@@ -117,6 +119,18 @@ pub fn args_get_keyslot(device_id: &Id, gen: u32) -> [u8; 32] {
     blake3_of(&w.finish())
 }
 
+/// `args_hash` for `put-keyslot` (§9.6/§12): `BLAKE3(canonical("put-keyslot" ‖ device_id ‖ le32(gen)
+/// ‖ BLAKE3(blob)))`, binding the exact keyslot (device, generation, content) being written.
+#[must_use]
+pub fn args_put_keyslot(device_id: &Id, gen: u32, blob: &[u8]) -> [u8; 32] {
+    let mut w = Writer::new();
+    w.raw(op::PUT_KEYSLOT.as_bytes())
+        .raw(device_id)
+        .u32(gen)
+        .raw(&blake3_of(blob));
+    blake3_of(&w.finish())
+}
+
 /// The op label, recomputed `args_hash`, and whether it is a write op, for a request (§12). Both the
 /// client (to sign) and the server (to verify) call this so neither can disagree on the binding.
 #[must_use]
@@ -165,6 +179,15 @@ pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
             ..
         } => (op::CAS_HEAD, args_cas_head(ref_h, old_head, new_head), true),
         Request::RosterAppend { entry, .. } => (op::ROSTER_APPEND, args_roster_append(entry), true),
+        Request::PutKeyslot {
+            device_id,
+            gen,
+            blob,
+        } => (
+            op::PUT_KEYSLOT,
+            args_put_keyslot(device_id, *gen, blob),
+            true,
+        ),
     }
 }
 

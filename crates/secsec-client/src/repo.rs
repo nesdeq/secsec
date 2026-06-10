@@ -260,6 +260,36 @@ pub fn init_repo(store: &Store, device: &DeviceKey, ts: u64) -> Result<[u8; 32],
     Ok(rfp)
 }
 
+/// §7 `init` over a [`Remote`] — the network counterpart of [`init_repo`]. The first device to reach an
+/// empty repo creates it **over the wire**: it mints `master_key_1` (RAM-only, never sent), pushes the
+/// self-signed genesis entry via `roster-append` and its own keyslot via `put-keyslot`, and returns the
+/// **RFP**. The master key never touches the server — only the genesis blob + the opaque keyslot do.
+/// Returns [`RepoError::AlreadyInitialized`] if another device won the genesis `roster-append` race.
+pub async fn init_repo_remote<R: Remote>(
+    remote: &R,
+    device: &DeviceKey,
+    ts: u64,
+) -> Result<[u8; 32], RepoError> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    getrandom::fill(key.as_mut_slice()).map_err(|_| RepoError::Rng)?;
+    let mk = MasterKey::new(1, *key);
+
+    let xwing_pub = device_xwing_pub(device)?;
+    let (entry, rfp) = genesis(device, xwing_pub.clone(), mk.mk_commit(), ts)?;
+    let roster_key = mk.roster_key();
+    let blob = seal_entry(&roster_key, 1, 0, &encode_entry(&entry));
+    // Genesis CAS: `old_tip` is the all-zero sentinel ("expect empty"); a `false` return means another
+    // device already created the repo.
+    if !remote.roster_append(&ABSENT_HEAD, &blob).await? {
+        return Err(RepoError::AlreadyInitialized);
+    }
+
+    let device_id = device.device_id()?;
+    let keyslot = wrap_keyslot(&key, 1, &device_id, &xwing_pub)?;
+    remote.put_keyslot(&device_id, 1, &keyslot).await?;
+    Ok(rfp)
+}
+
 fn frame_gen(blob: &[u8]) -> Result<u32, RepoError> {
     let frame_bytes = blob.get(..FRAME_LEN).ok_or(RepoError::BadFrame)?;
     Frame::decode(frame_bytes)

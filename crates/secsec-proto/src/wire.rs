@@ -205,6 +205,18 @@ pub enum Request {
         /// The generation whose wrap is requested.
         gen: u32,
     },
+    /// Store a device's keyslot blob at `/keyslots/<device_id>/<gen>` (§13) — the network half of
+    /// enrollment (`init`/`grant`/`rotate` writing a member's keyslot). A write op; the keyslot is an
+    /// opaque wrap the recipient authenticates against `mk_commit` (§7), so the server cannot forge a
+    /// valid one.
+    PutKeyslot {
+        /// `device_id = BLAKE3(canonical(pubkey))` of the keyslot owner.
+        device_id: Id,
+        /// Master-key generation the keyslot wraps.
+        gen: u32,
+        /// The opaque `algo_id ‖ body` keyslot blob (§8.3).
+        blob: Vec<u8>,
+    },
 }
 
 const T_GET: u8 = 0;
@@ -218,6 +230,7 @@ const T_GETKEYSLOT: u8 = 7;
 const T_GC: u8 = 8;
 const T_GETRKH: u8 = 9;
 const T_GETKH: u8 = 10;
+const T_PUTKEYSLOT: u8 = 11;
 
 impl Request {
     /// Canonical encoding (tag-prefixed).
@@ -277,6 +290,13 @@ impl Request {
             }
             Request::GetKeyhist { gen } => {
                 w.u8(T_GETKH).u32(*gen);
+            }
+            Request::PutKeyslot {
+                device_id,
+                gen,
+                blob,
+            } => {
+                w.u8(T_PUTKEYSLOT).raw(device_id).u32(*gen).bytes(blob);
             }
         }
         w.finish()
@@ -339,6 +359,11 @@ impl Request {
             }
             T_GETRKH => Request::GetRosterKeyhist { gen: r.u32()? },
             T_GETKH => Request::GetKeyhist { gen: r.u32()? },
+            T_PUTKEYSLOT => Request::PutKeyslot {
+                device_id: read32(&mut r)?,
+                gen: r.u32()?,
+                blob: r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec(),
+            },
             other => return Err(WireError::BadTag(other)),
         };
         r.finish()?;
