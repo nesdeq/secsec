@@ -3,8 +3,8 @@
 A self-hosted, end-to-end-encrypted, **live two-way** file-sync system (server + client),
 single static Rust binary. The server is **blind**: it stores only ciphertext and never learns
 file contents, names, structure, or sizes beyond a bounded, documented residual. The only
-credential is an SSH key. This document is implementation-ready and is the authoritative spec.
-The build plan, status, and assurance strategy live in `secsec-Implementation.md`.
+credential is an SSH key. This document is the authoritative spec. The crate structure,
+dependencies, and assurance strategy are in `secsec-Implementation.md`.
 
 > Design principle: **every security claim in §4 is paired with the exact mechanism that
 > provides it.** Anything not so backed is not claimed. The only items deferred to "residual"
@@ -89,9 +89,9 @@ Each row is a guarantee and the mechanism that earns it. Residuals in §22.
 | P10 | No catastrophic AEAD misuse / key-confusion for object, keyslot, and key-history wraps | Unique per-object key, fixed nonce, CMT-4 committing AEAD via CTX construction (§9.4); key-history wrap (§8.2) uses CTX pattern with ctx_tag_keyhist = BLAKE3::keyed_hash(k_keyhist_g, "secsec-ctx-v1" ‖ AD_keyhist ‖ T), binding master_key_g as plaintext |
 | P11 | Forward secrecy after revocation | Post-rotation data uses a new generation the revoked device cannot derive (§8.4) |
 | P12 | Transport is authenticated without a CA; first-contact TOFU window is a documented residual | TLS 1.3 to a pinned self-signed host key (TOFU on the first `sync`, fingerprint printed for out-of-band confirmation, then persisted in the folder link), channel-bound auth (§11); the pin rests on that one-time confirmation — the first-contact TOFU window is a residual (§22). A *joining* device additionally checks `host_id` under the invite-code MAC (§7) |
-| P13 | No algorithm/format downgrade once a `SetMinAlgo` entry has been received | Pinned TLS & signature algorithms; `SetMinAlgo` floor in the sigchain enforced on every fetched keyslot (not only at creation) **[wired]**; compile-time floor (§16) **[wired]**; withheld-entry detection via multi-remote cross-check (§14, §22) is **not wired to the CLI — see §2**. (No the CLI command *creates* a `SetMinAlgo` entry — intentional while X-Wing is the only algorithm, §16.) |
+| P13 | No algorithm/format downgrade once a `SetMinAlgo` entry has been received | Pinned TLS & signature algorithms; `SetMinAlgo` floor in the sigchain enforced on every fetched keyslot (not only at creation) **[wired]**; compile-time floor (§16) **[wired]**; withheld-entry detection via multi-remote cross-check (§14, §22) is **not wired to the CLI — see §2**. (No CLI command *creates* a `SetMinAlgo` entry — intentional while X-Wing is the only algorithm, §16.) |
 | P14 | No server-stored recovery blob to crack; lockout is avoided by backing up the SSH key, not a second secret | The SSH key is both credential and backup. A device holding it is a full plaintext replica; a reinstalled one re-joins via an invite from any peer (§7). Losing *every* device **and** the SSH key is unrecoverable by construction — the §22 total-loss residual. (A passphrase-wrapped recovery keyslot on an untrusted server was considered and **removed** as a net liability: it adds an offline-crackable, server-exfiltratable target for a backup the SSH key already provides.) |
-| P15 | Durability despite a hostile server **(not wired — see §2)** | Content-addressed replication to ≥2 remotes; client retains until quorum-confirmed via put→get→verify round-trip on each remote (§14). **The the CLI is single-remote**, so a binary user's durability is local retention against one server, not a ≥2-remote quorum |
+| P15 | Durability despite a hostile server **(not wired — see §2)** | Content-addressed replication to ≥2 remotes; client retains until quorum-confirmed via put→get→verify round-trip on each remote (§14). **The CLI is single-remote**, so a binary user's durability is local retention against one server, not a ≥2-remote quorum |
 
 ---
 ## 5. Identifiers & trust anchor
@@ -117,7 +117,7 @@ Each row is a guarantee and the mechanism that earns it. Residuals in §22.
   server.
   - `host_id = BLAKE3(canonical(server pinned SPKI bytes))`, where the SPKI bytes are the
     SubjectPublicKeyInfo DER encoding of the pinned server certificate public key (QUIC/TLS — the
-    the only transport).
+    only transport).
 - **RFP (Repository FingerPrint)** := `BLAKE3(canonical(genesis sigchain entry))`. The genesis
   transitively commits to device-1's key and to `mk_commit_1`. **RFP is the one out-of-band
   anchor**: established when the first device creates the repo, and delivered to each joining
@@ -355,9 +355,7 @@ forward, so roster forward secrecy is preserved.
 forward-wrap of `master_key_g` under `master_key_{g+1}` for **every** generation, so a current member
 can peel back to `master_key_1` and read *old file content* sealed under any past generation. At 64
 bytes per generation, bounded by the sigchain-length cap (§19), the total size is negligible — there
-is no depth limit and no trimming. (An earlier draft trimmed at 256 generations via a `HistoryReanchor`
-op; that was **removed** — it added a fresh-device fold hazard for marginal space savings in a
-single-user repo that will essentially never reach hundreds of rotations.)
+is no depth limit and no trimming.
 
 ### 8.3 Keyslots — versioned, authenticated by commitment, PQ-ready
 
@@ -1466,86 +1464,3 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
   match the server it connected to — §7.) The window is bounded to the first contact — after the
   pin is persisted in the folder's link, no further TOFU exposure exists.
 
----
-
-## 23. Design review & closure
-
-An independent end-to-end trace of the design (the former `finalrew.md`). These held up under review:
-
-- **CTX/CMT-4 AEAD (§9.4)** — `T` recomputed not stored, binds K/N/A/M; `nonce=0` is safe because
-  `k_obj` is unique per object. The three-phase decrypt is correct.
-- **Content-addressing ↔ key derivation** has no circularity (id from plaintext → `k_obj` from id →
-  re-verify id on fetch).
-- **KDF domain separation (§9.5)** — distinct labels, fixed-width `le32(g)‖u8(t)`, the `mk_commit`
-  keyed_hash exception is correctly called out.
-- **Signature namespacing (§9.6)** — server-chosen nonces confined to auth/write; cross-protocol
-  reuse is genuinely closed.
-- **Enrollment (§7)** — the shipped path is **invite-code pairing**: a single-use 96-bit code,
-  carried out-of-band, MACs the key-exchange end-to-end through the blind server's TTL'd mailbox
-  (server never learns the code), the joiner confirms the inviter-vouched `host_id` against its
-  TOFU pin, and the `mk_commit` highest-seq check anchors the unwrapped key to RFP. The
-  fake-universe attack is closed without any human digit comparison. Layered under the mandatory
-  `authorized_keys` connection gate (§11). (The lower-level direct-grant primitive's
-  `secsec-grant-v1`/`enrollment_nonce` attestation, §9.6, remains for non-mailbox enrollment.)
-- **X-Wing keyslot (`secsec-pq`)** — draft-10 conformant: single 32-byte seed expanded via
-  `SHAKE256(sk,96)` to the ML-KEM `(d,z)` seed + X25519 `sk_X`; **label-LAST** combiner
-  `SHA3-256(ss_M‖ss_X‖ct_X‖pk_X‖XWingLabel)`; verified byte-identical to the draft-10 Appendix C
-  vector (`xwing_kat`, not ignored). (An earlier draft of this review and §17 wrongly said
-  label-first — the obsolete draft-02 order; fixed.)
-- **Keep-everything default + multi-remote** makes the GC blast radius small and honest.
-
-The residuals in §22 are honest and genuinely minimal.
-
-**The flagged gaps — with resolution (closed 2026-06-10):**
-
-- **[HIGH → DOCUMENTED as a §22 residual] Concurrent mutual revocation has no tiebreak** — a stolen,
-  online device can win the CAS race and lock out the legitimate one. All devices are flat, equal
-  members; there is no privileged founder. When E does `RevokeDevice(B)+Rotate`, a compromised online
-  B can concurrently do `RevokeDevice(E)+Rotate`; the `/roster-head` CAS serializes them and whoever
-  lands first wins. It only bites when the stolen device is unlocked, online, and racing (in which
-  case it already had data access). **Resolution:** the flat model is retained by design (there is no
-  privileged founder — "the SSH key is the only credential"); the race is now explicitly acknowledged
-  as the **concurrent mutual-revocation residual** in §22 and on the P7 row (§3 "revoked device"
-  adversary). The privileged-founder / recovery-code-authorized-revocation alternative was considered
-  and deliberately not adopted (it would break the flat single-user model). Documented, not silently
-  undercutting P7.
-- **[RESOLVED — removed] HistoryReanchor broke sigchain folding** — trimming key-history below
-  `drop_before_gen` left a freshly-enrolled device unable to derive `roster_key_g` for the dropped
-  generations, so it couldn't verify succession from genesis. Rather than add a signed
-  membership-snapshot baseline, the op was **removed entirely**: both key-histories are now
-  never-trimmed (64 bytes/generation, negligible for a single-user repo). The hazard is gone with the
-  feature. It was never implemented in code.
-- **[LOW → RESOLVED] Spec-completeness items:**
-  - Cold-boot bootstrap order — now stated and implemented (§8.1 step 1): read the tip entry's
-    plaintext `FRAME.gen` → fetch that keyslot → decrypt the tip → peel.
-  - The client learns the current `put_epoch` from its persisted §15 arrival-receipt log, bound into
-    the GC compare-and-swap.
-  - The root tree/commit `path_salt` is the commit's `root_salt` field (commits seal under
-    `ZERO_SALT`); every non-root salt lives in its parent tree.
-  - Local-state-file rollback by a disk-level attacker is documented as subsumed by "client
-    compromise = total" (§22).
-
-**UX redesign (2026-06-10) — security held, ergonomics improved.** The credential model was reworked
-without weakening any §4 claim: (1) `~/.ssh/authorized_keys` became a **mandatory** server-side
-connection gate (§11), closing the "first connector seizes an empty repo" race that a network-only
-model exposed — layered over, never replacing, the keyslot roster; (2) device onboarding moved fully
-over the wire via **invite-code pairing** (§7), replacing the manual fingerprint+SAS ceremony with a
-single carried 96-bit code (higher entropy, no human digit comparison); (3) **recovery was removed**
-entirely (§8.6) as a net liability — the SSH key is credential and backup; (4) **GC became automatic**
-inside the sync loop (§15) rather than a manual command; (5) revocation is now a networked
-`revoke`/`devices` pair (§8.4). The CLI is `serve · sync · invite · devices · revoke`; the client
-keeps no control files in the synced folder (§13). The genesis-bootstrap exception (§12) and the
-invite-code MAC (§7) were the two mechanisms added; both were adversarially traced above.
-
-**Verdict.** Crypto and data-plane: built and tested. Revocation/key-management: the mutual-revocation
-race is documented as a §22 residual (the flat model is intentional); the reanchor/fold hazard was
-removed with the feature. The UX redesign preserved every §4 guarantee. All flagged items are
-resolved or consciously documented — nothing open.
-
----
-
-## Provenance
-
-This specification is the settled output of several adversarial security-review rounds; the
-review's end-to-end trace and gap closure are folded into §23 above. Every normative requirement
-stands on its own. Constants in §19 are normative and required for conformance.

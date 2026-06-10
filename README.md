@@ -162,4 +162,4 @@ mutual-revocation race, metadata leakage within padding/timing bounds) are enume
 
 ## License
 
-MIT OR Apache-2.0.
+GNU General Public License, version 2 (`GPL-2.0-only`) — see [`LICENSE`](LICENSE).
