@@ -1746,6 +1746,7 @@ dependencies = [
  "secsec-kdf",
  "secsec-keyslot",
  "secsec-object",
+ "secsec-pq",
  "secsec-proto",
  "secsec-roster",
  "secsec-server",

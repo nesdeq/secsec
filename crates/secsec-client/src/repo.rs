@@ -6,16 +6,22 @@
 //! form. [`open_repo`] reverses it (§8.1): unwrap the keyslot to a candidate, peel roster keys,
 //! decrypt + fold the chain, and verify both the RFP anchor and the candidate against `mk_commit`.
 //!
-//! [`rotate_repo`] mints a new generation (§8.4): it extends the never-trimmed roster-key history
-//! (§8.2), appends the `Rotate` entry (with the transitive revoke closure when revoking), and re-wraps
-//! every remaining member's keyslot. [`open_repo`]/[`open_repo_remote`] handle **any** generation —
-//! peeling the roster-key history back to genesis to fold the whole chain. (The *data* key-history that
-//! lets members read pre-rotation **object** content — §8.2 `/keyhist` — is a separate, not-yet-wired
-//! concern; rotation here covers membership + key generations, i.e. forward secrecy P6/P11.)
+//! [`rotate_repo`] mints a new generation (§8.4): it extends **both** §8.2 key-histories (roster-key
+//! for sigchain folding, data-key for old-object readability via [`data_keyring`]), appends the
+//! `Rotate` entry (with the transitive revoke closure when revoking), and re-wraps every remaining
+//! member's keyslot at the repo's `min_algo` (§16). [`open_repo`]/[`open_repo_remote`] handle **any**
+//! generation — peeling the roster-key history back to genesis to fold the whole chain.
+//!
+//! Keyslots are **algo-tagged** (`algo_id(1B) ‖ body`, §9.1): classical HPKE(X25519) or hybrid-PQ
+//! X-Wing (§17). A device's X-Wing keypair is derived from its SSH private scalar
+//! ([`secsec_sig::DeviceKey::xwing_seed`]) and its X-Wing public is published in the roster
+//! (`Genesis`/`AddDevice`), so a granter/rotation can wrap to it once `min_algo` reaches X-Wing. The
+//! cold-start unwrap dispatches by `algo_id` and enforces the §16 `min_algo` floor after folding.
 
 use crate::{Remote, RemoteError};
 use secsec_frame::{Frame, FRAME_LEN};
 use secsec_kdf::MasterKey;
+use secsec_pq::{XWingPublic, XWingSecret};
 use secsec_proto::server::limits::MAX_TOTAL_SIGCHAIN;
 use secsec_roster::{
     append, append_many, cold_start_fold, decode_entry, encode_entry, genesis, open_entry,
@@ -26,6 +32,87 @@ use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
 use secsec_store::{Store, StoreError, ABSENT_HEAD};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
+
+/// Keyslot algorithm ids (`finaldesign.md` §9.1 `algo_id` / §8.3): a stored keyslot blob is
+/// `algo_id(1B) ‖ body`, so cold-start dispatches the unwrap and §16 enforces the `min_algo` floor.
+pub const ALGO_CLASSICAL: u8 = secsec_frame::ALGO_CLASSICAL_V1; // 1 — HPKE DHKEM(X25519)
+/// Hybrid post-quantum keyslot — X-Wing (ML-KEM-768 ⊕ X25519), §17.
+pub const ALGO_XWING: u8 = 2;
+
+/// A device's X-Wing keypair, derived from its SSH private scalar (§8.3): the device needs no extra
+/// stored PQ key material — "the SSH key is the only credential" (§1).
+fn xwing_keypair(device: &DeviceKey) -> Result<(XWingSecret, XWingPublic), RepoError> {
+    let sk = XWingSecret::from_seed(*device.xwing_seed()?);
+    let pk = sk.public();
+    Ok((sk, pk))
+}
+
+/// A device's **enrollment public key** for keyslot `algo`: the 32-byte X25519 public (classical —
+/// derivable from the SSH key, so not separately published) or the X-Wing public bytes (hybrid-PQ —
+/// published in the roster so a granter can wrap to it).
+fn enroll_pub_for(device: &DeviceKey, algo: u8) -> Result<Vec<u8>, RepoError> {
+    match algo {
+        ALGO_CLASSICAL => Ok(device.x25519_public()?.to_vec()),
+        ALGO_XWING => Ok(xwing_keypair(device)?.1.to_bytes()),
+        other => Err(RepoError::UnsupportedAlgo(other)),
+    }
+}
+
+/// Wrap `master_key` to `enroll_pub` under `algo`, prefixing the stored keyslot with the `algo_id`
+/// (§9.1/§16). Classical: `enroll_pub` is the 32-byte X25519 public; X-Wing: the X-Wing public bytes.
+fn wrap_keyslot(
+    algo: u8,
+    master_key: &[u8; 32],
+    gen: u32,
+    device_id: &DeviceId,
+    enroll_pub: &[u8],
+) -> Result<Vec<u8>, RepoError> {
+    let body = match algo {
+        ALGO_CLASSICAL => {
+            let x: [u8; 32] = enroll_pub
+                .try_into()
+                .map_err(|_| RepoError::UnsupportedAlgo(algo))?;
+            secsec_keyslot::wrap(master_key, gen, device_id, &x)?
+        }
+        ALGO_XWING => {
+            let pk = XWingPublic::from_bytes(enroll_pub).map_err(|_| RepoError::Pq)?;
+            secsec_pq::wrap_pq(master_key, gen, device_id, &pk).map_err(|_| RepoError::Pq)?
+        }
+        other => return Err(RepoError::UnsupportedAlgo(other)),
+    };
+    let mut out = Vec::with_capacity(1 + body.len());
+    out.push(algo);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// The `algo_id` of a stored keyslot (its first byte).
+fn keyslot_algo(keyslot: &[u8]) -> Result<u8, RepoError> {
+    keyslot.first().copied().ok_or(RepoError::BadKeyslot)
+}
+
+/// Unwrap a stored (algo-prefixed) keyslot to the **raw** master-key bytes for cold-start (§8.1),
+/// dispatching by `algo_id`. The §16 `min_algo` floor is checked by the caller **after** folding (the
+/// floor lives inside the chain this unwrap bootstraps); see [`open_repo`].
+fn unwrap_keyslot_raw(
+    keyslot: &[u8],
+    gen: u32,
+    device_id: &DeviceId,
+    device: &DeviceKey,
+) -> Result<Zeroizing<[u8; 32]>, RepoError> {
+    let (&algo, body) = keyslot.split_first().ok_or(RepoError::BadKeyslot)?;
+    match algo {
+        ALGO_CLASSICAL => {
+            let secret = device.x25519_secret()?;
+            Ok(secsec_keyslot::unwrap_raw(body, gen, device_id, &secret)?)
+        }
+        ALGO_XWING => {
+            let (sk, _) = xwing_keypair(device)?;
+            Ok(secsec_pq::unwrap_pq_raw(body, gen, device_id, &sk).map_err(|_| RepoError::Pq)?)
+        }
+        other => Err(RepoError::UnsupportedAlgo(other)),
+    }
+}
 
 /// Errors from repository genesis / open.
 #[derive(Debug)]
@@ -60,6 +147,19 @@ pub enum RepoError {
     MissingDataKeyhist(u32),
     /// A concurrent sigchain append moved the tip during a rotate; the caller should re-fold + retry.
     RosterCasConflict,
+    /// A stored keyslot carried an `algo_id` this build does not support (§16).
+    UnsupportedAlgo(u8),
+    /// A stored keyslot blob was empty / missing its `algo_id` prefix.
+    BadKeyslot,
+    /// An X-Wing keyslot operation failed (malformed public/ciphertext or AEAD).
+    Pq,
+    /// §16 downgrade floor: a fetched keyslot's `algo_id` was below the chain's `min_algo`.
+    AlgoTooWeak {
+        /// The keyslot's `algo_id`.
+        got: u8,
+        /// The folded chain's `min_algo` floor.
+        floor: u8,
+    },
     /// The far side errored, or returned a roster longer than the §19 cap (a misbehaving server).
     Remote(RemoteError),
 }
@@ -95,6 +195,15 @@ impl core::fmt::Display for RepoError {
                 write!(f, "DATA key-history wrap for generation {g} missing (§8.2)")
             }
             RepoError::RosterCasConflict => f.write_str("roster CAS conflict during rotate; retry"),
+            RepoError::UnsupportedAlgo(a) => write!(f, "unsupported keyslot algo_id {a}"),
+            RepoError::BadKeyslot => f.write_str("malformed keyslot (missing algo_id prefix)"),
+            RepoError::Pq => f.write_str("X-Wing keyslot operation failed"),
+            RepoError::AlgoTooWeak { got, floor } => {
+                write!(
+                    f,
+                    "keyslot algo_id {got} below min_algo floor {floor} (§16)"
+                )
+            }
             RepoError::Remote(e) => write!(f, "{e}"),
         }
     }
@@ -135,8 +244,10 @@ pub fn init_repo(store: &Store, device: &DeviceKey, ts: u64) -> Result<[u8; 32],
     getrandom::fill(key.as_mut_slice()).map_err(|_| RepoError::Rng)?;
     let mk = MasterKey::new(1, *key);
 
-    // Genesis entry + RFP, sealed under roster_key_1 and appended as seq 0 (old_tip = absent).
-    let (entry, rfp) = genesis(device, mk.mk_commit(), ts)?;
+    // Genesis publishes device-1's X-Wing public key (§8.3/§17) so a future `SetMinAlgo(X-Wing)` can
+    // re-wrap keyslots to it; the genesis keyslot itself is classical (the min_algo floor is 1).
+    let xwing_pub = enroll_pub_for(device, ALGO_XWING)?;
+    let (entry, rfp) = genesis(device, xwing_pub, mk.mk_commit(), ts)?;
     let roster_key = mk.roster_key();
     let blob = seal_entry(&roster_key, 1, 0, &encode_entry(&entry));
     if store.append_roster(&ABSENT_HEAD, &blob)?.is_none() {
@@ -144,9 +255,15 @@ pub fn init_repo(store: &Store, device: &DeviceKey, ts: u64) -> Result<[u8; 32],
         return Err(RepoError::AlreadyInitialized);
     }
 
-    // Device-1 keyslot wrapping master_key_1 to its own X25519 key.
+    // Device-1 keyslot wrapping master_key_1 to its own X25519 key (classical, algo-tagged).
     let device_id = device.device_id()?;
-    let keyslot = secsec_keyslot::wrap(&key, 1, &device_id, &device.x25519_public()?)?;
+    let keyslot = wrap_keyslot(
+        ALGO_CLASSICAL,
+        &key,
+        1,
+        &device_id,
+        &enroll_pub_for(device, ALGO_CLASSICAL)?,
+    )?;
     store.put_keyslot(&device_id, 1, &keyslot)?;
     Ok(rfp)
 }
@@ -187,8 +304,8 @@ pub fn open_repo(
     let keyslot = store
         .get_keyslot(&device_id, g_cur)?
         .ok_or(RepoError::NoKeyslot)?;
-    let secret = device.x25519_secret()?;
-    let candidate = secsec_keyslot::unwrap_raw(&keyslot, g_cur, &device_id, &secret)?;
+    // Dispatch the unwrap by the keyslot's algo_id (classical / X-Wing, §8.3/§17).
+    let candidate = unwrap_keyslot_raw(&keyslot, g_cur, &device_id, device)?;
 
     // Roster-key history (§8.2): the wrap for every generation 1..g_cur, so the fold can peel
     // roster_key_g back to genesis. Empty at g_cur=1.
@@ -200,7 +317,22 @@ pub fn open_repo(
         keyhist.insert(g, wrap);
     }
     let (state, mk) = cold_start_fold(&candidate, g_cur, rfp, &keyhist, &entries)?;
+    enforce_min_algo(&keyslot, &state)?;
     Ok((mk, state))
+}
+
+/// §16 downgrade floor: a fetched keyslot's `algo_id` MUST be ≥ the folded chain's `min_algo`. Checked
+/// **after** the fold (the floor lives in the chain the keyslot bootstraps), so a server cannot replay
+/// an older/weaker keyslot after a `SetMinAlgo` bump.
+fn enforce_min_algo(keyslot: &[u8], state: &State) -> Result<(), RepoError> {
+    let got = keyslot_algo(keyslot)?;
+    if got < state.min_algo {
+        return Err(RepoError::AlgoTooWeak {
+            got,
+            floor: state.min_algo,
+        });
+    }
+    Ok(())
 }
 
 /// Build the §8.2 DATA key-history keyring from the **local** store: peel `master_key_g` for every
@@ -322,13 +454,24 @@ pub fn rotate_repo(
         }
         None => std::collections::BTreeSet::new(),
     };
+    // The new keyslots use the repo's current min_algo (§16): classical to each member's X25519
+    // (derivable from its SSH key), or X-Wing to the member's published X-Wing public (§8.3/§17).
+    let algo = state.min_algo.max(ALGO_CLASSICAL);
     for (id, pubkey) in &state.members {
         if revoked.contains(id) {
             store.delete_keyslot(id, g)?;
             continue;
         }
-        let x = pubkey.x25519_public()?;
-        let ks = secsec_keyslot::wrap(&newkey, g1, id, &x)?;
+        let enroll_pub = if algo >= ALGO_XWING {
+            state
+                .enroll_pubs
+                .get(id)
+                .cloned()
+                .ok_or(RepoError::UnsupportedAlgo(algo))?
+        } else {
+            pubkey.x25519_public()?.to_vec()
+        };
+        let ks = wrap_keyslot(algo, &newkey, g1, id, &enroll_pub)?;
         store.put_keyslot(id, g1, &ks)?;
     }
 
@@ -344,15 +487,21 @@ pub fn rotate_repo(
 /// The **interactive** half — the SAS commitment-before-reveal ceremony, the human fingerprint check,
 /// and the per-`D_pubkey` rate limit (§7) — is the channel orchestration **above** this; the caller
 /// MUST complete it (confirming `d_pubkey` out-of-band) before invoking. `d_x25519_pub` is `d_pubkey`'s
-/// Curve25519 key (the Ed25519→X25519 map). On D's side, [`open_repo`]/[`open_repo_remote`] then verify
-/// the RFP + `mk_commit`, and the caller verifies this attestation with `secsec_roster::verify_grant`.
+/// Curve25519 key (the Ed25519→X25519 map). `d_xwing_pub` is D's X-Wing public key bytes (D derives it
+/// from its SSH key and sends it over the grant channel), published in the `AddDevice` entry so this
+/// and future rotations can wrap a hybrid-PQ keyslot to D once `min_algo` reaches X-Wing. The keyslot
+/// written here uses the repo's current `min_algo` (classical unless already bumped). On D's side,
+/// [`open_repo`]/[`open_repo_remote`] verify the RFP + `mk_commit`, and the caller verifies this
+/// attestation with `secsec_roster::verify_grant`.
 #[allow(clippy::too_many_arguments)]
 pub fn grant_device(
     store: &Store,
     device: &DeviceKey,
     mk: &MasterKey,
+    state: &State,
     d_pubkey: &DevicePublic,
     d_x25519_pub: &[u8; 32],
+    d_xwing_pub: &[u8],
     enrollment_nonce: &[u8; ENROLLMENT_NONCE_LEN],
     ts: u64,
 ) -> Result<Vec<u8>, RepoError> {
@@ -372,6 +521,7 @@ pub fn grant_device(
     let op = Op::AddDevice {
         pubkey: d_canonical.clone(),
         mk_commit,
+        enroll_pub: d_xwing_pub.to_vec(),
     };
     let entry = append(&tip_entry, op, device, ts)?;
     let roster_seq = entry.seq;
@@ -381,9 +531,20 @@ pub fn grant_device(
         return Err(RepoError::RosterCasConflict);
     }
 
-    // Wrap master_key_g to D's keyslot at the current generation.
+    // Wrap master_key_g to D's keyslot at the repo's current min_algo (§16): classical to D's X25519,
+    // or X-Wing to D's published X-Wing public once the floor reaches it.
     let d_id = d_pubkey.device_id()?;
-    let keyslot = secsec_keyslot::wrap(mk.expose_secret(), g, &d_id, d_x25519_pub)?;
+    let enroll_pub = match state.min_algo {
+        a if a >= ALGO_XWING => d_xwing_pub.to_vec(),
+        _ => d_x25519_pub.to_vec(),
+    };
+    let keyslot = wrap_keyslot(
+        state.min_algo.max(ALGO_CLASSICAL),
+        mk.expose_secret(),
+        g,
+        &d_id,
+        &enroll_pub,
+    )?;
     store.put_keyslot(&d_id, g, &keyslot)?;
 
     // Sign the grant attestation over the directly-delivered enrollment_nonce (§9.6).
@@ -433,8 +594,8 @@ pub async fn open_repo_remote<R: Remote>(
         .get_keyslot(&device_id, g_cur)
         .await?
         .ok_or(RepoError::NoKeyslot)?;
-    let secret = device.x25519_secret()?;
-    let candidate = secsec_keyslot::unwrap_raw(&keyslot, g_cur, &device_id, &secret)?;
+    // Dispatch the unwrap by the keyslot's algo_id (classical / X-Wing, §8.3/§17).
+    let candidate = unwrap_keyslot_raw(&keyslot, g_cur, &device_id, device)?;
 
     // Roster-key history (§8.2): fetch the wrap for every generation 1..g_cur over the wire so the
     // fold can peel back to genesis. A remote lacking a needed wrap can't support the cold-start.
@@ -447,6 +608,7 @@ pub async fn open_repo_remote<R: Remote>(
         keyhist.insert(g, wrap);
     }
     let (state, mk) = cold_start_fold(&candidate, g_cur, rfp, &keyhist, &entries)?;
+    enforce_min_algo(&keyslot, &state)?;
     Ok((mk, state))
 }
 
@@ -571,6 +733,62 @@ mod tests {
     }
 
     #[test]
+    fn xwing_keyslot_cold_start_and_min_algo_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("s.redb")).unwrap();
+        let device = DeviceKey::generate().unwrap();
+        let rfp = init_repo(&store, &device, 0).unwrap();
+        let (mk1, _st1) = open_repo(&store, &device, &rfp).unwrap();
+        let did = device.device_id().unwrap();
+
+        // Raise the repo floor to X-Wing (§16) by appending a SetMinAlgo(2) entry, signed by device-1.
+        let rk = mk1.roster_key();
+        let tip_seq = store.roster_len().unwrap() - 1;
+        let tip_blob = store.get_roster_entry(tip_seq).unwrap().unwrap();
+        let tip = decode_entry(&open_entry(&rk, 1, tip_seq, &tip_blob).unwrap()).unwrap();
+        let entry = append(
+            &tip,
+            Op::SetMinAlgo {
+                min_algo: ALGO_XWING,
+            },
+            &device,
+            0,
+        )
+        .unwrap();
+        let blob = seal_entry(&rk, 1, entry.seq, &encode_entry(&entry));
+        let old_tip = *blake3::hash(&tip_blob).as_bytes();
+        assert!(store.append_roster(&old_tip, &blob).unwrap().is_some());
+
+        // Re-wrap device-1's keyslot as X-Wing, to the X-Wing public published at genesis (§8.3/§17).
+        let xpub = enroll_pub_for(&device, ALGO_XWING).unwrap();
+        let xks = wrap_keyslot(ALGO_XWING, mk1.expose_secret(), 1, &did, &xpub).unwrap();
+        assert_eq!(keyslot_algo(&xks).unwrap(), ALGO_XWING);
+        store.put_keyslot(&did, 1, &xks).unwrap();
+
+        // Cold-start: dispatch unwraps the X-Wing keyslot (seed from the SSH key), folds (min_algo=2),
+        // and the §16 floor check passes (keyslot algo 2 ≥ floor 2).
+        let (mk_cs, st_cs) = open_repo(&store, &device, &rfp).unwrap();
+        assert_eq!(st_cs.min_algo, ALGO_XWING);
+        assert_eq!(mk_cs.generation(), 1);
+        assert_eq!(mk_cs.mk_commit(), mk1.mk_commit());
+
+        // §16 downgrade floor: a classical keyslot under min_algo=2 is rejected (no weak-keyslot replay).
+        let cks = wrap_keyslot(
+            ALGO_CLASSICAL,
+            mk1.expose_secret(),
+            1,
+            &did,
+            &enroll_pub_for(&device, ALGO_CLASSICAL).unwrap(),
+        )
+        .unwrap();
+        store.put_keyslot(&did, 1, &cks).unwrap();
+        assert!(matches!(
+            open_repo(&store, &device, &rfp),
+            Err(RepoError::AlgoTooWeak { got: 1, floor: 2 })
+        ));
+    }
+
+    #[test]
     fn grant_enrolls_a_second_device_end_to_end() {
         use secsec_roster::{sas_value, verify_grant};
         let dir = tempfile::tempdir().unwrap();
@@ -578,7 +796,7 @@ mod tests {
         let e = DeviceKey::generate().unwrap(); // granter (device 1)
         let d = DeviceKey::generate().unwrap(); // new device
         let rfp = init_repo(&store, &e, 0).unwrap();
-        let (mk, _st) = open_repo(&store, &e, &rfp).unwrap();
+        let (mk, st) = open_repo(&store, &e, &rfp).unwrap();
 
         // --- the SAS ceremony (cores; the channel/human steps are the caller's) ---
         let d_canonical = d.public().to_canonical().unwrap();
@@ -591,8 +809,21 @@ mod tests {
         // --- E writes the grant records + attestation ---
         let enrollment_nonce = [0x99u8; ENROLLMENT_NONCE_LEN];
         let d_x = d.x25519_public().unwrap();
-        let attestation =
-            grant_device(&store, &e, &mk, &d.public(), &d_x, &enrollment_nonce, 0).unwrap();
+        // D derives its X-Wing public from its SSH key and sends it over the grant channel (published
+        // in AddDevice for future X-Wing rotations; the gen-1 keyslot here is classical).
+        let d_xwing = enroll_pub_for(&d, ALGO_XWING).unwrap();
+        let attestation = grant_device(
+            &store,
+            &e,
+            &mk,
+            &st,
+            &d.public(),
+            &d_x,
+            &d_xwing,
+            &enrollment_nonce,
+            0,
+        )
+        .unwrap();
 
         // --- D's first sync: cold-start recovers the master key + sees itself a member ---
         let (mk_d, st_d) = open_repo(&store, &d, &rfp).unwrap();

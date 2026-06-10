@@ -20,6 +20,7 @@ secsec-sync = { path = "../secsec-sync" }
 secsec-engine = { path = "../secsec-engine" }
 secsec-roster = { path = "../secsec-roster" }
 secsec-keyslot = { path = "../secsec-keyslot" }
+secsec-pq = { path = "../secsec-pq" }
 secsec-sig = { path = "../secsec-sig" }
 secsec-transport = { path = "../secsec-transport" }
 secsec-proto = { path = "../secsec-proto" }

@@ -38,6 +38,10 @@ pub enum Op {
         pubkey: Vec<u8>,
         /// `mk_commit_1`.
         mk_commit: MkCommit,
+        /// The device's **X-Wing public key** bytes (§8.3/§17), published so a granter can wrap a
+        /// hybrid-PQ keyslot to it. Empty for a classical-only repo (the device's X25519 keyslot key
+        /// is derivable from its SSH public key). Opaque here — the keyslot layer interprets it.
+        enroll_pub: Vec<u8>,
     },
     /// Add a device: its canonical pubkey + the current generation's commitment.
     AddDevice {
@@ -45,6 +49,9 @@ pub enum Op {
         pubkey: Vec<u8>,
         /// `mk_commit_g` at the time of the grant.
         mk_commit: MkCommit,
+        /// The new device's **X-Wing public key** bytes (§8.3/§17), as in [`Op::Genesis`]; empty for
+        /// a classical-only enrollment.
+        enroll_pub: Vec<u8>,
     },
     /// Remove a device by id.
     RevokeDevice {
@@ -164,11 +171,19 @@ impl From<FrameError> for RosterError {
 
 fn encode_op(w: &mut Writer, op: &Op) {
     match op {
-        Op::Genesis { pubkey, mk_commit } => {
-            w.u8(0).bytes(pubkey).raw(mk_commit);
+        Op::Genesis {
+            pubkey,
+            mk_commit,
+            enroll_pub,
+        } => {
+            w.u8(0).bytes(pubkey).raw(mk_commit).bytes(enroll_pub);
         }
-        Op::AddDevice { pubkey, mk_commit } => {
-            w.u8(1).bytes(pubkey).raw(mk_commit);
+        Op::AddDevice {
+            pubkey,
+            mk_commit,
+            enroll_pub,
+        } => {
+            w.u8(1).bytes(pubkey).raw(mk_commit).bytes(enroll_pub);
         }
         Op::RevokeDevice { device } => {
             w.u8(2).raw(device);
@@ -207,17 +222,24 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, RosterError> {
     let tag = r.u8()?;
     Ok(match tag {
         0 => {
+            // Read in encode order: pubkey, mk_commit, enroll_pub.
             let pubkey = r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec();
+            let mk_commit = read32(r)?;
+            let enroll_pub = r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec();
             Op::Genesis {
                 pubkey,
-                mk_commit: read32(r)?,
+                mk_commit,
+                enroll_pub,
             }
         }
         1 => {
             let pubkey = r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec();
+            let mk_commit = read32(r)?;
+            let enroll_pub = r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec();
             Op::AddDevice {
                 pubkey,
-                mk_commit: read32(r)?,
+                mk_commit,
+                enroll_pub,
             }
         }
         2 => Op::RevokeDevice { device: read32(r)? },
@@ -498,15 +520,21 @@ pub fn peel_data_keys(
     Ok(keys)
 }
 
-/// Create the genesis entry (seq 0, self-signed by device-1). Returns `(entry, rfp)`.
+/// Create the genesis entry (seq 0, self-signed by device-1). Returns `(entry, rfp)`. `enroll_pub` is
+/// device-1's X-Wing public key bytes (§8.3/§17), or empty for a classical-only repo.
 pub fn genesis(
     device: &DeviceKey,
+    enroll_pub: Vec<u8>,
     mk_commit: MkCommit,
     ts: u64,
 ) -> Result<(Entry, [u8; 32]), RosterError> {
     let signer = device.device_id()?;
     let pubkey = device.public().to_canonical()?;
-    let op = Op::Genesis { pubkey, mk_commit };
+    let op = Op::Genesis {
+        pubkey,
+        mk_commit,
+        enroll_pub,
+    };
     let sig = device.sign(NS_ROSTER, &signed_bytes(0, &[0u8; 32], &op, ts, &signer))?;
     let entry = Entry {
         seq: 0,
@@ -574,6 +602,10 @@ pub struct State {
     pub added_by: BTreeMap<DeviceId, DeviceId>,
     /// For each member in [`added_by`], the `seq` of its (latest) `AddDevice` entry.
     pub added_at: BTreeMap<DeviceId, u64>,
+    /// Per current member, the **X-Wing public key** bytes it published at enrollment (§8.3/§17), so
+    /// a granter/rotation can wrap a hybrid-PQ keyslot to it. Empty/absent for classical-only devices.
+    /// Cleared on revoke.
+    pub enroll_pubs: BTreeMap<DeviceId, Vec<u8>>,
 }
 
 impl State {
@@ -608,8 +640,16 @@ pub fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterError> {
     if entry_hash(g) != *rfp {
         return Err(RosterError::RfpMismatch);
     }
-    let (gpub, gmk) = match &g.op {
-        Op::Genesis { pubkey, mk_commit } => (DevicePublic::from_canonical(pubkey)?, *mk_commit),
+    let (gpub, gmk, g_enroll) = match &g.op {
+        Op::Genesis {
+            pubkey,
+            mk_commit,
+            enroll_pub,
+        } => (
+            DevicePublic::from_canonical(pubkey)?,
+            *mk_commit,
+            enroll_pub.clone(),
+        ),
         _ => return Err(RosterError::BadGenesis),
     };
     // Genesis must be self-signed by device-1 (signer id == the embedded pubkey's id).
@@ -625,9 +665,13 @@ pub fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterError> {
         mk_commits: BTreeMap::new(),
         added_by: BTreeMap::new(),
         added_at: BTreeMap::new(),
+        enroll_pubs: BTreeMap::new(),
     };
     st.members.insert(g.signer, gpub);
     st.mk_commits.insert(1, gmk);
+    if !g_enroll.is_empty() {
+        st.enroll_pubs.insert(g.signer, g_enroll);
+    }
 
     for (i, e) in entries.iter().enumerate().skip(1) {
         if e.seq != i as u64 {
@@ -645,6 +689,7 @@ pub fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterError> {
             Op::AddDevice {
                 pubkey,
                 mk_commit: _,
+                enroll_pub,
             } => {
                 let p = DevicePublic::from_canonical(pubkey)?;
                 let id = p.device_id()?;
@@ -653,11 +698,17 @@ pub fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterError> {
                 // the prior grant, so the latest adder/seq wins.
                 st.added_by.insert(id, e.signer);
                 st.added_at.insert(id, e.seq);
+                if enroll_pub.is_empty() {
+                    st.enroll_pubs.remove(&id);
+                } else {
+                    st.enroll_pubs.insert(id, enroll_pub.clone());
+                }
             }
             Op::RevokeDevice { device } => {
                 st.members.remove(device);
                 st.added_by.remove(device);
                 st.added_at.remove(device);
+                st.enroll_pubs.remove(device);
             }
             Op::Rotate { mk_commit } => {
                 st.generation += 1;
@@ -958,12 +1009,13 @@ mod tests {
         Op::AddDevice {
             pubkey: pubkey_of(d),
             mk_commit: MK,
+            enroll_pub: vec![],
         }
     }
 
     /// device-1 genesis, then a list of appended ops, returns (entries, rfp).
     fn chain(d1: &DeviceKey, ops: Vec<(Op, &DeviceKey)>) -> (Vec<Entry>, [u8; 32]) {
-        let (g, rfp) = genesis(d1, MK, 0).unwrap();
+        let (g, rfp) = genesis(d1, vec![], MK, 0).unwrap();
         let mut entries = vec![g];
         for (op, signer) in ops {
             let e = append(entries.last().unwrap(), op, signer, 0).unwrap();
@@ -994,6 +1046,7 @@ mod tests {
                     Op::AddDevice {
                         pubkey: pubkey_of(&d2),
                         mk_commit: MK,
+                        enroll_pub: vec![],
                     },
                     &d1,
                 ),
@@ -1033,6 +1086,7 @@ mod tests {
                 Op::AddDevice {
                     pubkey: pubkey_of(&d2),
                     mk_commit: MK,
+                    enroll_pub: vec![],
                 },
                 &d1,
             )],
@@ -1184,6 +1238,7 @@ mod tests {
                     Op::AddDevice {
                         pubkey: pubkey_of(&d2),
                         mk_commit: MK,
+                        enroll_pub: vec![],
                     },
                     &d1,
                 ),
@@ -1219,6 +1274,7 @@ mod tests {
                 Op::AddDevice {
                     pubkey: pubkey_of(&d2),
                     mk_commit: MK,
+                    enroll_pub: vec![],
                 },
                 &d1,
             )],
@@ -1251,6 +1307,7 @@ mod tests {
                     Op::AddDevice {
                         pubkey: pubkey_of(&d2),
                         mk_commit: MK,
+                        enroll_pub: vec![],
                     },
                     &d1,
                 ),
@@ -1285,6 +1342,7 @@ mod tests {
                     Op::AddDevice {
                         pubkey: pubkey_of(&d2),
                         mk_commit: MK,
+                        enroll_pub: vec![],
                     },
                     &d1,
                 ),
@@ -1317,7 +1375,7 @@ mod tests {
     #[test]
     fn decode_rejects_trailing_bytes() {
         let d1 = DeviceKey::generate().unwrap();
-        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
         let mut bytes = encode_entry(&g);
         bytes.push(0x00);
         assert!(matches!(
@@ -1329,7 +1387,7 @@ mod tests {
     #[test]
     fn decode_rejects_truncation() {
         let d1 = DeviceKey::generate().unwrap();
-        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
         let bytes = encode_entry(&g);
         assert!(matches!(
             decode_entry(&bytes[..bytes.len() - 1]),
@@ -1340,7 +1398,7 @@ mod tests {
     #[test]
     fn decode_rejects_unknown_op_tag() {
         let d1 = DeviceKey::generate().unwrap();
-        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
         let mut bytes = encode_entry(&g);
         // The op tag sits right after seq(8) + prev(32). Flip Genesis(0) to an unknown tag.
         bytes[40] = 0xFF;
@@ -1358,7 +1416,7 @@ mod tests {
     #[test]
     fn entry_aead_round_trip() {
         let d1 = DeviceKey::generate().unwrap();
-        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
         let pt = encode_entry(&g);
         let rk = roster_key_for(1, [0x33; 32]);
 
@@ -1375,7 +1433,7 @@ mod tests {
     #[test]
     fn entry_aead_wrong_generation_is_frame_mismatch() {
         let d1 = DeviceKey::generate().unwrap();
-        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
         let rk = roster_key_for(1, [0x33; 32]);
         let blob = seal_entry(&rk, 1, 0, &encode_entry(&g));
         // Opening as a different generation must fail at the FRAME check (§18) before any AEAD work.
@@ -1388,7 +1446,7 @@ mod tests {
     #[test]
     fn entry_aead_wrong_seq_rejected() {
         let d1 = DeviceKey::generate().unwrap();
-        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
         let rk = roster_key_for(1, [0x33; 32]);
         let blob = seal_entry(&rk, 1, 7, &encode_entry(&g));
         // Same gen, wrong seq: both the per-entry key and AD differ -> AEAD open fails.
@@ -1401,7 +1459,7 @@ mod tests {
     #[test]
     fn entry_aead_wrong_key_rejected() {
         let d1 = DeviceKey::generate().unwrap();
-        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
         let rk = roster_key_for(1, [0x33; 32]);
         let other = roster_key_for(1, [0x44; 32]);
         let blob = seal_entry(&rk, 1, 0, &encode_entry(&g));
@@ -1414,7 +1472,7 @@ mod tests {
     #[test]
     fn entry_aead_tamper_rejected() {
         let d1 = DeviceKey::generate().unwrap();
-        let (g, _rfp) = genesis(&d1, MK, 0).unwrap();
+        let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
         let rk = roster_key_for(1, [0x33; 32]);
         let mut blob = seal_entry(&rk, 1, 0, &encode_entry(&g));
         // Flip a ciphertext byte (past FRAME + ctx_tag) -> commitment mismatch.
@@ -1714,12 +1772,13 @@ mod tests {
         let d2 = DeviceKey::generate().unwrap();
 
         // Plaintext chain: genesis(g1), AddDevice(g1), Rotate→g2, SetMinAlgo(g2, signed by d2).
-        let (g, rfp) = genesis(&d1, mkc1, 0).unwrap();
+        let (g, rfp) = genesis(&d1, vec![], mkc1, 0).unwrap();
         let e1 = append(
             &g,
             Op::AddDevice {
                 pubkey: pubkey_of(&d2),
                 mk_commit: mkc1,
+                enroll_pub: vec![],
             },
             &d1,
             0,
@@ -1759,12 +1818,13 @@ mod tests {
 
         let d1 = DeviceKey::generate().unwrap();
         let d2 = DeviceKey::generate().unwrap();
-        let (g, rfp) = genesis(&d1, mkc1, 0).unwrap();
+        let (g, rfp) = genesis(&d1, vec![], mkc1, 0).unwrap();
         let e1 = append(
             &g,
             Op::AddDevice {
                 pubkey: pubkey_of(&d2),
                 mk_commit: mkc1,
+                enroll_pub: vec![],
             },
             &d1,
             0,
@@ -1800,7 +1860,7 @@ mod tests {
         // candidate decrypts (its roster_key matches) and folds, but fails the §7-step-3 mk_commit
         // check — the forged-keyslot / fake-universe defense.
         let wrong_commit = MasterKey::new(1, [0xEE; 32]).mk_commit();
-        let (gf, rfpf) = genesis(&d1, wrong_commit, 0).unwrap();
+        let (gf, rfpf) = genesis(&d1, vec![], wrong_commit, 0).unwrap();
         let stored_f = vec![seal_entry(&rk1, 1, 0, &encode_entry(&gf))];
         assert!(matches!(
             cold_start_fold(&MK1, 1, &rfpf, &empty, &stored_f),
@@ -1852,7 +1912,7 @@ mod tests {
             let ids: Vec<DeviceId> = devices.iter().map(|d| d.device_id().unwrap()).collect();
 
             // Genesis by device 0 (the never-revoked founder, so a signer always exists).
-            let (g, rfp) = genesis(&devices[0], commit_for(1), 0).unwrap();
+            let (g, rfp) = genesis(&devices[0], vec![], commit_for(1), 0).unwrap();
             let mut entries = vec![g];
 
             // Reference model.
@@ -1868,6 +1928,7 @@ mod tests {
                         let op = Op::AddDevice {
                             pubkey: pubkey_of(&devices[target]),
                             mk_commit: commit_for(generation),
+                            enroll_pub: vec![],
                         };
                         entries.push(append(prev, op, &devices[signer], 0).unwrap());
                         members.insert(target);
