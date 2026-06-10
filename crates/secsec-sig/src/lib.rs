@@ -153,6 +153,21 @@ impl DeviceKey {
         )))
     }
 
+    /// The device's **X-Wing decapsulation-key seed** (§8.3/§17): `BLAKE3::derive_key(
+    /// "secsec-xwing-seed-v1", device_ed25519_scalar_clamped)`. Derived from the **private** clamped
+    /// scalar — never the public key — so under "the SSH key is the only credential" (§1) the device's
+    /// hybrid-PQ keypair needs **no extra stored material**: it is re-derived at runtime, exactly like
+    /// [`Self::local_seal_key`]. The caller builds `secsec_pq::XWingSecret::from_seed(seed)`; the
+    /// resulting X-Wing public key is published in the roster (`AddDevice`/`Genesis`, §8.3) so a
+    /// granter can wrap `master_key_g` to it.
+    pub fn xwing_seed(&self) -> Result<Zeroizing<[u8; 32]>, SigError> {
+        let scalar = self.x25519_secret()?;
+        Ok(Zeroizing::new(blake3::derive_key(
+            "secsec-xwing-seed-v1",
+            scalar.as_slice(),
+        )))
+    }
+
     /// SSHSIG-sign `msg` under `namespace`, returning the PEM-encoded signature bytes.
     pub fn sign(&self, namespace: &str, msg: &[u8]) -> Result<Vec<u8>, SigError> {
         let sig = self.key.sign(namespace, SIG_HASH, msg)?;
@@ -317,6 +332,21 @@ mod tests {
         // public-recoverable material (it passes through derive_key, so it differs from x25519_secret).
         assert_ne!(ka.as_slice(), a.x25519_secret().unwrap().as_slice());
         assert_ne!(ka.as_slice(), &a.x25519_public().unwrap());
+    }
+
+    #[test]
+    fn xwing_seed_is_private_derived_per_device_and_distinct_from_seal_key() {
+        let a = DeviceKey::generate().unwrap();
+        let b = DeviceKey::generate().unwrap();
+        let sa = a.xwing_seed().unwrap();
+        // deterministic for a given device (re-derived at runtime, never stored).
+        assert_eq!(*sa, *a.xwing_seed().unwrap());
+        // distinct per device.
+        assert_ne!(*sa, *b.xwing_seed().unwrap());
+        // §8.3: from the PRIVATE scalar, and domain-separated from the local-seal key and the scalar.
+        assert_ne!(sa.as_slice(), a.x25519_secret().unwrap().as_slice());
+        assert_ne!(sa.as_slice(), a.local_seal_key().unwrap().as_slice());
+        assert_ne!(sa.as_slice(), &a.x25519_public().unwrap());
     }
 
     #[test]

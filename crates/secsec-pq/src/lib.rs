@@ -300,15 +300,15 @@ pub fn wrap_pq(
     Ok(out)
 }
 
-/// Unwrap an X-Wing keyslot with `secret`, verifying the recovered key against `expected_mk_commit`
-/// (§7/§8.3). Returns the generation-`gen` [`secsec_kdf::MasterKey`].
-pub fn unwrap_pq(
+/// Unwrap an X-Wing keyslot to the **raw** 32-byte master key, **without** the `mk_commit` check —
+/// for the §8.1 cold-start bootstrap, where the commitment lives inside the still-encrypted sigchain
+/// (the fold verifies it). Every other caller MUST use [`unwrap_pq`], which checks the commitment.
+pub fn unwrap_pq_raw(
     keyslot: &[u8],
     gen: u32,
     device_id: &[u8; 32],
     secret: &XWingSecret,
-    expected_mk_commit: &[u8; 32],
-) -> Result<secsec_kdf::MasterKey, PqError> {
+) -> Result<Zeroizing<[u8; 32]>, PqError> {
     if keyslot.len() != XWING_CT_LEN + 32 + 32 {
         return Err(PqError::Malformed);
     }
@@ -325,6 +325,19 @@ pub fn unwrap_pq(
     }
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&pt);
+    Ok(key)
+}
+
+/// Unwrap an X-Wing keyslot with `secret`, verifying the recovered key against `expected_mk_commit`
+/// (§7/§8.3). Returns the generation-`gen` [`secsec_kdf::MasterKey`].
+pub fn unwrap_pq(
+    keyslot: &[u8],
+    gen: u32,
+    device_id: &[u8; 32],
+    secret: &XWingSecret,
+    expected_mk_commit: &[u8; 32],
+) -> Result<secsec_kdf::MasterKey, PqError> {
+    let key = unwrap_pq_raw(keyslot, gen, device_id, secret)?;
     let mk = secsec_kdf::MasterKey::new(gen, *key);
     if mk.mk_commit() != *expected_mk_commit {
         return Err(PqError::CommitMismatch);
