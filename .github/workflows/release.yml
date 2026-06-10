@@ -29,7 +29,7 @@ jobs:
           - { name: windows-x86_64, runner: windows-latest,   target: x86_64-pc-windows-msvc }
           - { name: windows-aarch64, runner: windows-11-arm,  target: aarch64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -69,7 +69,7 @@ jobs:
           $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
           [System.IO.File]::WriteAllText("$archive.sha256", "$hash  $archive`n")
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: secsec-${{ matrix.name }}
           path: |
@@ -88,7 +88,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: secsec-*
@@ -103,7 +103,7 @@ jobs:
           rm -f ./*.sha256
           ls -la
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.tar.gz
