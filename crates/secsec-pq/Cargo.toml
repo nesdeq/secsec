@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Hybrid post-quantum keyslot: X-Wing (ML-KEM-768 + X25519) master-key wrap (finaldesign.md §17)."
+description = "Hybrid post-quantum keyslot: X-Wing (ML-KEM-768 + X25519) master-key wrap (secsec-Design.md §17)."
 
 [lints]
 workspace = true

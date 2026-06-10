@@ -1,4 +1,4 @@
-//! GC serialization hashes (`finaldesign.md` §15). The canonical encodings that bind a `gc` call to
+//! GC serialization hashes (`secsec-Design.md` §15). The canonical encodings that bind a `gc` call to
 //! the client's complete view of mutable state, so the server can only execute a sweep the client
 //! actually authorized (a compare-and-swap against `all_heads_hash`, `roster_seq`, `put_epoch`).
 //!

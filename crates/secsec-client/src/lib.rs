@@ -1,4 +1,4 @@
-//! `secsec-client` — client orchestration over a [`Remote`] (`finaldesign.md` §10, §12, §14).
+//! `secsec-client` — client orchestration over a [`Remote`] (`secsec-Design.md` §10, §12, §14).
 //!
 //! This crate plumbs the proven cores to a remote store: it pushes the reachable **object closure**
 //! of a commit, advances the per-ref **head** via the blind-server compare-and-swap (§12), and on the

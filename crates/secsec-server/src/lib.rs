@@ -1,4 +1,4 @@
-//! `secsec-server` — the server request handler (`finaldesign.md` §12, §19). The §12 authorization
+//! `secsec-server` — the server request handler (`secsec-Design.md` §12, §19). The §12 authorization
 //! pipeline a `secsec serve` loop runs for every per-op request, over the content-addressed object
 //! store ([`secsec_store::Store`]):
 //!

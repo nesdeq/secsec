@@ -1,4 +1,4 @@
-//! `secsec-kdf` — the key-derivation hierarchy of `finaldesign.md` §5 and §9.5.
+//! `secsec-kdf` — the key-derivation hierarchy of `secsec-Design.md` §5 and §9.5.
 //!
 //! Every subkey is `BLAKE3::derive_key(context_label, IKM)` with a **distinct, hardcoded** context
 //! label (the domain separation of §9.5) and the secret in the IKM/message role. The IKM is built

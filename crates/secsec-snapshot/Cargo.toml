@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Object graph (Tree/Commit) + directory snapshot and restore (finaldesign.md §6, §9.2)."
+description = "Object graph (Tree/Commit) + directory snapshot and restore (secsec-Design.md §6, §9.2)."
 
 [lints]
 workspace = true

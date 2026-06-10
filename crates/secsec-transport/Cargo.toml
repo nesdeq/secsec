@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "QUIC+TLS1.3 transport: pinned self-signed host-key verifier (finaldesign.md §11, risk R1)."
+description = "QUIC+TLS1.3 transport: pinned self-signed host-key verifier (secsec-Design.md §11, risk R1)."
 
 [lints]
 workspace = true

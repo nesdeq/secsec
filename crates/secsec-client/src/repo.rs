@@ -1,4 +1,4 @@
-//! Repository genesis and cold-start open (`finaldesign.md` §7 `init`, §8.1 cold-start fold).
+//! Repository genesis and cold-start open (`secsec-Design.md` §7 `init`, §8.1 cold-start fold).
 //!
 //! [`init_repo`] creates a fresh repo for device 1: generate `master_key_1`, write the self-signed
 //! **genesis** sigchain entry (the RFP anchor, §5/§7) and device-1's **keyslot** wrapping the master
@@ -35,7 +35,7 @@ use secsec_store::{Store, StoreError, ABSENT_HEAD};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
-/// Keyslot algorithm id (`finaldesign.md` §9.1 / §8.3): a stored keyslot is `algo_id(1B) ‖ body`.
+/// Keyslot algorithm id (`secsec-Design.md` §9.1 / §8.3): a stored keyslot is `algo_id(1B) ‖ body`.
 /// **Post-quantum is mandatory** — X-Wing (§17) is the *only* keyslot algorithm; the classical
 /// X25519/HPKE wrap was removed. The 1-byte tag and the §16 `min_algo` floor remain for forward
 /// agility (a future PQ KEM bumps the floor via `SetMinAlgo`); any keyslot below X-Wing is rejected.

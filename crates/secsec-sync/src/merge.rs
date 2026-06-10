@@ -1,4 +1,4 @@
-//! Per-path three-way merge (`finaldesign.md` §10). The data half of the rollback-aware merge: given
+//! Per-path three-way merge (`secsec-Design.md` §10). The data half of the rollback-aware merge: given
 //! a common-ancestor tree (`base`) and two divergent trees (`ours`, `theirs`), produce the merged
 //! tree and the list of conflicts, with **no silent data loss**.
 //!

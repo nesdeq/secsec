@@ -1,4 +1,4 @@
-//! The authenticated serve loop (`finaldesign.md` §11/§12): run the application handshake on a QUIC
+//! The authenticated serve loop (`secsec-Design.md` §11/§12): run the application handshake on a QUIC
 //! connection, confirm the client is rostered (keyslot existence), then dispatch each per-op request
 //! stream through [`Server::handle`].
 //!

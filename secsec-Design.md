@@ -1,10 +1,10 @@
-# secsec — Final Design
+# secsec — Design
 
 A self-hosted, end-to-end-encrypted, **live two-way** file-sync system (server + client),
 single static Rust binary. The server is **blind**: it stores only ciphertext and never learns
 file contents, names, structure, or sizes beyond a bounded, documented residual. The only
-credential is an SSH key. This document is implementation-ready and is the authoritative spec;
-it supersedes `DESIGN.md`.
+credential is an SSH key. This document is implementation-ready and is the authoritative spec.
+The build plan, status, and assurance strategy live in `secsec-Implementation.md`.
 
 > Design principle: **every security claim in §4 is paired with the exact mechanism that
 > provides it.** Anything not so backed is not claimed. The only items deferred to "residual"
@@ -1402,9 +1402,67 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
 
 ---
 
+## 23. Design review & closure
+
+An independent end-to-end trace of the design (the former `finalrew.md`). These held up under review:
+
+- **CTX/CMT-4 AEAD (§9.4)** — `T` recomputed not stored, binds K/N/A/M; `nonce=0` is safe because
+  `k_obj` is unique per object. The three-phase decrypt is correct.
+- **Content-addressing ↔ key derivation** has no circularity (id from plaintext → `k_obj` from id →
+  re-verify id on fetch).
+- **KDF domain separation (§9.5)** — distinct labels, fixed-width `le32(g)‖u8(t)`, the `mk_commit`
+  keyed_hash exception is correctly called out.
+- **Signature namespacing (§9.6)** — server-chosen nonces confined to auth/write; cross-protocol
+  reuse is genuinely closed.
+- **Enrollment (§7)** — full fingerprint carried out-of-band by the human in step 1,
+  commitment-before-reveal SAS over RFP+D_pubkey, `mk_commit` highest-seq check, in-band
+  `enrollment_nonce`. The fake-universe attack is closed.
+- **X-Wing keyslot (`secsec-pq`)** — draft-10 conformant: single 32-byte seed expanded via
+  `SHAKE256(sk,96)` to the ML-KEM `(d,z)` seed + X25519 `sk_X`; **label-LAST** combiner
+  `SHA3-256(ss_M‖ss_X‖ct_X‖pk_X‖XWingLabel)`; verified byte-identical to the draft-10 Appendix C
+  vector (`xwing_kat`, not ignored). (An earlier draft of this review and §17 wrongly said
+  label-first — the obsolete draft-02 order; fixed.)
+- **Keep-everything default + multi-remote** makes the GC blast radius small and honest.
+
+The residuals in §22 are honest and genuinely minimal.
+
+**The flagged gaps — with resolution (closed 2026-06-10):**
+
+- **[HIGH → DOCUMENTED as a §22 residual] Concurrent mutual revocation has no tiebreak** — a stolen,
+  online device can win the CAS race and lock out the legitimate one. All devices are flat, equal
+  members; there is no privileged founder. When E does `RevokeDevice(B)+Rotate`, a compromised online
+  B can concurrently do `RevokeDevice(E)+Rotate`; the `/roster-head` CAS serializes them and whoever
+  lands first wins. It only bites when the stolen device is unlocked, online, and racing (in which
+  case it already had data access). **Resolution:** the flat model is retained by design (there is no
+  privileged founder — "the SSH key is the only credential"); the race is now explicitly acknowledged
+  as the **concurrent mutual-revocation residual** in §22 and on the P7 row (§3 "revoked device"
+  adversary). The privileged-founder / recovery-code-authorized-revocation alternative was considered
+  and deliberately not adopted (it would break the flat single-user model). Documented, not silently
+  undercutting P7.
+- **[RESOLVED — removed] HistoryReanchor broke sigchain folding** — trimming key-history below
+  `drop_before_gen` left a freshly-enrolled device unable to derive `roster_key_g` for the dropped
+  generations, so it couldn't verify succession from genesis. Rather than add a signed
+  membership-snapshot baseline, the op was **removed entirely**: both key-histories are now
+  never-trimmed (64 bytes/generation, negligible for a single-user repo). The hazard is gone with the
+  feature. It was never implemented in code.
+- **[LOW → RESOLVED] Spec-completeness items:**
+  - Cold-boot bootstrap order — now stated and implemented (§8.1 step 1): read the tip entry's
+    plaintext `FRAME.gen` → fetch that keyslot → decrypt the tip → peel.
+  - The client learns the current `put_epoch` from its persisted §15 arrival-receipt log, bound into
+    the GC compare-and-swap.
+  - The root tree/commit `path_salt` is the commit's `root_salt` field (commits seal under
+    `ZERO_SALT`); every non-root salt lives in its parent tree.
+  - Local-state-file rollback by a disk-level attacker is documented as subsumed by "client
+    compromise = total" (§22).
+
+**Verdict.** Crypto and data-plane: built and tested. Revocation/key-management: the mutual-revocation
+race is documented as a §22 residual (the flat model is intentional); the reanchor/fold hazard was
+removed with the feature. All flagged items are resolved or consciously documented — nothing open.
+
+---
+
 ## Provenance
 
-This specification is the settled output of several adversarial security-review rounds. The
-detailed finding→fix history lives in `securityreview.md` and the `_backup/` revisions, not
-in this document — every normative requirement above stands on its own. Constants in §19 are
-normative and required for conformance.
+This specification is the settled output of several adversarial security-review rounds; the
+review's end-to-end trace and gap closure are folded into §23 above. Every normative requirement
+stands on its own. Constants in §19 are normative and required for conformance.

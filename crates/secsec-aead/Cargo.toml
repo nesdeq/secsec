@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "CTX/CMT-4 fully-committing AEAD over ChaCha20-Poly1305 (finaldesign.md §9.4)."
+description = "CTX/CMT-4 fully-committing AEAD over ChaCha20-Poly1305 (secsec-Design.md §9.4)."
 
 [lints]
 workspace = true

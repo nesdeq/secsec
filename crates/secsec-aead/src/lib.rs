@@ -1,4 +1,4 @@
-//! `secsec-aead` — the per-object **fully-committing (CMT-4)** AEAD of `finaldesign.md` §9.4,
+//! `secsec-aead` — the per-object **fully-committing (CMT-4)** AEAD of `secsec-Design.md` §9.4,
 //! built as the CTX construction (Chan & Rogaway, ESORICS 2022) over ChaCha20-Poly1305.
 //!
 //! # Construction

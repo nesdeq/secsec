@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "secsec key-derivation hierarchy: master-key generations and domain-separated subkeys (finaldesign.md §5, §9.5)."
+description = "secsec key-derivation hierarchy: master-key generations and domain-separated subkeys (secsec-Design.md §5, §9.5)."
 
 [lints]
 workspace = true

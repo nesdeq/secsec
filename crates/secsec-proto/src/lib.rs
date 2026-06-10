@@ -1,4 +1,4 @@
-//! `secsec-proto` — per-operation authorization for the server API (`finaldesign.md` §12, §9.6).
+//! `secsec-proto` — per-operation authorization for the server API (`secsec-Design.md` §12, §9.6).
 //!
 //! **Every** repo operation — including reads — requires a per-op signature from a key that owns a
 //! keyslot (a rostered device); connection-level auth alone is not enough (§12). This crate builds

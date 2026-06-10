@@ -1,4 +1,4 @@
-//! Recovery keyslot (`finaldesign.md` §8.6, security property P14).
+//! Recovery keyslot (`secsec-Design.md` §8.6, security property P14).
 //!
 //! An optional, server-stored wrap of the master key under a key the user holds out-of-band — a
 //! 256-bit **recovery code** (preferred) or a **passphrase** (explicitly weaker). It uses the §9.4

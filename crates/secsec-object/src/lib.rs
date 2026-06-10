@@ -1,5 +1,5 @@
 //! `secsec-object` — the object plane: content addressing, authenticated seal/open with
-//! re-verification, and chunk padding (`finaldesign.md` §9.2, §9.4, §9.7).
+//! re-verification, and chunk padding (`secsec-Design.md` §9.2, §9.4, §9.7).
 //!
 //! This crate composes the foundation: `secsec-kdf` (keys), `secsec-frame` (framing + AD),
 //! `secsec-aead` (committing AEAD). An object is stored as `FRAME ‖ ctx_tag ‖ ciphertext`,

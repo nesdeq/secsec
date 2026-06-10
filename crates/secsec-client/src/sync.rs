@@ -1,4 +1,4 @@
-//! One-shot bidirectional sync of a working directory against a remote ref (`finaldesign.md` §10).
+//! One-shot bidirectional sync of a working directory against a remote ref (`secsec-Design.md` §10).
 //!
 //! [`sync_once`] reconciles a local working directory with `/refs/<ref>` on a [`Remote`], using a
 //! **base** (the last-synced commit) to avoid the classic data-loss trap: a fresh client with an empty

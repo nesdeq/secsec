@@ -1,4 +1,4 @@
-//! Decoder fuzz harness (`finaldesign.md` §3, §18). One `fuzz_*` entry per decoder that parses
+//! Decoder fuzz harness (`secsec-Design.md` §3, §18). One `fuzz_*` entry per decoder that parses
 //! **untrusted** bytes (from the network or disk). Each MUST be **total** on arbitrary input — never
 //! panic, never OOM (the §19 pre-allocation bounds guard against alloc/recursion/decompression bombs).
 //!

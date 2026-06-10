@@ -1,4 +1,4 @@
-//! Hybrid post-quantum keyslot — **X-Wing** (`finaldesign.md` §17).
+//! Hybrid post-quantum keyslot — **X-Wing** (`secsec-Design.md` §17).
 //!
 //! Wraps `master_key_g` to a device under the X-Wing KEM (ML-KEM-768 ⊕ X25519), so the harvestable
 //! asymmetric keyslot wrap is PQ-secure (the symmetric data plane is already PQ-safe). This is a

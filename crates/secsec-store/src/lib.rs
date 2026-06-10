@@ -1,4 +1,4 @@
-//! `secsec-store` — the server's content-addressed blob store (`finaldesign.md` §13).
+//! `secsec-store` — the server's content-addressed blob store (`secsec-Design.md` §13).
 //!
 //! Objects are opaque, content-addressed ciphertext blobs keyed by their 32-byte id. They are
 //! stored in a single embedded `redb` database (its B-tree *is* the packing — the server is never

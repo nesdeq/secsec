@@ -1,4 +1,4 @@
-//! §7 enrollment rate-limiting — the grant-attempt log (`finaldesign.md` §7, §19).
+//! §7 enrollment rate-limiting — the grant-attempt log (`secsec-Design.md` §7, §19).
 //!
 //! The granting device E MUST allow at most [`MAX_GRANT_SESSIONS_PER_HOUR`] SAS/grant sessions per
 //! `D_pubkey` per rolling hour, tracked in **E's local state**, independent of sigchain operations

@@ -1,4 +1,4 @@
-//! `secsec-frame` — object framing, type tags, and decoder bounds (`finaldesign.md` §9.1, §19).
+//! `secsec-frame` — object framing, type tags, and decoder bounds (`secsec-Design.md` §9.1, §19).
 //!
 //! Every stored object is `blob = FRAME ‖ ctx_tag(32) ‖ ciphertext`, where
 //! `FRAME = MAGIC(4) ‖ format_version(u8) ‖ algo_id(u8) ‖ gen(u32) ‖ type(u8)` (11 bytes).

@@ -1,4 +1,4 @@
-//! Signed arrival receipts (`finaldesign.md` §15, defence-in-depth per §22).
+//! Signed arrival receipts (`secsec-Design.md` §15, defence-in-depth per §22).
 //!
 //! On each successful `put`, a cooperative server signs a receipt
 //! `SIG_hostkey(id ‖ host_id ‖ arrival_gen ‖ put_epoch ‖ ts)` with a dedicated Ed25519 **host receipt

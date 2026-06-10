@@ -1,5 +1,5 @@
 //! `secsec-canon` — canonical, deterministic wire encoding for hashed / signed /
-//! content-addressed structures (`finaldesign.md` §9.3).
+//! content-addressed structures (`secsec-Design.md` §9.3).
 //!
 //! Guarantees this layer provides:
 //!

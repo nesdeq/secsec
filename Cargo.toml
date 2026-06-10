@@ -1,4 +1,4 @@
-# secsec — Cargo workspace. See IMPLEMENTATION.md for the crate map and build order.
+# secsec — Cargo workspace. See secsec-Implementation.md for the crate map and build order.
 [workspace]
 resolver = "2"
 members = ["crates/secsec-canon", "crates/secsec-aead", "crates/secsec-kdf", "crates/secsec-frame", "crates/secsec-chunk", "crates/secsec-object", "crates/secsec-store", "crates/secsec-snapshot", "crates/secsec-sig", "crates/secsec-roster", "crates/secsec-sync", "crates/secsec-transport", "crates/secsec-proto", "crates/secsec-server", "crates/secsec-engine", "crates/secsec-client", "crates/secsec-recovery", "crates/secsec-pq", "crates/secsec-fuzz", "bin/secsec", "xtask"]

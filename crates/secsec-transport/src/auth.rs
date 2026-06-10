@@ -1,4 +1,4 @@
-//! Connection authentication (`finaldesign.md` §11, §9.6). The pure-crypto core of the client→server
+//! Connection authentication (`secsec-Design.md` §11, §9.6). The pure-crypto core of the client→server
 //! handshake auth: the **session transcript** and the `secsec-auth-v1` signed payload that binds the
 //! client to this specific session, server identity, and channel.
 //!
@@ -99,7 +99,7 @@ impl From<secsec_sig::SigError> for AuthError {
 /// completed *this* session against *this* server over *this* channel.
 #[derive(Clone, Copy)]
 pub struct ConnectionAuth<'a> {
-    /// TLS exporter (QUIC) or SSH exchange hash `H` (stdio) — the channel binding.
+    /// The TLS 1.3 keying-material exporter — the channel binding (§11).
     pub channel_binding: &'a [u8],
     /// `BLAKE3(SPKI)` of the pinned server key (§11).
     pub host_id: [u8; 32],
@@ -111,8 +111,8 @@ pub struct ConnectionAuth<'a> {
 
 impl ConnectionAuth<'_> {
     /// The canonical signed payload: `channel_binding ‖ host_id ‖ session_transcript ‖ server_nonce`
-    /// (§9.6 field order). `channel_binding` is length-prefixed so the encoding is unambiguous across
-    /// modes (its length differs between QUIC exporter and SSH `H`); the rest are fixed-width.
+    /// (§9.6 field order). `channel_binding` is length-prefixed so the encoding is unambiguous; the
+    /// rest are fixed-width.
     #[must_use]
     pub fn message(&self) -> Vec<u8> {
         let mut w = Writer::new();

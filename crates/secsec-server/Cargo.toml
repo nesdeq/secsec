@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Server request handler: §12 per-op authorization pipeline over the object store (finaldesign.md §12, §19)."
+description = "Server request handler: §12 per-op authorization pipeline over the object store (secsec-Design.md §12, §19)."
 
 [lints]
 workspace = true

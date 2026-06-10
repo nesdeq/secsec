@@ -1,4 +1,4 @@
-//! Client-side per-op RPC over a handshaken QUIC connection (`finaldesign.md` §12). Each request is
+//! Client-side per-op RPC over a handshaken QUIC connection (`secsec-Design.md` §12). Each request is
 //! one bidirectional stream: the server sends a fresh per-op `server_nonce`, the client signs the
 //! `secsec-write-v1` / `secsec-read-v1` authorization over the recomputed `args_hash` + the session
 //! transcript (+ the nonce, for writes), sends the [`AuthedRequest`], and reads the [`Response`].

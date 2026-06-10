@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Decoder fuzz harness: one entry per untrusted-input decoder (finaldesign.md §3, §18)."
+description = "Decoder fuzz harness: one entry per untrusted-input decoder (secsec-Design.md §3, §18)."
 
 [lints]
 workspace = true

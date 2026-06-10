@@ -1,4 +1,4 @@
-//! `secsec-snapshot` — the object graph and directory snapshot/restore (`finaldesign.md` §6, §9.2).
+//! `secsec-snapshot` — the object graph and directory snapshot/restore (`secsec-Design.md` §6, §9.2).
 //!
 //! A snapshot is a `Commit` pointing at a root `Tree`; trees list files (chunk-id lists) and
 //! subtrees, content-addressed via [`secsec_object`]. [`snapshot_tree`] walks a directory, chunks

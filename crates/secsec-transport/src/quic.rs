@@ -1,4 +1,4 @@
-//! QUIC endpoints (`finaldesign.md` §11). Wires [`crate::PinnedServerVerifier`] into real `quinn`
+//! QUIC endpoints (`secsec-Design.md` §11). Wires [`crate::PinnedServerVerifier`] into real `quinn`
 //! client/server endpoints over TLS 1.3, with the pinned self-signed host key as the only trust
 //! anchor (no CA).
 //!

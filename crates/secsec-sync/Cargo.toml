@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Sync plane: signed+encrypted per-ref Head, keyed-hash ref names (finaldesign.md §6, §9.8, §13)."
+description = "Sync plane: signed+encrypted per-ref Head, keyed-hash ref names (secsec-Design.md §6, §9.8, §13)."
 
 [lints]
 workspace = true

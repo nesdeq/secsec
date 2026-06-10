@@ -1,4 +1,4 @@
-//! Multi-remote durability & reconciliation (`finaldesign.md` §14, security property P15).
+//! Multi-remote durability & reconciliation (`secsec-Design.md` §14, security property P15).
 //!
 //! Remotes are pure content-addressed **replicas**; the client is the sole reconciler. This module
 //! provides the three §14 primitives, built on the [`Remote`] abstraction:

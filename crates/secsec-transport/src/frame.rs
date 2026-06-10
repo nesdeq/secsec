@@ -1,4 +1,4 @@
-//! Length-prefixed message framing over QUIC streams (`finaldesign.md` §11/§12). Each protocol
+//! Length-prefixed message framing over QUIC streams (`secsec-Design.md` §11/§12). Each protocol
 //! message (handshake hello, RPC request/response) is sent as `le32(len) ‖ payload` on a stream, with
 //! the length bounded by [`MAX_FRAME_LEN`] **before allocation** (alloc-bomb guard, §9.1/§19).
 

@@ -1,4 +1,4 @@
-//! `secsec-engine` — sync orchestration (`finaldesign.md` §10).
+//! `secsec-engine` — sync orchestration (`secsec-Design.md` §10).
 //!
 //! This crate is the bridge between the stored object graph ([`secsec_snapshot`]) and the pure,
 //! storage-free three-way merge ([`secsec_sync::merge`]). The merge operates on an in-memory

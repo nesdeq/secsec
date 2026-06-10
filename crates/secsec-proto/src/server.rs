@@ -1,4 +1,4 @@
-//! Server-side enforcement (`finaldesign.md` §11, §12, §19). Pure, deterministic policy the QUIC
+//! Server-side enforcement (`secsec-Design.md` §11, §12, §19). Pure, deterministic policy the QUIC
 //! serve loop drives — kept clock-injected (every method takes `now`, unix seconds) so the security
 //! state machines are unit-testable without sockets or a real clock.
 //!

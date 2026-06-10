@@ -1,4 +1,4 @@
-//! Mechanical KAT vector check (`finaldesign.md` §3): compute every value in
+//! Mechanical KAT vector check (`secsec-Design.md` §3): compute every value in
 //! `vectors/secsec-kat-v1.txt` from the **live code paths** and compare against the committed file, so
 //! the human/cross-impl export can never drift from the implementation.
 

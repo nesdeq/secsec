@@ -1,4 +1,4 @@
-//! `secsec-chunk` — **keyed** FastCDC content-defined chunking (`finaldesign.md` §9.7).
+//! `secsec-chunk` — **keyed** FastCDC content-defined chunking (`secsec-Design.md` §9.7).
 //!
 //! Standard FastCDC uses a fixed, canonical gear table so that every implementation cuts at the
 //! same boundaries. secsec deliberately does the opposite: the 256-entry gear table is derived

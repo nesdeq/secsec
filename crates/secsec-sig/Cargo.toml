@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Device identity and SSHSIG signing with disjoint namespaces, Ed25519-only (finaldesign.md §5, §9.6)."
+description = "Device identity and SSHSIG signing with disjoint namespaces, Ed25519-only (secsec-Design.md §5, §9.6)."
 
 [lints]
 workspace = true

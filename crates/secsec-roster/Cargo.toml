@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Roster sigchain: entries, fold/succession, anti-rollback frontier (finaldesign.md §8.1)."
+description = "Roster sigchain: entries, fold/succession, anti-rollback frontier (secsec-Design.md §8.1)."
 
 [lints]
 workspace = true

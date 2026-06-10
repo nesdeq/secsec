@@ -1,4 +1,4 @@
-//! `secsec-sig` — device identity and SSHSIG signatures (`finaldesign.md` §5, §9.6).
+//! `secsec-sig` — device identity and SSHSIG signatures (`secsec-Design.md` §5, §9.6).
 //!
 //! A device is an **Ed25519** SSH keypair. Its `device_id` is `BLAKE3` over the canonical SSH
 //! public-key encoding, so the id is cryptographically bound to the key (§5). All signatures are

@@ -1,4 +1,4 @@
-//! `xtask` — build tooling (`finaldesign.md` §3, §20).
+//! `xtask` — build tooling (`secsec-Design.md` §3, §20).
 //!
 //! - `cargo xtask vectors` regenerates `vectors/secsec-kat-v1.txt` **mechanically** from the same code
 //!   paths the inline KAT `#[test]`s assert, so the human/cross-impl export can never drift from the

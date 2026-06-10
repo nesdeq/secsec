@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "secsec object plane: content addressing, seal/open with verify, and chunk padding (finaldesign.md §9.2, §9.4, §9.7)."
+description = "secsec object plane: content addressing, seal/open with verify, and chunk padding (secsec-Design.md §9.2, §9.4, §9.7)."
 
 [lints]
 workspace = true

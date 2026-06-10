@@ -1,4 +1,4 @@
-//! Cross-remote fork detection (`finaldesign.md` §10 fork algorithm, §14 multi-remote cross-check).
+//! Cross-remote fork detection (`secsec-Design.md` §10 fork algorithm, §14 multi-remote cross-check).
 //!
 //! "Gossip" of head hashes shrinks the fork-detection window: when two devices write to different
 //! remotes while partitioned, their per-ref heads become **DAG-incomparable** (neither an ancestor of

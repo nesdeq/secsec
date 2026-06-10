@@ -1,5 +1,5 @@
 //! `secsec-roster` — the roster sigchain: entries, fold/succession, and the anti-rollback frontier
-//! (`finaldesign.md` §8.1). This is the real ACL.
+//! (`secsec-Design.md` §8.1). This is the real ACL.
 //!
 //! An append-only, hash-chained, SSHSIG-signed log. Each entry is `{seq, prev, op, ts, signer}`
 //! signed under [`secsec_sig::NS_ROSTER`]; `prev` is the BLAKE3 of the full previous entry, and the

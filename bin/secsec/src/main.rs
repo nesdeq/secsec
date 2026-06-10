@@ -1,4 +1,4 @@
-//! `secsec` — the CLI binary (`finaldesign.md` §11, §12).
+//! `secsec` — the CLI binary (`secsec-Design.md` §11, §12).
 //!
 //! Subcommands:
 //! - `init` (§7) — repository genesis: write the genesis roster + this device's keyslot, print the RFP.

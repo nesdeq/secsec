@@ -1,4 +1,4 @@
-//! Client-driven garbage collection (`finaldesign.md` §15). The client is the sole GC driver: it
+//! Client-driven garbage collection (`secsec-Design.md` §15). The client is the sole GC driver: it
 //! computes the **keep-set** (the reachable object closure over the rostered heads), picks a safe
 //! **`gc_gen`** from its own signed arrival receipts (never a server-asserted counter), binds its view
 //! of the server's mutable state (`all_heads_hash`/`roster_seq`/`put_epoch`), and sends the sweep — a

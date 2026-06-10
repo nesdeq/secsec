@@ -1,4 +1,4 @@
-//! Rollback-aware merge gates and fork detection (`finaldesign.md` §10, §8.5; risk R4).
+//! Rollback-aware merge gates and fork detection (`secsec-Design.md` §10, §8.5; risk R4).
 //!
 //! Before a client merges a server-presented sibling head it must clear three gates (§10), checked
 //! against its **persisted frontier** ([`SyncFrontier`], the §8.5 counters) so a malicious server

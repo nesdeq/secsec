@@ -1,4 +1,4 @@
-//! Wire messages for the server API (`finaldesign.md` §11 handshake, §12 RPC). Strict, bounded
+//! Wire messages for the server API (`secsec-Design.md` §11 handshake, §12 RPC). Strict, bounded
 //! canonical codecs for the handshake hellos and the request/response types.
 //!
 //! Every length-prefixed field is bounded by its §19 limit **before allocation** (alloc-bomb guard),

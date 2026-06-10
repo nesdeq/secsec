@@ -1,9 +1,9 @@
-# secsec — Implementation Plan
+# secsec — Implementation
 
-Blueprint for building the system specified in `finaldesign.md`. This document is the agreed
-plan **before** code: verified crate selection, workspace layout, test/assurance strategy, the
-risk register for the security-critical cores, and phased milestones. It does not restate the
-design — read `finaldesign.md` for *what*; this is *how*.
+Blueprint and status for building the system specified in `secsec-Design.md`: verified crate
+selection, workspace layout, test/assurance strategy, the risk register for the security-critical
+cores, phased milestones, and the current build status. It does not restate the design — read
+`secsec-Design.md` for *what*; this is *how* and *where it stands*.
 
 > **Posture.** secsec is a security-critical cryptosystem whose entire value is "the server
 > cannot read your data." A subtle bug is silent and total, so **correctness and provability
@@ -17,7 +17,7 @@ design — read `finaldesign.md` for *what*; this is *how*.
 Device keys are **Ed25519-only** (RSA dropped from scope); targets are **Linux, macOS, Windows**.
 **WebDAV browse is dropped.** Implications: the custom QUIC verifier (R1) is the *sole* transport-auth
 path and thus top priority; `host_id` = pinned-SPKI hash; the `rsa` and `russh` crates drop out
-entirely; key-memory locking needs a cross-platform shim (`mlock` / `VirtualLock`). `finaldesign.md`
+entirely; key-memory locking needs a cross-platform shim (`mlock` / `VirtualLock`). `secsec-Design.md`
 describes exactly what ships — QUIC-only, Ed25519-only, X-Wing-mandatory; the dropped paths are gone
 from the spec, not merely demoted.
 
@@ -81,10 +81,12 @@ secsec/
 ```
 
 Dependency direction is strictly downward (canon → aead/kdf/frame → object/sig/chunk →
-snapshot/store/keyslot/roster → sync → engine → transport/proto → client/server). No security-critical
-crate depends on a higher layer. (`secsec-object`, `secsec-snapshot`, `secsec-keyslot` were split
-out as their own crates from the original `object`/`roster` grouping, keeping each core small and
-separately reviewable. `secsec-engine` is split from `secsec-sync` on the same principle: §10's
+snapshot/store/pq/roster → sync → engine → transport/proto → client/server). No security-critical
+crate depends on a higher layer. (`secsec-object` and `secsec-snapshot` were split out as their own
+crates from the original `object`/`roster` grouping, keeping each core small and separately
+reviewable. The X-Wing keyslot lives in `secsec-pq` — the standalone `secsec-keyslot` crate of an
+earlier draft (a classical HPKE wrap) was removed when the keyslot became X-Wing-only.
+`secsec-engine` is split from `secsec-sync` on the same principle: §10's
 merge/dag/rollback logic stays **storage-free and purely testable** inside `secsec-sync`, while the
 bridge that materializes stored trees into the merge model, re-seals the result, and authors the
 signed merge commit — the only §10 code that touches `store`+`snapshot` — lives in `secsec-engine`.
@@ -152,8 +154,8 @@ No OpenSSL anywhere.
 - **M1 — Object plane.** `secsec-object`, `secsec-chunk`, `secsec-store`; push/pull/restore
   against a local in-process fake server. **Exit:** round-trip a real directory tree; fetch
   re-verifies every id; keyed-CDC decision resolved (R8).
-- **M2 — Identity & roster.** `secsec-roster`: keyslots (HPKE), enrollment (RFP/SAS commitment),
-  generations/rotation, roster-key history, fold/succession, write/read-auth gate.
+- **M2 — Identity & roster.** `secsec-roster`: keyslots (X-Wing, §8.3), enrollment (RFP/SAS
+  commitment), generations/rotation, roster-key history, fold/succession, write/read-auth gate.
   **Exit:** model-based fold tests; enrollment MITM negative tests; revoke⇒rotate works.
 - **M3 — Sync.** `secsec-sync`: refs, `cas-head`, rollback-aware three-way merge, fork detection.
   **Exit:** adversarial replay/rollback tests; conflict keep-both verified.
@@ -203,5 +205,80 @@ No OpenSSL anywhere.
 4. **Keyslot KEM:** **X-Wing** (`libcrux-ml-kem`, formally verified, + `x25519-dalek`) — mandatory,
    the only keyslot algorithm. No `hpke`/`rsa` (the classical and RSA keyslots were removed).
 
-**Still open (not blocking M0):**
-6. **Audit sourcing** — who reviews the cores and when (per-milestone vs final gate).
+**Open:**
+5. **Audit sourcing** — an independent cryptographic review of the cores before production data
+   (the build gets to audit-*ready*; it does not replace the audit).
+
+---
+
+## 8. Status
+
+### Snapshot
+
+- **19 crates + `secsec` binary** (+ `xtask` tooling, `fuzz/` cargo-fuzz layout) · **257 tests** ·
+  clippy `-D warnings` + fmt clean · spec ↔ code ↔ doc consistent.
+- **Transport is QUIC/TLS-only.** RSA device keys, WebDAV, and the stdio/SSH transport were **dropped
+  from scope** (cut from code *and* spec): stdio adds nothing over the pinned QUIC host key, and RSA
+  is superseded by the Ed25519-only device key. The spec describes exactly what ships.
+- **Post-quantum is mandatory.** X-Wing (ML-KEM-768 ⊕ X25519, draft-10) is the **only** keyslot
+  algorithm; there is no classical keyslot to downgrade to.
+- **The product runs end-to-end** with real processes over QUIC: `init` / `serve` / `sync`
+  (+ `--watch`) / `rotate` / `enroll-pubkey` / `grant` / `recovery-init` / `recover` / `gc`. Verified
+  with 4 clients converging through a blind server (linear edits + a concurrent-edit three-way merge,
+  byte-identical trees) and a zero-plaintext-leak check over the server store.
+
+### Milestones — all done
+
+| M | Scope | Status |
+|---|---|---|
+| M0 Foundation | canon/aead/kdf/frame | ✅ done |
+| M1 Object plane | object/chunk/store, snapshot/restore | ✅ done |
+| M2 Identity & roster | sigchain, keyslots, generations, rotate/revoke, SAS | ✅ done |
+| M3 Sync | head, dag, merge, rollback gates, fork detection | ✅ done |
+| M4 Transport | QUIC pinned verifier, §12 wire + server pipeline, limits | ✅ done |
+| M5 Live sync | watcher, concurrent multi-client, clone/publish/pull/merge, init, frontier seal, `--watch` | ✅ done |
+| M6 Durability & recovery | frontier seal, recovery keyslot + `recover`, min-algo, GC, multi-remote, gossip | ✅ done |
+| M7 PQ keyslot | X-Wing (mandatory), full algo_id/keyslot integration | ✅ done |
+
+### Risks — all closed
+
+R1 verifier · R2 CTX committing AEAD · R3 keyslot KEM (now X-Wing) · R4 rollback-merge · R5
+fold/cold-start · R6 GC · R7 canonical encoding · R8 keyed-CDC.
+
+### What each surface does
+
+- **§17 hybrid-PQ keyslot (`secsec-pq`):** X-Wing = ML-KEM-768 + X25519, **draft-10 conformant** —
+  single-seed `SHAKE256(sk,96)` key expansion, **label-LAST** combiner, FIPS 203 §7.1 PCT. `xwing_kat`
+  asserts byte-identity vs the draft-10 Appendix C vector (passing, not ignored). The device's X-Wing
+  seed is `derive_key("secsec-xwing-seed-v1", ed25519_seed)` — derived from the raw Ed25519 **seed**,
+  not the clamped scalar, so a quantum adversary cannot reconstruct it from the public Ed25519 key (§8.3).
+- **PQ-mandatory keyslot integration (`repo.rs`):** keyslots are `algo_id ‖ body` with X-Wing
+  (`algo_id = 2`) the only algorithm; `init`/`grant`/`rotate` wrap to each member's roster-published
+  X-Wing public; cold-start dispatches by `algo_id` and enforces the §16 floor (`min_algo.max(X-Wing)`).
+- **§8.2 DATA key-history:** the cross-generation read path — `open_object` resolves each object's
+  generation via a `MasterKeys` resolver, so fetch/push/merge/sync cross rotation boundaries; the CLI
+  builds the keyring at cold-start. Proven in-process, over live QUIC, and across a rotation.
+- **§8.6 recovery (`secsec-recovery` + `repo.rs` + CLI):** `recovery-init` seals the master key under
+  a fresh 256-bit code (CTX/CMT-4); `recover` reconstructs the key from the code alone (anchored to the
+  RFP via the chain fold) and restores the ref's tree locally (`restore_ref_local`). Round-trip,
+  wrong-code, stale-after-rotation, and byte-identical-restore tests pass.
+- **§15 GC end-to-end:** `sync` surfaces arrival receipts and persists them to a local receipt log;
+  `gc` reads the log, picks a grace-aged `gc_gen` + `put_epoch`, fetches the keep-set local
+  (fail-safe), and issues the CAS sweep. The sweep + CAS-conflict path are proven over live QUIC.
+- **§7 SAS grant rate-limit (`enroll.rs`):** the granter caps SAS/grant sessions at 5 per `D_pubkey`
+  per rolling hour in local state; the `grant` CLI enforces it against a log beside the store.
+- **§14/§10 multi-remote + gossip:** quorum put→get→verify, cross-remote sigchain reconciliation
+  (longest valid chain + rollback alarms), DAG-incomparable fork detection → audit records.
+
+### Log (most recent first)
+
+- **Final push — project complete.** PQ made mandatory (X-Wing the only keyslot; classical removed).
+  `recovery-init`/`recover` finished end-to-end (creation → recover → local restore). GC finished
+  end-to-end (sync persists arrival receipts → `gc` consumes them → CAS sweep). §7 grant rate-limit
+  wired into the `grant` CLI. stdio/SSH transport **cut** from code and spec (QUIC-only); RSA
+  references purged from the spec (Ed25519-only). Full workspace: 257 tests, clippy `-D warnings`, fmt.
+- X-Wing rewritten to draft-10 (the one audit defect) + KAT-proven; X-Wing seed derived from the
+  Ed25519 seed (PQ-safe). `HistoryReanchor` removed (spec-unsound). `secsec-keyslot` crate deleted.
+- `all_heads_hash` fixed (server-visible head-blob hashes). Recovery crate (§8.6). Min-algo (§16).
+- Lock-free store (`Arc<Server>`); `restore` preserves mtime/mode (idempotent snapshot).
+- `sync --watch` continuous loop; concurrent server. `init` genesis + cold-start over the wire.

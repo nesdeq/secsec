@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Recovery keyslot: recovery-code / passphrase wrap of the master key, RFP-anchored (finaldesign.md §8.6)."
+description = "Recovery keyslot: recovery-code / passphrase wrap of the master key, RFP-anchored (secsec-Design.md §8.6)."
 
 [lints]
 workspace = true

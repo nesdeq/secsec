@@ -1,4 +1,4 @@
-//! The application-layer handshake over a live QUIC connection (`finaldesign.md` §11). After the
+//! The application-layer handshake over a live QUIC connection (`secsec-Design.md` §11). After the
 //! pinned TLS handshake ([`crate::PinnedServerVerifier`]) the two ends run this on a control stream:
 //!
 //! 1. client → `ClientHello {version, client_nonce}`;

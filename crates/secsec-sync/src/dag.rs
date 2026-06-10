@@ -1,4 +1,4 @@
-//! Commit-DAG ancestry (`finaldesign.md` §10). Pure graph logic over the commit parent-DAG — the
+//! Commit-DAG ancestry (`secsec-Design.md` §10). Pure graph logic over the commit parent-DAG — the
 //! shared foundation for **fork detection** ("`H_B` is DAG-incomparable to `H_A`") and the
 //! **rollback-aware three-way merge** ("merge vs the common ancestor").
 //!

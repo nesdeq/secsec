@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Server-side content-addressed blob store over redb (finaldesign.md §13)."
+description = "Server-side content-addressed blob store over redb (secsec-Design.md §13)."
 
 [lints]
 workspace = true

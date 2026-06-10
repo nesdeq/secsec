@@ -1,6 +1,6 @@
 # secsec fuzz targets
 
-`cargo-fuzz` targets — one per untrusted-input decoder (`finaldesign.md` §3, §18). Each must be
+`cargo-fuzz` targets — one per untrusted-input decoder (`secsec-Design.md` §3, §18). Each must be
 **total** on arbitrary input (never panic / OOM; the §19 pre-allocation bounds guard against
 alloc/recursion/decompression bombs).
 

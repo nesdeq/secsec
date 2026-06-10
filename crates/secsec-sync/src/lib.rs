@@ -1,4 +1,4 @@
-//! `secsec-sync` — the sync plane (`finaldesign.md` §10). This first slice is the **Head**: the
+//! `secsec-sync` — the sync plane (`secsec-Design.md` §10). This first slice is the **Head**: the
 //! per-ref, mutable, **signed + encrypted** pointer at `/refs/<H>` (§6, §9.8, §13).
 //!
 //! A head names the current commit of a ref. It is:
