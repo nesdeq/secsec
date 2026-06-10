@@ -19,8 +19,8 @@ use secsec_kdf::MasterKey;
 use secsec_proto::server::limits::MAX_TOTAL_SIGCHAIN;
 use secsec_roster::{
     append, append_many, cold_start_fold, decode_entry, encode_entry, genesis, open_entry,
-    revoke_closure, revoke_rotate_ops, seal_entry, seal_roster_keyhist, sign_grant, Op,
-    RosterError, State, ENROLLMENT_NONCE_LEN,
+    peel_data_keys, revoke_closure, revoke_rotate_ops, seal_data_keyhist, seal_entry,
+    seal_roster_keyhist, sign_grant, Op, RosterError, State, ENROLLMENT_NONCE_LEN,
 };
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
 use secsec_store::{Store, StoreError, ABSENT_HEAD};
@@ -55,6 +55,9 @@ pub enum RepoError {
     RotationUnsupported(u32),
     /// The roster-key-history wrap for generation `g` (§8.2) was absent — the chain can't be peeled.
     MissingRosterKeyhist(u32),
+    /// The DATA key-history wrap for generation `g` (§8.2 `/keyhist`) was absent — pre-rotation object
+    /// content under that generation can't be read.
+    MissingDataKeyhist(u32),
     /// A concurrent sigchain append moved the tip during a rotate; the caller should re-fold + retry.
     RosterCasConflict,
     /// The far side errored, or returned a roster longer than the §19 cap (a misbehaving server).
@@ -87,6 +90,9 @@ impl core::fmt::Display for RepoError {
                     f,
                     "roster-key-history wrap for generation {g} missing (§8.2)"
                 )
+            }
+            RepoError::MissingDataKeyhist(g) => {
+                write!(f, "DATA key-history wrap for generation {g} missing (§8.2)")
             }
             RepoError::RosterCasConflict => f.write_str("roster CAS conflict during rotate; retry"),
             RepoError::Remote(e) => write!(f, "{e}"),
@@ -197,6 +203,40 @@ pub fn open_repo(
     Ok((mk, state))
 }
 
+/// Build the §8.2 DATA key-history keyring from the **local** store: peel `master_key_g` for every
+/// generation `1..=mk.generation()`, so the caller can open objects sealed under any past generation
+/// (pre-rotation content readability). Returns `g → master_key_g`. A missing `/keyhist/<g>` wrap is
+/// [`RepoError::MissingDataKeyhist`]. At generation 1 the map is just `{1: mk}` (no history to peel).
+pub fn data_keyring(store: &Store, mk: &MasterKey) -> Result<BTreeMap<u32, MasterKey>, RepoError> {
+    let g_cur = mk.generation();
+    let mut hist: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+    for g in 1..g_cur {
+        let wrap = store
+            .get_keyhist(g)?
+            .ok_or(RepoError::MissingDataKeyhist(g))?;
+        hist.insert(g, wrap);
+    }
+    Ok(peel_data_keys(mk.expose_secret(), g_cur, &hist)?)
+}
+
+/// The network counterpart of [`data_keyring`]: peel the §8.2 DATA key-history over a [`Remote`]
+/// (`get-keyhist` for `g = 1..g_cur`), so a cold-started device can read pre-rotation object content.
+pub async fn data_keyring_remote<R: Remote>(
+    remote: &R,
+    mk: &MasterKey,
+) -> Result<BTreeMap<u32, MasterKey>, RepoError> {
+    let g_cur = mk.generation();
+    let mut hist: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+    for g in 1..g_cur {
+        let wrap = remote
+            .get_keyhist(g)
+            .await?
+            .ok_or(RepoError::MissingDataKeyhist(g))?;
+        hist.insert(g, wrap);
+    }
+    Ok(peel_data_keys(mk.expose_secret(), g_cur, &hist)?)
+}
+
 /// §8.4 rotation: mint `master_key_{g+1}`, extend the never-trimmed roster-key history (§8.2), append
 /// the `Rotate` entry (plus the transitive revoke closure when `revoke` is set), and re-wrap every
 /// remaining member's keyslot to the new generation. Returns the new live `(MasterKey, State)`.
@@ -204,9 +244,10 @@ pub fn open_repo(
 /// `device` (a current member) signs the appended entries. `mk`/`state` are the current generation's;
 /// `rfp` is the pinned anchor. When `revoke` is `Some(b)`, `b` and its transitive add-by closure
 /// (§8.1, conservative: all grants) are revoked before the rotate and their keyslots deleted — the
-/// `revoke ⇒ rotate` forward-secrecy flow (P6/P11). **Note:** this rotates membership + keys; the
-/// *data* key-history that lets members read pre-rotation **object** content (§8.2 `/keyhist`) is a
-/// separate concern not written here.
+/// `revoke ⇒ rotate` forward-secrecy flow (P6/P11). It writes **both** §8.2 key-histories: the
+/// roster-key history (sigchain folding) **and** the DATA key-history (`/keyhist/<g>`, wrapping
+/// `master_key_g` under `master_key_{g+1}`) so a current member can later [`data_keyring`]-peel old
+/// master keys and read pre-rotation **object** content.
 pub fn rotate_repo(
     store: &Store,
     device: &DeviceKey,
@@ -229,6 +270,12 @@ pub fn rotate_repo(
     // §8.2 roster-key history: wrap roster_key_g under roster_key_{g+1} so future cold-start can peel.
     let wrap = seal_roster_keyhist(&rk_g1, g, &rk_g);
     store.put_roster_keyhist(g, &wrap)?;
+
+    // §8.2 DATA key-history: wrap master_key_g under master_key_{g+1} so a current member can peel it
+    // back and read pre-rotation OBJECT content. (The roster-key history above is for sigchain
+    // folding; this one is for old-data readability — both never-trimmed.)
+    let data_wrap = seal_data_keyhist(&newkey, g, mk.expose_secret());
+    store.put_keyhist(g, &data_wrap)?;
 
     // Fetch + decrypt the current tip entry to chain the new ops onto it.
     let n = store.roster_len()?;
@@ -473,6 +520,54 @@ mod tests {
 
         // a wrong RFP still fails the fold after rotation.
         assert!(open_repo(&store, &device, &[0xAB; 32]).is_err());
+    }
+
+    #[test]
+    fn rotation_writes_data_keyhist_and_old_objects_stay_readable() {
+        use secsec_frame::ObjType;
+        use secsec_object::{open_object, seal_object};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("s.redb")).unwrap();
+        let device = DeviceKey::generate().unwrap();
+        let rfp = init_repo(&store, &device, 0).unwrap();
+
+        // gen 1: open + seal an object under master_key_1.
+        let (mk1, st1) = open_repo(&store, &device, &rfp).unwrap();
+        assert_eq!(mk1.generation(), 1);
+        let salt = [0x07u8; 16];
+        let (id1, blob1) = seal_object(&mk1, ObjType::Chunk, &salt, b"gen-1 content");
+        store.put(&id1, &blob1).unwrap();
+
+        // a genesis-only repo's data keyring is just {1: mk} (nothing to peel).
+        let kr1 = data_keyring(&store, &mk1).unwrap();
+        assert_eq!(kr1.len(), 1);
+        assert!(kr1.contains_key(&1));
+
+        // rotate → gen 2; this writes the §8.2 DATA key-history wrap for gen 1.
+        let (mk2, _st2) = rotate_repo(&store, &device, &mk1, &st1, &rfp, None, 0).unwrap();
+        assert_eq!(mk2.generation(), 2);
+        let (id2, blob2) = seal_object(&mk2, ObjType::Chunk, &salt, b"gen-2 content");
+        store.put(&id2, &blob2).unwrap();
+
+        // FRESH cold-start (no in-memory key): recover the gen-2 master key, then peel the data keyring.
+        let (mk_cs, _st_cs) = open_repo(&store, &device, &rfp).unwrap();
+        assert_eq!(mk_cs.generation(), 2);
+        let kr = data_keyring(&store, &mk_cs).unwrap();
+        assert_eq!(kr.len(), 2, "peeled master_key_1 and master_key_2");
+
+        // The cold-started device reads BOTH generations by selecting the right-gen key — the whole
+        // point of §8.2: a routine rotate does not make pre-rotation object content unreadable.
+        assert_eq!(
+            open_object(&kr[&1], ObjType::Chunk, &salt, &id1, &blob1).unwrap(),
+            b"gen-1 content"
+        );
+        assert_eq!(
+            open_object(&kr[&2], ObjType::Chunk, &salt, &id2, &blob2).unwrap(),
+            b"gen-2 content"
+        );
+        // Using the wrong generation's key fails (FRAME gen mismatch) — no silent cross-gen read.
+        assert!(open_object(&kr[&2], ObjType::Chunk, &salt, &id1, &blob1).is_err());
     }
 
     #[test]

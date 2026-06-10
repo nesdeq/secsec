@@ -28,6 +28,7 @@ const L_ROSTER: &str = "secsec-roster-enc-v1";
 const L_REFNAME: &str = "secsec-ref-name-v1";
 const L_ROSTER_ENTRY: &str = "secsec-roster-entry-v1";
 const L_ROSTER_KEYHIST: &str = "secsec-roster-keyhist-v1";
+const L_KEYHIST: &str = "secsec-keyhist-enc-v1";
 const L_OBJ: &str = "secsec-obj-key-v1";
 const MK_COMMIT_MSG_LABEL: &[u8] = b"secsec-mk-commit-v1";
 
@@ -165,6 +166,18 @@ pub fn roster_keyhist_key(roster_key_next: &[u8; 32], g: u32) -> SecretKey {
     })
 }
 
+/// `k_keyhist_g` (§8.2 **DATA** key-history): the forward-wrap key for `master_key_g`, derived from
+/// the *next* generation's **master key** `master_key_{g+1}` so a current member can peel
+/// `master_key_g … master_key_1` and read pre-rotation **object** content. Distinct from
+/// [`roster_keyhist_key`] (which wraps roster keys for sigchain folding); the two are keyed by
+/// different IKM (master key vs roster key) under distinct labels.
+#[must_use]
+pub fn data_keyhist_key(master_key_next: &[u8; 32], g: u32) -> SecretKey {
+    derive(L_KEYHIST, |w| {
+        w.raw(master_key_next).u32(g);
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +238,9 @@ mod tests {
         push(*roster_entry_key(&rk1, 1));
         push(*roster_keyhist_key(&rk2, 1));
         push(*roster_keyhist_key(&rk2, 2));
+        // DATA key-history: distinct from roster_keyhist (different label) and gen-separated.
+        push(*data_keyhist_key(&[0x22; 32], 1));
+        push(*data_keyhist_key(&[0x22; 32], 2));
     }
 
     #[test]

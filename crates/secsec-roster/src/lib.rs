@@ -21,7 +21,7 @@ use secsec_frame::{
     assemble_blob, parse_blob, Frame, FrameError, ObjType, CTX_TAG_LEN, FRAME_LEN,
     MAX_ROSTER_ENTRY_SIZE,
 };
-use secsec_kdf::{roster_entry_key, roster_keyhist_key, MasterKey, SecretKey};
+use secsec_kdf::{data_keyhist_key, roster_entry_key, roster_keyhist_key, MasterKey, SecretKey};
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic, NS_GRANT, NS_ROSTER};
 use std::collections::{BTreeMap, BTreeSet};
 use zeroize::{Zeroize, Zeroizing};
@@ -399,6 +399,99 @@ pub fn peel_roster_keys(
             .expect("roster_key for current peel generation is present");
         let wrap = history.get(&(g - 1)).ok_or(RosterError::Aead)?;
         let prev = open_roster_keyhist(next, g - 1, wrap)?;
+        keys.insert(g - 1, prev);
+        g -= 1;
+    }
+    Ok(keys)
+}
+
+// ---------------------------------------------------------------------------
+// DATA key-history (§8.2 "Master-key generations & history"): a forward chain
+// of wraps of `master_key_g` under `master_key_{g+1}`, so a current member can
+// peel `master_key_current → … → master_key_1` and read **object** content
+// sealed under any past generation. Parallel to the roster-key history above
+// (which exists for sigchain folding); this one exists for old-data readability.
+// A revoked device, lacking the current master key, cannot peel forward → the
+// pre-rotation ciphertext it can still decrypt is only what it cached (§22).
+// ---------------------------------------------------------------------------
+
+/// Stored size of one DATA `keyhist_g` wrap: `ctx_tag(32) ‖ ct(32)` (§8.2) — the same CTX layout as
+/// the roster-key history, wrapping the 32-byte `master_key_g` instead of a roster key. No FRAME
+/// prefix: `g` is known from the storage path and the AD is reconstructed by the reader.
+pub const DATA_KEYHIST_LEN: usize = CTX_TAG_LEN + 32;
+
+/// Wrap `master_key_g` so a holder of `master_key_{g+1}` (the next generation) can recover it (§8.2).
+/// Keyed by `k_keyhist_g = data_keyhist_key(master_key_{g+1}, g)`, AD = `FRAME(type=keyhist, gen=g)`;
+/// returns the bare [`DATA_KEYHIST_LEN`]-byte `ctx_tag ‖ ct`. The CTX/CMT-4 construction binds the
+/// plaintext `master_key_g`, closing partitioning-oracle attacks at the data-key-history layer.
+#[must_use]
+pub fn seal_data_keyhist(
+    master_key_next: &[u8; 32],
+    g: u32,
+    master_key_g: &[u8; 32],
+) -> [u8; DATA_KEYHIST_LEN] {
+    let k = data_keyhist_key(master_key_next, g);
+    let ad = Frame::v1(g, ObjType::Keyhist).encode();
+    let (ctx_tag, ct) = secsec_aead::seal(&k, &ad, master_key_g);
+    let mut out = [0u8; DATA_KEYHIST_LEN];
+    out[..CTX_TAG_LEN].copy_from_slice(&ctx_tag);
+    out[CTX_TAG_LEN..].copy_from_slice(&ct);
+    out
+}
+
+/// Recover `master_key_g` from a DATA `keyhist_g` wrap using `master_key_{g+1}` (§8.2). Verifies the
+/// CMT-4 commitment before releasing the key. Returns the generation-`g` [`MasterKey`].
+pub fn open_data_keyhist(
+    master_key_next: &[u8; 32],
+    g: u32,
+    stored: &[u8],
+) -> Result<MasterKey, RosterError> {
+    if stored.len() != DATA_KEYHIST_LEN {
+        return Err(RosterError::Aead);
+    }
+    let ctx_tag: &[u8; CTX_TAG_LEN] = stored[..CTX_TAG_LEN]
+        .try_into()
+        .expect("slice is exactly CTX_TAG_LEN");
+    let ct = &stored[CTX_TAG_LEN..];
+    let ad = Frame::v1(g, ObjType::Keyhist).encode();
+    let k = data_keyhist_key(master_key_next, g);
+    let mut pt = secsec_aead::open(&k, &ad, ctx_tag, ct).map_err(|_| RosterError::Aead)?;
+    if pt.len() != 32 {
+        pt.zeroize();
+        return Err(RosterError::Aead);
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&pt);
+    pt.zeroize();
+    Ok(MasterKey::new(g, *key))
+}
+
+/// Peel the entire DATA key-history: from `master_key_current` (generation `current_gen`), recover
+/// `master_key_g` for every `g` in `1..current_gen` using the wraps in `history` (keyed by gen `g`,
+/// each [`DATA_KEYHIST_LEN`] bytes). Returns a map `g → master_key_g` for all `1..=current_gen`
+/// (including `current_gen`). A missing or unopenable wrap aborts the peel (a current member can
+/// always produce the chain). The peel proceeds downward because decrypting `keyhist_g` requires
+/// `master_key_{g+1}`.
+pub fn peel_data_keys(
+    master_key_current: &[u8; 32],
+    current_gen: u32,
+    history: &BTreeMap<u32, Vec<u8>>,
+) -> Result<BTreeMap<u32, MasterKey>, RosterError> {
+    let mut keys: BTreeMap<u32, MasterKey> = BTreeMap::new();
+    keys.insert(
+        current_gen,
+        MasterKey::new(current_gen, *master_key_current),
+    );
+    let mut g = current_gen;
+    while g > 1 {
+        let next = Zeroizing::new(
+            *keys
+                .get(&g)
+                .expect("master key for current peel generation is present")
+                .expose_secret(),
+        );
+        let wrap = history.get(&(g - 1)).ok_or(RosterError::Aead)?;
+        let prev = open_data_keyhist(&next, g - 1, wrap)?;
         keys.insert(g - 1, prev);
         g -= 1;
     }
@@ -1412,6 +1505,46 @@ mod tests {
         history.insert(2, seal_roster_keyhist(&rks[2], 2, &rks[1]).to_vec());
         assert!(matches!(
             peel_roster_keys(&rks[(n - 1) as usize], n, &history),
+            Err(RosterError::Aead)
+        ));
+    }
+
+    // ---- DATA key-history (§8.2: read pre-rotation object content) ----
+
+    #[test]
+    fn data_keyhist_peels_every_master_key() {
+        // Five generations with independent master keys; build the never-trimmed DATA wrap chain.
+        let mks: [[u8; 32]; 5] = [[1; 32], [2; 32], [3; 32], [4; 32], [5; 32]];
+        let mut history: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        for g in 1u32..5 {
+            // wrap master_key_g under master_key_{g+1}.
+            let wrap = seal_data_keyhist(&mks[g as usize], g, &mks[(g - 1) as usize]);
+            assert_eq!(wrap.len(), DATA_KEYHIST_LEN);
+            history.insert(g, wrap.to_vec());
+        }
+        let peeled = peel_data_keys(&mks[4], 5, &history).unwrap();
+        assert_eq!(peeled.len(), 5);
+        for g in 1u32..=5 {
+            // each recovered MasterKey is the genuine generation-g key (same derived subkeys).
+            let want = MasterKey::new(g, mks[(g - 1) as usize]);
+            assert_eq!(peeled[&g].generation(), g);
+            assert_eq!(
+                &peeled[&g].roster_key()[..],
+                &want.roster_key()[..],
+                "recovered master_key_{g} must match"
+            );
+            assert_eq!(peeled[&g].mk_commit(), want.mk_commit());
+        }
+        // wrong next-gen key → AEAD failure (CMT-4, not a silent wrong key).
+        assert!(matches!(
+            open_data_keyhist(&[0x99; 32], 1, &history[&1]),
+            Err(RosterError::Aead)
+        ));
+        // a missing wrap aborts the peel (a current member can always produce the full chain).
+        let mut partial = history.clone();
+        partial.remove(&1);
+        assert!(matches!(
+            peel_data_keys(&mks[4], 5, &partial),
             Err(RosterError::Aead)
         ));
     }

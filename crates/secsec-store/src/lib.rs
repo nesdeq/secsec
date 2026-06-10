@@ -33,6 +33,10 @@ const ROSTER: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("roste
 /// `gen(u32)` → roster-key-history wrap (§8.2 `/roster-keyhist/<g>`; never trimmed). Lets a current
 /// member peel `roster_key_g` for every generation to fold the whole sigchain (§8.1 cold-start).
 const ROSTER_KEYHIST: TableDefinition<'static, u32, &[u8]> = TableDefinition::new("roster_keyhist");
+/// `gen(u32)` → DATA key-history wrap (§8.2 `/keyhist/<g>`). Wraps `master_key_g` under
+/// `master_key_{g+1}` so a current member can peel old master keys and read pre-rotation **object**
+/// content (distinct from `ROSTER_KEYHIST`, which is only for sigchain folding).
+const KEYHIST: TableDefinition<'static, u32, &[u8]> = TableDefinition::new("keyhist");
 
 const PUT_EPOCH: &str = "put_epoch";
 
@@ -103,6 +107,7 @@ impl Store {
             wtx.open_table(REFS)?;
             wtx.open_table(ROSTER)?;
             wtx.open_table(ROSTER_KEYHIST)?;
+            wtx.open_table(KEYHIST)?;
         }
         wtx.commit()?;
         Ok(Self { db })
@@ -137,6 +142,25 @@ impl Store {
     pub fn get_roster_keyhist(&self, g: u32) -> Result<Option<Vec<u8>>, StoreError> {
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(ROSTER_KEYHIST)?;
+        Ok(t.get(g)?.map(|v| v.value().to_vec()))
+    }
+
+    /// Store the DATA key-history wrap for generation `g` (§8.2 `/keyhist/<g>`): `master_key_g` sealed
+    /// under `master_key_{g+1}`, so a current member can recover it to read pre-rotation objects.
+    pub fn put_keyhist(&self, g: u32, wrap: &[u8]) -> Result<(), StoreError> {
+        let wtx = self.db.begin_write()?;
+        {
+            let mut t = wtx.open_table(KEYHIST)?;
+            t.insert(g, wrap)?;
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// The DATA key-history wrap for generation `g`, or `None` (§8.2 `/keyhist/<g>`).
+    pub fn get_keyhist(&self, g: u32) -> Result<Option<Vec<u8>>, StoreError> {
+        let rtx = self.db.begin_read()?;
+        let t = rtx.open_table(KEYHIST)?;
         Ok(t.get(g)?.map(|v| v.value().to_vec()))
     }
 

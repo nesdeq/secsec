@@ -112,6 +112,10 @@ impl Remote for QuicRemote<'_> {
         )
     }
 
+    async fn get_keyhist(&self, gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
+        expect_blob("get-keyhist", self.call(Request::GetKeyhist { gen }).await?)
+    }
+
     async fn cas_head(
         &self,
         ref_h: &Id,
@@ -410,6 +414,18 @@ mod tests {
             );
             assert!(state.is_member(&device.device_id().unwrap()));
             assert!(state.mk_commits.contains_key(&1) && state.mk_commits.contains_key(&2));
+
+            // §8.2 DATA key-history over the wire: peel master_key_1 + master_key_2 via get-keyhist,
+            // so a cold-started device could read pre-rotation object content.
+            let keyring = crate::repo::data_keyring_remote(&remote, &mk_cs)
+                .await
+                .unwrap();
+            assert_eq!(
+                keyring.len(),
+                2,
+                "data keyring peels both generations over QUIC"
+            );
+            assert!(keyring.contains_key(&1) && keyring.contains_key(&2));
 
             conn.close(0u32.into(), b"done");
             let _ = srv.await;

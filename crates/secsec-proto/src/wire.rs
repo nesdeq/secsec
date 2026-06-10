@@ -198,6 +198,13 @@ pub enum Request {
         /// The generation whose wrap is requested.
         gen: u32,
     },
+    /// Fetch the DATA key-history wrap at `/keyhist/<gen>` (§8.2) — peeling `master_key_g` across
+    /// generations so a current member can read pre-rotation **object** content. A read op; the server
+    /// returns the opaque wrap.
+    GetKeyhist {
+        /// The generation whose wrap is requested.
+        gen: u32,
+    },
 }
 
 const T_GET: u8 = 0;
@@ -210,6 +217,7 @@ const T_GETROSTER: u8 = 6;
 const T_GETKEYSLOT: u8 = 7;
 const T_GC: u8 = 8;
 const T_GETRKH: u8 = 9;
+const T_GETKH: u8 = 10;
 
 impl Request {
     /// Canonical encoding (tag-prefixed).
@@ -266,6 +274,9 @@ impl Request {
             }
             Request::GetRosterKeyhist { gen } => {
                 w.u8(T_GETRKH).u32(*gen);
+            }
+            Request::GetKeyhist { gen } => {
+                w.u8(T_GETKH).u32(*gen);
             }
         }
         w.finish()
@@ -327,6 +338,7 @@ impl Request {
                 }
             }
             T_GETRKH => Request::GetRosterKeyhist { gen: r.u32()? },
+            T_GETKH => Request::GetKeyhist { gen: r.u32()? },
             other => return Err(WireError::BadTag(other)),
         };
         r.finish()?;
@@ -607,6 +619,7 @@ mod tests {
                 gc_gen: 9,
             },
             Request::GetRosterKeyhist { gen: 2 },
+            Request::GetKeyhist { gen: 5 },
         ];
         for req in reqs {
             assert_eq!(Request::decode(&req.encode()).unwrap(), req);

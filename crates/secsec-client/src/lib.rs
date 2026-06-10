@@ -121,6 +121,12 @@ pub trait Remote {
     async fn get_roster_keyhist(&self, _gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
         Ok(None)
     }
+    /// Fetch the DATA key-history wrap for generation `gen` (`None` if absent) — peeling
+    /// `master_key_g` to read pre-rotation object content (§8.2 `/keyhist/<g>`). Default returns
+    /// `None` so in-process backends without keyhist still compile.
+    async fn get_keyhist(&self, _gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
+        Ok(None)
+    }
     /// Blind compare-and-swap (§12): replace `/refs/<ref_h>` with `new_blob` iff `BLAKE3(current
     /// stored blob)` (or [`ABSENT_HEAD`]) equals `expected_old`. Returns `true` on swap, `false` on
     /// conflict.

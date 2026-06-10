@@ -50,6 +50,8 @@ pub mod op {
     pub const GET_KEYSLOT: &str = "get-keyslot";
     /// Fetch a roster-key-history wrap (`/roster-keyhist/<g>`, §8.2) — for rotation-era cold-start.
     pub const GET_ROSTER_KEYHIST: &str = "get-roster-keyhist";
+    /// Fetch a DATA key-history wrap (`/keyhist/<g>`, §8.2) — peeling `master_key_g` for old objects.
+    pub const GET_KEYHIST: &str = "get-keyhist";
 }
 
 fn blake3_of(bytes: &[u8]) -> [u8; 32] {
@@ -135,6 +137,12 @@ pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
             let mut w = Writer::new();
             w.raw(op::GET_ROSTER_KEYHIST.as_bytes()).u32(*gen);
             (op::GET_ROSTER_KEYHIST, blake3_of(&w.finish()), false)
+        }
+        Request::GetKeyhist { gen } => {
+            // bound like get-roster-keyhist but on the DATA key-history generation index.
+            let mut w = Writer::new();
+            w.raw(op::GET_KEYHIST.as_bytes()).u32(*gen);
+            (op::GET_KEYHIST, blake3_of(&w.finish()), false)
         }
         // gc's real args_hash binds the SERVER's all_heads_hash/roster_seq/put_epoch (a §15
         // compare-and-swap), so it is computed in the server's gc handler and the client's gc driver,
