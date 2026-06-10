@@ -167,76 +167,9 @@ pub fn detect_head_rollback(observations: &[(usize, u64)], hwm: u64) -> Vec<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{repo::init_repo, GcOutcome, Receipt, RemoteError};
+    use crate::repo::init_repo;
+    use crate::testmem::MemRemote;
     use secsec_kdf::MasterKey;
-
-    /// In-process [`Remote`] over a real [`Store`]; `lie_on_get` makes it serve garbage on `get_blob`
-    /// (an acks-put-but-returns-garbage remote, for the P15 quorum test).
-    struct MemRemote {
-        store: Store,
-        lie_on_get: bool,
-    }
-    impl MemRemote {
-        fn new(store: Store) -> Self {
-            Self {
-                store,
-                lie_on_get: false,
-            }
-        }
-    }
-    impl Remote for MemRemote {
-        async fn get_blob(&self, id: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
-            if self.lie_on_get {
-                return Ok(Some(b"garbage".to_vec()));
-            }
-            self.store.get(id).map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<Receipt, RemoteError> {
-            self.store
-                .put(id, blob)
-                .map_err(|e| RemoteError(e.to_string()))?;
-            Ok(Receipt::unsigned(1, 1))
-        }
-        async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
-            self.store
-                .get_ref(ref_h)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn get_roster_entry(&self, seq: u64) -> Result<Option<Vec<u8>>, RemoteError> {
-            self.store
-                .get_roster_entry(seq)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn get_keyslot(&self, did: &Id, gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
-            self.store
-                .get_keyslot(did, gen)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn cas_head(
-            &self,
-            ref_h: &Id,
-            old: &Id,
-            new_blob: &[u8],
-        ) -> Result<bool, RemoteError> {
-            self.store
-                .cas_ref(ref_h, old, new_blob)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn gc(
-            &self,
-            keep: Vec<Id>,
-            gc_gen: u64,
-            _ahh: &[u8; 32],
-            _rs: u64,
-            _pe: u64,
-        ) -> Result<GcOutcome, RemoteError> {
-            let k: std::collections::BTreeSet<[u8; 32]> = keep.into_iter().collect();
-            self.store
-                .gc(&k, gc_gen)
-                .map(|_| GcOutcome::Swept)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-    }
 
     fn store(dir: &std::path::Path, n: &str) -> Store {
         Store::open(dir.join(n)).unwrap()

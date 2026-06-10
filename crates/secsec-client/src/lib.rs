@@ -27,6 +27,10 @@ pub mod repo;
 pub mod sync;
 pub mod watcher;
 
+/// Shared in-process [`Remote`] used by the test modules (consolidates four identical copies).
+#[cfg(test)]
+mod testmem;
+
 use secsec_engine::{merge_heads, CommitAuthor, MergeError, SyncAction};
 use secsec_frame::ObjType;
 use secsec_kdf::{MasterKey, MasterKeys};
@@ -680,78 +684,8 @@ pub fn save_frontier(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testmem::MemRemote;
     use secsec_sig::DeviceKey;
-
-    /// An in-process [`Remote`] backed by a real [`Store`] — exercises the exact blind-CAS semantics
-    /// the QUIC server uses (`cas_ref` = `BLAKE3`-of-blob compare), minus the network.
-    struct MemRemote {
-        store: Store,
-    }
-    impl Remote for MemRemote {
-        async fn get_blob(&self, id: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
-            self.store.get(id).map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<Receipt, RemoteError> {
-            self.store
-                .put(id, blob)
-                .map_err(|e| RemoteError(e.to_string()))?;
-            let arrival_gen = self
-                .store
-                .arrival_epoch(id)
-                .map_err(|e| RemoteError(e.to_string()))?
-                .unwrap_or(0);
-            let put_epoch = self
-                .store
-                .put_epoch()
-                .map_err(|e| RemoteError(e.to_string()))?;
-            Ok(Receipt::unsigned(arrival_gen, put_epoch))
-        }
-        async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
-            self.store
-                .get_ref(ref_h)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn get_roster_entry(&self, seq: u64) -> Result<Option<Vec<u8>>, RemoteError> {
-            self.store
-                .get_roster_entry(seq)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn get_keyslot(
-            &self,
-            device_id: &Id,
-            gen: u32,
-        ) -> Result<Option<Vec<u8>>, RemoteError> {
-            self.store
-                .get_keyslot(device_id, gen)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn cas_head(
-            &self,
-            ref_h: &Id,
-            expected_old: &Id,
-            new_blob: &[u8],
-        ) -> Result<bool, RemoteError> {
-            self.store
-                .cas_ref(ref_h, expected_old, new_blob)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn gc(
-            &self,
-            keep_set: Vec<Id>,
-            gc_gen: u64,
-            _all_heads_hash: &[u8; 32],
-            _roster_seq: u64,
-            _put_epoch: u64,
-        ) -> Result<GcOutcome, RemoteError> {
-            // In-process backing store: no §12 auth pipeline, so the CAS isn't exercised here (that's
-            // the server's job, covered by the live-QUIC test). Just sweep.
-            let keep: std::collections::BTreeSet<[u8; 32]> = keep_set.into_iter().collect();
-            self.store
-                .gc(&keep, gc_gen)
-                .map(|_| GcOutcome::Swept)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-    }
 
     fn mk() -> MasterKey {
         MasterKey::new(1, [0x33; 32])
@@ -817,9 +751,7 @@ mod tests {
             secsec_snapshot::seal_signed_commit(&m, &a_store, &device, &commit).unwrap();
 
         // The remote (blind server).
-        let remote = MemRemote {
-            store: open_store(dir.path(), "remote.redb"),
-        };
+        let remote = MemRemote::new(open_store(dir.path(), "remote.redb"));
 
         // Push objects + advance the head.
         let pushed = push_objects(&remote, &a_store, &m, &commit_id)
@@ -848,9 +780,7 @@ mod tests {
         let m = mk();
         let device = DeviceKey::generate().unwrap();
         let a_store = open_store(dir.path(), "a.redb");
-        let remote = MemRemote {
-            store: open_store(dir.path(), "remote.redb"),
-        };
+        let remote = MemRemote::new(open_store(dir.path(), "remote.redb"));
 
         // v1
         let src = tempfile::tempdir().unwrap();
@@ -957,9 +887,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let remote = MemRemote {
-            store: open_store(dir.path(), "remote.redb"),
-        };
+        let remote = MemRemote::new(open_store(dir.path(), "remote.redb"));
         let a_store = open_store(dir.path(), "a.redb");
         let b_store = open_store(dir.path(), "b.redb");
 

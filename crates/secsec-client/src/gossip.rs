@@ -265,58 +265,10 @@ pub fn read_fork_log(path: &Path) -> Result<Vec<ForkEvent>, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{push_head, push_objects, GcOutcome, Receipt, RemoteError};
+    use crate::testmem::MemRemote;
+    use crate::{push_head, push_objects};
     use secsec_kdf::MasterKey;
     use secsec_sig::DeviceKey;
-
-    struct MemRemote {
-        store: Store,
-    }
-    impl Remote for MemRemote {
-        async fn get_blob(&self, id: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
-            self.store.get(id).map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<Receipt, RemoteError> {
-            self.store
-                .put(id, blob)
-                .map_err(|e| RemoteError(e.to_string()))?;
-            Ok(Receipt::unsigned(1, 1))
-        }
-        async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
-            self.store
-                .get_ref(ref_h)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn get_roster_entry(&self, seq: u64) -> Result<Option<Vec<u8>>, RemoteError> {
-            self.store
-                .get_roster_entry(seq)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn get_keyslot(&self, d: &Id, g: u32) -> Result<Option<Vec<u8>>, RemoteError> {
-            self.store
-                .get_keyslot(d, g)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn cas_head(&self, r: &Id, o: &Id, b: &[u8]) -> Result<bool, RemoteError> {
-            self.store
-                .cas_ref(r, o, b)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-        async fn gc(
-            &self,
-            keep: Vec<Id>,
-            g: u64,
-            _a: &[u8; 32],
-            _r: u64,
-            _p: u64,
-        ) -> Result<GcOutcome, RemoteError> {
-            let k: std::collections::BTreeSet<[u8; 32]> = keep.into_iter().collect();
-            self.store
-                .gc(&k, g)
-                .map(|_| GcOutcome::Swept)
-                .map_err(|e| RemoteError(e.to_string()))
-        }
-    }
 
     fn commit(
         store: &Store,
@@ -363,9 +315,7 @@ mod tests {
         let head_b = commit(&local, &m, &dev, bbdir.path(), vec![base]);
 
         // remote R1 publishes head B; our local head is A. They share `base` but are incomparable.
-        let r1 = MemRemote {
-            store: Store::open(dir.path().join("r1.redb")).unwrap(),
-        };
+        let r1 = MemRemote::new(Store::open(dir.path().join("r1.redb")).unwrap());
         push_objects(&r1, &local, &m, &head_b).await.unwrap();
         push_head(&r1, &m, &dev, "main", head_b, 0, None)
             .await
@@ -385,9 +335,7 @@ mod tests {
         let cdir = tempfile::tempdir().unwrap();
         std::fs::write(cdir.path().join("f"), b"branch-A-next").unwrap();
         let head_c = commit(&local, &m, &dev, cdir.path(), vec![head_a]);
-        let r2 = MemRemote {
-            store: Store::open(dir.path().join("r2.redb")).unwrap(),
-        };
+        let r2 = MemRemote::new(Store::open(dir.path().join("r2.redb")).unwrap());
         push_objects(&r2, &local, &m, &head_c).await.unwrap();
         push_head(&r2, &m, &dev, "main", head_c, 0, None)
             .await

@@ -287,81 +287,9 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testmem::MemRemote;
     use secsec_kdf::MasterKey;
     use secsec_store::Store;
-
-    struct MemRemote {
-        store: Store,
-    }
-    impl Remote for MemRemote {
-        async fn get_blob(&self, id: &Id) -> Result<Option<Vec<u8>>, crate::RemoteError> {
-            self.store
-                .get(id)
-                .map_err(|e| crate::RemoteError(e.to_string()))
-        }
-        async fn put_blob(
-            &self,
-            id: &Id,
-            blob: &[u8],
-        ) -> Result<crate::Receipt, crate::RemoteError> {
-            self.store
-                .put(id, blob)
-                .map_err(|e| crate::RemoteError(e.to_string()))?;
-            let arrival_gen = self
-                .store
-                .arrival_epoch(id)
-                .map_err(|e| crate::RemoteError(e.to_string()))?
-                .unwrap_or(0);
-            let put_epoch = self
-                .store
-                .put_epoch()
-                .map_err(|e| crate::RemoteError(e.to_string()))?;
-            Ok(crate::Receipt::unsigned(arrival_gen, put_epoch))
-        }
-        async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, crate::RemoteError> {
-            self.store
-                .get_ref(ref_h)
-                .map_err(|e| crate::RemoteError(e.to_string()))
-        }
-        async fn get_roster_entry(&self, seq: u64) -> Result<Option<Vec<u8>>, crate::RemoteError> {
-            self.store
-                .get_roster_entry(seq)
-                .map_err(|e| crate::RemoteError(e.to_string()))
-        }
-        async fn get_keyslot(
-            &self,
-            device_id: &Id,
-            gen: u32,
-        ) -> Result<Option<Vec<u8>>, crate::RemoteError> {
-            self.store
-                .get_keyslot(device_id, gen)
-                .map_err(|e| crate::RemoteError(e.to_string()))
-        }
-        async fn cas_head(
-            &self,
-            ref_h: &Id,
-            expected_old: &Id,
-            new_blob: &[u8],
-        ) -> Result<bool, crate::RemoteError> {
-            self.store
-                .cas_ref(ref_h, expected_old, new_blob)
-                .map_err(|e| crate::RemoteError(e.to_string()))
-        }
-        async fn gc(
-            &self,
-            keep_set: Vec<Id>,
-            gc_gen: u64,
-            _all_heads_hash: &[u8; 32],
-            _roster_seq: u64,
-            _put_epoch: u64,
-        ) -> Result<crate::GcOutcome, crate::RemoteError> {
-            let keep: std::collections::BTreeSet<[u8; 32]> = keep_set.into_iter().collect();
-            self.store
-                .gc(&keep, gc_gen)
-                .map(|_| crate::GcOutcome::Swept)
-                .map_err(|e| crate::RemoteError(e.to_string()))
-        }
-    }
 
     fn read_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
         let mut out = Vec::new();
@@ -385,9 +313,7 @@ mod tests {
             [(dev_a.device_id().unwrap(), dev_a.public())]
                 .into_iter()
                 .collect();
-        let remote = MemRemote {
-            store: Store::open(dir.path().join("remote.redb")).unwrap(),
-        };
+        let remote = MemRemote::new(Store::open(dir.path().join("remote.redb")).unwrap());
         let a_store = Store::open(dir.path().join("a.redb")).unwrap();
         let b_store = Store::open(dir.path().join("b.redb")).unwrap();
         let fr = SyncFrontier::default();
