@@ -1,9 +1,10 @@
 name: release
 
-# Build the `secsec` binary for the three OSes × {x86_64, aarch64} on native runners
-# (no cross-compiling — `ring`/`blake3` ship C+asm), then attach the archives and a
-# SHA256SUMS to the GitHub Release for the tag. Linux is static musl; macOS/Windows are
-# native. Triggered by rc*/v* tag pushes; also runnable manually for a dry build.
+# Build the `secsec` binary for the three OSes × {x86_64, aarch64} and attach the archives
+# + a SHA256SUMS to the GitHub Release for the tag. Each arch builds on a native runner,
+# except macOS x86_64, which is cross-built on an Apple-Silicon runner (universal SDK) —
+# GitHub's Intel macOS runners are scarce/deprecated. Linux is static musl. Triggered by
+# rc*/v* tag pushes; also runnable manually for a dry build.
 on:
   push:
     tags:
@@ -24,7 +25,7 @@ jobs:
         include:
           - { name: linux-x86_64,   runner: ubuntu-latest,    target: x86_64-unknown-linux-musl }
           - { name: linux-aarch64,  runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
-          - { name: macos-x86_64,   runner: macos-13,         target: x86_64-apple-darwin }
+          - { name: macos-x86_64,   runner: macos-latest,     target: x86_64-apple-darwin }
           - { name: macos-aarch64,  runner: macos-latest,     target: aarch64-apple-darwin }
           - { name: windows-x86_64, runner: windows-latest,   target: x86_64-pc-windows-msvc }
           - { name: windows-aarch64, runner: windows-11-arm,  target: aarch64-pc-windows-msvc }
