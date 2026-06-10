@@ -42,11 +42,26 @@ Build the binary:
 cargo build --release      # target/release/secsec
 ```
 
-**Server operator** — initialize the repository directly on the server's store (a local admin op,
-like `git init`), then run the blind server:
+**Owner — create the repository (device 1, on a *trusted* machine).** `init` is a client/owner
+operation, not a server one: it generates `master_key_1` in RAM (dropped immediately — it is never
+written), self-signs the **genesis** roster entry with *your* SSH key, wraps the master key to your
+own keyslot, and prints the **RFP** anchor. `--key` is your device key. Run it where you trust the
+machine — the master key must never touch the server box.
 
 ```sh
-secsec init    --store /srv/repo.redb --key ~/.ssh/id_ed25519   # prints the RFP — record it out-of-band
+secsec init --store ./repo.redb --key ~/.ssh/id_ed25519   # prints the RFP — record it out-of-band
+```
+
+In this build `init` / `grant` / `rotate` write the store file **directly** (they are local admin
+ops, not network calls), so the resulting `repo.redb` *is* the repository. Place it on the server to
+serve (e.g. `scp repo.redb server:/srv/`); the server only ever stores opaque blobs.
+
+**Server — serve the store (no SSH key, no master key — it is blind).** Its only identity is a
+self-signed TLS **host key**, like `sshd`'s; clients pin it. Membership ("which keys are allowed") is
+the encrypted, signed roster *inside* the store — the server can neither read nor forge it; it just
+gates each request on whether the connecting key owns a keyslot.
+
+```sh
 secsec hostkey --hostkey-dir /srv/hostkey                       # prints the host pin (host_id)
 secsec serve   --store /srv/repo.redb --hostkey-dir /srv/hostkey --listen 0.0.0.0:8899
 ```
@@ -61,20 +76,24 @@ secsec sync \
   --watch        # optional: keep running, re-sync on file changes + a periodic poll
 ```
 
-**Enroll another device** (`grant` is a local-store admin op the operator runs after verifying the new
-device's keys out-of-band via the SAS):
+**Enroll another device.** `grant` is run by an existing **member** (it needs that member's key to
+unwrap and re-wrap the master key to the new device's keyslot), against the repo store, after
+verifying the new device's keys out-of-band via the SAS ceremony — again on a trusted machine, not
+the blind server. The updated store is then served as before.
 
 ```sh
 # on the new device:
 secsec enroll-pubkey --key ~/.ssh/id_ed25519     # prints its ssh + X-Wing public keys
-# on the operator's box, against the repo store:
-secsec grant --store /srv/repo.redb --key ~/.ssh/operator_ed25519 --rfp <RFP-hex> \
+# on a current member's machine, against the repo store:
+secsec grant --store ./repo.redb --key ~/.ssh/id_ed25519 --rfp <RFP-hex> \
              --device-pub <ssh-hex> --xwing-pub <xwing-hex>
 ```
 
-Other commands: `rotate [--revoke <device-id>]` (mint a new key generation; `revoke ⇒ rotate` for
-forward secrecy), `recovery-init` / `recover` (break-glass 256-bit recovery code, §8.6), and `gc`
-(client-driven, grace-windowed garbage collection, §15). Run `secsec <command> --help` for flags.
+Other member-side admin ops (same model — they hold the master key, so run on a trusted device):
+`rotate [--revoke <device-id>]` (mint a new key generation; `revoke ⇒ rotate` for forward secrecy),
+`recovery-init` / `recover` (break-glass 256-bit recovery code, §8.6). `gc` (client-driven,
+grace-windowed garbage collection, §15) runs over the network like `sync`. Run
+`secsec <command> --help` for flags.
 
 ## Architecture
 
