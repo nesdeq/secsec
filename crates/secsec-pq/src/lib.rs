@@ -1,27 +1,32 @@
 //! Hybrid post-quantum keyslot — **X-Wing** (`finaldesign.md` §17).
 //!
 //! Wraps `master_key_g` to a device under the X-Wing KEM (ML-KEM-768 ⊕ X25519), so the harvestable
-//! asymmetric keyslot wrap is PQ-secure (the symmetric data plane is already PQ-safe). The combiner is
-//! **label-first** per ePrint 2024/039 §3 / draft-connolly-cfrg-xwing-kem-10 §4.1:
+//! asymmetric keyslot wrap is PQ-secure (the symmetric data plane is already PQ-safe). This is a
+//! **byte-faithful** X-Wing per draft-connolly-cfrg-xwing-kem-10 / ePrint 2024/039:
 //!
 //! ```text
-//! ss = SHA3-256( XWingLabel(6) ‖ ss_MLKEM(32) ‖ ss_X25519(32) ‖ ct_X(32) ‖ pk_X(32) )
-//! keyslot_ct = ct_MLKEM(1088) ‖ ct_X(32)                                    // 1120 bytes
+//! // key generation (draft-10 §6 expandDecapsulationKey): a single 32-byte seed `sk`
+//! expanded = SHAKE256(sk, 96)
+//! (d, z)   = expanded[0:32], expanded[32:64]   // ML-KEM-768 KeyGen_internal seed
+//! sk_X     = expanded[64:96]                    // X25519 static secret
+//!
+//! // combiner (draft-10 §6 Combiner) — the XWingLabel is placed **LAST**:
+//! ss = SHA3-256( ss_MLKEM(32) ‖ ss_X25519(32) ‖ ct_X(32) ‖ pk_X(32) ‖ XWingLabel(6) )
+//! keyslot_ct = ct_MLKEM(1088) ‖ ct_X(32)                                       // 1120 bytes
 //! ```
 //!
-//! ML-KEM-768 keys are stored in **`(d, z)` seed form** (a 64-byte seed; the expanded keypair is
-//! derived at runtime via [`libcrux_ml_kem`], FIPS 203 §7.1) — required to avoid MAL-BIND-K-CT /
-//! MAL-BIND-K-PK failures (Schmieg, ePrint 2024/523). The X-Wing shared secret then keys the §9.4 CTX
-//! committing AEAD to wrap the master key; authenticity rests on the §7 `mk_commit` check, not the wrap.
+//! The X-Wing secret key is the 32-byte `sk` seed alone; the ML-KEM `(d,z)` seed and the X25519
+//! secret are *derived* from it (FIPS 203 §7.1 seed form for ML-KEM, required to avoid
+//! MAL-BIND-K-CT / MAL-BIND-K-PK failures — Schmieg, ePrint 2024/523). The X-Wing shared secret then
+//! keys the §9.4 CTX committing AEAD to wrap the master key; authenticity rests on the §7 `mk_commit`
+//! check, not the wrap.
 //!
-//! ## ⚠ Conformance gate (§17, normative)
+//! ## Conformance (§17, normative)
 //!
-//! This is the **construction**; it is **NOT yet conformance-verified**. §17 MANDATES verifying
-//! byte-identical shared secrets against the ePrint 2024/039 §A test vectors before any implementation
-//! is accepted as conformant, and the spec pins draft-10 (label-first) — both must be confirmed before
-//! this keyslot is enabled (via a `SetMinAlgo` bump). [`xwing_kat`] is the placeholder for that vector;
-//! it is `#[ignore]`d until the published vectors are wired in. The internal round-trip / `mk_commit` /
-//! tamper tests below prove the construction is self-consistent, not that it matches the standard.
+//! [`xwing_kat`] asserts a byte-identical shared secret against the draft-10 Appendix C test vector
+//! (the published `(seed, eseed) → ss`), exercising keygen, encapsulation, and the combiner end to
+//! end against the formally-verified [`libcrux_ml_kem`] ML-KEM-768 and X25519. §17 mandates this
+//! gate "before any implementation is accepted as conformant"; it runs in normal CI (not `#[ignore]`d).
 
 #![forbid(unsafe_code)]
 
@@ -31,10 +36,12 @@ use sha3::{Digest, Sha3_256};
 use x25519_dalek::{PublicKey as XPub, StaticSecret};
 use zeroize::Zeroizing;
 
-/// X-Wing 6-byte domain label `XWingLabel` (ePrint 2024/039 §3): `\\.//^\\` — placed **first** in the
+/// X-Wing 6-byte domain label `XWingLabel` (draft-10 §6): the ASCII `\.//^\`, placed **last** in the
 /// combiner input.
 const XWING_LABEL: [u8; 6] = [0x5c, 0x2e, 0x2f, 0x2f, 0x5e, 0x5c];
 
+/// X-Wing decapsulation-key seed length: a single 32-byte secret (draft-10 §6).
+pub const XWING_SEED_LEN: usize = 32;
 /// ML-KEM-768 ciphertext length (§17).
 pub const ML_KEM_CT_LEN: usize = 1088;
 /// ML-KEM-768 public-key length.
@@ -43,6 +50,8 @@ pub const ML_KEM_PK_LEN: usize = 1184;
 pub const ML_KEM_SEED_LEN: usize = 64;
 /// X25519 key length.
 pub const X_LEN: usize = 32;
+/// X-Wing encapsulation seed length: `m(32) ‖ ek_X(32)` (draft-10 §6 EncapsulateDerand).
+pub const XWING_ESEED_LEN: usize = 64;
 /// X-Wing keyslot ciphertext length: `ct_MLKEM ‖ ct_X`.
 pub const XWING_CT_LEN: usize = ML_KEM_CT_LEN + X_LEN;
 
@@ -57,6 +66,8 @@ pub enum PqError {
     CommitMismatch,
     /// OS RNG failure.
     Rng,
+    /// The FIPS 203 §7.1 keypair consistency check failed at key generation (§17; fatal).
+    Keygen,
 }
 
 impl core::fmt::Display for PqError {
@@ -66,16 +77,19 @@ impl core::fmt::Display for PqError {
             PqError::Aead => f.write_str("X-Wing keyslot AEAD open failed"),
             PqError::CommitMismatch => f.write_str("recovered key fails mk_commit (§8.3)"),
             PqError::Rng => f.write_str("OS RNG failure"),
+            PqError::Keygen => {
+                f.write_str("ML-KEM keypair consistency check failed (FIPS 203 §7.1)")
+            }
         }
     }
 }
 impl std::error::Error for PqError {}
 
-/// A device's X-Wing **secret** key: the ML-KEM-768 `(d,z)` seed plus the X25519 static secret. Stored
-/// in seed form (§17); the expanded ML-KEM keypair is derived on demand. Zeroized on drop.
+/// A device's X-Wing **secret** key: the single 32-byte decapsulation-key seed `sk` (draft-10 §6).
+/// The ML-KEM `(d,z)` seed and the X25519 static secret are derived from it on demand via
+/// [`expand`]. Zeroized on drop.
 pub struct XWingSecret {
-    mlkem_seed: Zeroizing<[u8; ML_KEM_SEED_LEN]>,
-    x25519: StaticSecret,
+    seed: Zeroizing<[u8; XWING_SEED_LEN]>,
 }
 
 /// A device's X-Wing **public** key: the ML-KEM-768 encapsulation key + the X25519 public key.
@@ -85,42 +99,80 @@ pub struct XWingPublic {
     x25519_pk: [u8; X_LEN],
 }
 
-impl XWingSecret {
-    /// Generate a fresh X-Wing keypair (OS CSPRNG). Returns `(secret, public)`.
-    pub fn generate() -> Result<(Self, XWingPublic), PqError> {
-        let mut seed = Zeroizing::new([0u8; ML_KEM_SEED_LEN]);
-        getrandom::fill(seed.as_mut_slice()).map_err(|_| PqError::Rng)?;
-        let mut xsk = [0u8; X_LEN];
-        getrandom::fill(&mut xsk).map_err(|_| PqError::Rng)?;
-        let x25519 = StaticSecret::from(xsk);
+/// `expandDecapsulationKey(sk)` (draft-10 §6): `SHAKE256(sk, 96)` → `(d‖z) = [0:64]` (the ML-KEM-768
+/// keygen seed) and `sk_X = [64:96]` (the X25519 static secret). Returns the derived ML-KEM seed and
+/// the X25519 secret; both are zeroizing.
+fn expand(seed: &[u8; XWING_SEED_LEN]) -> (Zeroizing<[u8; ML_KEM_SEED_LEN]>, StaticSecret) {
+    use sha3::digest::{ExtendableOutput, Update, XofReader};
+    let mut x = sha3::Shake256::default();
+    x.update(seed);
+    let mut reader = x.finalize_xof();
+    let mut expanded = Zeroizing::new([0u8; 96]);
+    reader.read(expanded.as_mut_slice());
 
-        let kp = mlkem768::generate_key_pair(*seed);
-        let public = XWingPublic {
-            mlkem_pk: *kp.pk(),
-            x25519_pk: XPub::from(&x25519).to_bytes(),
-        };
-        Ok((
-            Self {
-                mlkem_seed: seed,
-                x25519,
-            },
-            public,
-        ))
+    let mut mlkem_seed = Zeroizing::new([0u8; ML_KEM_SEED_LEN]);
+    mlkem_seed.copy_from_slice(&expanded[..ML_KEM_SEED_LEN]);
+    let mut xsk = Zeroizing::new([0u8; X_LEN]);
+    xsk.copy_from_slice(&expanded[ML_KEM_SEED_LEN..]);
+    // StaticSecret::from copies the bytes; X25519 clamps the scalar at use (RFC 7748), matching
+    // X-Wing's `X25519(sk_X, …)`. `xsk` is zeroized on drop.
+    (mlkem_seed, StaticSecret::from(*xsk))
+}
+
+impl XWingSecret {
+    /// Generate a fresh X-Wing keypair (OS CSPRNG): draw the 32-byte seed, then run the FIPS 203 §7.1
+    /// keypair consistency check (§17, normative — failure is fatal). Returns `(secret, public)`.
+    pub fn generate() -> Result<(Self, XWingPublic), PqError> {
+        let mut seed = Zeroizing::new([0u8; XWING_SEED_LEN]);
+        getrandom::fill(seed.as_mut_slice()).map_err(|_| PqError::Rng)?;
+        let secret = Self { seed };
+        let public = secret.public();
+        secret.pairwise_consistency_check()?;
+        Ok((secret, public))
     }
 
-    /// This secret's public key.
+    /// Construct from a stored 32-byte X-Wing seed — key **loading** (a recovered decapsulation key,
+    /// or the §17 conformance vector), not key generation, so the §7.1 consistency check (a
+    /// key-generation step) is not re-run.
+    #[must_use]
+    pub fn from_seed(seed: [u8; XWING_SEED_LEN]) -> Self {
+        Self {
+            seed: Zeroizing::new(seed),
+        }
+    }
+
+    /// This secret's public key (re-derives the ML-KEM + X25519 public keys from the seed).
     #[must_use]
     pub fn public(&self) -> XWingPublic {
-        let kp = mlkem768::generate_key_pair(*self.mlkem_seed);
+        let (mlkem_seed, x25519) = expand(&self.seed);
+        let kp = mlkem768::generate_key_pair(*mlkem_seed);
         XWingPublic {
             mlkem_pk: *kp.pk(),
-            x25519_pk: XPub::from(&self.x25519).to_bytes(),
+            x25519_pk: XPub::from(&x25519).to_bytes(),
         }
+    }
+
+    /// FIPS 203 §7.1 pairwise consistency check (§17): the freshly-generated ML-KEM keypair must
+    /// encapsulate/decapsulate to the same shared secret. Catches a faulty keygen / RNG before the
+    /// key is ever used. The X25519 half is checked structurally by [`expand`] deriving the public
+    /// from the secret.
+    fn pairwise_consistency_check(&self) -> Result<(), PqError> {
+        let (mlkem_seed, _x) = expand(&self.seed);
+        let kp = mlkem768::generate_key_pair(*mlkem_seed);
+        let mut coins = [0u8; 32];
+        getrandom::fill(&mut coins).map_err(|_| PqError::Rng)?;
+        let pk = mlkem768::MlKem768PublicKey::from(*kp.pk());
+        let (ct, ss_e) = mlkem768::encapsulate(&pk, coins);
+        let ss_d = mlkem768::decapsulate(kp.private_key(), &ct);
+        if ss_e != ss_d {
+            return Err(PqError::Keygen);
+        }
+        Ok(())
     }
 }
 
 impl XWingPublic {
-    /// Serialize as `mlkem_pk(1184) ‖ x25519_pk(32)` (the form published for a device).
+    /// Serialize as `mlkem_pk(1184) ‖ x25519_pk(32)` (the 1216-byte form published for a device).
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(ML_KEM_PK_LEN + X_LEN);
@@ -145,7 +197,8 @@ impl XWingPublic {
     }
 }
 
-/// The X-Wing combiner (§17): `ss = SHA3-256(label ‖ ss_MLKEM ‖ ss_X25519 ‖ ct_X ‖ pk_X)`.
+/// The X-Wing combiner (draft-10 §6): `ss = SHA3-256(ss_MLKEM ‖ ss_X25519 ‖ ct_X ‖ pk_X ‖ XWingLabel)`.
+/// The label is **last**.
 fn combine(
     ss_mlkem: &[u8; 32],
     ss_x25519: &[u8; 32],
@@ -153,29 +206,34 @@ fn combine(
     pk_x: &[u8; X_LEN],
 ) -> Zeroizing<[u8; 32]> {
     let mut h = Sha3_256::new();
-    h.update(XWING_LABEL);
     h.update(ss_mlkem);
     h.update(ss_x25519);
     h.update(ct_x);
     h.update(pk_x);
+    h.update(XWING_LABEL);
     let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(&h.finalize());
     out
 }
 
-/// X-Wing encapsulate to `recipient`: returns `(keyslot_ct, ss)` where `keyslot_ct = ct_MLKEM ‖ ct_X`
-/// and `ss` is the 32-byte shared secret (§17).
-fn encapsulate(recipient: &XWingPublic) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), PqError> {
-    // ML-KEM encaps.
-    let mut enc_rand = [0u8; 32];
-    getrandom::fill(&mut enc_rand).map_err(|_| PqError::Rng)?;
+/// X-Wing `EncapsulateDerand(pk, eseed)` (draft-10 §6) with the explicit 64-byte `eseed`: `m =
+/// eseed[0:32]` is the ML-KEM encapsulation randomness, `ek_X = eseed[32:64]` is the X25519 ephemeral
+/// secret. Returns `(keyslot_ct = ct_MLKEM ‖ ct_X, ss)`. Deterministic in `eseed` — the conformance
+/// vector and the per-op randomized [`encapsulate`] both route through here.
+fn encapsulate_derand(
+    recipient: &XWingPublic,
+    eseed: &[u8; XWING_ESEED_LEN],
+) -> (Vec<u8>, Zeroizing<[u8; 32]>) {
+    // ML-KEM encaps with m = eseed[0:32].
+    let mut m = Zeroizing::new([0u8; 32]);
+    m.copy_from_slice(&eseed[..32]);
     let pk = mlkem768::MlKem768PublicKey::from(recipient.mlkem_pk);
-    let (ct_m, ss_m) = mlkem768::encapsulate(&pk, enc_rand);
+    let (ct_m, ss_m) = mlkem768::encapsulate(&pk, *m);
 
-    // X25519 encaps: ephemeral key; ct_X = ephemeral public; ss_X = DH(eph, pk_X).
-    let mut eph = [0u8; X_LEN];
-    getrandom::fill(&mut eph).map_err(|_| PqError::Rng)?;
-    let eph = StaticSecret::from(eph);
+    // X25519 ephemeral with ek_X = eseed[32:64]: ct_X = ephemeral public; ss_X = DH(ek_X, pk_X).
+    let mut ek_x = Zeroizing::new([0u8; X_LEN]);
+    ek_x.copy_from_slice(&eseed[32..]);
+    let eph = StaticSecret::from(*ek_x);
     let ct_x = XPub::from(&eph).to_bytes();
     let pk_x = recipient.x25519_pk;
     let ss_x = eph.diffie_hellman(&XPub::from(pk_x)).to_bytes();
@@ -185,7 +243,14 @@ fn encapsulate(recipient: &XWingPublic) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>)
     let mut keyslot_ct = Vec::with_capacity(XWING_CT_LEN);
     keyslot_ct.extend_from_slice(ct_m.as_slice());
     keyslot_ct.extend_from_slice(&ct_x);
-    Ok((keyslot_ct, ss))
+    (keyslot_ct, ss)
+}
+
+/// X-Wing encapsulate to `recipient` with fresh OS-CSPRNG `eseed`: returns `(keyslot_ct, ss)` (§17).
+fn encapsulate(recipient: &XWingPublic) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), PqError> {
+    let mut eseed = Zeroizing::new([0u8; XWING_ESEED_LEN]);
+    getrandom::fill(eseed.as_mut_slice()).map_err(|_| PqError::Rng)?;
+    Ok(encapsulate_derand(recipient, &eseed))
 }
 
 /// X-Wing decapsulate with `secret` from `keyslot_ct = ct_MLKEM ‖ ct_X`: returns `ss` (§17).
@@ -197,13 +262,14 @@ fn decapsulate(secret: &XWingSecret, keyslot_ct: &[u8]) -> Result<Zeroizing<[u8;
     let mut ct_m_arr = [0u8; ML_KEM_CT_LEN];
     ct_m_arr.copy_from_slice(ct_m_bytes);
     let ct_m = mlkem768::MlKem768Ciphertext::from(ct_m_arr);
-    let kp = mlkem768::generate_key_pair(*secret.mlkem_seed);
+    let (mlkem_seed, x25519) = expand(&secret.seed);
+    let kp = mlkem768::generate_key_pair(*mlkem_seed);
     let ss_m = mlkem768::decapsulate(kp.private_key(), &ct_m);
 
     let mut ct_x = [0u8; X_LEN];
     ct_x.copy_from_slice(ct_x_bytes);
-    let ss_x = secret.x25519.diffie_hellman(&XPub::from(ct_x)).to_bytes();
-    let pk_x = XPub::from(&secret.x25519).to_bytes();
+    let ss_x = x25519.diffie_hellman(&XPub::from(ct_x)).to_bytes();
+    let pk_x = XPub::from(&x25519).to_bytes();
 
     Ok(combine(&ss_m, &ss_x, &ct_x, &pk_x))
 }
@@ -279,6 +345,14 @@ mod tests {
         MasterKey::new(GEN, MK).mk_commit()
     }
 
+    fn unhex(s: &str) -> Vec<u8> {
+        assert!(s.len() % 2 == 0, "odd hex length");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
     #[test]
     fn xwing_kem_round_trips() {
         // the bare KEM: encaps then decaps must agree on the shared secret.
@@ -339,19 +413,43 @@ mod tests {
         let (_sk, pk) = XWingSecret::generate().unwrap();
         let parsed = XWingPublic::from_bytes(&pk.to_bytes()).unwrap();
         assert_eq!(parsed.to_bytes(), pk.to_bytes());
+        assert_eq!(pk.to_bytes().len(), ML_KEM_PK_LEN + X_LEN); // 1216
         assert!(matches!(
             XWingPublic::from_bytes(b"short"),
             Err(PqError::Malformed)
         ));
     }
 
-    /// §17 CONFORMANCE GATE: byte-identical X-Wing shared secret vs the ePrint 2024/039 §A test
-    /// vectors. **Required before this keyslot is enabled** (`SetMinAlgo`). Ignored until the published
-    /// vectors (and the draft-10 vs draft-06 decision) are wired in.
+    /// §17 CONFORMANCE GATE: byte-identical X-Wing shared secret vs the published draft-10 Appendix C
+    /// test vector (the first vector; `seed`/`eseed` → `ss`). Asserting `ss` exercises keygen
+    /// (SHAKE256 seed-expand → ML-KEM `(d,z)` + X25519 `sk_X`), `EncapsulateDerand`, and the
+    /// label-**last** combiner end to end against the formally-verified ML-KEM-768. This is what makes
+    /// the keyslot *conformant* X-Wing rather than a self-consistent look-alike.
     #[test]
-    #[ignore = "needs ePrint 2024/039 §A published vectors (§17 conformance gate)"]
     fn xwing_kat() {
-        // TODO: load the draft-10 / ePrint 2024/039 Appendix A vectors and assert the combiner output
-        // byte-for-byte (deterministic encaps with the vector's seeds).
+        let seed: [u8; XWING_SEED_LEN] =
+            unhex("7f9c2ba4e88f827d616045507605853ed73b8093f6efbc88eb1a6eacfa66ef26")
+                .try_into()
+                .unwrap();
+        let eseed: [u8; XWING_ESEED_LEN] = unhex(
+            "3cb1eea988004b93103cfb0aeefd2a686e01fa4a58e8a3639ca8a1e3f9ae57e2\
+             35b8cc873c23dc62b8d260169afa2f75ab916a58d974918835d25e6a435085b2",
+        )
+        .try_into()
+        .unwrap();
+        let expected_ss = unhex("d2df0522128f09dd8e2c92b1e905c793d8f57a54c3da25861f10bf4ca613e384");
+
+        let sk = XWingSecret::from_seed(seed);
+        let pk = sk.public();
+        // Encapsulate with the vector's eseed and assert the shared secret matches byte-for-byte.
+        let (ct, ss_enc) = encapsulate_derand(&pk, &eseed);
+        assert_eq!(
+            &ss_enc[..],
+            &expected_ss[..],
+            "X-Wing encaps shared secret must match the draft-10 vector (combiner/keygen conformance)"
+        );
+        // And decapsulation recovers the same shared secret from the produced ciphertext.
+        let ss_dec = decapsulate(&sk, &ct).unwrap();
+        assert_eq!(&ss_dec[..], &expected_ss[..]);
     }
 }

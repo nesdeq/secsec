@@ -5,7 +5,7 @@ I traced these end-to-end and they hold up:
 - KDF domain separation (§9.5) — distinct labels, fixed-width le32(g)‖u8(t), the mk_commit keyed_hash exception is correctly called out.
 - Signature namespacing (§9.6) — server-chosen nonces confined to auth/write; cross-protocol reuse is genuinely closed.
 - Enrollment (§7) — full fingerprint carried out-of-band by the human in step 1, commitment-before-reveal SAS over RFP+D_pubkey, mk_commit highest-seq check, in-band enrollment_nonce. The fake-universe attack is closed.
-- X-Wing combiner (label-first), seed-form ML-KEM storage — matches the spec.
+- X-Wing keyslot (`secsec-pq`) — draft-10 conformant: single 32-byte seed expanded via `SHAKE256(sk,96)` to the ML-KEM `(d,z)` seed + X25519 `sk_X`; **label-LAST** combiner `SHA3-256(ss_M‖ss_X‖ct_X‖pk_X‖XWingLabel)`; verified byte-identical to the draft-10 Appendix C vector (`xwing_kat`, not ignored). (An earlier draft of this file and §17 wrongly said label-first — the obsolete draft-02 order; fixed.)
 - Keep-everything default + multi-remote makes the GC blast radius small and honest.
 
 The residuals in §22 are honest and genuinely minimal.

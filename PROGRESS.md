@@ -26,8 +26,11 @@ Running status of milestones (M), risks (R), and forward-carried debts. Updated 
 
 ### M7 detail — done
 
-- ✅ §17 hybrid-PQ keyslot (`secsec-pq`: X-Wing = ML-KEM-768 + X25519, label-first SHA3-256 combiner,
-  libcrux-ml-kem; (d,z) seed-form storage). `xwing_kat` `#[ignore]`d pending ePrint 2024/039 §A vectors.
+- ✅ §17 hybrid-PQ keyslot (`secsec-pq`: X-Wing = ML-KEM-768 + X25519). **draft-10 conformant:**
+  single-seed `SHAKE256(sk,96)` key expansion, **label-LAST** combiner, FIPS 203 §7.1 PCT.
+  `xwing_kat` asserts byte-identity vs the draft-10 Appendix C vector (passing, **not** ignored).
+  (Was non-conformant — label-first + two independent seeds — concealed by the ignored KAT; fixed.)
+  **Not yet wired** into the `algo_id`/keyslot flow (reachable via a future `SetMinAlgo` bump).
 - ✅ §11 stdio/SSH transport core: `SessionTranscript::new_stdio(H)` channel-binds the SSH exchange hash;
   `stream.rs` length-prefixed framing over any `AsyncRead`/`AsyncWrite` (alloc-bomb-guarded), `host_id =
   BLAKE3(K_S)`. **Follow-up (deployment-only, no security gain over pinned QUIC):** wiring a live `russh`
@@ -71,9 +74,22 @@ Worked through smallest→largest, tested+committed per slice:
 - [x] #16 M7 stdio/SSH transport (transcript channel-binding + generic byte-stream framing)
 
 Dropped from scope: RSA device keys, WebDAV.
-Residual follow-ups (not debt, no security gain): live `russh` subsystem wiring for stdio `H`/`K_S`;
-`secsec rotate` CLI surface + DATA-keyhist for pre-rotation objects; `xwing_kat` conformance vectors;
-§8.5 seal-before-push ordering is conservative (crash-safe via FF retry).
+## Conformance gaps (unbuilt spec features — *absent*, not *wrong*)
+
+The classical crypto/protocol/sync/transport/server/storage stack is conformant and tested (252
+tests, KATs, proptests, model-based differential fold test, live-QUIC e2e, fuzz-on-stable). The
+full-source audit (2026-06-10) found **one** soundness defect — `secsec-pq` was non-conformant
+X-Wing — now fixed and KAT-proven. The remaining gaps are unimplemented spec features:
+
+- **X-Wing `algo_id` integration** — the conformant keyslot exists but no `algo_id` reaches it;
+  `repo.rs` always uses the classical HPKE slot. Needs a FRAME `algo_id` + `SetMinAlgo` path.
+- **§8.2 DATA key-history** (`/keyhist/<g>`) — reading pre-rotation *object* content after a rotate
+  is unimplemented (only the roster-key history is). Cross-rotation history traversal breaks.
+- **§7 SAS rate-limit** (5/hr per D_pubkey), **§16 per-fetch `min_algo`** on keyslots, **§8.1
+  `HistoryReanchor`**, and CLI surfaces `rotate`/`grant`/`recover`/`gc` — all absent.
+- Live `russh` stdio `H`/`K_S` wiring (deployment-only, no security gain over pinned QUIC).
+
+Residual (not debt): §8.5 seal-before-push ordering is conservative (crash-safe via FF retry).
 
 ## Log (most recent first)
 

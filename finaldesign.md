@@ -1205,22 +1205,34 @@ Symmetric layer (ChaCha20-Poly1305, BLAKE3, 256-bit keys) is PQ-safe. The harves
 the asymmetric keyslot wrap. The `algo_id` mechanism supports a **hybrid keyslot** using **X-Wing**
 (draft-connolly-cfrg-xwing-kem-10 / ePrint 2024/039) as the normative hybrid KEM.
 
+**X-Wing decapsulation-key seed (normative).** The X-Wing secret key is a **single 32-byte seed**
+`sk`; the ML-KEM and X25519 secrets are *derived* from it (draft-connolly-cfrg-xwing-kem-10 §6
+`expandDecapsulationKey`), never drawn independently:
+```
+expanded = SHAKE256(sk, 96)                      // 96 bytes
+(d, z)   = expanded[0:32], expanded[32:64]       // ML-KEM-768 KeyGen_internal seed
+sk_X     = expanded[64:96]                        // X25519 static secret
+pk_X     = X25519(sk_X, X25519_BASE)
+```
+
 **X-Wing combiner (normative):**
 ```
 ss = SHA3-256(
-    0x5c2e2f2f5e5c ‖  // 6-byte domain label (XWingLabel, FIRST per ePrint 2024/039 §3)
     ss_MLKEM  ‖       // 32 B: ML-KEM-768 shared secret
     ss_X25519 ‖       // 32 B: X25519 shared secret
     ct_X      ‖       // 32 B: X25519 ephemeral public key (ciphertext)
-    pk_X              // 32 B: recipient X25519 static public key
+    pk_X      ‖       // 32 B: recipient X25519 static public key
+    0x5c2e2f2f5e5c    // 6-byte domain label (XWingLabel, LAST per draft-10 §6)
 )
 keyslot_ct = ct_MLKEM(1088 B) ‖ ct_X(32 B)   // total: 1120 B
+// encapsulation randomness eseed(64 B): m = eseed[0:32] (ML-KEM), ek_X = eseed[32:64] (X25519)
 ```
 
-All inputs are fixed-width (6+32+32+32+32 = 134 bytes); the label-first order is normative per
-ePrint 2024/039 §3 and draft-connolly-cfrg-xwing-kem-10 §4.1. Implementations MUST verify
-byte-identical shared secrets against the test vectors in ePrint 2024/039 §A (equivalently,
-draft-connolly-cfrg-xwing-kem-10 Appendix A) before any implementation is accepted as conformant.
+All inputs are fixed-width (32+32+32+32+6 = 134 bytes); the **label-last** order is normative per
+draft-connolly-cfrg-xwing-kem-10 §6 (the obsolete draft-02 placed it first — do not use that order).
+Implementations MUST verify a byte-identical shared secret against the draft-10 Appendix C test
+vectors before being accepted as conformant. (Cross-check: seed
+`7f9c2ba4…ef26`, eseed `3cb1eea9…85b2` ⇒ ss `d2df0522…e384`.)
 
 This achieves IND-CCA security (classical: gap-CDH in ROM; post-quantum: ML-KEM-768 IND-CCA) and
 satisfies MAL-BIND-K-CT and MAL-BIND-K-PK when ML-KEM-768 keys are stored in `(d, z)` seed form.
