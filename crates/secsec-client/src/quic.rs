@@ -123,6 +123,38 @@ impl Remote for QuicRemote<'_> {
             other => Err(RemoteError(format!("cas-head: unexpected {other:?}"))),
         }
     }
+
+    async fn gc(
+        &self,
+        keep_set: Vec<Id>,
+        gc_gen: u64,
+        all_heads_hash: &[u8; 32],
+        roster_seq: u64,
+        put_epoch: u64,
+    ) -> Result<crate::GcOutcome, RemoteError> {
+        // gc signs over the full args_gc (the §15 compare-and-swap binding), so it uses the dedicated
+        // request_gc path rather than self.call (which would sign the op_and_args placeholder).
+        let resp = secsec_transport::rpc::request_gc(
+            self.conn,
+            self.transcript,
+            self.device,
+            keep_set,
+            gc_gen,
+            all_heads_hash,
+            roster_seq,
+            put_epoch,
+        )
+        .await
+        .map_err(|e| RemoteError(e.to_string()))?;
+        match resp {
+            Response::Ok => Ok(crate::GcOutcome::Swept),
+            // The server returns BadAuth when the recomputed args_gc differs from the client's signed
+            // one — i.e. its state moved since the client read it (the §15 CAS failed).
+            Response::Err(ErrorCode::BadAuth) => Ok(crate::GcOutcome::CasConflict),
+            Response::Err(c) => Err(RemoteError(format!("gc: {c:?}"))),
+            other => Err(RemoteError(format!("gc: unexpected {other:?}"))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +333,137 @@ mod tests {
             assert!(crate::repo::open_repo_remote(&remote, &device, &[0xAB; 32])
                 .await
                 .is_err());
+
+            conn.close(0u32.into(), b"done");
+            let _ = srv.await;
+        });
+    }
+
+    /// §15 GC over **live QUIC**: push a snapshot (the keep-set), add two unreachable "garbage" blobs,
+    /// then gc — the old garbage (arrival ≤ gc_gen) is swept, the new garbage (arrival > gc_gen) and
+    /// the reachable closure are kept. Then a gc with a stale `all_heads_hash` fails the §15
+    /// compare-and-swap.
+    #[test]
+    fn gc_sweeps_garbage_keeps_reachable_over_live_quic() {
+        use crate::gc::gc_collect;
+        use crate::{push_head, push_objects, GcOutcome};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ck = generate_simple_self_signed(vec!["secsec.invalid".to_string()]).unwrap();
+            let (cert, key) = (ck.cert.der().to_vec(), ck.key_pair.serialize_der());
+            let pin = HostPin::from_cert(&cert).unwrap();
+            let host_id = pin.host_id();
+
+            let m = MasterKey::new(1, [0x44; 32]);
+            let device = DeviceKey::generate().unwrap();
+            let srv_dir = tempfile::tempdir().unwrap();
+            let srv_store = Store::open(srv_dir.path().join("s.redb")).unwrap();
+            srv_store
+                .put_keyslot(&device.device_id().unwrap(), 1, b"keyslot")
+                .unwrap();
+            let server = Server::new(srv_store);
+
+            let endpoint =
+                quinn::Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                let conn = endpoint.accept().await.unwrap().await.unwrap();
+                let _ = serve_connection(&conn, &server, host_id, || 1_000).await;
+            });
+
+            let mut client = quinn::Endpoint::client(loopback()).unwrap();
+            client.set_default_client_config(client_config(pin).unwrap());
+            let conn = client
+                .connect(addr, "secsec.invalid")
+                .unwrap()
+                .await
+                .unwrap();
+            let sess = client_handshake(&conn, &device, host_id, [0x11; 32])
+                .await
+                .unwrap();
+            let remote = QuicRemote::new(&conn, sess.transcript, &device);
+
+            // push a snapshot (the keep-set) and advance the head.
+            let src = tempfile::tempdir().unwrap();
+            std::fs::write(src.path().join("keep.txt"), b"reachable-data").unwrap();
+            let a_store = Store::open(srv_dir.path().join("a.redb")).unwrap();
+            let (rt_id, rs) =
+                secsec_snapshot::snapshot_tree(src.path(), &m, &a_store, None).unwrap();
+            let commit = secsec_snapshot::Commit {
+                root_tree: rt_id,
+                root_salt: rs,
+                parents: vec![],
+                device_id: device.device_id().unwrap(),
+                version: 1,
+                roster_seq: 0,
+                last_seen_head: [0u8; 32],
+                ts: 0,
+            };
+            let commit_id =
+                secsec_snapshot::seal_signed_commit(&m, &a_store, &device, &commit).unwrap();
+            push_objects(&remote, &a_store, &m, &commit_id)
+                .await
+                .unwrap();
+            push_head(&remote, &m, &device, "main", commit_id, 0, None)
+                .await
+                .unwrap();
+
+            // two unreachable garbage blobs (the server is blind — any bytes are accepted).
+            let g1 = [0xAA; 32];
+            let g2 = [0xBB; 32];
+            let r1 = remote.put_blob(&g1, b"garbage-one").await.unwrap();
+            let r2 = remote.put_blob(&g2, b"garbage-two").await.unwrap();
+            assert!(r2.put_epoch > r1.put_epoch);
+            assert!(remote.get_blob(&g1).await.unwrap().is_some());
+            assert!(remote.get_blob(&g2).await.unwrap().is_some());
+
+            // gc: sweep arrival ≤ r1.arrival_gen, bound to the current put_epoch (r2's). The keep-set
+            // (reachable from main) is read from a_store; all_heads_hash is computed from the head blob.
+            let outcome = gc_collect(
+                &remote,
+                &a_store,
+                &m,
+                &["main"],
+                r1.arrival_gen,
+                0,
+                r2.put_epoch,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, GcOutcome::Swept);
+
+            // g1 (old, unreachable) swept; g2 (newer than gc_gen) kept; reachable closure kept.
+            assert!(
+                remote.get_blob(&g1).await.unwrap().is_none(),
+                "old garbage swept"
+            );
+            assert!(
+                remote.get_blob(&g2).await.unwrap().is_some(),
+                "new garbage kept"
+            );
+            assert!(
+                remote.get_blob(&commit_id).await.unwrap().is_some(),
+                "reachable commit kept"
+            );
+
+            // a gc bound to a STALE all_heads_hash fails the §15 compare-and-swap.
+            let keep: Vec<[u8; 32]> =
+                secsec_snapshot::reachable_objects(&m, &a_store, &[commit_id])
+                    .unwrap()
+                    .into_iter()
+                    .collect();
+            let stale = remote
+                .gc(keep, r1.arrival_gen, &[0u8; 32], 0, r2.put_epoch)
+                .await
+                .unwrap();
+            assert_eq!(
+                stale,
+                GcOutcome::CasConflict,
+                "stale all_heads_hash must fail the CAS"
+            );
 
             conn.close(0u32.into(), b"done");
             let _ = srv.await;

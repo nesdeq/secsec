@@ -311,6 +311,20 @@ mod tests {
                 .cas_ref(ref_h, expected_old, new_blob)
                 .map_err(|e| crate::RemoteError(e.to_string()))
         }
+        async fn gc(
+            &self,
+            keep_set: Vec<Id>,
+            gc_gen: u64,
+            _all_heads_hash: &[u8; 32],
+            _roster_seq: u64,
+            _put_epoch: u64,
+        ) -> Result<crate::GcOutcome, crate::RemoteError> {
+            let keep: std::collections::BTreeSet<[u8; 32]> = keep_set.into_iter().collect();
+            self.store
+                .gc(&keep, gc_gen)
+                .map(|_| crate::GcOutcome::Swept)
+                .map_err(|e| crate::RemoteError(e.to_string()))
+        }
     }
 
     fn read_tree(root: &Path) -> Vec<(String, Vec<u8>)> {

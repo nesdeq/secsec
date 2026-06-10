@@ -61,6 +61,74 @@ pub async fn request(
     device: &DeviceKey,
     request: Request,
 ) -> Result<Response, RpcError> {
+    // `op_sig` is built from the recomputed `args_hash` (so the client can't lie about what it
+    // signed). gc has a state-bound args_hash and uses `request_gc` instead.
+    send_authed(conn, &request, |nonce| {
+        let (op_label, args_hash, is_write) = op_and_args(&request);
+        if is_write {
+            WriteAuth {
+                op: op_label,
+                args_hash,
+                session_transcript: transcript,
+                server_nonce: nonce,
+            }
+            .sign(device)
+            .map_err(map_proto_sig)
+        } else {
+            ReadAuth {
+                op: op_label,
+                args_hash,
+                session_transcript: transcript,
+            }
+            .sign(device)
+            .map_err(map_proto_sig)
+        }
+    })
+    .await
+}
+
+/// Issue a §15 `gc` request. Unlike other writes, gc's `args_hash` binds the client's view of the
+/// server's mutable state — `all_heads_hash`/`roster_seq`/`put_epoch` (a compare-and-swap, §15) — so
+/// the signature is built from the full `args_gc`, not the generic `op_and_args` placeholder. The
+/// server recomputes `args_gc` from its own state; a mismatch (concurrent mutation) fails the sig.
+#[allow(clippy::too_many_arguments)]
+pub async fn request_gc(
+    conn: &Connection,
+    transcript: [u8; 32],
+    device: &DeviceKey,
+    keep_set: Vec<[u8; 32]>,
+    gc_gen: u64,
+    all_heads_hash: &[u8; 32],
+    roster_seq: u64,
+    put_epoch: u64,
+) -> Result<Response, RpcError> {
+    let args_hash = secsec_proto::gc::args_gc(
+        &secsec_proto::gc::keep_set_hash(&keep_set),
+        gc_gen,
+        all_heads_hash,
+        roster_seq,
+        put_epoch,
+    );
+    let req = Request::Gc { keep_set, gc_gen };
+    send_authed(conn, &req, |nonce| {
+        WriteAuth {
+            op: secsec_proto::op::GC,
+            args_hash,
+            session_transcript: transcript,
+            server_nonce: nonce,
+        }
+        .sign(device)
+        .map_err(map_proto_sig)
+    })
+    .await
+}
+
+/// The shared per-op stream dance: open a bidi stream, read the server's fresh per-op nonce, build the
+/// `op_sig` via `sign` (given the nonce), send the [`AuthedRequest`], read the [`Response`].
+async fn send_authed<F>(conn: &Connection, request: &Request, sign: F) -> Result<Response, RpcError>
+where
+    F: FnOnce([u8; NONCE_LEN]) -> Result<Vec<u8>, RpcError>,
+{
     let (mut send, mut recv) = conn
         .open_bi()
         .await
@@ -76,27 +144,16 @@ pub async fn request(
         .try_into()
         .map_err(|_| RpcError::BadNonce)?;
 
-    let (op_label, args_hash, is_write) = op_and_args(&request);
-    let op_sig = if is_write {
-        WriteAuth {
-            op: op_label,
-            args_hash,
-            session_transcript: transcript,
-            server_nonce: nonce,
+    let op_sig = sign(nonce)?;
+    write_frame(
+        &mut send,
+        &AuthedRequest {
+            op_sig,
+            request: request.clone(),
         }
-        .sign(device)
-        .map_err(map_proto_sig)?
-    } else {
-        ReadAuth {
-            op: op_label,
-            args_hash,
-            session_transcript: transcript,
-        }
-        .sign(device)
-        .map_err(map_proto_sig)?
-    };
-
-    write_frame(&mut send, &AuthedRequest { op_sig, request }.encode()).await?;
+        .encode(),
+    )
+    .await?;
     let _ = send.finish();
 
     let resp = Response::decode(&read_frame(&mut recv, MAX_FRAME_LEN).await?)?;

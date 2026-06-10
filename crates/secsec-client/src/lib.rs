@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod gc;
 pub mod quic;
 pub mod repo;
 pub mod sync;
@@ -84,6 +85,28 @@ pub trait Remote {
         expected_old: &Id,
         new_blob: &[u8],
     ) -> Result<bool, RemoteError>;
+    /// Request a §15 GC sweep: delete objects with arrival `put_epoch ≤ gc_gen` not in `keep_set`. The
+    /// `all_heads_hash`/`roster_seq`/`put_epoch` are the client's view; the server recomputes them and
+    /// the sweep is a compare-and-swap (a concurrent mutation aborts it). Returns the outcome.
+    async fn gc(
+        &self,
+        keep_set: Vec<Id>,
+        gc_gen: u64,
+        all_heads_hash: &[u8; 32],
+        roster_seq: u64,
+        put_epoch: u64,
+    ) -> Result<GcOutcome, RemoteError>;
+}
+
+/// The result of a [`Remote::gc`] request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcOutcome {
+    /// The sweep ran (objects below `gc_gen` and outside the keep-set were deleted).
+    Swept,
+    /// The §15 compare-and-swap failed — the server's mutable state moved since the client computed
+    /// `all_heads_hash`/`roster_seq`/`put_epoch` (a concurrent `cas-head`/`roster-append`/`put`). The
+    /// client should re-read state and retry.
+    CasConflict,
 }
 
 /// Errors from client orchestration.
@@ -586,6 +609,22 @@ mod tests {
         ) -> Result<bool, RemoteError> {
             self.store
                 .cas_ref(ref_h, expected_old, new_blob)
+                .map_err(|e| RemoteError(e.to_string()))
+        }
+        async fn gc(
+            &self,
+            keep_set: Vec<Id>,
+            gc_gen: u64,
+            _all_heads_hash: &[u8; 32],
+            _roster_seq: u64,
+            _put_epoch: u64,
+        ) -> Result<GcOutcome, RemoteError> {
+            // In-process backing store: no §12 auth pipeline, so the CAS isn't exercised here (that's
+            // the server's job, covered by the live-QUIC test). Just sweep.
+            let keep: std::collections::BTreeSet<[u8; 32]> = keep_set.into_iter().collect();
+            self.store
+                .gc(&keep, gc_gen)
+                .map(|_| GcOutcome::Swept)
                 .map_err(|e| RemoteError(e.to_string()))
         }
     }
