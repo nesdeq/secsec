@@ -12,13 +12,14 @@ design — read `finaldesign.md` for *what*; this is *how*.
 > implementation gets an **independent professional cryptographic review before it touches real
 > data**. This plan gets us to audit-*ready*; it does not replace the audit.
 
-**v1 scope (locked 2026-06-09):** transport is **QUIC-only** (stdio/SSH mode deferred post-v1);
-device keys are **Ed25519-only** (RSA/OAEP deferred); targets are **Linux, macOS, Windows**.
-Implications: the custom QUIC verifier (R1) is the *sole* transport-auth path and thus top
-priority; `host_id` = pinned-SPKI hash; the `rsa` crate and `russh` drop out of the v1 dependency
-set; the §11 stdio channel-binding work is out of v1 scope; key-memory locking needs a
-cross-platform shim (`mlock` / `VirtualLock`). `finaldesign.md` remains the full spec — RSA and
-stdio are valid parts of it, just not v1.
+**v1 scope (locked 2026-06-09; RSA/WebDAV dropped 2026-06-10):** transport is **QUIC-only** for v1
+(stdio/SSH is post-v1, M7); device keys are **Ed25519-only** (RSA **dropped from scope**, not
+deferred); targets are **Linux, macOS, Windows**. **WebDAV browse is dropped from scope.** Implications:
+the custom QUIC verifier (R1) is the *sole* transport-auth path and thus top priority; `host_id` =
+pinned-SPKI hash; the `rsa` crate drops out entirely; `russh` enters only at M7 (stdio); key-memory
+locking needs a cross-platform shim (`mlock` / `VirtualLock`). `finaldesign.md` still *describes* RSA
+and WebDAV as part of the original design, but they are no longer planned work — Ed25519 is strictly
+better for a greenfield tool, and WebDAV is a convenience the core sync does not need.
 
 ---
 
@@ -166,8 +167,9 @@ No OpenSSL anywhere.
   orchestration end-to-end on one machine, then two.
 - **M6 — Durability & recovery.** Multi-remote reconcile + quorum, hardened GC, recovery flow,
   downgrade/min-algo enforcement, gossip. **Exit:** multi-writer GC sim; quorum put→get→verify.
-- **M7 — Later.** Hybrid-PQ keyslot (resolve X-Wing draft mismatch first), stdio/SSH transport,
-  RSA device keys, WebDAV browse.
+- **M7 — Later.** Hybrid-PQ keyslot (resolve X-Wing draft mismatch first) and stdio/SSH transport.
+  **(RSA device keys and WebDAV browse are dropped from scope — not deferred. Ed25519 is strictly
+  better than RSA for a greenfield tool; WebDAV is a convenience the core sync does not need.)**
 - **Audit gate.** Independent cryptographic review of the implementation before any production
   data. Treat its findings like §22 was treated: fix or consciously document.
 

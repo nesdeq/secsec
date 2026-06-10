@@ -20,7 +20,7 @@ Running status of milestones (M), risks (R), and forward-carried debts. Updated 
 | M4 Transport | QUIC pinned verifier, §12 wire + server pipeline, limits | ✅ done |
 | M5 Live sync | watcher, concurrent multi-client, clone/publish/pull/merge, init, frontier seal, `sync --watch` | ✅ done |
 | M6 Durability & recovery | see below | ✅ **done** |
-| M7 Later | PQ keyslot, stdio, RSA, WebDAV | ❌ deferred |
+| M7 Later | PQ keyslot (X-Wing), stdio/SSH transport | ⏳ in scope (RSA + WebDAV **dropped**) |
 
 ### M6 detail — all done
 
@@ -40,19 +40,26 @@ log to disk; device-to-device gossip transport (thin layer over the same fork ch
 
 ## Risks
 
-R1 verifier, R2 CTX, R3 HPKE, R4 rollback-merge, R5 fold/cold-start, R7 canonical, R8 keyed-CDC — all closed.
-R6 hardened GC — risk **closed** (fail-safe keep-set + serialization + sweep, all tested); orchestration wiring ⏳.
+R1 verifier, R2 CTX, R3 HPKE, R4 rollback-merge, R5 fold/cold-start, R6 GC, R7 canonical, R8 keyed-CDC
+— **all closed**.
 
-## Forward-carried debts
+## Forward-carried debts — active work plan (tasks #6–16)
 
-1. **Fuzz targets** — §3 CI gate, still zero (no `fuzz/`).
-2. GC orchestration (§15) — in progress.
-3. Multi-remote + quorum (§14) — not built.
-4. Rotation flow + rotation-era cold-start — genesis-only today.
-5. Grant ceremony (§7) — SAS primitives exist; interactive flow not wired.
-6. `--host-fp` fingerprint pinning — verifier compares full SPKI (uses `--host-cert`).
-7. `xtask` / reproducible build + mechanical vector generation — not built.
-8. §8.5 seal-before-push ordering — conservative (crash-safe via FF retry), not strictly enforced in `sync_ref`.
+Being worked through smallest→largest, tested+committed per slice:
+
+- [ ] #7 `--host-fp` fingerprint pinning (verifier hash-compare path; CLI flag)
+- [ ] #8 fork-event log to disk (§10 step 3 audit persistence)
+- [ ] #9 receipt host-key signature (§15 defence-in-depth)
+- [ ] #10 device-to-device gossip transport (thin layer over fork_check)
+- [ ] #11 **fuzz targets** (§3 CI gate — one per decoder)
+- [ ] #12 `xtask` (reproducible musl build + mechanical vector generation)
+- [ ] #13 rotation flow + rotation-era cold-start (§8.2/§8.4; removes genesis-only restriction)
+- [ ] #14 interactive grant ceremony (§7 SAS enrollment of a 2nd device)
+- [ ] #15 M7 hybrid-PQ keyslot (X-Wing)
+- [ ] #16 M7 stdio/SSH transport
+
+Dropped from scope: RSA device keys, WebDAV.
+Residual (not a debt): §8.5 seal-before-push ordering is conservative (crash-safe via FF retry).
 
 ## Log (most recent first)
 
