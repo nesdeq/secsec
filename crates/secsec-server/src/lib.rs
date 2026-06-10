@@ -247,6 +247,10 @@ impl Server {
                 Ok(blob) => Response::Blob(blob),
                 Err(_) => Response::Err(ErrorCode::Internal),
             },
+            Request::GetRosterKeyhist { gen } => match self.store.get_roster_keyhist(gen) {
+                Ok(blob) => Response::Blob(blob),
+                Err(_) => Response::Err(ErrorCode::Internal),
+            },
             Request::Has { ids } => {
                 if ids.len() > limits::MAX_HAS_IDS {
                     return Response::Err(ErrorCode::TooManyIds);

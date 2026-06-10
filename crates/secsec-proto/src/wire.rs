@@ -192,6 +192,12 @@ pub enum Request {
         /// Sweep objects whose arrival `put_epoch ≤ gc_gen`.
         gc_gen: u64,
     },
+    /// Fetch the roster-key-history wrap at `/roster-keyhist/<gen>` (§8.2) — for rotation-era cold-start
+    /// (peeling `roster_key_g` across generations). A read op; the server returns the opaque wrap.
+    GetRosterKeyhist {
+        /// The generation whose wrap is requested.
+        gen: u32,
+    },
 }
 
 const T_GET: u8 = 0;
@@ -203,6 +209,7 @@ const T_GETREF: u8 = 5;
 const T_GETROSTER: u8 = 6;
 const T_GETKEYSLOT: u8 = 7;
 const T_GC: u8 = 8;
+const T_GETRKH: u8 = 9;
 
 impl Request {
     /// Canonical encoding (tag-prefixed).
@@ -256,6 +263,9 @@ impl Request {
                     w.raw(id);
                 }
                 w.u64(*gc_gen);
+            }
+            Request::GetRosterKeyhist { gen } => {
+                w.u8(T_GETRKH).u32(*gen);
             }
         }
         w.finish()
@@ -316,6 +326,7 @@ impl Request {
                     gc_gen: r.u64()?,
                 }
             }
+            T_GETRKH => Request::GetRosterKeyhist { gen: r.u32()? },
             other => return Err(WireError::BadTag(other)),
         };
         r.finish()?;
@@ -595,6 +606,7 @@ mod tests {
                 keep_set: vec![[11; 32], [12; 32]],
                 gc_gen: 9,
             },
+            Request::GetRosterKeyhist { gen: 2 },
         ];
         for req in reqs {
             assert_eq!(Request::decode(&req.encode()).unwrap(), req);

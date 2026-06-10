@@ -105,6 +105,13 @@ impl Remote for QuicRemote<'_> {
         )
     }
 
+    async fn get_roster_keyhist(&self, gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
+        expect_blob(
+            "get-roster-keyhist",
+            self.call(Request::GetRosterKeyhist { gen }).await?,
+        )
+    }
+
     async fn cas_head(
         &self,
         ref_h: &Id,
@@ -339,6 +346,70 @@ mod tests {
             assert!(crate::repo::open_repo_remote(&remote, &device, &[0xAB; 32])
                 .await
                 .is_err());
+
+            conn.close(0u32.into(), b"done");
+            let _ = srv.await;
+        });
+    }
+
+    /// §8.2/§8.4 **rotation-era cold-start over live QUIC**: the served store is rotated to generation
+    /// 2 (writing the roster-key history), then a pinned client cold-starts over the wire — fetching
+    /// the sigchain, keyslot, AND roster-key-history (`get-roster-keyhist`) to peel back to genesis and
+    /// recover generation 2.
+    #[test]
+    fn rotation_era_cold_start_over_live_quic() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ck = generate_simple_self_signed(vec!["secsec.invalid".to_string()]).unwrap();
+            let (cert, key) = (ck.cert.der().to_vec(), ck.key_pair.serialize_der());
+            let pin = HostPin::from_cert(&cert).unwrap();
+            let host_id = pin.host_id();
+
+            let device = DeviceKey::generate().unwrap();
+            let srv_dir = tempfile::tempdir().unwrap();
+            let srv_store = Store::open(srv_dir.path().join("s.redb")).unwrap();
+            // genesis + rotate the SERVED store to generation 2 (in-process; writes roster-keyhist).
+            let rfp = crate::repo::init_repo(&srv_store, &device, 0).unwrap();
+            let (mk1, st1) = crate::repo::open_repo(&srv_store, &device, &rfp).unwrap();
+            let (mk2, _st2) =
+                crate::repo::rotate_repo(&srv_store, &device, &mk1, &st1, &rfp, None, 0).unwrap();
+            assert_eq!(mk2.generation(), 2);
+            let server = Server::new(srv_store);
+
+            let endpoint =
+                quinn::Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                let conn = endpoint.accept().await.unwrap().await.unwrap();
+                let _ = serve_connection(&conn, &server, host_id, || 1_000).await;
+            });
+
+            let mut client = quinn::Endpoint::client(loopback()).unwrap();
+            client.set_default_client_config(client_config(pin).unwrap());
+            let conn = client
+                .connect(addr, "secsec.invalid")
+                .unwrap()
+                .await
+                .unwrap();
+            let sess = client_handshake(&conn, &device, host_id, [0x11; 32])
+                .await
+                .unwrap();
+            let remote = QuicRemote::new(&conn, sess.transcript, &device);
+
+            // cold-start over the wire recovers generation 2 (peeling roster-keyhist to genesis).
+            let (mk_cs, state) = crate::repo::open_repo_remote(&remote, &device, &rfp)
+                .await
+                .unwrap();
+            assert_eq!(
+                mk_cs.generation(),
+                2,
+                "rotated generation recovered over QUIC"
+            );
+            assert!(state.is_member(&device.device_id().unwrap()));
+            assert!(state.mk_commits.contains_key(&1) && state.mk_commits.contains_key(&2));
 
             conn.close(0u32.into(), b"done");
             let _ = srv.await;

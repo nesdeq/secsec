@@ -48,6 +48,8 @@ pub mod op {
     pub const GET_ROSTER: &str = "get-roster";
     /// Fetch a device's keyslot blob (`/keyslots/<device_id>/<g>`, §13) — for cold-start unwrap (§8.1).
     pub const GET_KEYSLOT: &str = "get-keyslot";
+    /// Fetch a roster-key-history wrap (`/roster-keyhist/<g>`, §8.2) — for rotation-era cold-start.
+    pub const GET_ROSTER_KEYHIST: &str = "get-roster-keyhist";
 }
 
 fn blake3_of(bytes: &[u8]) -> [u8; 32] {
@@ -127,6 +129,12 @@ pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
         Request::GetRosterEntry { seq } => (op::GET_ROSTER, args_get_roster(*seq), false),
         Request::GetKeyslot { device_id, gen } => {
             (op::GET_KEYSLOT, args_get_keyslot(device_id, *gen), false)
+        }
+        Request::GetRosterKeyhist { gen } => {
+            // bound like get-roster but on a generation index.
+            let mut w = Writer::new();
+            w.raw(op::GET_ROSTER_KEYHIST.as_bytes()).u32(*gen);
+            (op::GET_ROSTER_KEYHIST, blake3_of(&w.finish()), false)
         }
         // gc's real args_hash binds the SERVER's all_heads_hash/roster_seq/put_epoch (a §15
         // compare-and-swap), so it is computed in the server's gc handler and the client's gc driver,

@@ -116,6 +116,11 @@ pub trait Remote {
     async fn get_roster_entry(&self, seq: u64) -> Result<Option<Vec<u8>>, RemoteError>;
     /// Fetch a device's keyslot blob for generation `gen` (`None` if absent) — cold-start unwrap.
     async fn get_keyslot(&self, device_id: &Id, gen: u32) -> Result<Option<Vec<u8>>, RemoteError>;
+    /// Fetch the roster-key-history wrap for generation `gen` (`None` if absent) — rotation-era
+    /// cold-start (§8.2). Default returns `None` so in-process backends without keyhist still compile.
+    async fn get_roster_keyhist(&self, _gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
+        Ok(None)
+    }
     /// Blind compare-and-swap (§12): replace `/refs/<ref_h>` with `new_blob` iff `BLAKE3(current
     /// stored blob)` (or [`ABSENT_HEAD`]) equals `expected_old`. Returns `true` on swap, `false` on
     /// conflict.
