@@ -61,6 +61,15 @@ impl MasterKey {
         self.generation
     }
 
+    /// The raw 32-byte master-key material. **Deliberate, narrow accessor** for the operations that
+    /// genuinely need the bytes (keyslot/recovery wrapping, §8.3/§8.6) — the same material
+    /// `keyslot::unwrap` produces and `keyslot::wrap` consumes. Anyone holding a `MasterKey` already
+    /// has full read access, so this exposes nothing new; everything else derives subkeys instead.
+    #[must_use]
+    pub fn expose_secret(&self) -> &[u8; 32] {
+        &self.key
+    }
+
     /// `enc_key[g][t]` — the per-(generation, type) key from which per-object keys are derived (§9.4).
     #[must_use]
     pub fn enc_key(&self, obj_type: u8) -> SecretKey {

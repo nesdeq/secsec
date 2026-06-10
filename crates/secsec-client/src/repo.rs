@@ -18,10 +18,11 @@ use secsec_frame::{Frame, FRAME_LEN};
 use secsec_kdf::MasterKey;
 use secsec_proto::server::limits::MAX_TOTAL_SIGCHAIN;
 use secsec_roster::{
-    append_many, cold_start_fold, decode_entry, encode_entry, genesis, open_entry, revoke_closure,
-    revoke_rotate_ops, seal_entry, seal_roster_keyhist, Op, RosterError, State,
+    append, append_many, cold_start_fold, decode_entry, encode_entry, genesis, open_entry,
+    revoke_closure, revoke_rotate_ops, seal_entry, seal_roster_keyhist, sign_grant, Op,
+    RosterError, State, ENROLLMENT_NONCE_LEN,
 };
-use secsec_sig::{DeviceId, DeviceKey};
+use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
 use secsec_store::{Store, StoreError, ABSENT_HEAD};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
@@ -288,6 +289,66 @@ pub fn rotate_repo(
     open_repo(store, device, rfp)
 }
 
+/// §7 `grant` (record-writing half): enroll device `d_pubkey` into the repo. The granter `device` (a
+/// current member holding `mk`) appends an `AddDevice` entry, wraps `master_key_g` to `d_pubkey`'s
+/// X25519 key as its keyslot, and signs the `secsec-grant-v1` attestation over `enrollment_nonce`.
+/// Returns the attestation signature for E to send to D over the out-of-band grant channel (§7 step 5).
+///
+/// The **interactive** half — the SAS commitment-before-reveal ceremony, the human fingerprint check,
+/// and the per-`D_pubkey` rate limit (§7) — is the channel orchestration **above** this; the caller
+/// MUST complete it (confirming `d_pubkey` out-of-band) before invoking. `d_x25519_pub` is `d_pubkey`'s
+/// Curve25519 key (the Ed25519→X25519 map). On D's side, [`open_repo`]/[`open_repo_remote`] then verify
+/// the RFP + `mk_commit`, and the caller verifies this attestation with `secsec_roster::verify_grant`.
+#[allow(clippy::too_many_arguments)]
+pub fn grant_device(
+    store: &Store,
+    device: &DeviceKey,
+    mk: &MasterKey,
+    d_pubkey: &DevicePublic,
+    d_x25519_pub: &[u8; 32],
+    enrollment_nonce: &[u8; ENROLLMENT_NONCE_LEN],
+    ts: u64,
+) -> Result<Vec<u8>, RepoError> {
+    let g = mk.generation();
+    let mk_commit = mk.mk_commit();
+    let rk = mk.roster_key();
+
+    // Fetch + decrypt the current tip to chain the AddDevice entry.
+    let n = store.roster_len()?;
+    let tip_seq = n.checked_sub(1).ok_or(RepoError::NotInitialized)?;
+    let tip_blob = store
+        .get_roster_entry(tip_seq)?
+        .ok_or(RepoError::MissingEntry(tip_seq))?;
+    let tip_entry = decode_entry(&open_entry(&rk, g, tip_seq, &tip_blob)?)?;
+
+    let d_canonical = d_pubkey.to_canonical()?;
+    let op = Op::AddDevice {
+        pubkey: d_canonical.clone(),
+        mk_commit,
+    };
+    let entry = append(&tip_entry, op, device, ts)?;
+    let roster_seq = entry.seq;
+    let blob = seal_entry(&rk, g, roster_seq, &encode_entry(&entry));
+    let old_tip = *blake3::hash(&tip_blob).as_bytes();
+    if store.append_roster(&old_tip, &blob)?.is_none() {
+        return Err(RepoError::RosterCasConflict);
+    }
+
+    // Wrap master_key_g to D's keyslot at the current generation.
+    let d_id = d_pubkey.device_id()?;
+    let keyslot = secsec_keyslot::wrap(mk.expose_secret(), g, &d_id, d_x25519_pub)?;
+    store.put_keyslot(&d_id, g, &keyslot)?;
+
+    // Sign the grant attestation over the directly-delivered enrollment_nonce (§9.6).
+    Ok(sign_grant(
+        device,
+        &d_canonical,
+        &mk_commit,
+        roster_seq,
+        enrollment_nonce,
+    )?)
+}
+
 /// Fetch a remote's full sigchain (`get-roster` `seq = 0, 1, …` until absent), bounded by the §19
 /// total-sigchain cap so a misbehaving server cannot stream entries forever. Entries are the stored
 /// (encrypted) blobs; the caller folds/verifies them against the RFP (§8.1).
@@ -412,5 +473,77 @@ mod tests {
 
         // a wrong RFP still fails the fold after rotation.
         assert!(open_repo(&store, &device, &[0xAB; 32]).is_err());
+    }
+
+    #[test]
+    fn grant_enrolls_a_second_device_end_to_end() {
+        use secsec_roster::{sas_value, verify_grant};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("s.redb")).unwrap();
+        let e = DeviceKey::generate().unwrap(); // granter (device 1)
+        let d = DeviceKey::generate().unwrap(); // new device
+        let rfp = init_repo(&store, &e, 0).unwrap();
+        let (mk, _st) = open_repo(&store, &e, &rfp).unwrap();
+
+        // --- the SAS ceremony (cores; the channel/human steps are the caller's) ---
+        let d_canonical = d.public().to_canonical().unwrap();
+        let grant_nonce = [0x42u8; secsec_roster::GRANT_NONCE_LEN];
+        // both sides compute the SAS over RFP ‖ D_pubkey ‖ grant_nonce; the human confirms they match.
+        let sas_e = sas_value(&rfp, &d_canonical, &grant_nonce);
+        let sas_d = sas_value(&rfp, &d_canonical, &grant_nonce);
+        assert_eq!(sas_e, sas_d, "SAS must agree out-of-band");
+
+        // --- E writes the grant records + attestation ---
+        let enrollment_nonce = [0x99u8; ENROLLMENT_NONCE_LEN];
+        let d_x = d.x25519_public().unwrap();
+        let attestation =
+            grant_device(&store, &e, &mk, &d.public(), &d_x, &enrollment_nonce, 0).unwrap();
+
+        // --- D's first sync: cold-start recovers the master key + sees itself a member ---
+        let (mk_d, st_d) = open_repo(&store, &d, &rfp).unwrap();
+        assert_eq!(mk_d.generation(), 1);
+        assert!(st_d.is_member(&d.device_id().unwrap()));
+        assert!(st_d.is_member(&e.device_id().unwrap()));
+        assert_eq!(st_d.members.len(), 2);
+
+        // D verifies the grant attestation covers exactly the enrollment_nonce it received from E (§7
+        // step 4), signed by a current member (E).
+        let roster_seq = store.roster_len().unwrap() - 1; // the AddDevice entry's seq
+        assert!(verify_grant(
+            &e.public(),
+            &d_canonical,
+            &mk.mk_commit(),
+            roster_seq,
+            &enrollment_nonce,
+            &attestation,
+        )
+        .is_ok());
+        // a wrong enrollment_nonce (a replayed/stale attestation) is rejected.
+        assert!(verify_grant(
+            &e.public(),
+            &d_canonical,
+            &mk.mk_commit(),
+            roster_seq,
+            &[0u8; ENROLLMENT_NONCE_LEN],
+            &attestation,
+        )
+        .is_err());
+
+        // after the grant, E can rotate-revoke D (revoke ⇒ rotate), removing it from membership.
+        let (_mk2, st2) = rotate_repo(
+            &store,
+            &e,
+            &mk,
+            &st_d,
+            &rfp,
+            Some(d.device_id().unwrap()),
+            0,
+        )
+        .unwrap();
+        assert!(
+            !st2.is_member(&d.device_id().unwrap()),
+            "revoked device removed"
+        );
+        assert!(st2.is_member(&e.device_id().unwrap()));
     }
 }
