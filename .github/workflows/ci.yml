@@ -20,7 +20,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
-  # Build + test on all three target platforms (v1 supports Linux/macOS/Windows).
+  # Build + test on all three target platforms (Linux/macOS/Windows).
   test:
     strategy:
       fail-fast: false

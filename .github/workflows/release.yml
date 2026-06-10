@@ -1,0 +1,112 @@
+name: release
+
+# Build the `secsec` binary for the three OSes × {x86_64, aarch64} on native runners
+# (no cross-compiling — `ring`/`blake3` ship C+asm), then attach the archives and a
+# SHA256SUMS to the GitHub Release for the tag. Linux is static musl; macOS/Windows are
+# native. Triggered by rc*/v* tag pushes; also runnable manually for a dry build.
+on:
+  push:
+    tags:
+      - 'rc*'
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   runner: ubuntu-latest,    target: x86_64-unknown-linux-musl }
+          - { name: linux-aarch64,  runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { name: macos-x86_64,   runner: macos-13,         target: x86_64-apple-darwin }
+          - { name: macos-aarch64,  runner: macos-latest,     target: aarch64-apple-darwin }
+          - { name: windows-x86_64, runner: windows-latest,   target: x86_64-pc-windows-msvc }
+          - { name: windows-aarch64, runner: windows-11-arm,  target: aarch64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # musl C toolchain for ring's C shims on the static Linux targets.
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --locked -p secsec --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/secsec"
+          strip "$bin" || true
+          archive="secsec-${{ github.ref_name }}-${{ matrix.name }}.tar.gz"
+          cp "$bin" secsec && chmod 755 secsec
+          tar -czf "$archive" secsec
+          rm -f secsec
+          shasum -a 256 "$archive" > "$archive.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bin = "target/${{ matrix.target }}/release/secsec.exe"
+          $archive = "secsec-${{ github.ref_name }}-${{ matrix.name }}.zip"
+          Copy-Item $bin secsec.exe
+          Compress-Archive -Path secsec.exe -DestinationPath $archive -Force
+          Remove-Item secsec.exe
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          [System.IO.File]::WriteAllText("$archive.sha256", "$hash  $archive`n")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: secsec-${{ matrix.name }}
+          path: |
+            secsec-*.tar.gz
+            secsec-*.zip
+            secsec-*.sha256
+          if-no-files-found: error
+
+  # Collect every artifact, fold the per-archive checksums into one SHA256SUMS, and
+  # publish the lot to the Release. Tag pushes only.
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: secsec-*
+          merge-multiple: true
+
+      - name: Combine checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          ls -la
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
