@@ -1,0 +1,13 @@
+# cargo-audit configuration (read automatically from .cargo/audit.toml).
+#
+# We pin one advisory exception, with rationale:
+#
+#   RUSTSEC-2023-0071 — `rsa` "Marvin Attack" key-recovery timing side-channel (no fixed release).
+#   The `rsa` crate is an OPTIONAL dependency of `ssh-key`; secsec-sig uses ssh-key with ONLY the
+#   `ed25519` feature, so the `rsa` feature is never enabled and the crate is never compiled into the
+#   binary (`cargo tree -i rsa` is empty — it is not in the build graph; it lingers in Cargo.lock only
+#   because Cargo pins versions for optional deps). The vulnerable RSA private-key operations are
+#   therefore unreachable. v1 is Ed25519-only and RSA is dropped from scope, so this will not change;
+#   revisit only if an `rsa`-enabling feature is ever turned on.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
