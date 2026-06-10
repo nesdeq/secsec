@@ -5,7 +5,7 @@ Running status of milestones (M), risks (R), and forward-carried debts. Updated 
 
 ## Snapshot
 
-- **20 crates + `secsec` binary** (+ `xtask` tooling, `fuzz/` cargo-fuzz layout) · 255 tests · clippy
+- **20 crates + `secsec` binary** (+ `xtask` tooling, `fuzz/` cargo-fuzz layout) · 258 tests · clippy
   `-D warnings` + fmt clean · spec↔code↔doc consistent.
 - **Full-source audit (2026-06-10):** read all ~18.3k LoC + the spec. Found **one** soundness/conformance
   defect — `secsec-pq` was non-conformant X-Wing (label-first + two independent seeds, hidden by an
@@ -78,30 +78,34 @@ Worked through smallest→largest, tested+committed per slice:
 - [x] #16 M7 stdio/SSH transport (transcript channel-binding + generic byte-stream framing)
 
 Dropped from scope: RSA device keys, WebDAV.
-## Conformance gaps (unbuilt spec features — *absent*, not *wrong*)
+## Audit + closure (2026-06-10)
 
-The classical crypto/protocol/sync/transport/server/storage stack is conformant and tested (252
-tests, KATs, proptests, model-based differential fold test, live-QUIC e2e, fuzz-on-stable). The
-full-source audit (2026-06-10) found **one** soundness defect — `secsec-pq` was non-conformant
-X-Wing — now fixed and KAT-proven. The remaining gaps are unimplemented spec features:
+Full-source audit read all ~18.3k LoC + the spec. Found **one** soundness/conformance defect —
+`secsec-pq` was non-conformant X-Wing (label-first combiner + two independent seeds, hidden by an
+ignored KAT). Everything else was conformant. Fixed the defect and closed the unbuilt-feature gaps:
 
-- ✅ **§8.2 DATA key-history** (`/keyhist/<g>`) — **done** (kdf `data_keyhist_key`, roster
-  `seal/open/peel_data_keys`, store `KEYHIST`, `GetKeyhist` wire op, `rotate_repo` producer,
-  `data_keyring`/`data_keyring_remote`). A fresh cold-started device peels the keyring and reads
-  pre- *and* post-rotation objects (proven in-process + over live QUIC). **Remaining consumer:**
-  auto-select the per-object generation inside `fetch_closure`/`restore` for full rotation-era LIVE
-  sync (the sync loop still runs at the genesis generation today).
-- **X-Wing `algo_id` integration** — the conformant keyslot exists but no `algo_id` reaches it;
-  `repo.rs` always uses the classical HPKE slot. Needs a FRAME `algo_id` + a device X-Wing-key
-  enrollment decision (derive the seed from the SSH scalar? publish in `AddDevice`?) + `SetMinAlgo`.
-- ✅ **§8.2 cross-generation reads** — **done.** `open_object` resolves each object's authenticated
-  generation via a `MasterKeys` resolver; every fetch/push/merge/sync path crosses rotation boundaries
-  (single-gen callers unchanged). The CLI builds the data keyring at cold-start. Proven by
-  `reads_across_a_generation_boundary_with_a_key_ring`.
-- ✅ **§8.1 `HistoryReanchor`** — **removed** (was spec-unsound per `finalrew.md`, never in code).
-  Both key-histories are now never-trimmed; no depth cap.
-- **§7 SAS rate-limit** (5/hr per D_pubkey), **§16 per-fetch `min_algo`** on keyslots (keyslots need
-  an `algo_id` first), and CLI surfaces `rotate`/`grant`/`recover`/`gc` — all absent.
+- ✅ **X-Wing conformance** — rewritten to draft-10 (single-seed `SHAKE256` keygen, label-LAST
+  combiner, FIPS 203 §7.1 PCT). `xwing_kat` proves byte-identity vs the draft-10 vector (not ignored).
+- ✅ **§8.2 DATA key-history** — layer (kdf/roster/store/wire/producer/peel) **+** the cross-generation
+  read consumer: `open_object` resolves each object's generation via a `MasterKeys` resolver, so every
+  fetch/push/merge/sync path crosses rotation boundaries (single-gen callers unchanged); the CLI builds
+  the keyring at cold-start. Proven in-process, over live QUIC, and across a rotation boundary.
+- ✅ **X-Wing `algo_id` integration** — keyslots are algo-tagged (`algo_id ‖ body`); a device's X-Wing
+  key derives from its SSH private scalar (`xwing_seed`), its X-Wing public is published in the roster
+  (`Genesis`/`AddDevice`), and init/grant/rotate wrap at the repo's `min_algo`. **§16** floor enforced
+  at cold-start (reject a keyslot below `min_algo`). Proven by `xwing_keyslot_cold_start_and_min_algo_floor`.
+- ✅ **§8.1 `HistoryReanchor`** — **removed** (spec-unsound per `finalrew.md`, never in code); both
+  key-histories are never-trimmed.
+- ✅ **CLI `rotate` / `grant` / `enroll-pubkey`** — membership management over the tested cores; the
+  full lifecycle (init → enroll-pubkey → grant → rotate --revoke) is verified end-to-end with real SSH keys.
+
+**Genuinely remaining** (each needs a real prerequisite, not deferral-avoidance):
+- **CLI `recover`** — needs a recovery-keyslot *creation* flow first (`secsec_recovery` is tested, but
+  no command/store-path ever creates a `/recovery` blob).
+- **CLI `gc`** — `gc_collect` is tested over live QUIC, but a safe `gc_gen` needs persisted arrival
+  receipts (the sync loop doesn't persist them yet); a manual `gc_gen` would bypass the §15 grace window.
+- **§7 SAS rate-limit** (5/hr per D_pubkey) — belongs to an *automated two-party SAS protocol*; the SAS
+  is human-mediated today (primitives `sas_commit`/`sas_value` exist), so the limit has no automated home.
 - Live `russh` stdio `H`/`K_S` wiring (deployment-only, no security gain over pinned QUIC).
 
 Residual (not debt): §8.5 seal-before-push ordering is conservative (crash-safe via FF retry).
