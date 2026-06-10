@@ -1550,6 +1550,7 @@ dependencies = [
  "notify",
  "quinn",
  "rcgen",
+ "secsec-canon",
  "secsec-engine",
  "secsec-frame",
  "secsec-kdf",

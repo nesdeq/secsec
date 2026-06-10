@@ -11,12 +11,14 @@
 //! the same inputs; it is a thin transport over this logic, not new crypto.
 
 use crate::{fetch_closure, fetch_head, resolve_head_signer, ClientError, Remote};
+use secsec_canon::{Reader, Writer};
 use secsec_kdf::MasterKey;
 use secsec_object::Id;
 use secsec_sig::{DeviceId, DevicePublic};
 use secsec_store::Store;
 use secsec_sync::dag::incomparable;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// A provable fork, for the §10 audit log: our head, the divergent (DAG-incomparable) head, the device
 /// that signed it, and the index of the remote that served it. `detected_at` is the client's wall-clock
@@ -79,6 +81,99 @@ pub async fn cross_remote_fork_scan<R: Remote>(
         }
     }
     Ok(forks)
+}
+
+// ---- fork-event log (§10 step 3: persisted audit record) ----
+
+impl ForkEvent {
+    /// Canonical fixed-width encoding (§9.3): `our_head ‖ their_head ‖ has_device(u8) ‖ device(32) ‖
+    /// remote(u64) ‖ detected_at(u64)`. The device field is present iff `has_device == 1`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.raw(&self.our_head).raw(&self.their_head);
+        match self.their_device {
+            Some(d) => {
+                w.u8(1).raw(&d);
+            }
+            None => {
+                w.u8(0).raw(&[0u8; 32]);
+            }
+        }
+        w.u64(self.remote as u64).u64(self.detected_at);
+        w.finish()
+    }
+
+    fn decode(r: &mut Reader<'_>) -> Result<Self, secsec_canon::CanonError> {
+        let our_head = read32(r)?;
+        let their_head = read32(r)?;
+        let has_device = r.u8()?;
+        let dev = read32(r)?;
+        let remote = r.u64()? as usize;
+        let detected_at = r.u64()?;
+        Ok(ForkEvent {
+            our_head,
+            their_head,
+            their_device: (has_device == 1).then_some(dev),
+            remote,
+            detected_at,
+        })
+    }
+}
+
+fn read32(r: &mut Reader<'_>) -> Result<Id, secsec_canon::CanonError> {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(r.raw(32)?);
+    Ok(out)
+}
+
+/// Append fork `events` to the §10-step-3 audit log at `path` (created if absent), each as a
+/// length-prefixed canonical record. The log is **append-only** and unencrypted — fork ids are commit
+/// content-addresses (not secret; the server already holds the objects), and the log's value is its
+/// completeness for user review, so it is never rewritten.
+pub fn append_fork_log(path: &Path, events: &[ForkEvent]) -> Result<(), ClientError> {
+    use std::io::Write;
+    if events.is_empty() {
+        return Ok(());
+    }
+    let mut buf = Vec::new();
+    for e in events {
+        let rec = e.encode();
+        buf.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&rec);
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(&buf)?;
+    Ok(())
+}
+
+/// Read the full fork-event log at `path` (empty if the file is absent). A truncated trailing record
+/// (e.g. a crash mid-append) ends the read cleanly — earlier complete records are returned.
+pub fn read_fork_log(path: &Path) -> Result<Vec<ForkEvent>, ClientError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(ClientError::Io(e)),
+    };
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[off..off + 4].try_into().expect("4 bytes")) as usize;
+        off += 4;
+        if off + len > bytes.len() {
+            break; // truncated trailing record (crash mid-append) — stop cleanly.
+        }
+        let mut r = Reader::new(&bytes[off..off + len]);
+        match ForkEvent::decode(&mut r) {
+            Ok(e) if r.finish().is_ok() => out.push(e),
+            _ => break, // malformed record — stop.
+        }
+        off += len;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -221,5 +316,49 @@ mod tests {
             none.is_empty(),
             "a descendant head is a fast-forward, not a fork"
         );
+
+        // persist the detected fork and read it back (§10 step 3).
+        let log = dir.path().join("forks.log");
+        append_fork_log(&log, &forks).unwrap();
+        // a second append accumulates (append-only).
+        let extra = ForkEvent {
+            our_head: [9u8; 32],
+            their_head: [8u8; 32],
+            their_device: None,
+            remote: 3,
+            detected_at: 99,
+        };
+        append_fork_log(&log, std::slice::from_ref(&extra)).unwrap();
+
+        let read = read_fork_log(&log).unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0], forks[0]);
+        assert_eq!(read[1], extra);
+        assert_eq!(read[1].their_device, None); // None device round-trips
+    }
+
+    #[test]
+    fn fork_log_round_trips_and_handles_absent_and_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("f.log");
+        // absent file → empty.
+        assert!(read_fork_log(&log).unwrap().is_empty());
+
+        let e = ForkEvent {
+            our_head: [1u8; 32],
+            their_head: [2u8; 32],
+            their_device: Some([3u8; 32]),
+            remote: 0,
+            detected_at: 7,
+        };
+        append_fork_log(&log, std::slice::from_ref(&e)).unwrap();
+        assert_eq!(read_fork_log(&log).unwrap(), vec![e.clone()]);
+
+        // a truncated trailing record (simulated crash mid-append) is dropped; prior records survive.
+        let mut bytes = std::fs::read(&log).unwrap();
+        bytes.extend_from_slice(&100u32.to_le_bytes()); // claims 100 more bytes, none follow
+        bytes.push(0xAB);
+        std::fs::write(&log, &bytes).unwrap();
+        assert_eq!(read_fork_log(&log).unwrap(), vec![e]);
     }
 }

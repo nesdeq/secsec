@@ -15,6 +15,7 @@ secsec-snapshot = { path = "../secsec-snapshot" }
 secsec-object = { path = "../secsec-object" }
 secsec-frame = { path = "../secsec-frame" }
 secsec-kdf = { path = "../secsec-kdf" }
+secsec-canon = { path = "../secsec-canon" }
 secsec-sync = { path = "../secsec-sync" }
 secsec-engine = { path = "../secsec-engine" }
 secsec-roster = { path = "../secsec-roster" }
