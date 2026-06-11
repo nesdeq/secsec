@@ -49,7 +49,7 @@ Build the binary:
 cargo build --release      # target/release/secsec
 ```
 
-The whole CLI is six commands: `serve · sync · invite · devices · hostpin · revoke`.
+The whole CLI is eight commands: `serve · sync · invite · devices · hostpin · log · restore · revoke`.
 
 **Server — run the blind server.** Its only configuration is `~/.ssh/authorized_keys`: list the
 **public** key of every device allowed to connect (standard OpenSSH format, one per line). The server
@@ -105,6 +105,21 @@ secsec revoke <device-id-prefix> ~/Sync     # rotate the key away from it (forwa
 Revocation mints a new key generation the revoked device cannot derive, so it can read nothing written
 afterward. Garbage collection runs **automatically** inside `sync` — there is no `gc` command. Run
 `secsec <command> --help` for flags.
+
+**History & restore.** Every sync is a signed commit, so the full version history is a by-product. Run
+these **inside the synced folder**:
+
+```sh
+secsec log                       # the whole repo's change log, newest first
+secsec log notes.md              # the version history of one file (or folder)
+secsec restore notes.md          # bring back the previous version of notes.md
+secsec restore notes.md <id>     # restore the version at a commit id from `secsec log notes.md`
+```
+
+`restore` writes the historic file/folder over the current one in your working folder; the running
+`sync` then propagates it to your other devices like any edit — no history rewrite, and a concurrent
+change still three-way-merges. The whole feature is read-side over the existing encrypted objects (no
+server, protocol, or key changes).
 
 ## Architecture
 

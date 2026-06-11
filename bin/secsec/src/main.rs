@@ -13,6 +13,9 @@
 //!   fingerprints) and revoke one over the wire (§8.4: rotate the key away from a stolen device).
 //! - `secsec hostpin <dir>` — print the server host fingerprint this folder pinned, to compare
 //!   out-of-band against the `host pin` the server prints on startup (§11 TOFU verification).
+//! - `secsec log [path]` / `secsec restore <path> [version]` — browse the change history (whole repo
+//!   or one file/folder) and restore a historic version into the working folder, which the next sync
+//!   propagates like any edit. Run inside the synced folder; read-side over the existing object plane.
 //!
 //! Garbage collection (§15) runs automatically inside `sync`; there is no manual command.
 
@@ -99,6 +102,19 @@ enum Cmd {
     Hostpin {
         /// A folder already linked to the repo (default: current directory).
         dir: Option<PathBuf>,
+    },
+    /// Show the change log of the synced folder you're in; with a path, that file/folder's history.
+    Log {
+        /// A file or folder within the repo (relative to the synced folder root). Omit for the whole repo.
+        path: Option<String>,
+    },
+    /// Restore a historic version of a file/folder into the working folder; the next sync propagates it
+    /// to other devices (like copying the old file over the current one). Run inside the synced folder.
+    Restore {
+        /// The file or folder within the repo to restore (relative to the synced folder root).
+        path: String,
+        /// The version: a commit-id prefix from `secsec log <path>`. Omit for the previous version.
+        version: Option<String>,
     },
     /// Revoke a device (e.g. a stolen one): rotate the key away from it so it can't read new data.
     Revoke {
@@ -830,6 +846,205 @@ fn run_hostpin(dir: PathBuf) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ---- log / restore (history) ----
+
+/// A repo-relative path: drop empty / `.` segments and reject `..` (no escaping the synced folder).
+fn normalize_repo_path(p: &str) -> Result<String, Box<dyn Error>> {
+    let comps: Vec<&str> = p
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    if comps.contains(&"..") {
+        return Err("path must be inside the synced folder (no '..')".into());
+    }
+    Ok(comps.join("/"))
+}
+
+/// Human-friendly age of an advisory commit timestamp (§10: `ts` is a hint, not trusted for security).
+fn rel_time(ts: u64, now: u64) -> String {
+    if ts == 0 {
+        return "unknown".into();
+    }
+    if now <= ts {
+        return "just now".into();
+    }
+    let d = now - ts;
+    if d < 60 {
+        format!("{d}s ago")
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86_400 {
+        format!("{}h ago", d / 3600)
+    } else {
+        format!("{}d ago", d / 86_400)
+    }
+}
+
+fn print_log_entry(e: &secsec_client::history::LogEntry, now: u64) {
+    let merge = if e.parents.len() > 1 { " merge" } else { "" };
+    let changed = if e.changed.is_empty() {
+        "(no content change)".to_string()
+    } else if e.changed.len() <= 4 {
+        e.changed.join(", ")
+    } else {
+        format!(
+            "{}, +{} more",
+            e.changed[..3].join(", "),
+            e.changed.len() - 3
+        )
+    };
+    println!(
+        "{}  {:<9}  dev {}{}  {}",
+        &hex(&e.commit_id)[..12],
+        rel_time(e.ts, now),
+        &hex(&e.device_id)[..8],
+        merge,
+        changed
+    );
+}
+
+fn print_path_version(v: &secsec_client::history::PathVersion, now: u64) {
+    let what = if !v.present {
+        "deleted"
+    } else if v.is_dir {
+        "changed (dir)"
+    } else {
+        "modified"
+    };
+    println!(
+        "{}  {:<9}  dev {}  {what}",
+        &hex(&v.commit_id)[..12],
+        rel_time(v.ts, now),
+        &hex(&v.device_id)[..8]
+    );
+}
+
+/// `secsec log [path]` — the repo's change history, or one file/folder's version history. Run inside
+/// the synced folder. Reads history over the wire into a throwaway store (the shared object cache may
+/// be held by a running `sync`), so it works alongside a live sync.
+async fn run_log(path: Option<String>) -> Result<(), Box<dyn Error>> {
+    let dir = std::env::current_dir()?;
+    let sdir = state_dir_for(&dir)?;
+    let link = read_link(&sdir).ok_or(
+        "not inside a synced folder — run `secsec log` in a folder you've `secsec sync`-ed",
+    )?;
+    let path = path.map(|p| normalize_repo_path(&p)).transpose()?;
+
+    let device = default_device()?;
+    let addr = resolve_server(&link.server)?;
+    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
+    let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
+    let rem = QuicRemote::new(&conn, sess.transcript, &device);
+    let (mk, _st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
+    let keyring = data_keyring_remote(&rem, &mk).await?;
+
+    let tmp = tempfile::tempdir()?;
+    let store = Store::open(tmp.path().join("history.redb"))?;
+    let now = unix_secs();
+    match secsec_client::fetch_head(&rem, &mk, &link.ref_name).await? {
+        None => println!(
+            "no history yet — nothing has been synced to '{}'.",
+            link.ref_name
+        ),
+        Some((head, _sig, _blob)) => {
+            secsec_client::history::fetch_history(&rem, &store, &keyring, &head.commit_id).await?;
+            match &path {
+                None => {
+                    let log = secsec_client::history::repo_log(&keyring, &store, &head.commit_id)?;
+                    for e in &log {
+                        print_log_entry(e, now);
+                    }
+                    println!("{} commit(s).", log.len());
+                }
+                Some(p) => {
+                    let hist =
+                        secsec_client::history::path_history(&keyring, &store, &head.commit_id, p)?;
+                    if hist.is_empty() {
+                        println!("no history for '{p}' (it may not exist in the repo).");
+                    } else {
+                        for v in &hist {
+                            print_path_version(v, now);
+                        }
+                        println!("{} version(s) of '{p}'.", hist.len());
+                    }
+                }
+            }
+        }
+    }
+    conn.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+    Ok(())
+}
+
+/// `secsec restore <path> [version]` — write a historic version of a file/folder into the working
+/// folder. With no version, restores the *previous* version of that path. The change then propagates
+/// via the normal sync (a running `secsec sync` picks it up), exactly like copying an old file over.
+async fn run_restore(path: String, version: Option<String>) -> Result<(), Box<dyn Error>> {
+    let dir = std::env::current_dir()?;
+    let sdir = state_dir_for(&dir)?;
+    let link = read_link(&sdir).ok_or(
+        "not inside a synced folder — run `secsec restore` in a folder you've `secsec sync`-ed",
+    )?;
+    let path = normalize_repo_path(&path)?;
+    if path.is_empty() {
+        return Err("specify a file or folder to restore".into());
+    }
+
+    let device = default_device()?;
+    let addr = resolve_server(&link.server)?;
+    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
+    let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
+    let rem = QuicRemote::new(&conn, sess.transcript, &device);
+    let (mk, _st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
+    let keyring = data_keyring_remote(&rem, &mk).await?;
+
+    let tmp = tempfile::tempdir()?;
+    let store = Store::open(tmp.path().join("history.redb"))?;
+    let head = secsec_client::fetch_head(&rem, &mk, &link.ref_name)
+        .await?
+        .ok_or("no history yet — nothing to restore")?
+        .0;
+    secsec_client::history::fetch_history(&rem, &store, &keyring, &head.commit_id).await?;
+
+    let target = match version {
+        Some(prefix) => {
+            let prefix = prefix.to_lowercase();
+            let ids = secsec_client::history::commit_ids(&keyring, &store, &head.commit_id)?;
+            let matches: Vec<[u8; 32]> = ids
+                .into_iter()
+                .filter(|c| hex(c).starts_with(&prefix))
+                .collect();
+            match matches.as_slice() {
+                [c] => *c,
+                [] => return Err(format!("no commit matches '{prefix}' — see `secsec log`").into()),
+                _ => {
+                    return Err(format!(
+                        "'{prefix}' matches more than one commit — use a longer prefix"
+                    )
+                    .into())
+                }
+            }
+        }
+        None => {
+            // path_history[0] = the current content's commit; [1] = the previous version.
+            let hist =
+                secsec_client::history::path_history(&keyring, &store, &head.commit_id, &path)?;
+            hist.get(1).map(|v| v.commit_id).ok_or_else(|| {
+                format!("'{path}' has no previous version to restore (only one version exists).")
+            })?
+        }
+    };
+
+    secsec_client::history::restore(&rem, &store, &keyring, &target, &path, &dir).await?;
+    println!(
+        "restored '{path}' from commit {} — your running `secsec sync` will propagate it (or run `secsec sync`).",
+        &hex(&target)[..12]
+    );
+    conn.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+    Ok(())
+}
+
 /// Revoke a device by a (prefix of its) device id: rotate the master key away from it (and its
 /// add-by closure) over the wire, so it can't decrypt anything written afterward. Also reminds the
 /// operator to remove its key from the server's `authorized_keys`.
@@ -912,6 +1127,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Cmd::Devices { dir } => rt()?.block_on(run_devices(dir.unwrap_or_else(cwd))),
         // hostpin is offline (reads the local link), so it needs no tokio runtime.
         Cmd::Hostpin { dir } => run_hostpin(dir.unwrap_or_else(cwd)),
+        Cmd::Log { path } => rt()?.block_on(run_log(path)),
+        Cmd::Restore { path, version } => rt()?.block_on(run_restore(path, version)),
         Cmd::Revoke { device, dir } => rt()?.block_on(run_revoke(device, dir.unwrap_or_else(cwd))),
     }
 }

@@ -20,6 +20,7 @@
 pub mod enroll;
 pub mod gc;
 pub mod gossip;
+pub mod history;
 pub mod multiremote;
 pub mod pair;
 pub mod quic;

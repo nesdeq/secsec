@@ -121,6 +121,8 @@ pub enum SnapError {
     Rng,
     /// Commit signature invalid, or the signer is not the commit's author (§9.6).
     BadSignature,
+    /// A requested path did not exist in the tree being resolved (`secsec log`/`restore`).
+    PathNotFound(String),
     /// Signing/key error.
     Sig(secsec_sig::SigError),
 }
@@ -139,6 +141,7 @@ impl core::fmt::Display for SnapError {
             SnapError::NonUtf8Name => f.write_str("non-UTF-8 file name"),
             SnapError::Rng => f.write_str("OS RNG failure"),
             SnapError::BadSignature => f.write_str("commit signature invalid or wrong author"),
+            SnapError::PathNotFound(p) => write!(f, "path not found in that version: {p}"),
             SnapError::Sig(e) => write!(f, "sig: {e}"),
         }
     }
@@ -789,6 +792,254 @@ fn collect_tree<K: MasterKeys>(
     Ok(())
 }
 
+// ---- path resolution, single-path restore, and tree diff (§10 history: `secsec log` / `restore`) ----
+
+/// A file or directory resolved at a path within a commit's tree (for `secsec log`/`restore`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathNode {
+    /// A regular file: its content is the ordered `chunks` sealed under `path_salt` (§9.2).
+    File {
+        /// Unix mode bits.
+        mode: u32,
+        /// Modification time (advisory).
+        mtime: u64,
+        /// Plaintext size.
+        size: u64,
+        /// The file's path salt.
+        path_salt: PathSalt,
+        /// Ordered chunk ids — the file's content identity.
+        chunks: Vec<Id>,
+    },
+    /// A directory: the subtree object id + its salt.
+    Dir {
+        /// Subtree content id.
+        subtree: Id,
+        /// Subtree path salt.
+        subtree_salt: PathSalt,
+    },
+}
+
+/// Split a slash-separated repo-relative path into clean components (dropping empty/`.` segments).
+fn path_components(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect()
+}
+
+/// Resolve the slash-separated `path` (relative to `(root_tree, root_salt)`) to the file or directory
+/// there, or `None` if any component is missing (or a non-final component is a file). An empty path
+/// resolves to the root directory. Walks one tree level per component (re-verifying §9.2 on each).
+pub fn resolve_path<K: MasterKeys>(
+    keys: &K,
+    store: &Store,
+    root_tree: &Id,
+    root_salt: &PathSalt,
+    path: &str,
+) -> Result<Option<PathNode>, SnapError> {
+    let comps = path_components(path);
+    if comps.is_empty() {
+        return Ok(Some(PathNode::Dir {
+            subtree: *root_tree,
+            subtree_salt: *root_salt,
+        }));
+    }
+    let (mut cur_tree, mut cur_salt) = (*root_tree, *root_salt);
+    for (i, comp) in comps.iter().enumerate() {
+        let tree = load_tree(&cur_tree, &cur_salt, keys, store)?;
+        let Some(entry) = tree.entries.iter().find(|e| entry_name(e) == *comp) else {
+            return Ok(None);
+        };
+        let last = i + 1 == comps.len();
+        match entry {
+            Entry::File {
+                mode,
+                mtime,
+                size,
+                path_salt,
+                chunks,
+                ..
+            } => {
+                return Ok(last.then(|| PathNode::File {
+                    mode: *mode,
+                    mtime: *mtime,
+                    size: *size,
+                    path_salt: *path_salt,
+                    chunks: chunks.clone(),
+                }));
+            }
+            Entry::Dir {
+                subtree,
+                subtree_salt,
+                ..
+            } => {
+                if last {
+                    return Ok(Some(PathNode::Dir {
+                        subtree: *subtree,
+                        subtree_salt: *subtree_salt,
+                    }));
+                }
+                cur_tree = *subtree;
+                cur_salt = *subtree_salt;
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Restore the file or directory at `path` from `commit` into `dest_root` at the same relative
+/// `path` — the read side of `secsec restore`. A file is materialized (parent dirs created, §9.2
+/// verified, padding stripped); a directory is restored recursively. `PathNotFound` if the path did
+/// not exist in that commit's tree. The caller then lets the normal sync commit + propagate it.
+pub fn restore_path<K: MasterKeys>(
+    keys: &K,
+    store: &Store,
+    commit: &Commit,
+    path: &str,
+    dest_root: &Path,
+) -> Result<(), SnapError> {
+    let node = resolve_path(keys, store, &commit.root_tree, &commit.root_salt, path)?
+        .ok_or_else(|| SnapError::PathNotFound(path.to_string()))?;
+    let target = dest_root.join(path);
+    match node {
+        PathNode::File {
+            mode,
+            mtime,
+            size,
+            path_salt,
+            chunks,
+        } => {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut data = Vec::new();
+            for cid in &chunks {
+                let padded = fetch_open(keys, ObjType::Chunk, &path_salt, cid, store)?;
+                data.extend_from_slice(unpad_chunk(&padded, Padding::PowerOfTwo)?);
+            }
+            if data.len() as u64 != size {
+                return Err(SnapError::Malformed("restored file size mismatch"));
+            }
+            std::fs::write(&target, &data)?;
+            apply_metadata(&target, mode, mtime)?;
+        }
+        PathNode::Dir {
+            subtree,
+            subtree_salt,
+        } => {
+            restore_tree_into(&subtree, &subtree_salt, keys, store, &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// The set of **file** paths whose content differs between `old` and `new` trees (each `(id, salt)`,
+/// or `None` for an empty side — e.g. a commit with no parent). Slash-separated, sorted. Unchanged
+/// subtrees are pruned by id equality, so this is cheap (it never descends into identical subtrees).
+/// Used to summarize what a commit changed vs its parent (`secsec log`).
+pub fn changed_paths<K: MasterKeys>(
+    keys: &K,
+    store: &Store,
+    old: Option<(&Id, &PathSalt)>,
+    new: Option<(&Id, &PathSalt)>,
+) -> Result<Vec<String>, SnapError> {
+    let mut out = Vec::new();
+    diff_trees(keys, store, old, new, "", 0, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_trees<K: MasterKeys>(
+    keys: &K,
+    store: &Store,
+    old: Option<(&Id, &PathSalt)>,
+    new: Option<(&Id, &PathSalt)>,
+    prefix: &str,
+    depth: usize,
+    out: &mut Vec<String>,
+) -> Result<(), SnapError> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(SnapError::DepthExceeded);
+    }
+    let load = |t: Option<(&Id, &PathSalt)>| -> Result<Vec<Entry>, SnapError> {
+        match t {
+            Some((id, salt)) => Ok(load_tree(id, salt, keys, store)?.entries),
+            None => Ok(Vec::new()),
+        }
+    };
+    let old_entries = load(old)?;
+    let new_entries = load(new)?;
+    let by_name = |es: &[Entry]| -> std::collections::BTreeMap<String, Entry> {
+        es.iter()
+            .map(|e| (entry_name(e).to_string(), e.clone()))
+            .collect()
+    };
+    let om = by_name(&old_entries);
+    let nm = by_name(&new_entries);
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for k in om.keys().chain(nm.keys()) {
+        names.insert(k.clone());
+    }
+    for name in &names {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        match (om.get(name), nm.get(name)) {
+            (Some(Entry::File { chunks: oc, .. }), Some(Entry::File { chunks: nc, .. })) => {
+                if oc != nc {
+                    out.push(path);
+                }
+            }
+            (
+                Some(Entry::Dir {
+                    subtree: os,
+                    subtree_salt: oss,
+                    ..
+                }),
+                Some(Entry::Dir {
+                    subtree: ns,
+                    subtree_salt: nss,
+                    ..
+                }),
+            ) => {
+                if os != ns {
+                    diff_trees(
+                        keys,
+                        store,
+                        Some((os, oss)),
+                        Some((ns, nss)),
+                        &path,
+                        depth + 1,
+                        out,
+                    )?;
+                }
+            }
+            // added / removed / type-changed: recurse into a present dir to list its files, else report.
+            (o, n) => {
+                let side = |e: Option<&Entry>| match e {
+                    Some(Entry::Dir {
+                        subtree,
+                        subtree_salt,
+                        ..
+                    }) => Some((*subtree, *subtree_salt)),
+                    _ => None,
+                };
+                match (side(o), side(n)) {
+                    (od, nd) if od.is_some() || nd.is_some() => {
+                        let oref = od.as_ref().map(|(i, s)| (i, s));
+                        let nref = nd.as_ref().map(|(i, s)| (i, s));
+                        diff_trees(keys, store, oref, nref, &path, depth + 1, out)?;
+                    }
+                    _ => out.push(path), // file added/removed, or file<->dir type change
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,6 +1047,79 @@ mod tests {
 
     fn mk() -> MasterKey {
         MasterKey::new(1, [0x66; 32])
+    }
+
+    /// `secsec log`/`restore` cores: resolve a path, diff two snapshots for the changed file, and
+    /// restore an old version of a file/folder over the current working copy.
+    #[test]
+    fn path_resolve_diff_and_restore() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let m = mk();
+
+        // v1: a/x="one", a/y="two", b="three".
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("a")).unwrap();
+        std::fs::write(src.path().join("a/x"), b"one").unwrap();
+        std::fs::write(src.path().join("a/y"), b"two").unwrap();
+        std::fs::write(src.path().join("b"), b"three").unwrap();
+        let (rt1, rs1) = snapshot_tree(src.path(), &m, &store, None).unwrap();
+
+        // resolve a file, a dir, and missing paths.
+        let Some(PathNode::File { size, .. }) =
+            resolve_path(&m, &store, &rt1, &rs1, "a/x").unwrap()
+        else {
+            panic!("a/x is a file")
+        };
+        assert_eq!(size, 3);
+        assert!(matches!(
+            resolve_path(&m, &store, &rt1, &rs1, "a").unwrap(),
+            Some(PathNode::Dir { .. })
+        ));
+        assert!(resolve_path(&m, &store, &rt1, &rs1, "nope")
+            .unwrap()
+            .is_none());
+        assert!(resolve_path(&m, &store, &rt1, &rs1, "a/nope")
+            .unwrap()
+            .is_none());
+
+        // v2: change only a/x.
+        std::fs::write(src.path().join("a/x"), b"ONE-modified").unwrap();
+        let (rt2, rs2) = snapshot_tree(src.path(), &m, &store, Some((&rt1, &rs1))).unwrap();
+        assert_eq!(
+            changed_paths(&m, &store, Some((&rt1, &rs1)), Some((&rt2, &rs2))).unwrap(),
+            vec!["a/x".to_string()],
+            "only a/x changed between the two snapshots"
+        );
+
+        // restore the OLD a/x (v1) over the current (v2) working copy.
+        let c1 = Commit {
+            root_tree: rt1,
+            root_salt: rs1,
+            parents: vec![],
+            device_id: [0; 32],
+            version: 1,
+            roster_seq: 0,
+            last_seen_head: [0; 32],
+            ts: 0,
+        };
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("a")).unwrap();
+        std::fs::write(work.path().join("a/x"), b"ONE-modified").unwrap();
+        restore_path(&m, &store, &c1, "a/x", work.path()).unwrap();
+        assert_eq!(std::fs::read(work.path().join("a/x")).unwrap(), b"one");
+
+        // restore a whole folder (a/) from v1 — both files come back.
+        std::fs::remove_dir_all(work.path().join("a")).unwrap();
+        restore_path(&m, &store, &c1, "a", work.path()).unwrap();
+        assert_eq!(std::fs::read(work.path().join("a/x")).unwrap(), b"one");
+        assert_eq!(std::fs::read(work.path().join("a/y")).unwrap(), b"two");
+
+        // a path that never existed errors clearly.
+        assert!(matches!(
+            restore_path(&m, &store, &c1, "nope", work.path()),
+            Err(SnapError::PathNotFound(_))
+        ));
     }
 
     #[test]
