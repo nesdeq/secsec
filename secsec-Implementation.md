@@ -14,9 +14,9 @@ register, and what each component does. It does not restate the design — read 
 
 **Scope.** Transport is **QUIC/TLS-only** (the pinned self-signed host key is the sole trust anchor;
 no CA, no stdio/SSH mode). Device keys are **Ed25519-only**. The keyslot KEM is **X-Wing**
-(ML-KEM-768 ⊕ X25519), mandatory — there is no classical keyslot to downgrade to. Targets are Linux,
-macOS, and Windows. secsec is **single-host**: one repo on one blind server (`secsec sync` takes one
-`--server`); there is no multi-remote, quorum, or gossip layer.
+(ML-KEM-768 ⊕ X25519) — post-quantum, the harvestable asymmetric exposure. Targets are Linux, macOS,
+and Windows. secsec is **single-host**: one repo on one blind server (`secsec sync` takes one
+`--server`).
 
 ---
 
@@ -38,7 +38,7 @@ secsec/
 │   ├── secsec-snapshot/  §6    Tree/Commit object graph + directory snapshot/restore
 │   ├── secsec-store/     §13   redb content-addressed blob store (server side)
 │   ├── secsec-sig/       §9.6  SSHSIG namespaces, verifier (alg pinning, negative tests)
-│   ├── secsec-pq/        §8.3,§17  X-Wing keyslot (ML-KEM-768 ⊕ X25519, the only keyslot), mk_commit authenticity, draft-10 KAT
+│   ├── secsec-pq/        §8.3,§17  X-Wing keyslot (ML-KEM-768 ⊕ X25519), mk_commit authenticity, draft-10 KAT
 │   ├── secsec-roster/    §8    sigchain fold/succession, per-entry AEAD, roster-key history, generations, enrollment
 │   ├── secsec-sync/      §10   refs, cas-head, rollback-aware merge (storage-free Node model), fork detection
 │   ├── secsec-engine/    §10   snapshot-tree ↔ merge-node bridge, three-way reconcile to the store
@@ -69,9 +69,8 @@ Pinned, minimal, no OpenSSL. The security-relevant choices:
 
 - **`libcrux-ml-kem`** — ML-KEM-768, **formally verified** (FIPS 203 final). The X-Wing keyslot
   (`secsec-pq`) is built directly on it (single-seed `SHAKE256(sk,96)` expansion, label-last
-  combiner, FIPS 203 §7.1 PCT), so no third-party X-Wing crate is trusted. No `hpke` / `rsa` — the
-  classical and RSA keyslots were removed (a pre-quantum keyslot is the one harvestable asymmetric
-  exposure, §17).
+  combiner, FIPS 203 §7.1 PCT), so no third-party X-Wing crate is trusted. No `hpke` / `rsa`: the
+  keyslot is X-Wing, so the one harvestable asymmetric exposure is post-quantum (§17).
 - **`chacha20poly1305` + `poly1305` + `chacha20`** — there is no drop-in committing-AEAD crate, so
   `secsec-aead` builds the CTX/CMT-4 construction from these primitives (one-time Poly1305 key from
   ChaCha20 block 0, `ctx_tag = BLAKE3::keyed_hash(...)`, `T` never stored). This is the fiddliest

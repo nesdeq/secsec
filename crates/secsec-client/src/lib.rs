@@ -66,7 +66,7 @@ pub struct Receipt {
     pub arrival_gen: u64,
     /// The server's current global `put_epoch` after this put.
     pub put_epoch: u64,
-    /// The server's asserted timestamp (advisory; never used for GC eligibility, §15/§22).
+    /// The server's asserted timestamp (advisory; never used for GC eligibility, §15/§21).
     pub ts: u64,
     /// The host's Ed25519 receipt public key (all-zero if unsigned).
     pub receipt_pubkey: [u8; 32],

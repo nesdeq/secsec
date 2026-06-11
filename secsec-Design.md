@@ -38,8 +38,7 @@ dependencies, and assurance strategy are in `secsec-Implementation.md`.
 > **Scope.** secsec is single-host: `secsec sync` takes one `--server`, and every guarantee in §4
 > holds against that one blind server. The whole CLI is `serve · sync · invite · devices · revoke ·
 > hostpin · log · restore`. Fork detection is the same-server DAG-incomparable check in the merge
-> path (§10). A `SetMinAlgo` floor is folded and enforced at cold-start for forward agility, but no
-> command *creates* one yet — intentional while X-Wing is the only keyslot algorithm (§16/§17).
+> path (§10).
 
 ## 3. Threat model
 
@@ -76,16 +75,16 @@ Each row is a guarantee and the mechanism that earns it. Residuals in §21.
 | P10 | No catastrophic AEAD misuse / key-confusion for object, keyslot, and key-history wraps | Unique per-object key, fixed nonce, CMT-4 committing AEAD via CTX construction (§9.4); key-history wrap (§8.2) uses CTX pattern with ctx_tag_keyhist = BLAKE3::keyed_hash(k_keyhist_g, "secsec-ctx-v1" ‖ AD_keyhist ‖ T), binding master_key_g as plaintext |
 | P11 | Forward secrecy after revocation | Post-rotation data uses a new generation the revoked device cannot derive (§8.4) |
 | P12 | Transport is authenticated without a CA; first-contact TOFU window is a documented residual | TLS 1.3 to a pinned self-signed host key (TOFU on the first `sync`, fingerprint printed for out-of-band confirmation, then persisted in the folder link), channel-bound auth (§11); the pin rests on that one-time confirmation — the first-contact TOFU window is a residual (§21). A *joining* device additionally checks `host_id` under the invite-code MAC (§7) |
-| P13 | No algorithm/format downgrade once a `SetMinAlgo` entry has been received | Pinned TLS & signature algorithms; `SetMinAlgo` floor in the sigchain enforced on every fetched keyslot (not only at creation); compile-time floor (§16). (No command *creates* a `SetMinAlgo` entry — intentional while X-Wing is the only keyslot algorithm, §16/§17. A server withholding a `SetMinAlgo` entry it has is bounded by anti-rollback once a client has advanced past it; §21.) |
-| P14 | No server-stored recovery blob to crack; lockout is avoided by backing up the SSH key, not a second secret | The SSH key is both credential and backup. A device holding it is a full plaintext replica; a reinstalled one re-joins via an invite from any peer (§7). Losing *every* device **and** the SSH key is unrecoverable by construction — the §21 total-loss residual. (A passphrase-wrapped recovery keyslot on an untrusted server was considered and **removed** as a net liability: it adds an offline-crackable, server-exfiltratable target for a backup the SSH key already provides.) |
+| P13 | No algorithm/format downgrade | Pinned TLS & signature algorithms; a compile-time `algo_id`/`format_version` floor (§16); the `min_algo` floor in the sigchain enforced on every fetched keyslot, not only at creation (a `SetMinAlgo` entry raises it). A server withholding a `SetMinAlgo` entry it holds is bounded by anti-rollback once a client has advanced past it (§21). |
+| P14 | No server-stored recovery blob to crack; lockout is avoided by backing up the SSH key, not a second secret | The SSH key is both credential and backup. A device holding it is a full plaintext replica; a reinstalled one re-joins via an invite from any peer (§7). Losing *every* device **and** the SSH key is unrecoverable by construction — the §21 total-loss residual. There is no server-stored recovery secret (§8.6): one would only add an offline-crackable, server-exfiltratable target for a backup the SSH key already provides. |
 
 ---
 ## 5. Identifiers & trust anchor
 
-- **Device key** — an **Ed25519** SSH keypair per device (Ed25519-only; RSA was dropped from
-  scope). Roles: *sign* (SSHSIG; agent/hardware OK) and *unwrap* (the X-Wing keyslot's X25519 half
-  is derived from the Ed25519 key — §8.3 — so unwrap needs the private key as a file; agent/FIDO
-  cannot do it). `ecdsa`/`sk-*`/RSA keys do not parse → enrollment-incapable.
+- **Device key** — an **Ed25519** SSH keypair per device (Ed25519-only). Roles: *sign* (SSHSIG;
+  agent/hardware OK) and *unwrap* (the X-Wing keyslot's X25519 half is derived from the Ed25519 key —
+  §8.3 — so unwrap needs the private key as a file; agent/FIDO cannot do it). `ecdsa`/`sk-*`/RSA keys
+  do not parse → enrollment-incapable.
 - **`device_id`** := `BLAKE3(canonical(device_pubkey))`. Cryptographically bound to the key;
   every commit/head/roster entry is verified by checking its signature against the pubkey that
   the roster maps this id to. A signer can never act under another device's id.
@@ -338,16 +337,15 @@ can peel back to `master_key_1` and read *old file content* sealed under any pas
 bytes per generation, bounded by the sigchain-length cap (§19), the total size is negligible — there
 is no depth limit and no trimming.
 
-### 8.3 Keyslots — versioned, authenticated by commitment, PQ-ready
+### 8.3 Keyslots — versioned, authenticated by commitment, post-quantum
 
-A keyslot wraps `master_key_g` to a device. It is stored `algo_id(1B) ‖ body`. **Post-quantum is
-mandatory: X-Wing is the *only* keyslot algorithm** (`algo_id = 2`). The classical X25519/HPKE wrap
-(and the RSA-OAEP variant) were **removed** — after the harvest-now-decrypt-later argument of §17, a
-pre-quantum keyslot is the one harvestable asymmetric exposure, so shipping it as an option is
-incoherent. The `algo_id` tag and the §16 `min_algo` floor remain for forward agility (a future PQ KEM
-bumps the floor); any keyslot below X-Wing is rejected at cold-start.
+A keyslot wraps `master_key_g` to a device. It is stored `algo_id(1B) ‖ body`. The keyslot KEM is
+**X-Wing** (`algo_id = 1`), so the one harvestable asymmetric exposure is **post-quantum** (the
+harvest-now-decrypt-later target of §17). The `algo_id` tag and the §16 `min_algo` floor give the
+protocol crypto agility; any keyslot whose `algo_id` is below the chain's `min_algo` is rejected at
+cold-start.
 
-- **X-Wing (the only keyslot, §17):** keyslot ciphertext = `ct_MLKEM(1088 B) ‖ ct_X(32 B)`, AEAD AD =
+- **X-Wing (§17):** keyslot ciphertext = `ct_MLKEM(1088 B) ‖ ct_X(32 B)`, AEAD AD =
   `info = "secsec-keyslot-v1" ‖ canonical(device_id) ‖ le32(gen)` (binds it to one device + generation).
   ML-KEM-768 key pairs stored exclusively in `(d, z)` seed form (§17). The device's X-Wing
   decapsulation seed is `BLAKE3::derive_key("secsec-xwing-seed-v1", ed25519_private_seed)` — derived
@@ -397,10 +395,9 @@ A bare `revoke` without rotate is **not offered** under this threat model.
 privileged founder. A stolen device that is unlocked, online, and actively racing can issue
 `RevokeDevice(legit)+Rotate` concurrently with the user's `RevokeDevice(stolen)+Rotate`; the
 `/roster-head` CAS serializes the two and whichever lands first wins, evicting the loser (whose
-retry then fails succession, §8.1, because it is now revoked). A complete fix (recovery-code-gated
-revocation, or a privileged device-1 key for `RevokeDevice`/`Rotate`) was considered and
-deliberately **not** adopted, to preserve the flat-device model. This is an accepted residual —
-full statement and mitigation in §21.
+retry then fails succession, §8.1, because it is now revoked). The flat-device model accepts this
+race as the cost of having no privileged founder key or recovery-code gate on revocation — full
+statement and mitigation in §21.
 
 ### 8.5 Counters and local sealed state
 
@@ -456,21 +453,15 @@ the client MUST alarm the user prominently and treat the session as a reinstall 
 residual). Authenticity is not lost (RFP + `mk_commit` still verify), but freshness guarantees
 do not hold until a peer confirms the current head.
 
-### 8.6 Recovery — removed (the SSH key is the backup)
+### 8.6 Backup — the SSH key is the only secret
 
-Earlier drafts offered an optional **recovery keyslot**: a passphrase- or recovery-code-wrapped copy
-of the master key, stored on the server, recoverable into a fresh device. It was **removed entirely**
-(the `secsec-recovery` crate and the `recover` command deleted).
-
-Rationale: the SSH key is already both the credential and the backup (§1, P14). Any device holding it
-is a full plaintext replica and can re-join from any peer via an invite (§7); there is nothing a
-server-stored recovery blob recovers that backing up the one SSH key does not. Against that marginal
-benefit, the recovery keyslot was a **net liability** — a second secret for the user to manage and,
-in the passphrase variant, an **offline-crackable, server-exfiltratable** target sitting on the
-untrusted server (precisely the asset the rest of this design works to deny it). Total loss of
-*every* device **and** the SSH key is the information-theoretic §21 residual; the honest mitigation is
-to back up the single credential, not to mint and store a second one. No recovery KDF (Argon2id),
-recovery keyslot, or `/recovery` server path exists.
+There is **no server-stored recovery secret**. The SSH key is both the credential and the backup
+(§1, P14): any device holding it is a full plaintext replica and can re-join from any peer via an
+invite (§7), so a server-stored recovery blob would recover nothing that backing up the one SSH key
+does not — while adding a second secret for the user to manage and, in any passphrase form, an
+offline-crackable, server-exfiltratable target on the untrusted server (precisely the asset the rest
+of this design denies it). The backup is therefore the single SSH credential. Total loss of *every*
+device **and** the SSH key is the information-theoretic §21 residual.
 
 ---
 ## 9. Cryptography
@@ -720,7 +711,7 @@ blob           = [FRAME] ‖ nonce(12) ‖ tag(16) ‖ ct          // FRAME pres
 A fresh nonce per write makes keystream reuse impossible even though `key` is reused across updates,
 so this construction does not need §9.4's per-object-unique key. It is deliberately **not**
 key-committing (CMT): unnecessary here, because the key is a single high-entropy, master-key-derived
-value (no multi-key / low-entropy partitioning-oracle surface, unlike keyslots/recovery), and
+value (no multi-key / low-entropy partitioning-oracle surface, unlike the keyslots), and
 authenticity against other devices and the server rests on the object's **signature**, not the
 symmetric tag.
 
@@ -963,28 +954,27 @@ key. All repo state is opaque:
 /roster-keyhist/<g>      roster-key history wraps (§8.2; never trimmed)
 /hostkey                 server self-signed host identity (first run)
 ```
-(There is **no** `/recovery` namespace — recovery was removed, §8.6.) The transient invite-pairing
-mailbox (§7) is **in-memory only**, never persisted: TTL'd slots keyed by `BLAKE3::derive_key(label, code)`.
+The transient invite-pairing mailbox (§7) is **in-memory only**, never persisted: TTL'd slots keyed by
+`BLAKE3::derive_key(label, code)`. There is no server-stored recovery secret (§8.6).
 
-The generation component `g` is a **plaintext integer**. Opaquing it (deriving the path component
-from a secret) was considered and **rejected** as unbuildable here: the server API has no `list`
-operation (§12), so a device must *compute* the exact path of every object it fetches — including,
-on a fresh reinstall, its own keyslot and the key-history chain it has **not yet decrypted**. A
-secret-derived path component would have to come from a key the device does not yet hold (the very
-key it is fetching) — a circular dependency — or be distributed out-of-band, adding a second anchor
-beside RFP. Plaintext `g` avoids both. The resulting leak (master-key rotation count and timing) is
-low-sensitivity metadata, enumerable by the server and documented as an accepted residual (§21), on
-par with the already-accepted device-count and access-timing leaks.
+The generation component `g` is a **plaintext integer**: it is not opaqued (a secret-derived path
+component) because the server API has no `list` operation (§12), so a device must *compute* the exact
+path of every object it fetches — including, on a fresh reinstall, its own keyslot and the key-history
+chain it has **not yet decrypted**. A secret-derived path component would have to come from a key the
+device does not yet hold (the very key it is fetching) — a circular dependency — or be distributed
+out-of-band, adding a second anchor beside RFP. The resulting leak (master-key rotation count and
+timing) is low-sensitivity metadata, enumerable by the server and an accepted residual (§21), on par
+with the device-count and access-timing leaks.
 
 Path notes:
-- `/keyslots/<device_id>/<g>` replaces `/keyslots/<pubkey>/<g>` — the device's full public key
-  bytes are no longer exposed in the filesystem path; the keyslot blob itself carries the public
-  key for verification. `device_id = BLAKE3(canonical(pubkey))` is already opaque.
-- `/refs/<H>` replaces `/refs/<device_id>` — ref names are stored under a keyed hash
-  `H = BLAKE3::keyed_hash(ref_name_key, ref_name)`, where `ref_name_key` is derived from
-  `master_key` (§9.5). The head blob is **signed and encrypted** (§9.8): the ref name lives **inside
-  the encryption** (recoverable only by a client holding `head_key_g`), so the server sees only the
-  hash `H` and ciphertext. This closes the ref-name leak.
+- `/keyslots/<device_id>/<g>` keys by `device_id`, not the raw public key — the device's full public
+  key bytes are never exposed in a path; the keyslot blob itself carries the public key for
+  verification. `device_id = BLAKE3(canonical(pubkey))` is already opaque.
+- `/refs/<H>` keys by a keyed hash `H = BLAKE3::keyed_hash(ref_name_key, ref_name)`, not the ref name
+  or device id, where `ref_name_key` is derived from `master_key` (§9.5). The head blob is **signed
+  and encrypted** (§9.8): the ref name lives **inside the encryption** (recoverable only by a client
+  holding `head_key_g`), so the server sees only the hash `H` and ciphertext. This closes the
+  ref-name leak.
 
 The server-side `redb` index holds **only** `{id, size, generation, pack-offset}` — never
 plaintext-derived metadata. One static binary; no external DB.
@@ -1032,9 +1022,8 @@ best-effort GC pass per session (after the first sync): it fetches the reachable
 ref, derives `gc_gen` from its own §15 arrival-receipt log (only generations whose every object has
 aged past the `GC_GRACE_WINDOW`), and issues the compare-and-swap `gc` op below. A failure is
 logged and skipped — never fatal to the sync. Retention is keep-everything until an object both
-falls out of the keep-set and ages past the grace window; nothing is deleted silently. The
-mechanism is unchanged from prior drafts; only the *trigger* moved from a manual command into the
-sync loop.
+falls out of the keep-set and ages past the grace window; nothing is deleted silently. There is no
+`gc` command — the sync loop is the trigger.
 
 The **same keep-everything policy also runs against the client's own local object cache**
 (`objects.secsec`) once per session, so both ends prune identically: it drops objects unreachable
@@ -1117,11 +1106,8 @@ delta-scoped transfer that would let the local cache hold only the current snaps
 - TLS ciphersuites/KX and SSHSIG signature algorithm are **fixed**, not negotiated.
 - A **compile-time absolute floor** rejects any `algo_id`/`format_version` below the minimum the
   build supports.
-- A **`SetMinAlgo` sigchain entry** raises the floor repo-wide after an upgrade. The fold and the
-  per-fetch floor enforcement are wired; no command *creates* such an entry yet — intentional while
-  X-Wing is the only keyslot algorithm (§17), so there is nothing to raise the floor *to* until a
-  second PQ KEM ships. `min_algo` is checked against the `algo_id` of **every fetched keyslot**, not
-  only at keyslot creation time.
+- A **`SetMinAlgo` sigchain entry** raises the `min_algo` floor repo-wide. `min_algo` is checked
+  against the `algo_id` of **every fetched keyslot**, not only at keyslot creation time.
   A returned keyslot with `algo_id < current min_algo` is rejected with an error — the server
   cannot replay an older/weaker keyslot after a `SetMinAlgo` bump. A device whose existing key
   does not satisfy the new `min_algo` MUST generate a new keypair satisfying it and complete the
@@ -1166,7 +1152,7 @@ keyslot_ct = ct_MLKEM(1088 B) ‖ ct_X(32 B)   // total: 1120 B
 ```
 
 All inputs are fixed-width (32+32+32+32+6 = 134 bytes); the **label-last** order is normative per
-draft-connolly-cfrg-xwing-kem-10 §6 (the obsolete draft-02 placed it first — do not use that order).
+draft-connolly-cfrg-xwing-kem-10 §6.
 Implementations MUST verify a byte-identical shared secret against the draft-10 Appendix C test
 vectors before being accepted as conformant. (Cross-check: seed
 `7f9c2ba4…ef26`, eseed `3cb1eea9…85b2` ⇒ ss `d2df0522…e384`.)
@@ -1183,13 +1169,12 @@ key generation the FIPS 203 §7.1 keypair consistency check MUST be performed; f
 expanded `ek` is never stored persistently. This requirement prevents MAL-BIND-K-CT and MAL-BIND-K-PK
 failures that arise under the expanded-key representation (Schmieg, ePrint 2024/523).
 
-The hybrid-PQ keyslot is **mandatory and the only keyslot** (§8.3): every keyslot — at genesis,
-enrollment, and every rotation — is X-Wing, so the harvestable asymmetric exposure is post-quantum by
-default, not opt-in. **Signatures**, by contrast, remain classical (Ed25519): forgery is *online*, not harvestable
-(an attacker needs the quantum computer at the moment of the attack, and a recorded signature broken
-later is worthless), so a PQ signature is lower urgency and is added later via the same `algo_id` /
-`SetMinAlgo` agility when quantum is imminent. Confidentiality (the symmetric data plane + the X-Wing
-keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today.
+Every keyslot — at genesis, enrollment, and every rotation — is the **hybrid-PQ X-Wing** keyslot
+(§8.3), so the harvestable asymmetric exposure is post-quantum by construction. **Signatures** are classical (Ed25519): forgery is *online*, not harvestable (an
+attacker needs the quantum computer at the moment of the attack, and a recorded signature broken later
+is worthless), so a PQ signature is lower urgency and can be added through the same `algo_id` /
+`SetMinAlgo` agility if quantum becomes imminent. Confidentiality (the symmetric data plane + the
+X-Wing keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today.
 ## 18. Implementation hardening
 
 - **Memory:** `master_key`, all derived subkeys, SSH private material → `secrecy`
@@ -1221,7 +1206,7 @@ keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today.
 | Connection rate limit | 10 new/s per source IP; 3 concurrent per authenticated key | server MUST enforce |
 | Device key algorithm | **Ed25519 only** | RSA/ECDSA/`sk-*` keys are rejected at parse (scope) |
 | Connection gate | `~/.ssh/authorized_keys`, re-read per connection, fail-closed | mandatory — `secsec serve` refuses to start without a usable key (§11, §12) |
-| Keyslot KEM (mandatory) | **X-Wing** (ML-KEM-768 ⊕ X25519, draft-connolly-cfrg-xwing-kem-10), `algo_id = 2`; CTX AEAD AD = "secsec-keyslot-v1" ‖ canonical(device_id) ‖ le32(gen); device X-Wing seed = `derive_key("secsec-xwing-seed-v1", ed25519_seed)` | post-quantum mandatory — the only keyslot algorithm; classical X25519/HPKE removed (§8.3). Floor enforced at cold-start (§16) |
+| Keyslot KEM | **X-Wing** (ML-KEM-768 ⊕ X25519, draft-connolly-cfrg-xwing-kem-10), `algo_id = 1`; CTX AEAD AD = "secsec-keyslot-v1" ‖ canonical(device_id) ‖ le32(gen); device X-Wing seed = `derive_key("secsec-xwing-seed-v1", ed25519_seed)` | post-quantum; the keyslot KEM (§8.3). `min_algo` floor enforced at cold-start (§16) |
 | Retention | keep-all; prune opt-in | no silent deletion |
 | Invite code length | 96 bits (12 bytes, OS CSPRNG), single-use; displayed as dash-grouped lowercase hex | the §7 out-of-band pairing secret; single-use + the mailbox TTL + the `authorized_keys` gate bound online guessing |
 | Pairing mailbox TTL (`PAIR_TTL`) | 600 s | server-side lifetime of an invite-pairing slot; an expired or consumed slot ends the exchange (§7, §12) |
@@ -1244,8 +1229,7 @@ keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today.
 (ML-KEM-768 for the X-Wing keyslot),`sha3` · `blake3` · `chacha20`+`poly1305` (the §9.4 CTX
 committing AEAD) · `fastcdc` · `notify` · `redb` · `tokio` · `zeroize`,`subtle`,`getrandom`.
 Transport is **QUIC/TLS-only** (no SSH/stdio mode — it adds nothing over the pinned host key, §11).
-(`argon2` was dropped with the recovery keyslot, §8.6.) Versions pinned; `cargo-audit`/`cargo-vet`
-gated.
+Versions pinned; `cargo-audit`/`cargo-vet` gated.
 
 ## 21. Residuals (proven-minimal)
 
@@ -1310,10 +1294,9 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
   unlocked, online, and actively racing — a state in which it already holds `master_key_g` and thus
   already had full data access; it is not a new exposure of data, only of repository control.
   Mitigation: revoke promptly while the legitimate device is the only one online; device
-  credential/physical security. A complete fix (recovery-code-gated revocation, or a privileged
-  device-1 key for `RevokeDevice`/`Rotate`) was considered and deliberately not adopted, to
-  preserve the flat-device model — this race is the accepted cost. Detection still fires on
-  reconvergence with any honest peer (§10 fork detection).
+  credential/physical security. The flat-device model has no privileged founder key or recovery-code
+  gate on revocation, so this race is its accepted cost. Detection still fires on reconvergence with
+  any honest peer (§10 fork detection).
 
 - **Bounded metadata leakage — cross-path (convergent mode).** Object sizes (within padding
   buckets), access timing, and cross-path chunk equality (identical chunks in different files
@@ -1339,11 +1322,10 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
   fixed substantially by default-on padding.
 
 - **SetMinAlgo withholding for devices that have never received the entry.** A device that has
-  never been served a `SetMinAlgo` entry (server withheld it from genesis) operates without the
-  downgrade protection that entry provides. On a single host there is no second remote to expose the
-  omission, so this is accepted. It is bounded by the **compile-time algorithm floor** (§16), which no
-  withholding can lower, and by anti-rollback once a client *has* received the entry (the persisted
-  anchor rejects a later chain that drops it). Moot today: X-Wing is the only keyslot algorithm.
+  never been served a `SetMinAlgo` entry (server withheld it from genesis) operates at the
+  **compile-time algorithm floor** (§16) rather than any higher floor that entry would set. The
+  compile-time floor — which no withholding can lower — is the bound; once a client *has* received a
+  `SetMinAlgo` entry, anti-rollback (the persisted anchor) keeps it from being dropped later.
 
 - **Delete log advisory only.** The append-only delete log is advisory on a cooperative server;
   a malicious server can omit or fabricate entries. Actual deletion integrity relies on

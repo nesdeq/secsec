@@ -489,7 +489,7 @@ pub enum Response {
         arrival_gen: u64,
         /// The server's current global `put_epoch` after this put.
         put_epoch: u64,
-        /// The server's asserted timestamp (advisory; never used for GC eligibility, §15/§22).
+        /// The server's asserted timestamp (advisory; never used for GC eligibility, §15/§21).
         ts: u64,
         /// The host's Ed25519 receipt public key (all-zero if receipts are unsigned).
         receipt_pubkey: [u8; 32],

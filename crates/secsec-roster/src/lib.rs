@@ -431,7 +431,7 @@ pub fn peel_roster_keys(
 // sealed under any past generation. Parallel to the roster-key history above
 // (which exists for sigchain folding); this one exists for old-data readability.
 // A revoked device, lacking the current master key, cannot peel forward → the
-// pre-rotation ciphertext it can still decrypt is only what it cached (§22).
+// pre-rotation ciphertext it can still decrypt is only what it cached (§21).
 // ---------------------------------------------------------------------------
 
 /// Stored size of one DATA `keyhist_g` wrap: `ctx_tag(32) ‖ ct(32)` (§8.2) — the same CTX layout as

@@ -5,7 +5,7 @@
 //! from the per-generation secret `cdc_seed`, so chunk boundaries are **repo-specific** and a
 //! cross-repo size-fingerprint database does not apply. (Boundary privacy is only partial — a
 //! chosen-plaintext archiver can recover the gear key, Alexeev et al. ePrint 2025/532 — so the
-//! load-bearing privacy mechanism is default-on chunk padding, §9.7/§22; keyed chunking is
+//! load-bearing privacy mechanism is default-on chunk padding, §9.7/§21; keyed chunking is
 //! defense-in-depth against the *offline* dictionary.)
 //!
 //! The cut-point algorithm is FastCDC v2020 normalized chunking (Xia et al.): a Gear rolling hash

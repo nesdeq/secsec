@@ -252,7 +252,7 @@ fn resolve_server(s: &str) -> Result<SocketAddr, Box<dyn Error>> {
 /// A folder's link to its repo (the git-remote analogue): server address, pinned host id, RFP anchor,
 /// ref name, and the §8.1 sigchain anti-rollback anchor (`roster_seq` + tip hash, P7). Stored at
 /// `<state>/link`; the synced folder stays clean. The anchor lives client-side so a malicious **server**
-/// cannot roll the roster back (a disk-level rewrite is the §22 client-compromise residual).
+/// cannot roll the roster back (a disk-level rewrite is the §21 client-compromise residual).
 struct Link {
     server: String,
     host_id: [u8; 32],

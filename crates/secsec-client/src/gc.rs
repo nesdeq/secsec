@@ -56,7 +56,7 @@ pub fn put_epoch_from_receipts(receipts: &[(Id, Receipt)]) -> u64 {
 }
 
 /// A persisted per-object arrival record (§15): the object's `arrival_gen`, the **local** time the
-/// client first recorded its receipt (the client's own clock — never the server's `timestamp`, §15/§22),
+/// client first recorded its receipt (the client's own clock — never the server's `timestamp`, §15/§21),
 /// and the highest `put_epoch` observed for it. The receipt log is the client's durable GC state across
 /// runs; it is the input to [`gc_gen_from_log`]/[`put_epoch_from_log`]. Not secret — object ids are
 /// public and the file is local-only — so it is stored as plain text, like the §7 grant log.

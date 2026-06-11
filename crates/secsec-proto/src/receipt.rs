@@ -1,4 +1,4 @@
-//! Signed arrival receipts (`secsec-Design.md` §15, defence-in-depth per §22).
+//! Signed arrival receipts (`secsec-Design.md` §15, defence-in-depth per §21).
 //!
 //! On each successful `put`, a cooperative server signs a receipt
 //! `SIG_hostkey(id ‖ host_id ‖ arrival_gen ‖ put_epoch ‖ ts)` with a dedicated Ed25519 **host receipt
@@ -7,7 +7,7 @@
 //! already-host-pinned connection). This gives the client durable, attributable evidence of what the
 //! server claimed about each object's arrival — useful for GC dispute/audit.
 //!
-//! **Not load-bearing (§22):** GC eligibility is a client-computed decision from the signed sigchain
+//! **Not load-bearing (§21):** GC eligibility is a client-computed decision from the signed sigchain
 //! frontier, never from server timestamps. A *malicious* server controls its own receipts; this
 //! defends against a *cooperative* server's bookkeeping errors and gives the client a paper trail.
 
