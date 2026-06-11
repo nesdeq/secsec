@@ -1026,11 +1026,19 @@ async fn run_restore(path: String, version: Option<String>) -> Result<(), Box<dy
             }
         }
         None => {
-            // path_history[0] = the current content's commit; [1] = the previous version.
             let hist =
                 secsec_client::history::path_history(&keyring, &store, &head.commit_id, &path)?;
-            hist.get(1).map(|v| v.commit_id).ok_or_else(|| {
-                format!("'{path}' has no previous version to restore (only one version exists).")
+            // If the path is gone from disk (deleted), bring back the most recent version where it
+            // existed — true undo-delete, whether or not the deletion has been synced yet. If it is
+            // still present, "previous version" means the one before the current (undo the last edit):
+            // history[0] is the current content's commit, history[1] the version before it.
+            let chosen = if dir.join(&path).exists() {
+                hist.get(1).map(|v| v.commit_id)
+            } else {
+                hist.iter().find(|v| v.present).map(|v| v.commit_id)
+            };
+            chosen.ok_or_else(|| {
+                format!("'{path}' has no earlier version in the history to restore.")
             })?
         }
     };
