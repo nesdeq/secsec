@@ -19,6 +19,8 @@ pub enum ServeError {
     Handshake(HandshakeError),
     /// The authenticated key owns no keyslot (§12).
     NotEnrolled,
+    /// The authenticated key already holds the maximum concurrent connections (§19).
+    TooManyConnections,
     /// A store error while checking enrollment.
     Store(String),
     /// A framing/decode error on a request stream.
@@ -30,9 +32,25 @@ impl core::fmt::Display for ServeError {
         match self {
             ServeError::Handshake(e) => write!(f, "handshake: {e}"),
             ServeError::NotEnrolled => f.write_str("connecting key is not enrolled"),
+            ServeError::TooManyConnections => {
+                f.write_str("too many concurrent connections for this key")
+            }
             ServeError::Store(e) => write!(f, "store: {e}"),
             ServeError::Wire(e) => write!(f, "wire: {e}"),
         }
+    }
+}
+
+/// RAII reservation of a per-key concurrent-connection slot (§19): acquired after the handshake
+/// authenticates a key, released when the connection task drops (normal close, error, or cancel).
+struct ConnGuard<'a> {
+    server: &'a Server,
+    device_id: secsec_sig::DeviceId,
+}
+
+impl Drop for ConnGuard<'_> {
+    fn drop(&mut self) {
+        self.server.release_conn(self.device_id);
     }
 }
 impl std::error::Error for ServeError {}
@@ -74,6 +92,13 @@ where
     if !server.is_authorized(&device_id) {
         return Err(ServeError::NotEnrolled);
     }
+
+    // §19 connection limit: at most `MAX_CONCURRENT_CONNS_PER_KEY` live connections per authenticated
+    // key. The guard releases the slot when this task ends (close, error, or cancellation).
+    if !server.acquire_conn(device_id) {
+        return Err(ServeError::TooManyConnections);
+    }
+    let _conn_guard = ConnGuard { server, device_id };
 
     // Membership (read/write) is enforced **per op** inside `Server::handle` (§12 keyslot-existence
     // check): an authorized-but-unenrolled key may complete the handshake and run only the §7

@@ -1710,6 +1710,7 @@ dependencies = [
  "rcgen",
  "rpassword",
  "secsec-client",
+ "secsec-proto",
  "secsec-server",
  "secsec-sig",
  "secsec-store",

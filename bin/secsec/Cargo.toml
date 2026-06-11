@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 secsec-server = { path = "../../crates/secsec-server" }
+secsec-proto = { path = "../../crates/secsec-proto" }
 secsec-store = { path = "../../crates/secsec-store" }
 secsec-transport = { path = "../../crates/secsec-transport" }
 secsec-client = { path = "../../crates/secsec-client" }

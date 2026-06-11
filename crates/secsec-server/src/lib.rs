@@ -69,6 +69,8 @@ struct ServerState {
     sigchain_calls: HashMap<DeviceId, WindowCounter>,
     /// §7 invite-onboarding mailbox: `slot → (blob, expiry)`. Transient, never persisted, TTL-evicted.
     pairing: HashMap<[u8; 32], (Vec<u8>, u64)>,
+    /// Live concurrent connections per authenticated key (§19: ≤ `MAX_CONCURRENT_CONNS_PER_KEY`).
+    conn_counts: HashMap<DeviceId, u32>,
 }
 
 impl ServerState {
@@ -303,6 +305,32 @@ impl Server {
 
     fn sigchain_refund(&self, d: DeviceId) {
         self.state.lock().expect("server state").sigchain_refund(d);
+    }
+
+    /// Reserve a concurrent-connection slot for `d` (§19: ≤ `MAX_CONCURRENT_CONNS_PER_KEY` per
+    /// authenticated key). Returns `true` if reserved (the caller MUST [`release_conn`](Self::release_conn)
+    /// on disconnect, e.g. via [`ConnGuard`]); `false` if the key is already at its cap.
+    #[must_use]
+    pub fn acquire_conn(&self, d: DeviceId) -> bool {
+        let mut st = self.state.lock().expect("server state");
+        let n = st.conn_counts.entry(d).or_insert(0);
+        if u64::from(*n) >= limits::MAX_CONCURRENT_CONNS_PER_KEY {
+            false
+        } else {
+            *n += 1;
+            true
+        }
+    }
+
+    /// Release a slot reserved by [`acquire_conn`](Self::acquire_conn).
+    pub fn release_conn(&self, d: DeviceId) {
+        let mut st = self.state.lock().expect("server state");
+        if let Some(n) = st.conn_counts.get_mut(&d) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                st.conn_counts.remove(&d);
+            }
+        }
     }
 
     /// Charge a read against the §19 per-key read byte-rate, returning the blob response or a
@@ -999,6 +1027,30 @@ mod tests {
             ),
             Response::Err(ErrorCode::BadRequest)
         );
+    }
+
+    #[test]
+    fn concurrent_connection_cap_per_key() {
+        let (s, _d) = server();
+        let d = DeviceKey::generate().unwrap().device_id().unwrap();
+        let max = limits::MAX_CONCURRENT_CONNS_PER_KEY;
+        // up to the cap acquire; the next is refused.
+        for _ in 0..max {
+            assert!(s.acquire_conn(d));
+        }
+        assert!(!s.acquire_conn(d), "over the per-key concurrency cap");
+        // releasing one frees a slot.
+        s.release_conn(d);
+        assert!(s.acquire_conn(d));
+        // a different key is independent.
+        let d2 = DeviceKey::generate().unwrap().device_id().unwrap();
+        assert!(s.acquire_conn(d2));
+        // releasing back to zero is clean (no underflow, entry removed).
+        for _ in 0..max {
+            s.release_conn(d);
+        }
+        s.release_conn(d); // extra release is a harmless no-op
+        assert!(s.acquire_conn(d));
     }
 
     #[test]

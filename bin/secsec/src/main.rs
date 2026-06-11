@@ -33,6 +33,7 @@ use secsec_client::repo::{
 };
 use secsec_client::sync::sync_once;
 use secsec_client::{load_frontier, save_frontier, FrontierLoad};
+use secsec_proto::server::{limits, WindowCounter};
 use secsec_server::{serve::serve_connection, Server};
 use secsec_sig::DeviceKey;
 use secsec_store::Store;
@@ -415,7 +416,26 @@ async fn run_serve(dir: PathBuf, port: u16) -> Result<(), Box<dyn Error>> {
         authorized.len(),
         endpoint.local_addr()?
     );
+    // §19 per-source-IP new-connection rate limit (10/s). The accept loop is a single task, so this
+    // map needs no lock; it is pruned at most once per window so idle source IPs cannot accumulate.
+    let mut ip_rate: std::collections::HashMap<std::net::IpAddr, WindowCounter> =
+        std::collections::HashMap::new();
+    let mut last_prune = 0u64;
     while let Some(incoming) = endpoint.accept().await {
+        let now = unix_secs();
+        let ip = incoming.remote_address().ip();
+        if now.saturating_sub(last_prune) >= 1 {
+            ip_rate.retain(|_, c| c.count(now) > 0);
+            last_prune = now;
+        }
+        let allowed = ip_rate
+            .entry(ip)
+            .or_insert_with(|| WindowCounter::new(1, limits::CONN_RATE_PER_SEC))
+            .try_record(now);
+        if !allowed {
+            incoming.refuse();
+            continue;
+        }
         let server = server.clone();
         tokio::spawn(async move {
             match incoming.await {
