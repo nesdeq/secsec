@@ -218,7 +218,7 @@ pub enum Request {
         blob: Vec<u8>,
     },
     /// Post an opaque blob to the transient **pairing mailbox** slot `slot` (§7 invite onboarding). The
-    /// slot is `BLAKE3(label ‖ invite_code)`, so only parties holding the code address it; the blob is
+    /// slot is `BLAKE3::derive_key(label, invite_code)`, so only parties holding the code address it; the blob is
     /// MAC'd under the code, so the server (which never learns the code) only relays it. Allowed
     /// **pre-enrollment** (a joining device owns no keyslot yet) and aggressively rate-limited + TTL'd.
     PairPut {

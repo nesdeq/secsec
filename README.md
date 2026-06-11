@@ -23,10 +23,11 @@ layout, risk register, and status are in [`secsec-Implementation.md`](secsec-Imp
 
 > **Status / maturity.** Feature-complete and exercised end-to-end with real processes
 > (multiple clients converging through a blind server, including a concurrent-edit three-way merge,
-> with a zero-plaintext-leak check on the server store). The CLI is **single-remote**: multi-remote
-> quorum durability and gossip fork-detection exist in library code but are not surfaced by any command
-> (see the Design §2 scope note). It has **not** had an independent professional cryptographic review —
-> do not trust it with irreplaceable data until it has (see `secsec-Implementation.md` §8).
+> with a zero-plaintext-leak check on the server store). secsec is **single-host by design** — one
+> repo lives on one blind server; every enrolled device is a full plaintext replica, so durability
+> rests on those device replicas plus the SSH-key backup, not on server replication. It has **not**
+> had an independent professional cryptographic review — do not trust it with irreplaceable data until
+> it has (see `secsec-Implementation.md` §8).
 
 ## How it works (one paragraph)
 
@@ -152,33 +153,15 @@ cargo audit                                         # supply-chain advisory scan
 CI (`.github/workflows/ci.yml`) runs lint, the test suite on Linux/macOS/Windows, and the advisory
 scan on every push.
 
-## Roadmap — capabilities the unwired code unlocks
-
-Three families of mechanism are **already implemented and tested in library code** but are not yet
-reachable from any CLI command (each is labelled `NOT WIRED` at the top of its module; see the Design
-§2 scope note). Wiring them needs no new crypto — only CLI/orchestration plumbing:
-
-| Capability | What it gives a user | Backed by (NOT WIRED) | Wiring needed |
-|---|---|---|---|
-| **Multi-remote durability (P15, §14)** | Survive a malicious or dead server: replicate each repo to ≥2 independent servers and retain local objects until a quorum has each passed `put→get→verify`. Today durability is "your one server + your backups." | `secsec-client::multiremote` — `quorum_put_objects`, `reconcile_roster_tips`, `detect_head_rollback` | Let `sync` take multiple `--server`s (repeatable, stored in the link); push to all and quorum-confirm; run the reconciliation/rollback checks before adopting state |
-| **Cross-remote rollback & withholding detection (P7/P13, §14)** | Catch a server that hides a `RevokeDevice` (serves a shorter sigchain), serves a stale head, or withholds a `SetMinAlgo` — by comparing what each remote presents. | `reconcile_roster_tips` (longest-valid-chain + laggard alarm), `detect_head_rollback` | Falls out of multi-remote above; surface the alarms to the user |
-| **Gossip / faster fork detection (P8, §10)** | Detect a partition/fork *sooner* (and write the §10 audit log) by exchanging head hashes across remotes or directly between devices. The same-server DAG fork check already ships; this shrinks the window. | `secsec-client::gossip` — `cross_remote_fork_scan`, `check_peer_head`, the fork-event log | Call `cross_remote_fork_scan` in the sync loop (needs multi-remote) or `check_peer_head` over a device-to-device channel; persist `ForkEvent`s |
-| **Direct SAS enrollment (§7)** | Enrol a device without relaying an invite code — the human compares a 6-digit SAS instead. Useful when the two devices share a screen but not a copy-paste channel. | `secsec-roster` SAS primitives + `secsec-client::enroll` rate limit + `repo::grant_device` | A `secsec grant`-style command driving the commitment/SAS ceremony + the per-key rate limit |
-| **Post-quantum algorithm migration (P13, §16)** | Raise the keyslot-algorithm floor repo-wide once a second PQ KEM ships, so all devices must re-key to it — crypto agility without a flag day. | The `SetMinAlgo` op (folded + enforced at cold-start; just no creator) | A `set-min-algo` command that appends a `SetMinAlgo` entry; devices below the floor re-grant |
-
-None of these change the security model — they extend it along the axes the design already specifies.
-Removing them instead of wiring them is the alternative; they are kept because they are correct,
-tested, and the intended next surface.
-
 ## Threat model (summary)
 
 The adversary is a **malicious/compromised server** (primary), a **network attacker**, a **revoked
 device**, and a **stolen client**. We trust only the device's SSH key and the user's out-of-band
 channel (carrying an invite code, or reading a fingerprint off a screen). Each security property in
-`secsec-Design.md` §4 (P1–P15)
-is paired with the exact mechanism that earns it; the bounded, proven-minimal residuals (availability,
-reinstall freshness, pre-rotation data for a colluding revoked device, the concurrent
-mutual-revocation race, metadata leakage within padding/timing bounds) are enumerated in §22.
+`secsec-Design.md` §4 (P1–P14) is paired with the exact mechanism that earns it; the bounded,
+proven-minimal residuals (availability, reinstall freshness, pre-rotation data for a colluding revoked
+device, the concurrent mutual-revocation race, metadata leakage within padding/timing bounds) are
+enumerated in §21.
 
 ## License
 

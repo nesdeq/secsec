@@ -6,9 +6,9 @@ implementation (or a re-implementation of a primitive) can self-check against th
 - **`secsec-kat-v1.txt`** — hex vectors chained from one root key (`master_key = 0x11×32`, generation
   `g = 1`), covering every layer: `[kdf]` (the §5/§9.5 derivations + `mk_commit`), `[frame]` (§9.1),
   `[aead]` (the §9.4 CTX/CMT-4 committing AEAD), `[object]` (§9.2 content-id + stored blob), `[head]`
-  (§9.8 mutable head blob), `[gc]` (§15 serialization hashes), `[auth]` (§11 session transcript),
-  `[sas]` (§7 enrollment short-auth-string), and `[roster]` (§9.5 per-entry AEAD + §8.2 roster-key
-  history). Each value is the exact output of the reference Rust implementation.
+  (§9.8 mutable head blob), `[gc]` (§15 serialization hashes), `[auth]` (§11 session transcript), and
+  `[roster]` (§9.5 per-entry AEAD + §8.2 roster-key history). Each value is the exact output of the
+  reference Rust implementation.
 
 ## How the vectors are kept honest
 

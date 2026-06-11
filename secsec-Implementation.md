@@ -15,9 +15,8 @@ register, and what each component does. It does not restate the design — read 
 **Scope.** Transport is **QUIC/TLS-only** (the pinned self-signed host key is the sole trust anchor;
 no CA, no stdio/SSH mode). Device keys are **Ed25519-only**. The keyslot KEM is **X-Wing**
 (ML-KEM-768 ⊕ X25519), mandatory — there is no classical keyslot to downgrade to. Targets are Linux,
-macOS, and Windows. The CLI is **single-remote**; the multi-remote/quorum and gossip layers are
-implemented and tested in library code but not wired to a command (see Design §2 and the README
-roadmap).
+macOS, and Windows. secsec is **single-host**: one repo on one blind server (`secsec sync` takes one
+`--server`); there is no multi-remote, quorum, or gossip layer.
 
 ---
 
@@ -45,7 +44,7 @@ secsec/
 │   ├── secsec-engine/    §10   snapshot-tree ↔ merge-node bridge, three-way reconcile to the store
 │   ├── secsec-transport/ §11   QUIC+TLS pinned verifier, auth, channel binding
 │   ├── secsec-proto/     §12   wire protocol, RPC framing, write/read-auth, rate limits, gc serialization (§15)
-│   ├── secsec-client/    §7,§10,§14,§15  orchestration: cold-start, watcher, sync loop, auto-GC, invite-pairing, multi-remote (library)
+│   ├── secsec-client/    §7,§10,§15  orchestration: cold-start, watcher, sync loop, auto-GC, invite-pairing
 │   └── secsec-server/          serve loop, quota/rate-limit + gc CAS enforcement, GC executor
 ├── bin/secsec            thin CLI over the crates
 ├── vectors/              committed KAT / cross-impl test vectors
@@ -58,9 +57,9 @@ snapshot/store/pq/roster → sync → engine → transport/proto → client/serv
 crate depends on a higher layer. `secsec-sync` keeps §10's merge/dag/rollback logic **storage-free
 and purely testable**; `secsec-engine` is the only §10 code that touches `store`+`snapshot` (it
 materializes stored trees into the merge model, re-seals the result, and authors the signed merge
-commit). The §14 multi-remote/quorum and §15 GC driver build on the `Remote` trait, which lives in
-`secsec-client`; the §15 serialization hashes are in `secsec-proto`, and the GC executor + CAS
-enforcement in `secsec-store`/`secsec-server`.
+commit). The §15 GC driver builds on the `Remote` trait, which lives in `secsec-client`; the §15
+serialization hashes are in `secsec-proto`, and the GC executor + CAS enforcement in
+`secsec-store`/`secsec-server`.
 
 ---
 
@@ -126,7 +125,7 @@ committed vectors, and `cargo-audit`. Reproducible static `musl` build via `xtas
 | R5 | Sigchain fold + cold-start + roster-key peel (§8) | mis-fold → wrong membership; bootstrap deadlock | model-based tests; explicit cold-start order; RFP-anchor + `mk_commit` checks; persisted anti-rollback anchor (P7) |
 | R6 | Hardened GC (§15) | deletes live data under concurrency / ref-hiding | fail-safe-on-missing; serialization CAS (`all_heads_hash`/`roster_seq`/`put_epoch`); keep-everything default; grace window keyed to local time |
 | R7 | Canonical serialization (§9.3) | malleability → signature bypass | verify over received bytes (re-encode guard); reject non-canonical; fuzz |
-| R8 | Keyed FastCDC (§9.7) | unkeyed boundaries → cross-repo size fingerprinting | gear table seeded from `cdc_seed[gen]`; default-on padding is the load-bearing privacy mechanism (§22) |
+| R8 | Keyed FastCDC (§9.7) | unkeyed boundaries → cross-repo size fingerprinting | gear table seeded from `cdc_seed[gen]`; default-on padding is the load-bearing privacy mechanism (§21) |
 
 ---
 
@@ -168,7 +167,7 @@ committed vectors, and `cargo-audit`. Reproducible static `musl` build via `xtas
 - **Invite-code pairing (`secsec-client::pair`, §7).** A joining device carries one single-use 96-bit
   code. The protocol MACs `{D_pubkey, D_xwing}` → host and `{RFP, host_id}` → joiner under
   `derive_key("secsec-pair-mac-v1", code)`, relayed through the server's transient, TTL'd mailbox at
-  slots `BLAKE3(label ‖ code)` — so the blind server never learns the code, cannot swap the joiner's
+  slots `BLAKE3::derive_key(label, code)` — so the blind server never learns the code, cannot swap the joiner's
   key, and cannot substitute the repo. The joiner confirms `host_id` against its TOFU pin and
   `mk_commit` at cold-start.
 
@@ -204,9 +203,3 @@ committed vectors, and `cargo-audit`. Reproducible static `musl` build via `xtas
   each device's `SHA256:…` SSH fingerprint and a self-marker; `secsec revoke <prefix>` resolves the
   id (refusing self-revocation) and rotates the key away from the target and its add-by closure over
   the wire, deleting its keyslots.
-
-- **Multi-remote durability & gossip (`secsec-client::multiremote` / `gossip`, §14/§10) — NOT
-  WIRED.** Quorum `put→get→verify`, cross-remote sigchain reconciliation, cross-remote head-rollback
-  alarms, and gossip fork detection are implemented and unit-tested but reached by no CLI command
-  (`secsec sync` is single-remote). They are the intended next surface; see Design §2 and the README
-  roadmap for what wiring them unlocks.

@@ -328,7 +328,7 @@ impl Server {
     /// keyslot yet), so it is dispatched before the keyslot-existence check. Authenticated only by the
     /// read-auth signature (proving the connecting key holds its private SSH key); the payload is MAC'd
     /// under the invite code end to end, so the blind server merely relays + TTLs it. Slot ids are
-    /// `BLAKE3(label ‖ code)`, so the server never learns the code.
+    /// `BLAKE3::derive_key(label, code)`, so the server never learns the code.
     fn handle_pair(&self, inc: Incoming<'_>, now: u64) -> Response {
         let (op_label, args_hash, _) = op_and_args(&inc.request);
         let ra = ReadAuth {
