@@ -12,11 +12,13 @@
 //! member's keyslot at the repo's `min_algo` (§16). [`open_repo`]/[`open_repo_remote`] handle **any**
 //! generation — peeling the roster-key history back to genesis to fold the whole chain.
 //!
-//! Keyslots are **algo-tagged** (`algo_id(1B) ‖ body`, §9.1): classical HPKE(X25519) or hybrid-PQ
-//! X-Wing (§17). A device's X-Wing keypair is derived from its SSH private scalar
-//! ([`secsec_sig::DeviceKey::xwing_seed`]) and its X-Wing public is published in the roster
-//! (`Genesis`/`AddDevice`), so a granter/rotation can wrap to it once `min_algo` reaches X-Wing. The
-//! cold-start unwrap dispatches by `algo_id` and enforces the §16 `min_algo` floor after folding.
+//! Keyslots are **algo-tagged** (`algo_id(1B) ‖ body`, §9.1) and **X-Wing only** (`algo_id = 2`,
+//! §8.3/§17) — the classical X25519/HPKE wrap was removed (a pre-quantum keyslot is the one
+//! harvestable asymmetric exposure). A device's X-Wing keypair is derived from its SSH private
+//! **seed** ([`secsec_sig::DeviceKey::xwing_seed`] — the seed, not the clamped scalar, so it is
+//! quantum-hard to recover from the public Ed25519 key) and its X-Wing public is published in the
+//! roster (`Genesis`/`AddDevice`), so a granter/rotation can wrap to it. The cold-start unwrap
+//! dispatches by `algo_id` and enforces the §16 `min_algo` floor after folding.
 
 use crate::{Remote, RemoteError};
 use secsec_frame::{Frame, FRAME_LEN};
@@ -945,7 +947,10 @@ mod tests {
         // E cold-starts onto the new generation; D is gone and its old keyslot was deleted.
         let (mk2, st2, _a) = open_repo_remote(&remote, &e, &rfp, None).await.unwrap();
         assert_eq!(mk2.generation(), 2);
-        assert!(!st2.is_member(&did), "revoked device removed from the roster");
+        assert!(
+            !st2.is_member(&did),
+            "revoked device removed from the roster"
+        );
         assert!(st2.is_member(&e.device_id().unwrap()));
         assert!(
             remote.store.get_keyslot(&did, 1).unwrap().is_none(),

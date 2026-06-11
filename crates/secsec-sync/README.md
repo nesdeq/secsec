@@ -25,7 +25,8 @@ frontier and HWM checks (§8.5, [`rollback`]).
 - `dag` — `ancestors`, `is_ancestor`, `incomparable`, `common_ancestors`, `lowest_common_ancestors`,
   `CommitMeta`.
 - `merge` — `three_way_merge`, `Node`, `Merge`, `Conflict`, `ConflictKind`.
-- `rollback` — `evaluate_merge` (the roster_seq / version / `head_version` HWM gates), `observe`,
-  `fork_check`, `MergeDecision`, `MergeReject`, `ForkStatus`.
+- `rollback` — `evaluate_merge` (the roster_seq / version / `head_version` HWM gates; a
+  DAG-incomparable sibling routes to the three-way keep-both merge), `observe`, `MergeDecision`,
+  `MergeReject`.
 
 The storage bridge that materializes `Node`s and re-seals the merge lives in `secsec-engine`.

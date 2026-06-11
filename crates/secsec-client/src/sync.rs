@@ -18,6 +18,7 @@ use crate::{
     fetch_closure, fetch_head, push_head, push_objects, resolve_head_signer, sync_ref, ClientError,
     CommitAuthor, Remote, SyncAction,
 };
+use secsec_engine::MergeError;
 use secsec_kdf::MasterKeys;
 use secsec_object::Id;
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
@@ -25,7 +26,6 @@ use secsec_snapshot::{
     open_signed_commit, restore_commit_tree, seal_signed_commit, snapshot_tree, verify_commit,
     Commit,
 };
-use secsec_engine::MergeError;
 use secsec_store::Store;
 use secsec_sync::rollback::{MergeReject, SiblingHead, SyncFrontier};
 use secsec_sync::{Head, NO_PREV_HEAD};
@@ -107,11 +107,7 @@ async fn pull_to<R: Remote, K: MasterKeys>(
             },
         )));
     }
-    let head_hwm = frontier
-        .head_version_hwm
-        .get(&signer)
-        .copied()
-        .unwrap_or(0);
+    let head_hwm = frontier.head_version_hwm.get(&signer).copied().unwrap_or(0);
     if head.head_version < head_hwm {
         return Err(ClientError::Merge(MergeError::Rollback(
             MergeReject::HeadRollback {
@@ -477,18 +473,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = MasterKey::new(1, [0x55; 32]);
         let dev = DeviceKey::generate().unwrap();
-        let members: BTreeMap<DeviceId, DevicePublic> =
-            [(dev.device_id().unwrap(), dev.public())]
-                .into_iter()
-                .collect();
+        let members: BTreeMap<DeviceId, DevicePublic> = [(dev.device_id().unwrap(), dev.public())]
+            .into_iter()
+            .collect();
         let remote = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
         let store = Store::open(dir.path().join("c.redb")).unwrap();
         let work = tempfile::tempdir().unwrap();
         std::fs::write(work.path().join("f.txt"), b"v1").unwrap();
 
         // A seal that always fails: the first publish must abort before advancing the ref.
-        let seal =
-            |_: &SyncFrontier| Err(ClientError::Io(std::io::Error::other("seal failed on purpose")));
+        let seal = |_: &SyncFrontier| {
+            Err(ClientError::Io(std::io::Error::other(
+                "seal failed on purpose",
+            )))
+        };
         let res = sync_once(
             &remote,
             &store,

@@ -14,18 +14,16 @@
 //! direct sibling **and** every device in the sibling's transitively reachable commit chain) — and,
 //! per §8.5, MUST seal the new frontier *before* writing the local merge commit.
 //!
-//! **`last_seen_head`** (embedded in commits, §10) is a **commit id**, so fork detection and the
-//! ancestor relations are all over the commit parent-DAG ([`crate::dag`]). [`fork_check`] implements
-//! the §10 fork algorithm: a known, DAG-incomparable `last_seen_head` is a provable fork → alarm.
+//! **`last_seen_head`** (embedded in commits, §10) is a **commit id**, so the fork condition and the
+//! ancestor relations are all over the commit parent-DAG ([`crate::dag`]): gate 3 routes a
+//! DAG-incomparable sibling to the three-way keep-both merge ([`crate::merge`]) — the wired
+//! same-server fork handling.
 
 use crate::dag::{self, Id, ParentMap};
 use secsec_canon::{CanonError, Reader, Writer};
 use secsec_frame::MAX_LIST_ELEMENTS;
 use secsec_sig::DeviceId;
 use std::collections::{BTreeMap, BTreeSet};
-
-/// The sentinel `last_seen_head` meaning "none" (§6: zero if none).
-pub const NO_HEAD: Id = [0u8; 32];
 
 /// Local sealed-state nonce length (§9.8): 96-bit.
 pub const FRONTIER_NONCE_LEN: usize = 12;
@@ -200,40 +198,6 @@ impl SyncFrontier {
                 *e = (*e).max(meta.version);
             }
         }
-    }
-}
-
-/// The result of the §10 fork check on an incoming commit's `last_seen_head`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForkStatus {
-    /// Comparable (ancestor either way) or no `last_seen_head` — no fork.
-    Comparable,
-    /// `last_seen_head` is known and DAG-incomparable to our head — a provable fork; alarm (§10).
-    Forked,
-    /// `last_seen_head` is unknown to the client — record it and fetch from all remotes (§10 step 2).
-    Unknown,
-}
-
-/// §10 fork detection. Given our current head commit, the set of commit ids the client `known`s, the
-/// parent-DAG, and an incoming commit's `last_seen_head` (a commit id, [`NO_HEAD`] if none), classify
-/// it. A known, incomparable `last_seen_head` is a provable fork.
-#[must_use]
-pub fn fork_check(
-    parents: &ParentMap,
-    known: &BTreeSet<Id>,
-    our_head: &Id,
-    last_seen_head: &Id,
-) -> ForkStatus {
-    if *last_seen_head == NO_HEAD {
-        return ForkStatus::Comparable;
-    }
-    if !known.contains(last_seen_head) {
-        return ForkStatus::Unknown;
-    }
-    if dag::incomparable(parents, our_head, last_seen_head) {
-        ForkStatus::Forked
-    } else {
-        ForkStatus::Comparable
     }
 }
 
@@ -548,23 +512,6 @@ mod tests {
         f.observe(&older, &g, &cm);
         assert_eq!(f.head_version_hwm.get(&dev(2)), Some(&5));
         assert_eq!(f.roster_seq, 4);
-    }
-
-    #[test]
-    fn fork_check_classifies() {
-        // 1 root; our head 2, other branch 3 -> incomparable. 4 descends from 2 (comparable).
-        let g = dag(&[(2, &[1]), (3, &[1]), (4, &[2])]);
-        let known = BTreeSet::from([id(1), id(2), id(3), id(4)]);
-        assert_eq!(fork_check(&g, &known, &id(2), &id(3)), ForkStatus::Forked);
-        assert_eq!(
-            fork_check(&g, &known, &id(4), &id(2)),
-            ForkStatus::Comparable
-        );
-        assert_eq!(
-            fork_check(&g, &known, &id(2), &NO_HEAD),
-            ForkStatus::Comparable
-        );
-        assert_eq!(fork_check(&g, &known, &id(2), &id(9)), ForkStatus::Unknown);
     }
 
     fn sample_frontier() -> SyncFrontier {
