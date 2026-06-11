@@ -422,9 +422,10 @@ async fn run_sync(
 
     // Connect: pin the saved host key, or TOFU on first contact.
     let pinned = link.as_ref().map(|l| l.host_id);
-    let (endpoint, conn, host_id) = connect(addr, pinned).await?;
+    let (mut endpoint, mut conn, host_id) = connect(addr, pinned).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
-    let rem = QuicRemote::new(&conn, sess.transcript, &device);
+    let mut transcript = sess.transcript;
+    let rem = QuicRemote::new(&conn, transcript, &device);
 
     // Establish the RFP: join via invite, reuse the link, or create the repo (first device).
     let rfp = if let Some(code_str) = invite_opt {
@@ -472,12 +473,12 @@ async fn run_sync(
     // Cold-start over the wire (P7 anti-rollback: the fetched chain must extend the persisted anchor).
     let prev_anchor = link.as_ref().and_then(|l| l.anchor);
     let was_linked = link.is_some();
-    let (mk, st, anchor) = open_repo_remote(&rem, &device, &rfp, prev_anchor).await?;
+    let (mut mk, mut st, mut anchor) = open_repo_remote(&rem, &device, &rfp, prev_anchor).await?;
     // Persist the link with the advanced anti-rollback anchor.
     write_link(
         &sdir,
         &Link {
-            server: server_str,
+            server: server_str.clone(),
             host_id,
             rfp,
             ref_name: ref_name.clone(),
@@ -485,9 +486,9 @@ async fn run_sync(
         },
     )?;
     // The roster_seq stamped on commits/heads is the current sigchain tip (drives §10 gate 1).
-    let roster_seq = anchor.max_seq;
+    let mut roster_seq = anchor.max_seq;
 
-    let keyring = data_keyring_remote(&rem, &mk).await?;
+    let mut keyring = data_keyring_remote(&rem, &mk).await?;
     let store = Store::open(sdir.join("objects.secsec"))?;
     let frontier_path = sdir.join("frontier");
     let base_path = sdir.join("base");
@@ -533,13 +534,82 @@ async fn run_sync(
     poll.tick().await;
 
     let mut initial = true;
+    let mut retry_now = false;
+    let mut want_refold = false;
     loop {
-        if !initial {
+        if !initial && !retry_now {
             tokio::select! {
                 ev = rx.recv() => { if ev.is_none() { break; } }
-                _ = poll.tick() => {}
+                _ = poll.tick() => { want_refold = true; } // periodic: pick up newly-enrolled devices
             }
         }
+        retry_now = false;
+
+        // Self-heal a dropped connection instead of erroring on every later sync until the user restarts.
+        if conn.close_reason().is_some() {
+            eprintln!("connection lost — reconnecting to {server_str}…");
+            match reconnect_session(addr, host_id, &device).await {
+                Ok((ep, c, t)) => {
+                    endpoint = ep;
+                    conn = c;
+                    transcript = t;
+                    want_refold = true;
+                }
+                Err(err) => {
+                    eprintln!("reconnect failed: {err}");
+                    initial = false;
+                    continue;
+                }
+            }
+        }
+
+        let rem = QuicRemote::new(&conn, transcript, &device);
+
+        // Re-fold the roster so a device that enrolled AFTER this loop started is recognized (else its
+        // head reads as "signed by a non-member"), and keep `roster_seq` current. Done on the periodic
+        // tick and after a reconnect — not on every file-change event, to keep saves snappy.
+        let refolded = want_refold;
+        if want_refold {
+            want_refold = false;
+            match open_repo_remote(&rem, &device, &rfp, Some(anchor)).await {
+                Ok((m, s, a)) => {
+                    if a.max_seq != anchor.max_seq {
+                        let _ = write_link(
+                            &sdir,
+                            &Link {
+                                server: server_str.clone(),
+                                host_id,
+                                rfp,
+                                ref_name: ref_name.clone(),
+                                anchor: Some(a),
+                            },
+                        );
+                    }
+                    mk = m;
+                    st = s;
+                    anchor = a;
+                    roster_seq = a.max_seq;
+                    if let Ok(k) = data_keyring_remote(&rem, &mk).await {
+                        keyring = k;
+                    }
+                }
+                // The server's repo no longer matches this folder's pinned identity (reset / divergence).
+                Err(RepoError::Rollback) | Err(RepoError::Roster(_)) => {
+                    eprintln!(
+                        "ALARM: the repo on {server_str} no longer matches this folder's pinned identity \
+                         (anti-rollback / RFP mismatch) — the server may have been reset or served \
+                         divergent state. Refusing to sync; re-link with `--invite` if this is intended."
+                    );
+                    break;
+                }
+                Err(e) => {
+                    if conn.close_reason().is_none() {
+                        eprintln!("roster refresh failed (using last known roster): {e}");
+                    }
+                }
+            }
+        }
+
         match sync_once(
             &rem,
             &store,
@@ -625,16 +695,51 @@ async fn run_sync(
                     }
                 }
             }
-            Err(e) => eprintln!("sync error: {e}"),
+            // A cas-head conflict is a normal concurrent-write race (another device advanced the ref
+            // while we were pushing), not an error — re-sync immediately to fetch its head and merge.
+            Err(secsec_client::ClientError::CasConflict) => {
+                retry_now = true;
+            }
+            // A head from a device we don't know: our roster may be stale. Refresh once and retry; if
+            // it still fails right after a refresh, it is a genuine non-member (forged/revoked) head.
+            Err(secsec_client::ClientError::HeadNotMember) => {
+                if refolded {
+                    eprintln!(
+                        "sync error: fetched head signed by a non-member (after roster refresh)"
+                    );
+                } else {
+                    want_refold = true;
+                    retry_now = true;
+                }
+            }
+            // A dead connection is healed by the reconnect at the top of the next iteration — don't
+            // surface it as a sync error.
+            Err(e) => {
+                if conn.close_reason().is_none() {
+                    eprintln!("sync error: {e}");
+                }
+            }
         }
         initial = false;
-        if once {
+        if once && !retry_now {
             break;
         }
     }
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
     Ok(())
+}
+
+/// Re-establish a session after a dropped connection: dial the (already-pinned) server again and
+/// redo the §11 handshake, returning the fresh endpoint + connection + session transcript.
+async fn reconnect_session(
+    addr: SocketAddr,
+    host_id: [u8; 32],
+    device: &DeviceKey,
+) -> Result<(quinn::Endpoint, quinn::Connection, [u8; 32]), Box<dyn Error>> {
+    let (endpoint, conn, _host_id) = connect(addr, Some(host_id)).await?;
+    let sess = client_handshake(&conn, device, host_id, rand32()?).await?;
+    Ok((endpoint, conn, sess.transcript))
 }
 
 // ---- invite ----
