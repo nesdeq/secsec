@@ -5,7 +5,7 @@
 use secsec_frame::{Frame, ObjType};
 use secsec_kdf::{obj_key, roster_entry_key, roster_keyhist_key, MasterKey};
 use secsec_proto::gc;
-use secsec_roster::{sas_commit, sas_display, sas_value, seal_entry, seal_roster_keyhist};
+use secsec_roster::{seal_entry, seal_roster_keyhist};
 use secsec_sync::{ref_hash, seal_head, Head};
 use secsec_transport::auth::SessionTranscript;
 use std::collections::BTreeMap;
@@ -93,15 +93,6 @@ fn computed() -> BTreeMap<String, String> {
     t.client_hello(1, &[1; 32])
         .server_hello(1, &[2; 32], &[3; 32]);
     put("session_transcript", hx(&t.finalize()));
-
-    // [sas]
-    put(
-        "sas_commit",
-        hx(&sas_commit(&[0x42; 16], &[0x5a; 32], b"d-pubkey")),
-    );
-    let sas = sas_value(&[0x5a; 32], b"d-pubkey", &[0x42; 16]);
-    put("sas_value", sas.to_string());
-    put("sas_display", format!("\"{}\"", sas_display(sas)));
 
     // [roster] — per-entry AEAD + roster-key history wrap.
     put(

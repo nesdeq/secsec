@@ -20,6 +20,5 @@ not parse, and `DevicePublic::verify` additionally rejects any non-Ed25519 key o
   the raw Ed25519 **seed** (not the clamped scalar, so it is quantum-hard to recover from the public
   key, §8.3).
 - `DevicePublic` — `from_canonical`, `verify(namespace, msg, sig)`, `device_id()`.
-- Namespace constants: `NS_AUTH`, `NS_WRITE`, `NS_READ`, `NS_COMMIT`, `NS_HEAD`, `NS_ROSTER`,
-  `NS_GRANT` (§9.6).
+- Namespace constants: `NS_AUTH`, `NS_WRITE`, `NS_READ`, `NS_COMMIT`, `NS_HEAD`, `NS_ROSTER` (§9.6).
 - `DeviceId`, `SigError`.

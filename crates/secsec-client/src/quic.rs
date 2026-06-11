@@ -273,7 +273,7 @@ impl Remote for QuicRemote<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{fetch_head, pull_restore, push_head, push_objects};
+    use crate::{fetch_closure, fetch_head, push_head, push_objects};
     use rcgen::generate_simple_self_signed;
     use secsec_kdf::MasterKey;
     use secsec_server::{serve::serve_connection, Server};
@@ -371,14 +371,22 @@ mod tests {
                 .await
                 .unwrap();
 
-            // a fresh reader pulls the head (get-ref) + closure (get) and restores it.
+            // a fresh reader pulls the head (get-ref) + closure (get), verifies, and restores it.
             let b_store = Store::open(srv_dir.path().join("b.redb")).unwrap();
             let dst = tempfile::tempdir().unwrap();
-            let got = pull_restore(&remote, &b_store, &m, &device.public(), "main", dst.path())
+            let (got, sig, _) = fetch_head(&remote, &m, "main")
                 .await
                 .unwrap()
                 .expect("ref present");
             assert_eq!(got, head);
+            secsec_sync::verify_head(&device.public(), &got, &sig).unwrap();
+            fetch_closure(&remote, &b_store, &m, &got.commit_id)
+                .await
+                .unwrap();
+            let (commit, csig) =
+                secsec_snapshot::open_signed_commit(&got.commit_id, &m, &b_store).unwrap();
+            secsec_snapshot::verify_commit(&device.public(), &commit, &csig).unwrap();
+            secsec_snapshot::restore_commit_tree(&commit, &m, &b_store, dst.path()).unwrap();
             assert_eq!(read_tree(src.path()), read_tree(dst.path()));
 
             // an absent ref returns None over the wire.

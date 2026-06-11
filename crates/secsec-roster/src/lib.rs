@@ -1,18 +1,17 @@
-//! `secsec-roster` — the roster sigchain: entries, fold/succession, and the anti-rollback frontier
+//! `secsec-roster` — the roster sigchain: entries, fold/succession, and key-history
 //! (`secsec-Design.md` §8.1). This is the real ACL.
 //!
 //! An append-only, hash-chained, SSHSIG-signed log. Each entry is `{seq, prev, op, ts, signer}`
 //! signed under [`secsec_sig::NS_ROSTER`]; `prev` is the BLAKE3 of the full previous entry, and the
 //! genesis entry's hash is the repository's **RFP** (§5). [`fold`] replays the chain with
 //! **succession**: entry `n` is valid only if its signer is a *current member* of the state folded
-//! from entries `0..n-1` — so a non-member or revoked device cannot extend the chain. [`Frontier`]
-//! + [`check_frontier`] implement the §8.1 anti-rollback (a chain shorter than, or inconsistent
-//!   with, a persisted frontier is rejected).
+//! from entries `0..n-1` — so a non-member or revoked device cannot extend the chain. The §8.1
+//! anti-rollback frontier (highest accepted seq + stored tip-blob hash) is enforced by the client
+//! cold-start ([`secsec-client`]'s `open_repo_remote`), which persists it in the per-folder link.
 //!
-//! Beyond the plaintext sigchain (entries, codec, fold/succession, frontier) this crate also holds
-//! the layers that wrap it: the per-entry AEAD under `roster_key_g` (§9.5), the never-trimmed
-//! roster-key history and its peel (§8.2), the cold-start bootstrap fold (§8.1), the enrollment
-//! primitives (SAS + grant attestation, §7/§9.6), and the revoke⇒rotate op builder (§8.4).
+//! Beyond the plaintext sigchain (entries, codec, fold/succession) this crate also holds the layers
+//! that wrap it: the per-entry AEAD under `roster_key_g` (§9.5), the never-trimmed roster-key history
+//! and its peel (§8.2), the cold-start bootstrap fold (§8.1), and the revoke⇒rotate op builder (§8.4).
 
 #![forbid(unsafe_code)]
 
@@ -22,7 +21,7 @@ use secsec_frame::{
     MAX_ROSTER_ENTRY_SIZE,
 };
 use secsec_kdf::{data_keyhist_key, roster_entry_key, roster_keyhist_key, MasterKey, SecretKey};
-use secsec_sig::{DeviceId, DeviceKey, DevicePublic, NS_GRANT, NS_ROSTER};
+use secsec_sig::{DeviceId, DeviceKey, DevicePublic, NS_ROSTER};
 use std::collections::{BTreeMap, BTreeSet};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -856,144 +855,6 @@ pub fn revoke_rotate_ops(
     ops
 }
 
-/// A persisted anti-rollback frontier (§8.1): the highest accepted seq and that entry's hash.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Frontier {
-    /// Highest accepted sequence number.
-    pub max_seq: u64,
-    /// Hash of the entry at `max_seq`.
-    pub tip_hash: [u8; 32],
-}
-
-/// The frontier of a (validated) chain.
-#[must_use]
-pub fn frontier_of(entries: &[Entry]) -> Option<Frontier> {
-    entries.last().map(|last| Frontier {
-        max_seq: last.seq,
-        tip_hash: entry_hash(last),
-    })
-}
-
-/// Reject a fetched chain that rolls back below `frontier` (§8.1 anti-rollback): it must be at
-/// least as long, and the entry at the frontier's `max_seq` must hash to the stored `tip_hash`
-/// (the tip-hash consistency check — a chain re-forked from an earlier point is caught here).
-pub fn check_frontier(entries: &[Entry], frontier: &Frontier) -> Result<(), RosterError> {
-    let idx = frontier.max_seq as usize;
-    if entries.len() <= idx {
-        return Err(RosterError::Rollback);
-    }
-    if entry_hash(&entries[idx]) != frontier.tip_hash {
-        return Err(RosterError::Rollback);
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Enrollment primitives (§7 SAS, §9.6 grant attestation). These are the pure,
-// stateless cryptographic cores of `grant`; the interactive protocol
-// (commitment-before-reveal ordering, rate limiting, channel handling) is an
-// orchestration layer above them (§7).
-// ---------------------------------------------------------------------------
-
-/// `grant_nonce` length: 128 bits (§7).
-pub const GRANT_NONCE_LEN: usize = 16;
-/// `enrollment_nonce` length: 32 bytes (§9.6).
-pub const ENROLLMENT_NONCE_LEN: usize = 32;
-/// SAS reduction modulus — a 6-digit decimal (§7 / §19, ~20 bits human-verified).
-pub const SAS_MODULUS: u32 = 1_000_000;
-
-const L_SAS_COMMIT: &[u8] = b"secsec-sas-commit-v1";
-const L_SAS: &[u8] = b"secsec-sas-v1";
-
-/// The SAS commitment `c_E = BLAKE3("secsec-sas-commit-v1" ‖ grant_nonce ‖ RFP ‖ D_pubkey)` (§7
-/// step 2b). E sends this to D **before** revealing `grant_nonce`, binding `grant_nonce` and
-/// `D_pubkey` so a relay must fix a substituted key before it knows the nonce (one blind guess).
-/// `d_pubkey` is D's canonical SSH public-key encoding (the bytes hashed for its `device_id`).
-#[must_use]
-pub fn sas_commit(
-    grant_nonce: &[u8; GRANT_NONCE_LEN],
-    rfp: &[u8; 32],
-    d_pubkey: &[u8],
-) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(L_SAS_COMMIT);
-    h.update(grant_nonce);
-    h.update(rfp);
-    h.update(d_pubkey);
-    *h.finalize().as_bytes()
-}
-
-/// The raw SAS value in `0..SAS_MODULUS` (§7 step 3): the **first 32 bits, big-endian**, of
-/// `BLAKE3("secsec-sas-v1" ‖ RFP ‖ D_pubkey ‖ grant_nonce)`, reduced mod 1,000,000. Both ends bind
-/// `RFP` and `D_pubkey`, so a server swapping either produces a mismatch the human aborts on.
-///
-/// (Endianness note: "the integer value of the first 32 bits" is read big-endian here; both parties
-/// run this same function, so the choice only affects the displayed digits, and a KAT pins it.)
-#[must_use]
-pub fn sas_value(rfp: &[u8; 32], d_pubkey: &[u8], grant_nonce: &[u8; GRANT_NONCE_LEN]) -> u32 {
-    let mut h = blake3::Hasher::new();
-    h.update(L_SAS);
-    h.update(rfp);
-    h.update(d_pubkey);
-    h.update(grant_nonce);
-    let digest = h.finalize();
-    let first4: [u8; 4] = digest.as_bytes()[..4].try_into().expect("4 bytes");
-    u32::from_be_bytes(first4) % SAS_MODULUS
-}
-
-/// Render a SAS value as the zero-padded 6-digit decimal the human compares (§7).
-#[must_use]
-pub fn sas_display(sas: u32) -> String {
-    format!("{:06}", sas % SAS_MODULUS)
-}
-
-/// The grant-attestation signed message (§9.6): `device_pubkey ‖ mk_commit_g ‖ roster_seq ‖
-/// enrollment_nonce`, canonically encoded (length-prefixed pubkey, fixed-width remainder).
-fn grant_message(
-    d_pubkey: &[u8],
-    mk_commit: &MkCommit,
-    roster_seq: u64,
-    enrollment_nonce: &[u8; ENROLLMENT_NONCE_LEN],
-) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.bytes(d_pubkey)
-        .raw(mk_commit)
-        .u64(roster_seq)
-        .raw(enrollment_nonce);
-    w.finish()
-}
-
-/// Sign a `secsec-grant-v1` attestation (§7 step 5, §9.6): the granting device E attests that it
-/// wrapped `master_key_g` (committed by `mk_commit`) to `d_pubkey` at `roster_seq`, bound to the
-/// `enrollment_nonce` it sent D directly over the out-of-band grant channel. Returns the SSHSIG PEM.
-pub fn sign_grant(
-    signer: &DeviceKey,
-    d_pubkey: &[u8],
-    mk_commit: &MkCommit,
-    roster_seq: u64,
-    enrollment_nonce: &[u8; ENROLLMENT_NONCE_LEN],
-) -> Result<Vec<u8>, RosterError> {
-    let msg = grant_message(d_pubkey, mk_commit, roster_seq, enrollment_nonce);
-    Ok(signer.sign(NS_GRANT, &msg)?)
-}
-
-/// Verify a `secsec-grant-v1` attestation against the (rostered) signer's public key. D MUST call
-/// this with the `enrollment_nonce` it received **directly from E over the grant channel** — not a
-/// value read back from the server-fetched attestation — or the freshness check is vacuous (§9.6).
-pub fn verify_grant(
-    signer_pub: &DevicePublic,
-    d_pubkey: &[u8],
-    mk_commit: &MkCommit,
-    roster_seq: u64,
-    enrollment_nonce: &[u8; ENROLLMENT_NONCE_LEN],
-    sig: &[u8],
-) -> Result<(), RosterError> {
-    let msg = grant_message(d_pubkey, mk_commit, roster_seq, enrollment_nonce);
-    signer_pub
-        .verify(NS_GRANT, &msg, sig)
-        .map_err(|_| RosterError::BadSignature)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,41 +1158,6 @@ mod tests {
     }
 
     #[test]
-    fn frontier_blocks_rollback() {
-        let d1 = DeviceKey::generate().unwrap();
-        let d2 = DeviceKey::generate().unwrap();
-        let (entries, _rfp) = chain(
-            &d1,
-            vec![
-                (
-                    Op::AddDevice {
-                        pubkey: pubkey_of(&d2),
-                        mk_commit: MK,
-                        enroll_pub: vec![],
-                    },
-                    &d1,
-                ),
-                (
-                    Op::RevokeDevice {
-                        device: d2.device_id().unwrap(),
-                    },
-                    &d1,
-                ),
-            ],
-        );
-        let frontier = frontier_of(&entries).unwrap();
-        assert_eq!(frontier.max_seq, 2);
-        // Full chain satisfies the frontier.
-        assert!(check_frontier(&entries, &frontier).is_ok());
-        // A rolled-back (truncated) chain that drops the revoke is rejected.
-        let truncated = &entries[..2];
-        assert!(matches!(
-            check_frontier(truncated, &frontier),
-            Err(RosterError::Rollback)
-        ));
-    }
-
-    #[test]
     fn codec_round_trips_every_op_and_preserves_hash() {
         let d1 = DeviceKey::generate().unwrap();
         let d2 = DeviceKey::generate().unwrap();
@@ -1604,131 +1430,6 @@ mod tests {
         assert!(matches!(
             peel_data_keys(&mks[4], 5, &partial),
             Err(RosterError::Aead)
-        ));
-    }
-
-    // ---- Enrollment primitives (§7 SAS, §9.6 grant attestation) ----
-
-    const RFP: [u8; 32] = [0x5A; 32];
-    const GNONCE: [u8; GRANT_NONCE_LEN] = [0x42; GRANT_NONCE_LEN];
-    const ENONCE: [u8; ENROLLMENT_NONCE_LEN] = [0x24; ENROLLMENT_NONCE_LEN];
-
-    #[test]
-    fn sas_value_in_range_and_six_digits() {
-        let d = DeviceKey::generate().unwrap();
-        let pk = d.public().to_canonical().unwrap();
-        let sas = sas_value(&RFP, &pk, &GNONCE);
-        assert!(sas < SAS_MODULUS);
-        let shown = sas_display(sas);
-        assert_eq!(shown.len(), 6);
-        assert!(shown.chars().all(|c| c.is_ascii_digit()));
-    }
-
-    #[test]
-    fn sas_commit_and_value_are_deterministic() {
-        let d = DeviceKey::generate().unwrap();
-        let pk = d.public().to_canonical().unwrap();
-        assert_eq!(
-            sas_commit(&GNONCE, &RFP, &pk),
-            sas_commit(&GNONCE, &RFP, &pk)
-        );
-        assert_eq!(sas_value(&RFP, &pk, &GNONCE), sas_value(&RFP, &pk, &GNONCE));
-    }
-
-    /// SAS KAT (frozen): pins the construction and the big-endian truncation. `RFP=0x5A*32`,
-    /// `D_pubkey=b"d-pubkey"`, `grant_nonce=0x42*16`.
-    #[test]
-    fn sas_kat() {
-        let pk = b"d-pubkey";
-        assert_eq!(
-            hx(&sas_commit(&GNONCE, &RFP, pk)),
-            "f5a4341d3e5b2fef2277a226c19ee97e40903906f83dd0a649f44b44226254bc"
-        );
-        // value + its zero-padded display, both pinned.
-        assert_eq!(sas_value(&RFP, pk, &GNONCE), 488_285);
-        assert_eq!(sas_display(488_285), "488285");
-    }
-
-    /// MITM substitution: a relay swapping `D_pubkey` (or the server swapping RFP) changes both the
-    /// commitment and the SAS, so the human comparison aborts (§7 step 3).
-    #[test]
-    fn sas_binds_pubkey_and_rfp() {
-        let real = DeviceKey::generate()
-            .unwrap()
-            .public()
-            .to_canonical()
-            .unwrap();
-        let fake = DeviceKey::generate()
-            .unwrap()
-            .public()
-            .to_canonical()
-            .unwrap();
-        assert_ne!(
-            sas_value(&RFP, &real, &GNONCE),
-            sas_value(&RFP, &fake, &GNONCE)
-        );
-        assert_ne!(
-            sas_commit(&GNONCE, &RFP, &real),
-            sas_commit(&GNONCE, &RFP, &fake)
-        );
-        // swapping RFP also changes the SAS
-        let other_rfp = [0xA5; 32];
-        assert_ne!(
-            sas_value(&RFP, &real, &GNONCE),
-            sas_value(&other_rfp, &real, &GNONCE)
-        );
-    }
-
-    #[test]
-    fn grant_attestation_round_trip() {
-        let e = DeviceKey::generate().unwrap(); // granting device
-        let d = DeviceKey::generate().unwrap(); // new device
-        let d_pk = d.public().to_canonical().unwrap();
-        let mk_commit = [0x11; 32];
-        let sig = sign_grant(&e, &d_pk, &mk_commit, 7, &ENONCE).unwrap();
-        assert!(verify_grant(&e.public(), &d_pk, &mk_commit, 7, &ENONCE, &sig).is_ok());
-    }
-
-    #[test]
-    fn grant_attestation_rejects_field_tampering() {
-        let e = DeviceKey::generate().unwrap();
-        let d = DeviceKey::generate().unwrap();
-        let d_pk = d.public().to_canonical().unwrap();
-        let mk_commit = [0x11; 32];
-        let sig = sign_grant(&e, &d_pk, &mk_commit, 7, &ENONCE).unwrap();
-
-        // wrong enrollment_nonce (the vacuous-replay guard, §9.6)
-        let mut bad_nonce = ENONCE;
-        bad_nonce[0] ^= 0x01;
-        assert!(matches!(
-            verify_grant(&e.public(), &d_pk, &mk_commit, 7, &bad_nonce, &sig),
-            Err(RosterError::BadSignature)
-        ));
-        // wrong roster_seq
-        assert!(matches!(
-            verify_grant(&e.public(), &d_pk, &mk_commit, 8, &ENONCE, &sig),
-            Err(RosterError::BadSignature)
-        ));
-        // wrong mk_commit
-        assert!(matches!(
-            verify_grant(&e.public(), &d_pk, &[0x22; 32], 7, &ENONCE, &sig),
-            Err(RosterError::BadSignature)
-        ));
-        // wrong device pubkey
-        let other_pk = DeviceKey::generate()
-            .unwrap()
-            .public()
-            .to_canonical()
-            .unwrap();
-        assert!(matches!(
-            verify_grant(&e.public(), &other_pk, &mk_commit, 7, &ENONCE, &sig),
-            Err(RosterError::BadSignature)
-        ));
-        // wrong signer
-        let other_signer = DeviceKey::generate().unwrap().public();
-        assert!(matches!(
-            verify_grant(&other_signer, &d_pk, &mk_commit, 7, &ENONCE, &sig),
-            Err(RosterError::BadSignature)
         ));
     }
 

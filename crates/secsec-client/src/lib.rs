@@ -1,4 +1,4 @@
-//! `secsec-client` — client orchestration over a [`Remote`] (`secsec-Design.md` §10, §12, §14).
+//! `secsec-client` — client orchestration over a [`Remote`] (`secsec-Design.md` §10, §12).
 //!
 //! This crate plumbs the proven cores to a remote store: it pushes the reachable **object closure**
 //! of a commit, advances the per-ref **head** via the blind-server compare-and-swap (§12), and on the
@@ -7,21 +7,16 @@
 //! against the real blind-CAS storage semantics in-process; the QUIC adapter (over `secsec-transport`)
 //! is a thin layer on top.
 //!
-//! - **Linear path:** [`push_objects`]/[`push_head`] then [`pull_restore`] — push, then
-//!   pull-and-restore by a holder of the same master key.
-//! - **Cross-device sync** ([`sync_ref`]): fetch the remote head, [`resolve_head_signer`] against the
-//!   folded roster (the head carries no `device_id`, so the signer is the one member key that
-//!   verifies it), bring the remote closure local, run the rollback-gated three-way merge
-//!   ([`secsec_engine::merge_heads`]), and push the merge — two devices reconciling through one blind
-//!   server with no silent data loss.
+//! **Cross-device sync** ([`sync_ref`]): fetch the remote head, [`resolve_head_signer`] against the
+//! folded roster (the head carries no `device_id`, so the signer is the one member key that verifies
+//! it), bring the remote closure local, run the rollback-gated three-way merge
+//! ([`secsec_engine::merge_heads`]), and push the merge — two devices reconciling through one blind
+//! server with no silent data loss.
 
 #![forbid(unsafe_code)]
 
-pub mod enroll;
 pub mod gc;
-pub mod gossip;
 pub mod history;
-pub mod multiremote;
 pub mod pair;
 pub mod quic;
 pub mod repo;
@@ -474,31 +469,6 @@ pub async fn fetch_closure<R: Remote, K: MasterKeys>(
     Ok(fetched)
 }
 
-/// Pull a ref end-to-end: fetch+verify the head against `signer` (the linear single-author case — the
-/// caller resolves the signer key), fetch the commit's object closure (verifying each object), verify
-/// the commit signature against `signer`, and restore the working tree to `dest`. Returns the head, or
-/// `None` if the ref is absent. (Cross-device merge of a divergent head is the next slice.)
-pub async fn pull_restore<R: Remote, K: MasterKeys>(
-    remote: &R,
-    store: &Store,
-    keys: &K,
-    signer: &DevicePublic,
-    ref_name: &str,
-    dest: &Path,
-) -> Result<Option<Head>, ClientError> {
-    // The head is always at the current generation (its blob is sealed under the current `head_key_g`);
-    // the commit closure it points at may span generations, so reads route through `keys` (§8.2).
-    let Some((head, sig, _blob)) = fetch_head(remote, keys.current(), ref_name).await? else {
-        return Ok(None);
-    };
-    verify_head(signer, &head, &sig)?;
-    fetch_closure(remote, store, keys, &head.commit_id).await?;
-    let (commit, csig) = secsec_snapshot::open_signed_commit(&head.commit_id, keys, store)?;
-    secsec_snapshot::verify_commit(signer, &commit, &csig)?;
-    secsec_snapshot::restore_commit_tree(&commit, keys, store, dest)?;
-    Ok(Some(head))
-}
-
 // ---- cross-device sync (fetch → resolve signer → rollback-gated merge → push) ----
 
 /// Resolve which roster member signed `head` by trying each member's key. The head carries no
@@ -721,58 +691,6 @@ mod tests {
         }
         walk(root, "", &mut out);
         out
-    }
-
-    #[tokio::test]
-    async fn linear_push_then_pull_restore_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let m = mk();
-        let device = DeviceKey::generate().unwrap();
-
-        // Author A: local store + a working tree.
-        let a_store = open_store(dir.path(), "a.redb");
-        let src = tempfile::tempdir().unwrap();
-        std::fs::write(src.path().join("a.txt"), b"alpha").unwrap();
-        std::fs::create_dir_all(src.path().join("sub")).unwrap();
-        std::fs::write(src.path().join("sub/b.bin"), [7u8; 9000]).unwrap();
-
-        // Snapshot → signed commit in A's store.
-        let (rt, rs) = secsec_snapshot::snapshot_tree(src.path(), &m, &a_store, None).unwrap();
-        let commit = secsec_snapshot::Commit {
-            root_tree: rt,
-            root_salt: rs,
-            parents: vec![],
-            device_id: device.device_id().unwrap(),
-            version: 1,
-            roster_seq: 0,
-            last_seen_head: [0u8; 32],
-            ts: 0,
-        };
-        let commit_id =
-            secsec_snapshot::seal_signed_commit(&m, &a_store, &device, &commit).unwrap();
-
-        // The remote (blind server).
-        let remote = MemRemote::new(open_store(dir.path(), "remote.redb"));
-
-        // Push objects + advance the head.
-        let pushed = push_objects(&remote, &a_store, &m, &commit_id)
-            .await
-            .unwrap();
-        assert!(pushed.len() >= 4); // commit + root tree + subtree + ≥1 chunk
-        let (head, _blob) = push_head(&remote, &m, &device, "main", commit_id, 0, None)
-            .await
-            .unwrap();
-        assert_eq!(head.head_version, 1);
-
-        // Author B: a FRESH empty store, same master key, knows A's signer key.
-        let b_store = open_store(dir.path(), "b.redb");
-        let dst = tempfile::tempdir().unwrap();
-        let got = pull_restore(&remote, &b_store, &m, &device.public(), "main", dst.path())
-            .await
-            .unwrap()
-            .expect("ref present");
-        assert_eq!(got, head);
-        assert_eq!(read_tree(src.path()), read_tree(dst.path()));
     }
 
     #[tokio::test]

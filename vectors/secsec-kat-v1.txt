@@ -79,16 +79,6 @@ args_gc        = 3de0fa63d87bdfb22b9e4df2a4cb5b8d9e636eb966f7f254514645c0eec3690
 # version=1, client_nonce=0x01*32, server_nonce=0x02*32, host_id=0x03*32.
 session_transcript = d7da869b22932e7f1e55fe87d1bec0245d9c41273dc4b39e38c3c4e0328ebbde
 
-[sas]   # asserts: secsec-roster  tests::sas_kat
-# §7 enrollment short-authentication-string. Inputs:
-rfp         = 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a
-d_pubkey    = "d-pubkey"                      # 8 ASCII bytes, not hex
-grant_nonce = 42424242424242424242424242424242   # 16 bytes
-# Outputs:
-sas_commit  = f5a4341d3e5b2fef2277a226c19ee97e40903906f83dd0a649f44b44226254bc
-sas_value   = 488285        # first 32 bits big-endian of BLAKE3(...) mod 1_000_000
-sas_display = "488285"      # zero-padded 6-digit decimal
-
 [roster]   # asserts: secsec-roster  tests::wire_kat
 # Per-entry AEAD (§9.5) and roster-key history (§8.2), keyed by roster_key[g=1] above.
 # roster_entry_aead: seal_entry(roster_key[g=1], gen=1, seq=1, plaintext); blob = FRAME ‖ ctx_tag ‖ ct.

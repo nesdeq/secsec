@@ -28,8 +28,6 @@ pub const NS_COMMIT: &str = "secsec-commit-v1";
 pub const NS_HEAD: &str = "secsec-head-v1";
 /// Roster sigchain-entry namespace.
 pub const NS_ROSTER: &str = "secsec-roster-v1";
-/// Grant-attestation namespace.
-pub const NS_GRANT: &str = "secsec-grant-v1";
 
 /// A 256-bit device identifier, `BLAKE3(canonical(pubkey))`.
 pub type DeviceId = [u8; 32];

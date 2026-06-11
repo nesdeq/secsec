@@ -1,10 +1,7 @@
-//! Shared test-only in-process [`Remote`] over a real [`Store`] — the single home for what were four
-//! byte-identical per-module copies (`lib`/`sync`/`multiremote`/`gossip` tests). It exercises the exact
-//! blind-CAS semantics the QUIC server uses (`cas_ref` = `BLAKE3`-of-blob compare), minus the network.
-//!
-//! `lie_on_get` makes `get_blob` serve garbage (an acks-put-but-returns-garbage remote, for the P15
-//! quorum test). The module is `#[cfg(test)]` (gated by its declaration in `lib.rs`), so it only exists
-//! in test builds, where every test module uses it.
+//! Shared test-only in-process [`Remote`] over a real [`Store`] — the single home for what were
+//! byte-identical per-module copies (`lib`/`sync` tests). It exercises the exact blind-CAS semantics
+//! the QUIC server uses (`cas_ref` = `BLAKE3`-of-blob compare), minus the network. The module is
+//! `#[cfg(test)]` (gated by its declaration in `lib.rs`), so it only exists in test builds.
 
 use crate::{GcOutcome, Receipt, Remote, RemoteError};
 use secsec_object::Id;
@@ -14,25 +11,17 @@ use secsec_store::Store;
 pub(crate) struct MemRemote {
     /// The backing object/ref/keyslot store.
     pub store: Store,
-    /// When set, `get_blob` returns garbage instead of the stored blob (durability/quorum tests).
-    pub lie_on_get: bool,
 }
 
 impl MemRemote {
     /// A truthful in-process remote over `store`.
     pub fn new(store: Store) -> Self {
-        Self {
-            store,
-            lie_on_get: false,
-        }
+        Self { store }
     }
 }
 
 impl Remote for MemRemote {
     async fn get_blob(&self, id: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
-        if self.lie_on_get {
-            return Ok(Some(b"garbage".to_vec()));
-        }
         self.store.get(id).map_err(|e| RemoteError(e.to_string()))
     }
     async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<Receipt, RemoteError> {
@@ -63,6 +52,16 @@ impl Remote for MemRemote {
     async fn get_keyslot(&self, device_id: &Id, gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
         self.store
             .get_keyslot(device_id, gen)
+            .map_err(|e| RemoteError(e.to_string()))
+    }
+    async fn get_keyhist(&self, gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
+        self.store
+            .get_keyhist(gen)
+            .map_err(|e| RemoteError(e.to_string()))
+    }
+    async fn get_roster_keyhist(&self, gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
+        self.store
+            .get_roster_keyhist(gen)
             .map_err(|e| RemoteError(e.to_string()))
     }
     async fn cas_head(
@@ -100,6 +99,16 @@ impl Remote for MemRemote {
         self.store
             .append_roster(old_tip, entry)
             .map(|seq| seq.is_some())
+            .map_err(|e| RemoteError(e.to_string()))
+    }
+    async fn put_keyhist(&self, gen: u32, blob: &[u8]) -> Result<(), RemoteError> {
+        self.store
+            .put_keyhist(gen, blob)
+            .map_err(|e| RemoteError(e.to_string()))
+    }
+    async fn put_roster_keyhist(&self, gen: u32, blob: &[u8]) -> Result<(), RemoteError> {
+        self.store
+            .put_roster_keyhist(gen, blob)
             .map_err(|e| RemoteError(e.to_string()))
     }
     async fn delete_keyslot(&self, device_id: &Id, gen: u32) -> Result<(), RemoteError> {

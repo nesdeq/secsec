@@ -26,7 +26,7 @@ use secsec_proto::server::limits::MAX_TOTAL_SIGCHAIN;
 use secsec_roster::{
     append, append_many, cold_start_fold, decode_entry, encode_entry, genesis, open_entry,
     peel_data_keys, revoke_closure, revoke_rotate_ops, seal_data_keyhist, seal_entry,
-    seal_roster_keyhist, sign_grant, Op, RosterError, State, ENROLLMENT_NONCE_LEN,
+    seal_roster_keyhist, Op, RosterError, State,
 };
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
 use secsec_store::{Store, StoreError, ABSENT_HEAD};
@@ -589,73 +589,6 @@ pub async fn rotate_repo_remote<R: Remote>(
         .map(|(mk, st, _)| (mk, st))
 }
 
-/// §7 `grant` (record-writing half): enroll device `d_pubkey` into the repo. The granter `device` (a
-/// current member holding `mk`) appends an `AddDevice` entry (publishing `d_xwing_pub`), wraps
-/// `master_key_g` to D's **X-Wing** keyslot (PQ is mandatory, §8.3/§17), and signs the
-/// `secsec-grant-v1` attestation over `enrollment_nonce`. Returns the attestation for E to send to D
-/// over the out-of-band grant channel (§7 step 5).
-///
-/// The **interactive** half — the SAS commitment-before-reveal ceremony, the human fingerprint check,
-/// and the per-`D_pubkey` rate limit (§7) — is the channel orchestration **above** this; the caller
-/// MUST complete it (confirming `d_pubkey` and `d_xwing_pub` out-of-band via the SAS) before invoking.
-/// `d_xwing_pub` is D's X-Wing public key bytes (D derives it from its SSH key — see
-/// `secsec_sig::DeviceKey::xwing_seed` — and sends it over the grant channel). On D's side,
-/// [`open_repo`]/[`open_repo_remote`] verify the RFP + `mk_commit`, and the caller verifies this
-/// attestation with `secsec_roster::verify_grant`.
-pub fn grant_device(
-    store: &Store,
-    device: &DeviceKey,
-    mk: &MasterKey,
-    d_pubkey: &DevicePublic,
-    d_xwing_pub: &[u8],
-    enrollment_nonce: &[u8; ENROLLMENT_NONCE_LEN],
-    ts: u64,
-) -> Result<Vec<u8>, RepoError> {
-    // PQ is mandatory: the new device MUST publish an X-Wing public key to be wrapped to.
-    if d_xwing_pub.is_empty() {
-        return Err(RepoError::Pq);
-    }
-    let g = mk.generation();
-    let mk_commit = mk.mk_commit();
-    let rk = mk.roster_key();
-
-    // Fetch + decrypt the current tip to chain the AddDevice entry.
-    let n = store.roster_len()?;
-    let tip_seq = n.checked_sub(1).ok_or(RepoError::NotInitialized)?;
-    let tip_blob = store
-        .get_roster_entry(tip_seq)?
-        .ok_or(RepoError::MissingEntry(tip_seq))?;
-    let tip_entry = decode_entry(&open_entry(&rk, g, tip_seq, &tip_blob)?)?;
-
-    let d_canonical = d_pubkey.to_canonical()?;
-    let op = Op::AddDevice {
-        pubkey: d_canonical.clone(),
-        mk_commit,
-        enroll_pub: d_xwing_pub.to_vec(),
-    };
-    let entry = append(&tip_entry, op, device, ts)?;
-    let roster_seq = entry.seq;
-    let blob = seal_entry(&rk, g, roster_seq, &encode_entry(&entry));
-    let old_tip = *blake3::hash(&tip_blob).as_bytes();
-    if store.append_roster(&old_tip, &blob)?.is_none() {
-        return Err(RepoError::RosterCasConflict);
-    }
-
-    // Wrap master_key_g to D's X-Wing keyslot (§8.3/§17).
-    let d_id = d_pubkey.device_id()?;
-    let keyslot = wrap_keyslot(mk.expose_secret(), g, &d_id, d_xwing_pub)?;
-    store.put_keyslot(&d_id, g, &keyslot)?;
-
-    // Sign the grant attestation over the directly-delivered enrollment_nonce (§9.6).
-    Ok(sign_grant(
-        device,
-        &d_canonical,
-        &mk_commit,
-        roster_seq,
-        enrollment_nonce,
-    )?)
-}
-
 /// §7 `grant` over a [`Remote`] — the network half of enrollment, run by a current member while
 /// completing an invite pairing ([`crate::pair`]). Fetches the sigchain tip, appends an `AddDevice`
 /// entry (publishing D's X-Wing public), and wraps `master_key_g` to D's keyslot, all over the wire
@@ -976,77 +909,47 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn grant_enrolls_a_second_device_end_to_end() {
-        use secsec_roster::{sas_value, verify_grant};
+    /// The wired enrollment + revocation path over a [`Remote`]: E creates the repo, grants D (the
+    /// invite-pairing grant, minus the mailbox MAC), then revoke⇒rotates D away — D leaves the roster,
+    /// its keyslot is deleted, and a new generation is minted (§8.4).
+    #[tokio::test]
+    async fn grant_then_revoke_rotate_over_remote() {
+        use crate::testmem::MemRemote;
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("s.redb")).unwrap();
-        let e = DeviceKey::generate().unwrap(); // granter (device 1)
-        let d = DeviceKey::generate().unwrap(); // new device
-        let rfp = init_repo(&store, &e, 0).unwrap();
-        let (mk, _st) = open_repo(&store, &e, &rfp).unwrap();
+        let remote = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
+        let e = DeviceKey::generate().unwrap(); // founder (device 1)
+        let d = DeviceKey::generate().unwrap(); // device to enroll then revoke
 
-        // --- the SAS ceremony (cores; the channel/human steps are the caller's) ---
-        let d_canonical = d.public().to_canonical().unwrap();
-        let grant_nonce = [0x42u8; secsec_roster::GRANT_NONCE_LEN];
-        // both sides compute the SAS over RFP ‖ D_pubkey ‖ grant_nonce; the human confirms they match.
-        let sas_e = sas_value(&rfp, &d_canonical, &grant_nonce);
-        let sas_d = sas_value(&rfp, &d_canonical, &grant_nonce);
-        assert_eq!(sas_e, sas_d, "SAS must agree out-of-band");
+        let rfp = init_repo_remote(&remote, &e, 0).await.unwrap();
+        let (mk, _st, _a) = open_repo_remote(&remote, &e, &rfp, None).await.unwrap();
 
-        // --- E writes the grant records + attestation ---
-        let enrollment_nonce = [0x99u8; ENROLLMENT_NONCE_LEN];
-        // D derives its X-Wing public from its SSH key and sends it over the grant channel; E wraps
-        // D's (mandatory) X-Wing keyslot to it.
+        // E grants D.
         let d_xwing = device_xwing_pub(&d).unwrap();
-        let attestation =
-            grant_device(&store, &e, &mk, &d.public(), &d_xwing, &enrollment_nonce, 0).unwrap();
+        grant_device_remote(&remote, &e, &mk, &d.public(), &d_xwing, 0)
+            .await
+            .unwrap();
 
-        // --- D's first sync: cold-start recovers the master key + sees itself a member ---
-        let (mk_d, st_d) = open_repo(&store, &d, &rfp).unwrap();
+        // D is now a member and owns a gen-1 keyslot.
+        let did = d.device_id().unwrap();
+        let (mk_d, st_d, _a) = open_repo_remote(&remote, &d, &rfp, None).await.unwrap();
         assert_eq!(mk_d.generation(), 1);
-        assert!(st_d.is_member(&d.device_id().unwrap()));
+        assert!(st_d.is_member(&did));
         assert!(st_d.is_member(&e.device_id().unwrap()));
-        assert_eq!(st_d.members.len(), 2);
+        assert!(remote.store.get_keyslot(&did, 1).unwrap().is_some());
 
-        // D verifies the grant attestation covers exactly the enrollment_nonce it received from E (§7
-        // step 4), signed by a current member (E).
-        let roster_seq = store.roster_len().unwrap() - 1; // the AddDevice entry's seq
-        assert!(verify_grant(
-            &e.public(),
-            &d_canonical,
-            &mk.mk_commit(),
-            roster_seq,
-            &enrollment_nonce,
-            &attestation,
-        )
-        .is_ok());
-        // a wrong enrollment_nonce (a replayed/stale attestation) is rejected.
-        assert!(verify_grant(
-            &e.public(),
-            &d_canonical,
-            &mk.mk_commit(),
-            roster_seq,
-            &[0u8; ENROLLMENT_NONCE_LEN],
-            &attestation,
-        )
-        .is_err());
+        // E revoke⇒rotates D.
+        rotate_repo_remote(&remote, &e, &mk, &st_d, &rfp, Some(did), 0)
+            .await
+            .unwrap();
 
-        // after the grant, E can rotate-revoke D (revoke ⇒ rotate), removing it from membership.
-        let (_mk2, st2) = rotate_repo(
-            &store,
-            &e,
-            &mk,
-            &st_d,
-            &rfp,
-            Some(d.device_id().unwrap()),
-            0,
-        )
-        .unwrap();
-        assert!(
-            !st2.is_member(&d.device_id().unwrap()),
-            "revoked device removed"
-        );
+        // E cold-starts onto the new generation; D is gone and its old keyslot was deleted.
+        let (mk2, st2, _a) = open_repo_remote(&remote, &e, &rfp, None).await.unwrap();
+        assert_eq!(mk2.generation(), 2);
+        assert!(!st2.is_member(&did), "revoked device removed from the roster");
         assert!(st2.is_member(&e.device_id().unwrap()));
+        assert!(
+            remote.store.get_keyslot(&did, 1).unwrap().is_none(),
+            "revoked device's keyslot was deleted"
+        );
     }
 }
