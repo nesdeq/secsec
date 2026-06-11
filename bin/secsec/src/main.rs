@@ -16,6 +16,9 @@
 //! - `secsec log [path]` / `secsec restore <path> [version]` — browse the change history (whole repo
 //!   or one file/folder) and restore a historic version into the working folder, which the next sync
 //!   propagates like any edit. Run inside the synced folder; read-side over the existing object plane.
+//! - `secsec reset [dir]` — wipe secsec's local state where it is run (the client link/cache for a
+//!   synced folder and/or a blind server's repo + host key in a serve dir), leaving your files and
+//!   your `~/.ssh` key untouched. Start-over button after a botched link or for decommissioning.
 //!
 //! Garbage collection (§15) runs automatically inside `sync`; there is no manual command.
 
@@ -122,6 +125,15 @@ enum Cmd {
         device: String,
         /// A folder already linked to the repo (default: current directory).
         dir: Option<PathBuf>,
+    },
+    /// Wipe secsec's local state at a location (client link/cache and/or server repo + host key) and
+    /// start over — your files and your `~/.ssh` key are left untouched. Stop a running sync/serve first.
+    Reset {
+        /// The synced folder and/or serve dir to reset (default: current directory).
+        dir: Option<PathBuf>,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -536,6 +548,19 @@ async fn run_sync(
         Ok(s) => Some(parse_hex32(&s)?),
         Err(_) => None,
     };
+
+    // Startup store hygiene, once per session — the local mirror of the server's §15 keep-everything
+    // GC, so both ends prune identically: drop objects unreachable from our last-synced head (orphans
+    // from cas-conflict retries / aborted pushes), keeping the full reachable history. Best-effort:
+    // never blocks syncing. (This trims the logical object set; it does not shrink the redb file,
+    // which redb re-grows to its working size on the next write — a real footprint cut needs §15+ work.)
+    if let Some(b) = base {
+        match secsec_client::gc::local_sweep(&keyring, &store, &b) {
+            Ok(n) if n > 0 => eprintln!("local GC: dropped {n} unreachable object(s)"),
+            _ => {}
+        }
+    }
+
     println!(
         "synced '{}' (generation {}, {} member(s)) ↔ {}",
         ref_name,
@@ -1122,6 +1147,90 @@ async fn run_revoke(device_prefix: String, dir: PathBuf) -> Result<(), Box<dyn E
     Ok(())
 }
 
+// ---- reset ----
+
+/// `secsec reset [dir]` — remove all secsec-owned state at a location and start clean, **without**
+/// touching your files or your `~/.ssh` key. Deletes whichever of these exist here:
+///   * the client sync state for the folder — the link, object cache, and rollback cursor, kept
+///     out-of-tree under `~/.local/state/secsec/<hash>` (so the folder itself stays just your files);
+///   * a blind server's `repo.secsec` (the whole encrypted store) and `hostkey/` (host + receipt key).
+///
+/// A synced folder yields only the first; a serve dir only the latter — they don't overlap. Prompts
+/// with the exact paths before deleting (skip with `--yes`). Afterwards the next `sync` re-clones as a
+/// fresh device, and the next `serve` mints a new host key (clients re-TOFU). Stop a running
+/// sync/serve before resetting so it isn't operating on a store you just unlinked.
+fn run_reset(dir: PathBuf, yes: bool) -> Result<(), Box<dyn Error>> {
+    // (path, what-it-is, is_dir) for each piece of secsec state that actually exists at `dir`.
+    let mut targets: Vec<(PathBuf, &str, bool)> = Vec::new();
+
+    // Client state: out-of-tree, keyed by the folder's canonical path (must match `state_dir_for`).
+    if let Ok(abs) = std::fs::canonicalize(&dir) {
+        let h = blake3::hash(abs.to_string_lossy().as_bytes());
+        let cdir = home()?.join(".local/state/secsec").join(hex(h.as_bytes()));
+        if cdir.exists() {
+            targets.push((
+                cdir,
+                "client sync state — link, object cache, rollback cursor",
+                true,
+            ));
+        }
+    }
+    // Server state: lives directly in the serve dir (which holds nothing but these).
+    let repo = dir.join("repo.secsec");
+    if repo.is_file() {
+        targets.push((
+            repo,
+            "server repository — the ENTIRE encrypted store (all devices' data)",
+            false,
+        ));
+    }
+    let hostkey = dir.join("hostkey");
+    if hostkey.is_dir() {
+        targets.push((
+            hostkey,
+            "server host key + receipt seed — clients will have to re-verify the pin",
+            true,
+        ));
+    }
+
+    if targets.is_empty() {
+        println!(
+            "nothing to reset — no secsec state found at {}",
+            dir.display()
+        );
+        return Ok(());
+    }
+
+    println!("This will permanently remove:");
+    for (path, what, _) in &targets {
+        println!("  {}\n      {what}", path.display());
+    }
+    println!("Your files and your ~/.ssh key are left untouched.");
+
+    if !yes {
+        use std::io::Write;
+        eprint!("Proceed? [y/N] ");
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES") {
+            println!("aborted — nothing removed.");
+            return Ok(());
+        }
+    }
+
+    for (path, _, is_dir) in &targets {
+        if *is_dir {
+            std::fs::remove_dir_all(path)?;
+        } else {
+            std::fs::remove_file(path)?;
+        }
+        println!("removed {}", path.display());
+    }
+    println!("reset complete.");
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let rt = || tokio::runtime::Runtime::new();
@@ -1151,5 +1260,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Cmd::Log { path } => rt()?.block_on(run_log(path)),
         Cmd::Restore { path, version } => rt()?.block_on(run_restore(path, version)),
         Cmd::Revoke { device, dir } => rt()?.block_on(run_revoke(device, dir.unwrap_or_else(cwd))),
+        // reset is pure filesystem cleanup (no network), so it needs no tokio runtime.
+        Cmd::Reset { dir, yes } => run_reset(dir.unwrap_or_else(cwd), yes),
     }
 }

@@ -205,6 +205,17 @@ pub async fn gc_collect<R: Remote, K: MasterKeys>(
         .await?)
 }
 
+/// Keep-everything sweep of the client's **own** object cache — the local mirror of the server's §15
+/// sweep, so both ends prune identically. Delete every object **unreachable** from `head` (the orphans
+/// left by cas-conflict retries and aborted pushes), keeping the full reachable history. Unlike the
+/// server sweep there is **no grace window**: this cache serves only the local device, so anything
+/// unreachable from our head is pure garbage. Returns the number of objects dropped. **Fail-safe**: if
+/// the reachable closure can't be built (a missing object), it errors and deletes nothing.
+pub fn local_sweep<K: MasterKeys>(keys: &K, store: &Store, head: &Id) -> Result<u64, ClientError> {
+    let keep = reachable_objects(keys, store, &[*head])?;
+    Ok(store.gc(&keep, u64::MAX)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -86,6 +86,7 @@ from_redb!(
     redb::TableError,
     redb::StorageError,
     redb::CommitError,
+    redb::CompactionError,
 );
 
 /// A content-addressed object store backed by a single `redb` database file.
@@ -402,6 +403,15 @@ impl Store {
         let objs = rtx.open_table(OBJECTS)?;
         Ok(objs.len()?)
     }
+
+    /// Compact the database file, returning freed pages to the OS — reclaims the space left by a
+    /// [`Store::gc`] sweep (deleted objects) and by redb's copy-on-write churn. Returns `true` if it
+    /// shrank the file. Requires **exclusive** access (no other live read/write transaction), so call
+    /// it at startup before any other work. Best-effort at the call site: a failure leaves the store
+    /// fully usable, just not compacted.
+    pub fn compact(&mut self) -> Result<bool, StoreError> {
+        Ok(self.db.compact()?)
+    }
 }
 
 #[cfg(test)]
@@ -584,5 +594,29 @@ mod tests {
 
         // a second identical sweep deletes nothing.
         assert_eq!(s.gc(&keep, 3).unwrap(), 0);
+    }
+
+    #[test]
+    fn compact_reclaims_space_after_a_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("objects.redb");
+        let mut s = Store::open(&path).unwrap();
+        // Fill with sizable objects so the live file is clearly non-trivial.
+        for i in 0..256u32 {
+            let mut k = [0u8; 32];
+            k[..4].copy_from_slice(&i.to_le_bytes());
+            s.put(&k, &vec![0xab; 4096]).unwrap();
+        }
+        let grown = std::fs::metadata(&path).unwrap().len();
+        // Sweep everything (keep nothing; every epoch ≤ u64::MAX).
+        assert_eq!(s.gc(&BTreeSet::new(), u64::MAX).unwrap(), 256);
+        assert_eq!(s.object_count().unwrap(), 0);
+        // The sweep frees pages but does not shrink the file; compaction returns them to the OS.
+        s.compact().unwrap();
+        let compacted = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            compacted < grown,
+            "compaction reclaims swept space ({grown} → {compacted})"
+        );
     }
 }

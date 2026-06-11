@@ -424,4 +424,49 @@ mod tests {
         .unwrap();
         assert_eq!(r5.kind, SyncKind::UpToDate);
     }
+
+    #[tokio::test]
+    async fn local_sweep_keeps_reachable_and_drops_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = MasterKey::new(1, [0x55; 32]);
+        let dev_a = DeviceKey::generate().unwrap();
+        let members: BTreeMap<DeviceId, DevicePublic> =
+            [(dev_a.device_id().unwrap(), dev_a.public())]
+                .into_iter()
+                .collect();
+        let remote = MemRemote::new(Store::open(dir.path().join("remote.redb")).unwrap());
+        let a_store = Store::open(dir.path().join("a.redb")).unwrap();
+
+        // A publishes a folder → a_store holds exactly the head's reachable closure.
+        let a_dir = tempfile::tempdir().unwrap();
+        std::fs::write(a_dir.path().join("hello.txt"), b"v1").unwrap();
+        let r = sync_once(
+            &remote,
+            &a_store,
+            a_dir.path(),
+            &m,
+            &dev_a,
+            &members,
+            &SyncFrontier::default(),
+            "main",
+            0,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        let head = r.base.unwrap();
+        let reachable = a_store.object_count().unwrap();
+
+        // Inject an object unreachable from the head (an orphan, as a cas-conflict retry would leave).
+        a_store.put(&[0xee; 32], b"orphan").unwrap();
+        assert_eq!(a_store.object_count().unwrap(), reachable + 1);
+
+        // The sweep drops exactly the orphan; the head's full closure survives and still opens.
+        let dropped = crate::gc::local_sweep(&m, &a_store, &head).unwrap();
+        assert_eq!(dropped, 1, "only the unreachable orphan is dropped");
+        assert_eq!(a_store.get(&[0xee; 32]).unwrap(), None);
+        assert_eq!(a_store.object_count().unwrap(), reachable);
+        assert!(open_signed_commit(&head, &m, &a_store).is_ok());
+    }
 }

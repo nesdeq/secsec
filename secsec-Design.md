@@ -1113,6 +1113,14 @@ falls out of the keep-set and ages past the grace window; nothing is deleted sil
 mechanism is unchanged from prior drafts; only the *trigger* moved from a manual command into the
 sync loop.
 
+The **same keep-everything policy also runs against the client's own local object cache**
+(`objects.secsec`) once per session, so both ends prune identically: it drops objects unreachable
+from the client's head — orphans left by cas-conflict retries and aborted pushes — while keeping the
+full reachable history (no grace window is needed, since that cache serves only the local device).
+This trims the *logical* object set; it does not by itself shrink the on-disk `redb` file, which
+`redb` re-grows to its working size on the next write — reclaiming the file footprint needs the
+delta-scoped transfer that would let the local cache hold only the current snapshot.
+
 - **Keep-set** = reachable closure over the heads of **all devices in the RFP-anchored roster**
   (each at `/refs/<H>`), unioned across all remotes — not merely the refs a server volunteers.
   If a rostered device's head is unavailable on a remote, GC **fails safe** (keeps that remote's
