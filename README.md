@@ -64,7 +64,8 @@ secsec serve /srv/data 8899        # dir defaults to the current dir, port to 88
 ```
 
 **Device 1 — create the repository and sync.** The first device to sync a folder *creates* the repo
-(genesis). It uses `~/.ssh/id_ed25519`. Name the server once; afterwards just `secsec sync <dir>`.
+(genesis). It uses `~/.ssh/id_ed25519` (prompting for its passphrase if the key is encrypted). Name
+the server once; afterwards just `secsec sync <dir>`.
 
 ```sh
 secsec sync ~/Sync --server server.example:8899

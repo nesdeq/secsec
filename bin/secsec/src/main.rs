@@ -35,6 +35,7 @@ use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 /// Default listen port (§19: udp/8899).
 const DEFAULT_PORT: u16 = 8899;
@@ -141,12 +142,43 @@ fn home() -> Result<PathBuf, Box<dyn Error>> {
         .ok_or_else(|| "HOME is not set".into())
 }
 
-/// Load this device's SSH key from `~/.ssh/id_ed25519`.
+/// Load this device's SSH key from `~/.ssh/id_ed25519`. If the key is passphrase-encrypted, prompt
+/// for the passphrase (no echo) and decrypt it in memory — secsec needs the raw key, not just an
+/// agent, so the passphrase is required, but the on-disk key stays encrypted (see
+/// [`DeviceKey::from_openssh_passphrase`]).
 fn default_device() -> Result<DeviceKey, Box<dyn Error>> {
     let path = home()?.join(".ssh/id_ed25519");
     let pem = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read device key {}: {e}", path.display()))?;
-    Ok(DeviceKey::from_openssh(&pem)?)
+    match DeviceKey::from_openssh(&pem) {
+        Ok(device) => Ok(device),
+        Err(secsec_sig::SigError::Encrypted) => decrypt_device(&pem, &path),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The device key is passphrase-encrypted: prompt on the terminal with no echo (up to 3 attempts) and
+/// decrypt it in RAM. The typed passphrase is zeroized after each try and the on-disk key is never
+/// modified.
+fn decrypt_device(pem: &str, path: &Path) -> Result<DeviceKey, Box<dyn Error>> {
+    const MAX_TRIES: usize = 3;
+    for attempt in 1..=MAX_TRIES {
+        let passphrase = Zeroizing::new(rpassword::prompt_password(format!(
+            "passphrase for {}: ",
+            path.display()
+        ))?);
+        match DeviceKey::from_openssh_passphrase(pem, &passphrase) {
+            Ok(device) => return Ok(device),
+            // Wrong passphrase: re-prompt unless that was the last allowed attempt.
+            Err(secsec_sig::SigError::BadPassphrase) => {
+                if attempt < MAX_TRIES {
+                    eprintln!("wrong passphrase — try again");
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err("could not decrypt the device key: wrong passphrase".into())
 }
 
 /// The out-of-tree state directory for a synced folder: `~/.local/state/secsec/<hash(abspath)>/`

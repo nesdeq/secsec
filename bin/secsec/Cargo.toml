@@ -26,3 +26,5 @@ getrandom = "0.3"
 blake3 = "1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rcgen = "0.13"
+rpassword = "7"              # no-echo TTY prompt for an encrypted ~/.ssh/id_ed25519 passphrase
+zeroize = "1"                # wipe the typed passphrase from memory after decrypting the key

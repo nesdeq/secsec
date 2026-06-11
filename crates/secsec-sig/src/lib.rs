@@ -48,6 +48,10 @@ pub enum SigError {
     VerifyFailed,
     /// Ed25519 → X25519 key conversion failed (malformed key point).
     KeyConversion,
+    /// The private key is passphrase-encrypted; load it with [`DeviceKey::from_openssh_passphrase`].
+    Encrypted,
+    /// Decrypting an encrypted private key failed — wrong passphrase.
+    BadPassphrase,
 }
 
 impl core::fmt::Display for SigError {
@@ -57,6 +61,10 @@ impl core::fmt::Display for SigError {
             SigError::NotEd25519 => f.write_str("key/signature is not Ed25519"),
             SigError::VerifyFailed => f.write_str("signature verification failed"),
             SigError::KeyConversion => f.write_str("Ed25519 to X25519 conversion failed"),
+            SigError::Encrypted => f.write_str("private key is passphrase-encrypted"),
+            SigError::BadPassphrase => {
+                f.write_str("could not decrypt private key (wrong passphrase)")
+            }
         }
     }
 }
@@ -86,9 +94,38 @@ impl DeviceKey {
         Ok(Self { key })
     }
 
-    /// Load a device key from an OpenSSH-format private key (PEM). Rejects non-Ed25519 keys.
+    /// Load a device key from an **unencrypted** OpenSSH-format private key (PEM). Rejects
+    /// non-Ed25519 keys, and rejects a passphrase-encrypted key with [`SigError::Encrypted`] —
+    /// call [`Self::from_openssh_passphrase`] to supply the passphrase.
     pub fn from_openssh(pem: &str) -> Result<Self, SigError> {
+        Self::finish(PrivateKey::from_openssh(pem)?)
+    }
+
+    /// Load a device key from an OpenSSH-format private key (PEM), decrypting it in memory with
+    /// `passphrase` when the key is encrypted (a no-op for an unencrypted key).
+    ///
+    /// secsec needs the **raw** private key, not just a signing oracle: the X-Wing keyslot
+    /// decapsulation seed ([`Self::xwing_seed`]) and the local-seal key ([`Self::local_seal_key`])
+    /// are derived from it (§5/§8.3), so an ssh-agent cannot stand in. The decrypted key lives only
+    /// in this process (zeroized on drop, like every other secret here) and is never written back to
+    /// disk — the on-disk key stays encrypted.
+    pub fn from_openssh_passphrase(pem: &str, passphrase: &str) -> Result<Self, SigError> {
         let key = PrivateKey::from_openssh(pem)?;
+        let key = if key.is_encrypted() {
+            key.decrypt(passphrase)
+                .map_err(|_| SigError::BadPassphrase)?
+        } else {
+            key
+        };
+        Self::finish(key)
+    }
+
+    /// Validate a parsed private key: reject one that is still encrypted (no passphrase supplied) or
+    /// not Ed25519, then wrap it.
+    fn finish(key: PrivateKey) -> Result<Self, SigError> {
+        if key.is_encrypted() {
+            return Err(SigError::Encrypted);
+        }
         if key.algorithm() != Algorithm::Ed25519 {
             return Err(SigError::NotEd25519);
         }
@@ -377,5 +414,51 @@ mod tests {
         let opensshd = pk.key.to_openssh().unwrap();
         let reparsed = DevicePublic::from_openssh(&opensshd).unwrap();
         assert_eq!(reparsed.device_id().unwrap(), pk.device_id().unwrap());
+    }
+
+    /// A passphrase-encrypted `id_ed25519`: `from_openssh` refuses it with a clear `Encrypted` (not a
+    /// later confusing sign failure), `from_openssh_passphrase` decrypts it in memory and yields a
+    /// fully usable key (same id, and it can sign), and a wrong passphrase is `BadPassphrase`.
+    #[test]
+    fn encrypted_key_loads_only_with_the_right_passphrase() {
+        let k = DeviceKey::generate().unwrap();
+        let id = k.device_id().unwrap();
+        // Encrypt the same key under a passphrase and serialize it as an OpenSSH PEM.
+        let encrypted_pem = k
+            .key
+            .encrypt(&mut rand_core::OsRng, b"correct horse")
+            .unwrap()
+            .to_openssh(LineEnding::LF)
+            .unwrap();
+
+        // Plain loader refuses an encrypted key up front (was: load-then-fail-at-sign → `Auth`).
+        assert!(matches!(
+            DeviceKey::from_openssh(&encrypted_pem),
+            Err(SigError::Encrypted)
+        ));
+        // Wrong passphrase → BadPassphrase.
+        assert!(matches!(
+            DeviceKey::from_openssh_passphrase(&encrypted_pem, "wrong"),
+            Err(SigError::BadPassphrase)
+        ));
+        // Right passphrase → the genuine key: same id, and the previously-failing sign path works.
+        let dk = DeviceKey::from_openssh_passphrase(&encrypted_pem, "correct horse").unwrap();
+        assert_eq!(dk.device_id().unwrap(), id);
+        let sig = dk.sign(NS_AUTH, b"connection-auth payload").unwrap();
+        assert!(dk
+            .public()
+            .verify(NS_AUTH, b"connection-auth payload", &sig)
+            .is_ok());
+        // The keyslot-decap seed is derivable too (the agent-can't-do-this material).
+        assert!(dk.xwing_seed().is_ok());
+    }
+
+    /// An unencrypted key still loads through `from_openssh_passphrase` (the passphrase is ignored).
+    #[test]
+    fn passphrase_loader_is_a_noop_for_unencrypted_keys() {
+        let k = DeviceKey::generate().unwrap();
+        let pem = k.key.to_openssh(LineEnding::LF).unwrap();
+        let dk = DeviceKey::from_openssh_passphrase(&pem, "ignored").unwrap();
+        assert_eq!(dk.device_id().unwrap(), k.device_id().unwrap());
     }
 }
