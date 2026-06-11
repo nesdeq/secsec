@@ -810,26 +810,38 @@ pub fn devices_added_by(state: &State, revoked: &DeviceId, after_seq: u64) -> Ve
 }
 
 /// The **transitive** revoke-before-add closure (§8.1, §8.4 step 1): every current member reachable
-/// from `revoked` through the add-by graph within the window — devices `revoked` granted, devices
-/// *they* granted, and so on (all at/after `after_seq`). Returns the set **excluding** `revoked`
-/// itself, sorted.
+/// from `revoked` through the add-by graph whose own grant is at/after `after_seq` — devices `revoked`
+/// granted, devices *they* granted, and so on. Returns the set **excluding** `revoked` itself, sorted.
 ///
-/// One level is not enough: a compromised device B can add C and have C add E, so that revoking B
-/// (one level → only C) leaves E behind to survive the rotation. Closing only the direct level
-/// reopens the very backdoor `revoke⇒rotate` exists to shut, so the whole subtree is swept. Deeper
-/// levels trivially satisfy `after_seq` (a child cannot be added before its parent existed).
+/// One level is not enough: a compromised device B can add C and have C add E, so revoking only B's
+/// direct grants leaves the nested sleeper E to survive the rotation. The traversal therefore walks
+/// the **whole** add-by subtree — *through* an out-of-scope (pre-`after_seq`) child to reach its
+/// post-`after_seq` descendants — but only **collects** grants at/after `after_seq`. A grant made
+/// before the revoker's reference point was already witnessed and accepted under prior trust, so it is
+/// retained; one of *its* later grants is not, and is swept. (Applying the `after_seq` filter to the
+/// *traversal* rather than only the *collection* would let a pre-reference child shield its
+/// post-reference subtree — the bug this avoids.) With `after_seq == 0` (the wired `revoke⇒rotate`
+/// callers) every reachable device is collected — the whole subtree is swept.
 #[must_use]
 pub fn revoke_closure(state: &State, revoked: &DeviceId, after_seq: u64) -> Vec<DeviceId> {
-    let mut found: BTreeSet<DeviceId> = BTreeSet::new();
+    let mut result: BTreeSet<DeviceId> = BTreeSet::new();
+    let mut seen: BTreeSet<DeviceId> = BTreeSet::new();
     let mut work = vec![*revoked];
     while let Some(cur) = work.pop() {
-        for d in devices_added_by(state, &cur, after_seq) {
-            if found.insert(d) {
-                work.push(d);
+        // Walk the entire add-by subtree (after_seq = 0 ⇒ all children of `cur`), even through
+        // out-of-scope children, so a post-reference descendant of a pre-reference child is reached.
+        for d in devices_added_by(state, &cur, 0) {
+            if !seen.insert(d) {
+                continue;
+            }
+            work.push(d);
+            // Collect only grants at/after the revoker's reference point.
+            if state.added_at.get(&d).is_some_and(|s| *s >= after_seq) {
+                result.insert(d);
             }
         }
     }
-    found.into_iter().collect()
+    result.into_iter().collect()
 }
 
 /// Build the ordered op sequence for `revoke⇒rotate` (§8.4): `RevokeDevice(revoked)`, then a
@@ -1045,6 +1057,33 @@ mod tests {
         let mut want = vec![c.device_id().unwrap(), e.device_id().unwrap()];
         want.sort();
         assert_eq!(closure, want);
+    }
+
+    /// `after_seq > 0`: a pre-reference child is retained (its grant was witnessed under prior trust),
+    /// but the traversal still reaches and sweeps its **post-reference** descendant — the nested-sleeper
+    /// guard must not be blocked by an out-of-scope intermediate.
+    #[test]
+    fn revoke_closure_reaches_post_reference_descendant_of_pre_reference_child() {
+        let d1 = DeviceKey::generate().unwrap();
+        let b = DeviceKey::generate().unwrap();
+        let c = DeviceKey::generate().unwrap();
+        let e = DeviceKey::generate().unwrap();
+        let (entries, rfp) = chain(
+            &d1,
+            vec![
+                (add(&b), &d1), // seq 1
+                (add(&c), &b),  // seq 2: B adds C  (pre-reference grant)
+                (add(&e), &c),  // seq 3: C adds E  (post-reference grant)
+            ],
+        );
+        let st = fold(&entries, &rfp).unwrap();
+        let b_id = b.device_id().unwrap();
+
+        // Reference point seq = 3: C's grant (seq 2) is out of scope; E's grant (seq 3) is in scope.
+        // C is retained; E — the sleeper C added after the reference — is swept.
+        let closure = revoke_closure(&st, &b_id, 3);
+        assert_eq!(closure, vec![e.device_id().unwrap()]);
+        assert!(!closure.contains(&c.device_id().unwrap()));
     }
 
     /// End-to-end: building revoke⇒rotate ops, appending them, and re-folding leaves none of the
