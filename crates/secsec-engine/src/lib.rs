@@ -78,7 +78,7 @@ fn load_nodes_inner<K: MasterKeys>(
     store: &Store,
     depth: usize,
 ) -> Result<BTreeMap<String, Node>, EngineError> {
-    if depth > MAX_TREE_DEPTH {
+    if depth >= MAX_TREE_DEPTH {
         return Err(EngineError::DepthExceeded);
     }
     let tree = secsec_snapshot::load_tree(tree_id, tree_salt, keys, store)?;

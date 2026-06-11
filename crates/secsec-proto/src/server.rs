@@ -207,6 +207,14 @@ impl WindowCounter {
         }
     }
 
+    /// Undo the most recent [`try_record`](Self::try_record) — for an op that was counted but then did
+    /// no work (e.g. it lost a downstream compare-and-swap). Pops the latest event; a no-op if empty.
+    /// Events are interchangeable timestamps, so popping the back restores the count correctly even
+    /// under interleaved records on the same counter.
+    pub fn refund(&mut self) {
+        self.events.pop_back();
+    }
+
     /// Events currently within the trailing window (after pruning to `now`).
     pub fn count(&mut self, now: u64) -> u64 {
         self.prune(now);
@@ -332,6 +340,21 @@ mod tests {
         // after the window slides past the early events, capacity frees up.
         assert!(w.try_record(3601), "event at 3601 prunes the t=0 event");
         assert_eq!(w.count(3601), 4); // t in {10,20,30,3601}
+    }
+
+    #[test]
+    fn window_counter_refund_returns_a_slot() {
+        let mut w = WindowCounter::new(limits::HOUR_SECS, 2);
+        assert!(w.try_record(0));
+        assert!(w.try_record(0));
+        assert!(!w.try_record(0), "cap reached");
+        w.refund(); // e.g. the recorded op then lost a CAS
+        assert!(w.try_record(0), "a refunded slot is reusable");
+        assert_eq!(w.count(0), 2);
+        // refund on an empty counter is a harmless no-op.
+        let mut e = WindowCounter::new(60, 1);
+        e.refund();
+        assert_eq!(e.count(0), 0);
     }
 
     #[test]

@@ -546,7 +546,7 @@ fn snapshot_dir(
     prev: Option<&Tree>,
     this_salt: PathSalt,
 ) -> Result<(Id, PathSalt), SnapError> {
-    if depth > MAX_TREE_DEPTH {
+    if depth >= MAX_TREE_DEPTH {
         return Err(SnapError::DepthExceeded);
     }
     // Read and sort entries by name for a deterministic, canonical tree.
@@ -649,7 +649,7 @@ fn restore_tree<K: MasterKeys>(
     dir: &Path,
     depth: usize,
 ) -> Result<(), SnapError> {
-    if depth > MAX_TREE_DEPTH {
+    if depth >= MAX_TREE_DEPTH {
         return Err(SnapError::DepthExceeded);
     }
     let tree = decode_tree(&fetch_open(keys, ObjType::Tree, tree_salt, tree_id, store)?)?;
@@ -707,7 +707,12 @@ fn apply_metadata(path: &Path, mode: u32, mtime: u64) -> Result<(), SnapError> {
     }
     #[cfg(not(unix))]
     let _ = mode;
-    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(mtime as i64, 0))?;
+    // `mtime` is attacker-influenced (decoded from a member-authored tree); saturate at i64::MAX so a
+    // hostile value cannot wrap to a negative (pre-1970) time, which would break snapshot→restore
+    // idempotence (re-snapshot reads back the OS-clamped value, not the stored one) and spuriously
+    // re-commit. Snapshots only ever record real file mtimes, so this never affects honest data.
+    let secs = i64::try_from(mtime).unwrap_or(i64::MAX);
+    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(secs, 0))?;
     Ok(())
 }
 
@@ -799,7 +804,7 @@ fn collect_tree<K: MasterKeys>(
     depth: usize,
     reachable: &mut std::collections::BTreeSet<Id>,
 ) -> Result<(), SnapError> {
-    if depth > MAX_TREE_DEPTH {
+    if depth >= MAX_TREE_DEPTH {
         return Err(SnapError::DepthExceeded);
     }
     if !reachable.insert(*tree_id) {
@@ -989,7 +994,7 @@ fn diff_trees<K: MasterKeys>(
     depth: usize,
     out: &mut Vec<String>,
 ) -> Result<(), SnapError> {
-    if depth > MAX_TREE_DEPTH {
+    if depth >= MAX_TREE_DEPTH {
         return Err(SnapError::DepthExceeded);
     }
     let load = |t: Option<(&Id, &PathSalt)>| -> Result<Vec<Entry>, SnapError> {

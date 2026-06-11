@@ -24,7 +24,9 @@ pub const FORMAT_VERSION_V1: u8 = 1;
 /// Compile-time format-version floor (§16): anything below this is rejected outright.
 pub const MIN_FORMAT_VERSION: u8 = 1;
 
-/// `algo_id` for the classical suite (ChaCha20-Poly1305 CTX AEAD; X25519/HPKE keyslots).
+/// `algo_id` for the v1 object AEAD suite (ChaCha20-Poly1305 CTX, §9.4). This is the FRAME's
+/// symmetric-suite tag and is a **separate namespace** from the keyslot KEM `algo_id` (X-Wing = 2,
+/// §8.3), which is carried in the keyslot blob, not the FRAME.
 pub const ALGO_CLASSICAL_V1: u8 = 1;
 /// Compile-time algorithm floor (§16): `algo_id` below this is rejected as a downgrade.
 pub const MIN_ALGO_ID: u8 = 1;

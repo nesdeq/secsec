@@ -136,6 +136,15 @@ impl ServerState {
             .try_record(now)
     }
 
+    /// Refund a sigchain-append slot charged by [`sigchain_record`](Self::sigchain_record) when the
+    /// append then lost the tip CAS — a CAS-losing racer should not burn one of its 60/hr slots (§8.1:
+    /// retried revocations must still succeed within the window).
+    fn sigchain_refund(&mut self, d: DeviceId) {
+        if let Some(w) = self.sigchain_calls.get_mut(&d) {
+            w.refund();
+        }
+    }
+
     fn add_quota(&mut self, d: DeviceId, n: u64) -> bool {
         self.quotas
             .entry(d)
@@ -290,6 +299,10 @@ impl Server {
             .lock()
             .expect("server state")
             .sigchain_record(d, now)
+    }
+
+    fn sigchain_refund(&self, d: DeviceId) {
+        self.state.lock().expect("server state").sigchain_refund(d);
     }
 
     /// Charge a read against the §19 per-key read byte-rate, returning the blob response or a
@@ -563,7 +576,12 @@ impl Server {
                 // Append CAS-guarded by the /roster-head tip (§8.1): a racing append loses.
                 match self.store.append_roster(&old_tip, &entry) {
                     Ok(Some(_seq)) => Response::Ok,
-                    Ok(None) => Response::Err(ErrorCode::CasConflict),
+                    // A CAS loss did not grow the chain; refund the slot so a benign race doesn't
+                    // exhaust the device's hourly budget and block a legitimate retried revocation.
+                    Ok(None) => {
+                        self.sigchain_refund(device_id);
+                        Response::Err(ErrorCode::CasConflict)
+                    }
                     Err(_) => Response::Err(ErrorCode::Internal),
                 }
             }
