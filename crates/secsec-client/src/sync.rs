@@ -142,8 +142,10 @@ async fn pull_to<R: Remote, K: MasterKeys>(
 
 /// Reconcile `dir` with `/refs/<ref_name>` once (§10). See the module docs for the four cases. `base`
 /// is the last-synced commit (`None` on a fresh client / new repo); `roster_seq` is the current
-/// sigchain sequence the commit is written under. Returns the action, the new base to persist, and the
-/// advanced frontier.
+/// sigchain sequence the commit is written under. `seal` persists the advanced frontier and is invoked
+/// **before** any head push that advances the ref (§8.5 seal-before-write); a `seal` failure aborts
+/// before publishing. Returns the action, the new base to persist, and the advanced frontier (which
+/// the caller should also persist after the call, to capture our own commit's high-water).
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_once<R: Remote, K: MasterKeys>(
     remote: &R,
@@ -157,6 +159,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
     roster_seq: u64,
     base: Option<Id>,
     ts: u64,
+    seal: &dyn Fn(&SyncFrontier) -> Result<(), ClientError>,
 ) -> Result<SyncOutcome, ClientError> {
     // Writes (snapshot, commit, head) use the current generation; reads (closures, old commits) route
     // through `keys`, which resolves any past generation after a rotation (§8.2).
@@ -242,6 +245,8 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
     match head {
         // First publish: no remote head yet.
         None => {
+            // §8.5: seal the frontier (carrying our commit's version) before the ref-advancing push.
+            seal(&f)?;
             let receipts = push_objects(remote, store, keys, &our_commit).await?;
             push_head(
                 remote,
@@ -279,6 +284,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                 ref_name,
                 &our_commit,
                 author,
+                seal,
             )
             .await?;
             let receipts = report.receipts;
@@ -348,6 +354,7 @@ mod tests {
         let a_store = Store::open(dir.path().join("a.redb")).unwrap();
         let b_store = Store::open(dir.path().join("b.redb")).unwrap();
         let fr = SyncFrontier::default();
+        let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
 
         // A publishes a folder.
         let a_dir = tempfile::tempdir().unwrap();
@@ -364,6 +371,7 @@ mod tests {
             0,
             None,
             0,
+            &seal,
         )
         .await
         .unwrap();
@@ -386,6 +394,7 @@ mod tests {
             0,
             None,
             0,
+            &seal,
         )
         .await
         .unwrap();
@@ -408,6 +417,7 @@ mod tests {
             0,
             a_base,
             0,
+            &seal,
         )
         .await
         .unwrap();
@@ -427,6 +437,7 @@ mod tests {
             0,
             b_base,
             0,
+            &seal,
         )
         .await
         .unwrap();
@@ -450,10 +461,59 @@ mod tests {
             0,
             r4.base,
             0,
+            &seal,
         )
         .await
         .unwrap();
         assert_eq!(r5.kind, SyncKind::UpToDate);
+    }
+
+    /// §8.5: the frontier seal runs **before** the ref-advancing push, so a seal failure aborts the
+    /// publish — no head is written to the remote. (A crash post-push could otherwise leave a published
+    /// head uncovered by the persisted anti-rollback frontier.)
+    #[tokio::test]
+    async fn seal_failure_aborts_before_publishing() {
+        use secsec_sync::ref_hash;
+        let dir = tempfile::tempdir().unwrap();
+        let m = MasterKey::new(1, [0x55; 32]);
+        let dev = DeviceKey::generate().unwrap();
+        let members: BTreeMap<DeviceId, DevicePublic> =
+            [(dev.device_id().unwrap(), dev.public())]
+                .into_iter()
+                .collect();
+        let remote = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
+        let store = Store::open(dir.path().join("c.redb")).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("f.txt"), b"v1").unwrap();
+
+        // A seal that always fails: the first publish must abort before advancing the ref.
+        let seal =
+            |_: &SyncFrontier| Err(ClientError::Io(std::io::Error::other("seal failed on purpose")));
+        let res = sync_once(
+            &remote,
+            &store,
+            work.path(),
+            &m,
+            &dev,
+            &members,
+            &SyncFrontier::default(),
+            "main",
+            0,
+            None,
+            0,
+            &seal,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(ClientError::Io(_))),
+            "a seal failure must abort the publish"
+        );
+        // The ref was NOT advanced — the remote head is still absent.
+        let ref_h = ref_hash(&m.ref_name_key(), "main");
+        assert!(
+            remote.get_ref(&ref_h).await.unwrap().is_none(),
+            "no head must be published when the pre-push seal fails"
+        );
     }
 
     /// §8.5/§10: the pull path must reject a replayed head whose `head_version` is below the persisted
@@ -522,6 +582,7 @@ mod tests {
                 .collect();
         let remote = MemRemote::new(Store::open(dir.path().join("remote.redb")).unwrap());
         let a_store = Store::open(dir.path().join("a.redb")).unwrap();
+        let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
 
         // A publishes a folder → a_store holds exactly the head's reachable closure.
         let a_dir = tempfile::tempdir().unwrap();
@@ -538,6 +599,7 @@ mod tests {
             0,
             None,
             0,
+            &seal,
         )
         .await
         .unwrap();

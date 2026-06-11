@@ -509,12 +509,13 @@ pub struct SyncReport {
 /// 4. **Merge** → push the merge commit and advance the ref; **AlreadyHave** (we are ahead) → push
 ///    `our_commit` and advance; **FastForward** (remote is ahead) → adopt it, no write.
 ///
-/// `author` stamps any commit/head we author. The returned [`SyncReport::frontier`] must be persisted
-/// before the next sync (§8.5; persistence is a later slice). Restoring the working tree is the
-/// caller's step (it holds the destination path).
+/// `author` stamps any commit/head we author. `seal` persists the advanced frontier and is invoked
+/// **before** any head push that advances the ref (§8.5: seal the new frontier first, only then write
+/// the head) — a `seal` failure aborts before publishing. Restoring the working tree is the caller's
+/// step (it holds the destination path).
 // The arguments are all distinct, caller-supplied inputs (remote / local store / key / roster /
-// frontier / ref / commit / authorship) with no cohesive subgroup; a parameter object here would
-// only exist to satisfy the lint.
+// frontier / ref / commit / authorship / seal) with no cohesive subgroup; a parameter object here
+// would only exist to satisfy the lint.
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_ref<R: Remote, K: MasterKeys>(
     remote: &R,
@@ -525,6 +526,7 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
     ref_name: &str,
     our_commit: &Id,
     author: CommitAuthor<'_>,
+    seal: &dyn Fn(&SyncFrontier) -> Result<(), ClientError>,
 ) -> Result<SyncReport, ClientError> {
     let device: &DeviceKey = author.device;
     let roster_seq = author.roster_seq;
@@ -533,6 +535,9 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
     let Some((remote_head, remote_sig, remote_blob)) =
         fetch_head(remote, keys.current(), ref_name).await?
     else {
+        // §8.5: seal the frontier (carrying our commit's version, set by the caller) before the
+        // ref-advancing push.
+        seal(frontier)?;
         let receipts = push_objects(remote, store, keys, our_commit).await?;
         let (head, blob) = push_head(
             remote,
@@ -578,6 +583,10 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
     };
 
     let (wrote, receipts) = if let Some(commit_id) = new_commit {
+        // §8.5: seal the observed frontier (the merge's sibling/commit high-waters) before publishing
+        // a head that descends from those observations, so a crash post-push can't leave a published
+        // head uncovered by the persisted anti-rollback frontier.
+        seal(&plan.frontier)?;
         let receipts = push_objects(remote, store, keys, &commit_id).await?;
         let (head, blob) = push_head(
             remote,
@@ -850,6 +859,7 @@ mod tests {
         let c_b = seal_commit(&b_store, &m, &dev_b, bt2, bs2, vec![c_base], 1, c_base);
 
         // B syncs: fetch A's head, rollback-gated merge with c_B, push the merge + advance the ref.
+        let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
         let rep_b = sync_ref(
             &remote,
             &b_store,
@@ -864,6 +874,7 @@ mod tests {
                 roster_seq: 0,
                 ts: 0,
             },
+            &seal,
         )
         .await
         .unwrap();
@@ -920,6 +931,7 @@ mod tests {
                 roster_seq: 0,
                 ts: 0,
             },
+            &seal,
         )
         .await
         .unwrap();

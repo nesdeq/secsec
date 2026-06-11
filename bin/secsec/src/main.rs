@@ -692,6 +692,10 @@ async fn run_sync(
             }
         }
 
+        // §8.5: seal the advanced frontier to disk BEFORE any ref-advancing head push. `sync_once`
+        // invokes this immediately before publishing, so a crash post-push can't leave a published
+        // head uncovered by the persisted anti-rollback frontier.
+        let seal = |fr: &SyncFrontier| save_frontier(&frontier_path, fr, &device);
         match sync_once(
             &rem,
             &store,
@@ -704,10 +708,13 @@ async fn run_sync(
             roster_seq,
             base,
             unix_secs(),
+            &seal,
         )
         .await
         {
             Ok(outcome) => {
+                // Persist the final frontier too — it additionally carries our own commit's high-water,
+                // which the pre-push seal (observations only) need not have included.
                 save_frontier(&frontier_path, &outcome.frontier, &device)?;
                 if let Some(b) = outcome.base {
                     std::fs::write(&base_path, hex(&b))?;
