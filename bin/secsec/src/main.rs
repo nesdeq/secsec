@@ -597,32 +597,45 @@ async fn run_sync(
             want_refold = false;
             match open_repo_remote(&rem, &device, &rfp, Some(anchor)).await {
                 Ok((m, s, a)) => {
-                    if a.max_seq != anchor.max_seq {
-                        let _ = write_link(
-                            &sdir,
-                            &Link {
-                                server: server_str.clone(),
-                                host_id,
-                                rfp,
-                                ref_name: ref_name.clone(),
-                                anchor: Some(a),
-                            },
-                        );
-                    }
-                    mk = m;
-                    st = s;
-                    anchor = a;
-                    roster_seq = a.max_seq;
-                    if let Ok(k) = data_keyring_remote(&rem, &mk).await {
-                        keyring = k;
+                    // Re-peel the data-key ring FIRST, so the roster update is all-or-nothing: never
+                    // advance the generation (`mk`) without its matching keyring (which would make the
+                    // current head/objects unreadable until the next tick). On a peel failure (e.g. a
+                    // transient fetch glitch) keep the last-known roster and try again next cycle.
+                    match data_keyring_remote(&rem, &m).await {
+                        Ok(k) => {
+                            if a.max_seq != anchor.max_seq {
+                                let _ = write_link(
+                                    &sdir,
+                                    &Link {
+                                        server: server_str.clone(),
+                                        host_id,
+                                        rfp,
+                                        ref_name: ref_name.clone(),
+                                        anchor: Some(a),
+                                    },
+                                );
+                            }
+                            mk = m;
+                            st = s;
+                            anchor = a;
+                            roster_seq = a.max_seq;
+                            keyring = k;
+                        }
+                        Err(e) => {
+                            if conn.close_reason().is_none() {
+                                eprintln!("roster refresh failed (using last known roster): {e}");
+                            }
+                        }
                     }
                 }
-                // The server's repo no longer matches this folder's pinned identity (reset / divergence).
-                Err(RepoError::Rollback) | Err(RepoError::Roster(_)) => {
+                // A genuine server rollback/reset: the fetched chain does not extend our persisted
+                // anti-rollback anchor (P7). Only this is fatal; other roster-fold errors are treated as
+                // transient below — a glitchy or partial fetch must not permanently stop syncing.
+                Err(RepoError::Rollback) => {
                     eprintln!(
-                        "ALARM: the repo on {server_str} no longer matches this folder's pinned identity \
-                         (anti-rollback / RFP mismatch) — the server may have been reset or served \
-                         divergent state. Refusing to sync; re-link with `--invite` if this is intended."
+                        "ALARM: the repo on {server_str} no longer extends this folder's anti-rollback \
+                         anchor (P7) — the server may have been reset or rolled back. Refusing to sync; \
+                         re-link with `--invite` if this is intended."
                     );
                     break;
                 }
