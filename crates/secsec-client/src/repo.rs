@@ -107,6 +107,10 @@ pub enum RepoError {
     NotInitialized,
     /// `init` was run on a store that already has a roster tip.
     AlreadyInitialized,
+    /// `init_repo_remote` was called by a device that already owns a keyslot (it is already enrolled).
+    /// Running genesis again would overwrite — and on losing the genesis race, delete — that live
+    /// keyslot, locking the device out of its own repo; the create flow refuses instead (§7).
+    AlreadyEnrolled,
     /// A roster entry expected in `0..roster_len` was missing.
     MissingEntry(u64),
     /// This device owns no keyslot at the current generation (not enrolled here).
@@ -152,6 +156,9 @@ impl core::fmt::Display for RepoError {
             RepoError::Rng => f.write_str("OS RNG failure"),
             RepoError::NotInitialized => f.write_str("store has no roster (run init)"),
             RepoError::AlreadyInitialized => f.write_str("store already initialized"),
+            RepoError::AlreadyEnrolled => {
+                f.write_str("this device is already enrolled; refusing to re-create the repo")
+            }
             RepoError::MissingEntry(s) => write!(f, "roster entry {s} missing"),
             RepoError::NoKeyslot => {
                 f.write_str("no keyslot for this device at the current generation")
@@ -256,10 +263,22 @@ pub async fn init_repo_remote<R: Remote>(
     let roster_key = mk.roster_key();
     let blob = seal_entry(&roster_key, 1, 0, &encode_entry(&entry));
 
+    // Refuse to run genesis if this device is already enrolled (it already owns a gen-1 keyslot).
+    // The keyslot path is /keyslots/<device_id>/1, so the put_keyslot below would OVERWRITE the live
+    // keyslot, and the lost-genesis-race cleanup would then DELETE it — self-lockout. This bites when
+    // an enrolled device runs `sync` on a new, unlinked folder with no --invite (it falls into the
+    // create path). Only `Ok(Some(_))` — we can actually read our own keyslot — means enrolled: a
+    // genuinely fresh device's keyslot read is gated by the server (NotEnrolled ⇒ Err), which we treat
+    // as not-enrolled, the legitimate genesis path. Catching the enrolled case leaves the live keyslot
+    // untouched and makes the cleanup delete below safe (now only reached for a keyslot we just wrote).
+    let device_id = device.device_id()?;
+    if matches!(remote.get_keyslot(&device_id, 1).await, Ok(Some(_))) {
+        return Err(RepoError::AlreadyEnrolled);
+    }
+
     // Write the creator's own keyslot FIRST (allowed pre-enrollment only while the roster is empty —
     // the server's genesis-bootstrap exception), so that by the time the genesis entry is appended the
     // creator is already enrolled.
-    let device_id = device.device_id()?;
     let keyslot = wrap_keyslot(&key, 1, &device_id, &xwing_pub)?;
     remote.put_keyslot(&device_id, 1, &keyslot).await?;
 
@@ -778,6 +797,42 @@ pub async fn open_repo_remote<R: Remote>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a device that already owns a keyslot must not be able to destroy it by re-running
+    /// genesis. An enrolled device that re-enters `init_repo_remote` (e.g. `sync` on a new, unlinked
+    /// folder with no `--invite`, which falls into the create path) MUST be refused with
+    /// `AlreadyEnrolled` and keep its live keyslot. The previous put-keyslot → lost-race delete-keyslot
+    /// path overwrote then deleted the device's only keyslot, locking it out of its own repo.
+    #[tokio::test]
+    async fn init_remote_refuses_an_enrolled_device_and_keeps_its_keyslot() {
+        use crate::testmem::MemRemote;
+        let dir = tempfile::tempdir().unwrap();
+        let remote = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
+        let device = DeviceKey::generate().unwrap();
+
+        // Create the repo over the wire, then confirm the device opens it (keyslot present, unwraps).
+        let rfp = init_repo_remote(&remote, &device, 0).await.unwrap();
+        let (mk1, _st, _anchor) = open_repo_remote(&remote, &device, &rfp, None)
+            .await
+            .unwrap();
+
+        // Re-running genesis (the new-unlinked-folder, no-invite case) is refused, touching nothing.
+        assert!(matches!(
+            init_repo_remote(&remote, &device, 0).await,
+            Err(RepoError::AlreadyEnrolled)
+        ));
+
+        // The live keyslot survived: the device still cold-starts to the SAME master key + membership.
+        let (mk2, st, _) = open_repo_remote(&remote, &device, &rfp, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            mk2.mk_commit(),
+            mk1.mk_commit(),
+            "keyslot must be intact (same master key) after a refused re-init"
+        );
+        assert!(st.is_member(&device.device_id().unwrap()));
+    }
 
     #[test]
     fn init_then_open_recovers_master_key_and_membership() {

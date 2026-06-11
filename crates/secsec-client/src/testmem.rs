@@ -89,4 +89,23 @@ impl Remote for MemRemote {
             .map(|_| GcOutcome::Swept)
             .map_err(|e| RemoteError(e.to_string()))
     }
+    // Enrollment ops (delegating to the store), so the in-process remote can drive the genesis /
+    // grant / rotate flows (`init_repo_remote`, `grant_device_remote`, `rotate_repo_remote`) too.
+    async fn put_keyslot(&self, device_id: &Id, gen: u32, blob: &[u8]) -> Result<(), RemoteError> {
+        self.store
+            .put_keyslot(device_id, gen, blob)
+            .map_err(|e| RemoteError(e.to_string()))
+    }
+    async fn roster_append(&self, old_tip: &Id, entry: &[u8]) -> Result<bool, RemoteError> {
+        self.store
+            .append_roster(old_tip, entry)
+            .map(|seq| seq.is_some())
+            .map_err(|e| RemoteError(e.to_string()))
+    }
+    async fn delete_keyslot(&self, device_id: &Id, gen: u32) -> Result<(), RemoteError> {
+        self.store
+            .delete_keyslot(device_id, gen)
+            .map(|_| ())
+            .map_err(|e| RemoteError(e.to_string()))
+    }
 }

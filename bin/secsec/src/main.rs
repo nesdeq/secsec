@@ -20,7 +20,8 @@ use clap::{Parser, Subcommand};
 use secsec_client::pair;
 use secsec_client::quic::QuicRemote;
 use secsec_client::repo::{
-    data_keyring_remote, fetch_roster_entries, init_repo_remote, open_repo_remote, RosterAnchor,
+    data_keyring_remote, fetch_roster_entries, init_repo_remote, open_repo_remote, RepoError,
+    RosterAnchor,
 };
 use secsec_client::sync::sync_once;
 use secsec_client::{load_frontier, save_frontier, FrontierLoad};
@@ -447,6 +448,17 @@ async fn run_sync(
             Ok(rfp) => {
                 println!("created new repository");
                 rfp
+            }
+            // This device is already a member of the repo, but this folder isn't linked to it — so
+            // don't (and the library won't) re-run genesis over its live keyslot.
+            Err(RepoError::AlreadyEnrolled) => {
+                return Err(format!(
+                    "this device is already enrolled in the repo on {server_str}, but this folder isn't linked to it. \
+                     Sync the folder you first linked here, or re-establish this one: run `secsec invite` on an enrolled \
+                     device and `secsec sync {} --server {server_str} --invite <code>` here.",
+                    dir.display()
+                )
+                .into());
             }
             Err(e) => {
                 return Err(format!(
