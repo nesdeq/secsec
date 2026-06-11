@@ -11,6 +11,8 @@
 //!   new device over the wire.
 //! - `secsec devices <dir>` / `secsec revoke <device> <dir>` — list enrolled devices (with SSH
 //!   fingerprints) and revoke one over the wire (§8.4: rotate the key away from a stolen device).
+//! - `secsec hostpin <dir>` — print the server host fingerprint this folder pinned, to compare
+//!   out-of-band against the `host pin` the server prints on startup (§11 TOFU verification).
 //!
 //! Garbage collection (§15) runs automatically inside `sync`; there is no manual command.
 
@@ -89,6 +91,12 @@ enum Cmd {
     },
     /// List the devices enrolled in a linked folder's repo (with their SSH key fingerprints).
     Devices {
+        /// A folder already linked to the repo (default: current directory).
+        dir: Option<PathBuf>,
+    },
+    /// Show the pinned server host fingerprint for a folder, to compare out-of-band against the
+    /// `host pin` the server prints on startup (TOFU first-contact verification).
+    Hostpin {
         /// A folder already linked to the repo (default: current directory).
         dir: Option<PathBuf>,
     },
@@ -807,6 +815,21 @@ async fn run_devices(dir: PathBuf) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Print the server host fingerprint this folder pinned (TOFU, §11). It is `BLAKE3(SPKI)` of the
+/// server's self-signed cert — the same value the server prints as `host pin` on startup — so an
+/// operator can compare the two **out-of-band** to confirm there was no first-contact MITM. Offline:
+/// it reads the pinned value from the folder's local link, it does not reach the server.
+fn run_hostpin(dir: PathBuf) -> Result<(), Box<dyn Error>> {
+    let sdir = state_dir_for(&dir)?;
+    let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
+    println!("server:   {}", link.server);
+    println!("host pin: {}", hex(&link.host_id));
+    println!(
+        "compare this to the `host pin` printed by `secsec serve` on the server (out-of-band)."
+    );
+    Ok(())
+}
+
 /// Revoke a device by a (prefix of its) device id: rotate the master key away from it (and its
 /// add-by closure) over the wire, so it can't decrypt anything written afterward. Also reminds the
 /// operator to remove its key from the server's `authorized_keys`.
@@ -887,6 +910,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         )),
         Cmd::Invite { dir } => rt()?.block_on(run_invite(dir.unwrap_or_else(cwd))),
         Cmd::Devices { dir } => rt()?.block_on(run_devices(dir.unwrap_or_else(cwd))),
+        // hostpin is offline (reads the local link), so it needs no tokio runtime.
+        Cmd::Hostpin { dir } => run_hostpin(dir.unwrap_or_else(cwd)),
         Cmd::Revoke { device, dir } => rt()?.block_on(run_revoke(device, dir.unwrap_or_else(cwd))),
     }
 }

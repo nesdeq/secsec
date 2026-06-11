@@ -49,7 +49,7 @@ Build the binary:
 cargo build --release      # target/release/secsec
 ```
 
-The whole CLI is five commands: `serve · sync · invite · devices · revoke`.
+The whole CLI is six commands: `serve · sync · invite · devices · hostpin · revoke`.
 
 **Server — run the blind server.** Its only configuration is `~/.ssh/authorized_keys`: list the
 **public** key of every device allowed to connect (standard OpenSSH format, one per line). The server
@@ -62,6 +62,10 @@ cat device1.pub device2.pub >> ~/.ssh/authorized_keys   # who may connect
 secsec serve /srv/data 8899        # dir defaults to the current dir, port to 8899
 # prints the host pin (verify it out-of-band) and the authorized_keys path it is gating on
 ```
+
+The host pin is `BLAKE3` of the server's self-signed cert. A client trusts it on first contact (TOFU)
+and pins it; to confirm there was no first-contact MITM, compare the server's printed `host pin`
+against `secsec hostpin <dir>` on the client (it prints the value that folder pinned).
 
 **Device 1 — create the repository and sync.** The first device to sync a folder *creates* the repo
 (genesis). It uses `~/.ssh/id_ed25519` (prompting for its passphrase if the key is encrypted). Name
