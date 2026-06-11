@@ -693,14 +693,31 @@ async fn run_sync(
                     std::fs::write(&base_path, hex(&b))?;
                 }
                 if !outcome.receipts.is_empty() {
-                    let mut log = secsec_client::gc::parse_receipt_log(
-                        &std::fs::read_to_string(&receipts_path).unwrap_or_default(),
-                    );
-                    secsec_client::gc::merge_receipts(&mut log, &outcome.receipts, unix_secs());
-                    std::fs::write(
-                        &receipts_path,
-                        secsec_client::gc::serialize_receipt_log(&log),
-                    )?;
+                    // §15: verify each arrival receipt's signature against the pinned host before
+                    // recording it — a forged `put_epoch`/`arrival_gen` must not enter the GC log
+                    // (defence-in-depth; GC eligibility still rests on local receipt times, not these).
+                    let verified: Vec<_> = outcome
+                        .receipts
+                        .iter()
+                        .copied()
+                        .filter(|(id, r)| r.verify(id, &host_id))
+                        .collect();
+                    let dropped = outcome.receipts.len() - verified.len();
+                    if dropped > 0 {
+                        eprintln!(
+                            "warning: dropped {dropped} unverifiable arrival receipt(s) from {server_str}"
+                        );
+                    }
+                    if !verified.is_empty() {
+                        let mut log = secsec_client::gc::parse_receipt_log(
+                            &std::fs::read_to_string(&receipts_path).unwrap_or_default(),
+                        );
+                        secsec_client::gc::merge_receipts(&mut log, &verified, unix_secs());
+                        std::fs::write(
+                            &receipts_path,
+                            secsec_client::gc::serialize_receipt_log(&log),
+                        )?;
+                    }
                 }
                 if initial || !matches!(outcome.kind, secsec_client::sync::SyncKind::UpToDate) {
                     println!("sync: {:?}", outcome.kind);
