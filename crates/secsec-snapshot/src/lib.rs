@@ -239,6 +239,26 @@ fn encode_tree(tree: &Tree) -> Vec<u8> {
     w.finish()
 }
 
+/// Reject a tree entry name that could escape the synced folder on restore (§9.2/§18). A name MUST be
+/// a single, non-empty path component: never empty, `.`/`..`, or containing a path separator (`/`,
+/// `\`) or a NUL byte. `restore_tree`/`restore_path` join these names onto a destination directory, so
+/// an unchecked `..` or `/etc/...` (which `Path::join` resolves as an escape/absolute replacement)
+/// would let a malicious member's tree write arbitrary files outside the synced folder. Trees are
+/// keyed-hash content-addressed (a blind server cannot forge one), but a compromised/stolen member
+/// (§3) can author such a tree, so the guard is enforced here at decode for every restore path.
+fn validate_entry_name(name: &str) -> Result<(), SnapError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(SnapError::Malformed("unsafe tree entry name"));
+    }
+    Ok(())
+}
+
 fn decode_tree(bytes: &[u8]) -> Result<Tree, SnapError> {
     let mut r = Reader::new(bytes);
     let count = r.u32()? as usize;
@@ -250,6 +270,17 @@ fn decode_tree(bytes: &[u8]) -> Result<Tree, SnapError> {
         let kind = r.u8()?;
         let name =
             String::from_utf8(r.bytes(MAX_NAME)?.to_vec()).map_err(|_| SnapError::NonUtf8Name)?;
+        // Path-traversal guard (above) + canonical ordering (§9.3): entries MUST be strictly
+        // ascending by name, which also forbids duplicate names ("no duplicate keys"). `snapshot_dir`
+        // emits sorted, unique names, so an out-of-order or duplicate entry is a malformed/forged tree.
+        validate_entry_name(&name)?;
+        if let Some(last) = entries.last() {
+            if name.as_str() <= entry_name(last) {
+                return Err(SnapError::Malformed(
+                    "tree entries must be strictly ascending and unique by name",
+                ));
+            }
+        }
         let mode = r.u32()?;
         let mtime = r.u64()?;
         match kind {
@@ -1160,6 +1191,79 @@ mod tests {
             decode_signed_commit(&encode_signed_commit(&commit, b"sig-bytes")).unwrap();
         assert_eq!(got, commit);
         assert_eq!(sig, b"sig-bytes");
+    }
+
+    /// Path-traversal guard (§9.2/§18): `decode_tree` MUST reject a tree entry whose name could escape
+    /// the synced folder on restore. `encode_tree` happily serializes any name (a malicious member
+    /// authors the bytes), so the decode-side check is the security boundary.
+    #[test]
+    fn decode_tree_rejects_path_traversal_names() {
+        let one = |name: &str| Tree {
+            entries: vec![Entry::File {
+                name: name.into(),
+                mode: 0o644,
+                mtime: 0,
+                size: 0,
+                path_salt: [0u8; 16],
+                chunks: vec![],
+            }],
+        };
+        for bad in [
+            "..",
+            ".",
+            "",
+            "../etc/passwd",
+            "a/b",
+            "/abs",
+            "back\\slash",
+            "nul\0byte",
+        ] {
+            assert!(
+                matches!(
+                    decode_tree(&encode_tree(&one(bad))),
+                    Err(SnapError::Malformed(_))
+                ),
+                "name {bad:?} must be rejected as an unsafe tree entry name"
+            );
+        }
+        // a benign single-component name still decodes.
+        assert!(decode_tree(&encode_tree(&one("ok.txt"))).is_ok());
+    }
+
+    /// Canonical ordering (§9.3 "no duplicate keys", deterministic order): `decode_tree` MUST reject
+    /// entries that are not strictly ascending by name (out-of-order or duplicate). `snapshot_dir`
+    /// only ever emits sorted, unique names, so anything else is a malformed/forged tree.
+    #[test]
+    fn decode_tree_rejects_unsorted_and_duplicate_names() {
+        let file = |name: &str| Entry::File {
+            name: name.into(),
+            mode: 0o644,
+            mtime: 0,
+            size: 0,
+            path_salt: [0u8; 16],
+            chunks: vec![],
+        };
+        // out of order ("b" before "a").
+        let unsorted = Tree {
+            entries: vec![file("b"), file("a")],
+        };
+        assert!(matches!(
+            decode_tree(&encode_tree(&unsorted)),
+            Err(SnapError::Malformed(_))
+        ));
+        // duplicate name.
+        let dup = Tree {
+            entries: vec![file("a"), file("a")],
+        };
+        assert!(matches!(
+            decode_tree(&encode_tree(&dup)),
+            Err(SnapError::Malformed(_))
+        ));
+        // strictly ascending is accepted.
+        let ok = Tree {
+            entries: vec![file("a"), file("b"), file("c")],
+        };
+        assert_eq!(decode_tree(&encode_tree(&ok)).unwrap(), ok);
     }
 
     #[test]
