@@ -25,8 +25,9 @@ use secsec_snapshot::{
     open_signed_commit, restore_commit_tree, seal_signed_commit, snapshot_tree, verify_commit,
     Commit,
 };
+use secsec_engine::MergeError;
 use secsec_store::Store;
-use secsec_sync::rollback::{SiblingHead, SyncFrontier};
+use secsec_sync::rollback::{MergeReject, SiblingHead, SyncFrontier};
 use secsec_sync::{Head, NO_PREV_HEAD};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -91,6 +92,36 @@ async fn pull_to<R: Remote, K: MasterKeys>(
     dir: &Path,
 ) -> Result<SyncFrontier, ClientError> {
     let signer = resolve_head_signer(members, head, head_sig).ok_or(ClientError::HeadNotMember)?;
+
+    // §8.5/§10 anti-rollback on the **pull** path (clone / no-local-change fast-forward). The merge
+    // path runs these gates inside `merge_heads`; a head adopted-and-restored here must clear them too,
+    // or a malicious server could replay an older member-signed head and silently roll this device's
+    // working dir back to it (and the §10 `observe` below would then be operating on rolled-back
+    // state). On a fresh clone the frontier is empty, so both gates pass; a genuinely newer head also
+    // passes. Only a head whose counters regress below the persisted frontier is rejected (alarm).
+    if head.roster_seq < frontier.roster_seq {
+        return Err(ClientError::Merge(MergeError::Rollback(
+            MergeReject::RosterRollback {
+                sibling: head.roster_seq,
+                frontier: frontier.roster_seq,
+            },
+        )));
+    }
+    let head_hwm = frontier
+        .head_version_hwm
+        .get(&signer)
+        .copied()
+        .unwrap_or(0);
+    if head.head_version < head_hwm {
+        return Err(ClientError::Merge(MergeError::Rollback(
+            MergeReject::HeadRollback {
+                device: signer,
+                head_version: head.head_version,
+                hwm: head_hwm,
+            },
+        )));
+    }
+
     fetch_closure(remote, store, keys, &head.commit_id).await?;
     let (commit, csig) = open_signed_commit(&head.commit_id, keys, store)?;
     verify_commit(author_key(members, &commit)?, &commit, &csig)?;
@@ -423,6 +454,61 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r5.kind, SyncKind::UpToDate);
+    }
+
+    /// §8.5/§10: the pull path must reject a replayed head whose `head_version` is below the persisted
+    /// per-device high-water — otherwise a malicious server could silently roll a no-local-change
+    /// client's working dir back to an older (still member-signed) head. The gate runs before any
+    /// closure fetch, so an empty remote is enough to exercise it.
+    #[tokio::test]
+    async fn pull_to_rejects_head_below_frontier_high_water() {
+        use secsec_engine::MergeError;
+        use secsec_sync::rollback::MergeReject;
+        use secsec_sync::{build_head, sign_head};
+
+        let dir = tempfile::tempdir().unwrap();
+        let m = MasterKey::new(1, [0x55; 32]);
+        let dev = DeviceKey::generate().unwrap();
+        let signer = dev.device_id().unwrap();
+        let members: BTreeMap<DeviceId, DevicePublic> =
+            [(signer, dev.public())].into_iter().collect();
+        let remote = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
+        let store = Store::open(dir.path().join("c.redb")).unwrap();
+
+        // A validly-signed but OLD head (head_version 1).
+        let head = build_head("main", [0xC0; 32], 0, None);
+        let sig = sign_head(&dev, &head).unwrap();
+
+        // The client has already observed head_version 5 from this device.
+        let frontier = SyncFrontier {
+            head_version_hwm: BTreeMap::from([(signer, 5)]),
+            ..Default::default()
+        };
+        let work = tempfile::tempdir().unwrap();
+        let res = pull_to(
+            &remote,
+            &store,
+            &m,
+            &frontier,
+            &members,
+            &head,
+            &sig,
+            work.path(),
+        )
+        .await;
+        assert!(
+            matches!(
+                res,
+                Err(ClientError::Merge(MergeError::Rollback(
+                    MergeReject::HeadRollback {
+                        head_version: 1,
+                        hwm: 5,
+                        ..
+                    }
+                )))
+            ),
+            "a pulled head below the persisted head_version high-water must be a rollback alarm"
+        );
     }
 
     #[tokio::test]
