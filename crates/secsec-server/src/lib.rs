@@ -22,6 +22,7 @@
 
 pub mod serve;
 
+use secsec_frame::MAX_BLOB_SIZE;
 use secsec_proto::server::{limits, NonceStore, StorageQuota, TokenBucket, WindowCounter};
 use secsec_proto::wire::{ErrorCode, Request, Response};
 use secsec_proto::{gc, op, op_and_args, ReadAuth, WriteAuth};
@@ -400,10 +401,20 @@ impl Server {
         };
         // keyslot presence only (no decryption) — a store error fails closed.
         if !self.store.keyslot_exists(&device_id).unwrap_or(false) {
-            let genesis_bootstrap = matches!(
-                inc.request,
-                Request::RosterAppend { .. } | Request::PutKeyslot { .. }
-            ) && self.store.roster_len().map(|n| n == 0).unwrap_or(false);
+            // Genesis-bootstrap exception (§7/§12): while the roster is empty, the first device may
+            // write the genesis sigchain entry and **its own** keyslot. A `put-keyslot` here is bound
+            // to the authenticated device's own id, so a listed-but-unenrolled key cannot squat a
+            // keyslot for an *arbitrary* device_id during the genesis window. (The normal grant path,
+            // where an enrolled member writes a joiner's keyslot, takes the `keyslot_exists` branch and
+            // is unaffected.)
+            let genesis_bootstrap = self.store.roster_len().map(|n| n == 0).unwrap_or(false)
+                && match &inc.request {
+                    Request::RosterAppend { .. } => true,
+                    Request::PutKeyslot {
+                        device_id: owner, ..
+                    } => *owner == device_id,
+                    _ => false,
+                };
             if !genesis_bootstrap {
                 return Response::Err(ErrorCode::NotEnrolled);
             }
@@ -482,6 +493,12 @@ impl Server {
                 declared_size,
                 blob,
             } => {
+                // §11/§12 (normative): reject an over-large `declared_size` outright before doing any
+                // work. The wire decoder already caps the *actual* blob at MAX_BLOB_SIZE; this makes
+                // the spec's "MUST reject any put() with declared_size > 16 MiB" an explicit gate.
+                if declared_size as usize > MAX_BLOB_SIZE {
+                    return Response::Err(ErrorCode::BadRequest);
+                }
                 if blob.len() != declared_size as usize {
                     return Response::Err(ErrorCode::BadRequest);
                 }
@@ -842,6 +859,57 @@ mod tests {
             s.handle(write_req(&dev, put, T, nonce), 0),
             Response::Err(ErrorCode::BadRequest)
         );
+    }
+
+    #[test]
+    fn put_declared_size_over_max_is_rejected() {
+        // §11/§12: a `declared_size` over 16 MiB is rejected outright, before the size-match check.
+        let (s, _d) = server();
+        let dev = DeviceKey::generate().unwrap();
+        enroll(&s, &dev);
+        let nonce = [0x07; 32];
+        s.issue_nonce(nonce, 0);
+        let put = Request::Put {
+            id: [6; 32],
+            declared_size: u32::MAX, // > 16 MiB
+            blob: vec![0u8; 8],
+        };
+        assert_eq!(
+            s.handle(write_req(&dev, put, T, nonce), 0),
+            Response::Err(ErrorCode::BadRequest)
+        );
+    }
+
+    #[test]
+    fn genesis_putkeyslot_must_target_own_device() {
+        // On an empty repo, the genesis exception lets an unenrolled key write only ITS OWN keyslot —
+        // not squat one for an arbitrary device_id.
+        let (s, _d) = server();
+        let dev = DeviceKey::generate().unwrap(); // unenrolled; roster empty
+        let other = [0x55; 32];
+
+        let n1 = [0x40; 32];
+        s.issue_nonce(n1, 0);
+        let put_other = Request::PutKeyslot {
+            device_id: other,
+            gen: 1,
+            blob: b"ks".to_vec(),
+        };
+        assert_eq!(
+            s.handle(write_req(&dev, put_other, T, n1), 0),
+            Response::Err(ErrorCode::NotEnrolled),
+            "genesis exception must not let an unenrolled key write another device's keyslot"
+        );
+
+        // Its OWN keyslot during genesis is permitted.
+        let n2 = [0x41; 32];
+        s.issue_nonce(n2, 0);
+        let put_own = Request::PutKeyslot {
+            device_id: dev.device_id().unwrap(),
+            gen: 1,
+            blob: b"ks".to_vec(),
+        };
+        assert_eq!(s.handle(write_req(&dev, put_own, T, n2), 0), Response::Ok);
     }
 
     #[test]

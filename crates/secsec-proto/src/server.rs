@@ -50,6 +50,8 @@ pub struct NonceStore {
     ttl: u64,
     /// nonce → expiry (unix seconds). Presence = issued & not yet consumed.
     live: HashMap<[u8; 32], u64>,
+    /// Last time expired nonces were swept (amortized housekeeping; see [`issue`](Self::issue)).
+    last_evict: u64,
 }
 
 impl Default for NonceStore {
@@ -65,12 +67,22 @@ impl NonceStore {
         Self {
             ttl: ttl_secs,
             live: HashMap::new(),
+            last_evict: 0,
         }
     }
 
     /// Record a freshly-issued `nonce`, valid until `now + ttl`. (The caller draws `nonce` from the
     /// OS CSPRNG.)
+    ///
+    /// A nonce is removed by [`consume`](Self::consume) on use, but read ops and abandoned writes
+    /// never consume their issued nonce — so without housekeeping the live set would grow with every
+    /// stream. We therefore sweep expired entries at most once per TTL window on issue, bounding the
+    /// live set to roughly one TTL's worth of issuance. This reuses `ttl` (no separate cap constant).
     pub fn issue(&mut self, nonce: [u8; 32], now: u64) {
+        if now.saturating_sub(self.last_evict) >= self.ttl {
+            self.evict_expired(now);
+            self.last_evict = now;
+        }
         self.live.insert(nonce, now.saturating_add(self.ttl));
     }
 
@@ -271,6 +283,30 @@ mod tests {
         s.evict_expired(170); // [1] expired (160), [2] expires at 260
         assert_eq!(s.live_count(), 1);
         assert!(s.consume(&[2; 32], 170));
+    }
+
+    /// `issue` must amortize eviction so never-consumed nonces (read streams, abandoned writes) cannot
+    /// accumulate without bound: once a TTL window has elapsed, the next issue sweeps the expired set.
+    #[test]
+    fn issue_bounds_live_set_across_ttl_windows() {
+        let mut s = NonceStore::new(60);
+        // A burst of nonces issued at t=0 that are never consumed.
+        for i in 0..100u32 {
+            let mut n = [0u8; 32];
+            n[..4].copy_from_slice(&i.to_le_bytes());
+            s.issue(n, 0);
+        }
+        assert_eq!(s.live_count(), 100);
+        // Issuing again within the same TTL window does not sweep (entries still valid).
+        s.issue([0xAA; 32], 30);
+        assert_eq!(s.live_count(), 101);
+        // Past the TTL window, the next issue sweeps every now-expired nonce — the set stays bounded.
+        s.issue([0xBB; 32], 200);
+        assert_eq!(
+            s.live_count(),
+            1,
+            "expired nonces are swept on issue past the TTL window"
+        );
     }
 
     #[test]
