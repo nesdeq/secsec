@@ -13,7 +13,7 @@
 //!
 //! The `args_hash` per op is the normative §12 binding: `put`/`cas-head`/`roster-append`/`get`/`has`
 //! here, and `gc`'s §15 serialization (`keep_set_hash`, `all_heads_hash`, `args_gc`) in [`gc`]. The
-//! GC *executor* (keep-set traversal, generation/grace sweep) is the hardened-GC work of M6.
+//! GC *executor* (keep-set traversal, generation/grace sweep) lives in `secsec-store`/`secsec-server`.
 
 #![forbid(unsafe_code)]
 

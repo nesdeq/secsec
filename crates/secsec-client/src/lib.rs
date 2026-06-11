@@ -275,8 +275,8 @@ impl From<secsec_engine::EngineError> for ClientError {
 }
 impl From<repo::RepoError> for ClientError {
     fn from(e: repo::RepoError) -> Self {
-        // Reuse the Remote variant — a RepoError surfaced through multi-remote reconciliation is, from
-        // the orchestration's view, "this remote's repository state was unusable".
+        // Reuse the Remote variant — a RepoError surfaced from a cold-start/rotate over the remote is,
+        // from the orchestration's view, "the server's repository state was unusable".
         ClientError::Remote(RemoteError(e.to_string()))
     }
 }

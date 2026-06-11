@@ -9,7 +9,8 @@
 //!
 //! Both pin TLS 1.3 + the §19 transport tuning (30 s idle, 10 s keepalive). The application-layer
 //! auth handshake (session transcript + `secsec-auth-v1`, [`crate::auth`]) runs on the first stream
-//! after the QUIC handshake; that wiring + the RPC dispatch is the next slice.
+//! after the QUIC handshake ([`crate::handshake`]); per-op requests are dispatched on later streams
+//! ([`crate::rpc`]).
 
 use crate::{HostPin, PinnedServerVerifier};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};

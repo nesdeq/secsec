@@ -24,10 +24,10 @@ pub const FORMAT_VERSION_V1: u8 = 1;
 /// Compile-time format-version floor (§16): anything below this is rejected outright.
 pub const MIN_FORMAT_VERSION: u8 = 1;
 
-/// `algo_id` for the v1 object AEAD suite (ChaCha20-Poly1305 CTX, §9.4). This is the FRAME's
-/// symmetric-suite tag and is a **separate namespace** from the keyslot KEM `algo_id` (X-Wing = 2,
-/// §8.3), which is carried in the keyslot blob, not the FRAME.
-pub const ALGO_CLASSICAL_V1: u8 = 1;
+/// `algo_id` for the object AEAD suite (ChaCha20-Poly1305 CTX, §9.4). This is the FRAME's
+/// symmetric-suite tag, a **separate namespace** from the keyslot KEM `algo_id` (X-Wing = 1, §8.3),
+/// which is carried in the keyslot blob rather than the FRAME.
+pub const ALGO_V1: u8 = 1;
 /// Compile-time algorithm floor (§16): `algo_id` below this is rejected as a downgrade.
 pub const MIN_ALGO_ID: u8 = 1;
 
@@ -110,12 +110,12 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// A FRAME at the current version + classical algorithm suite.
+    /// A FRAME at the current format version and AEAD suite.
     #[must_use]
     pub fn v1(gen: u32, obj_type: ObjType) -> Self {
         Self {
             format_version: FORMAT_VERSION_V1,
-            algo_id: ALGO_CLASSICAL_V1,
+            algo_id: ALGO_V1,
             gen,
             obj_type,
         }
@@ -149,7 +149,7 @@ impl Frame {
             return Err(FrameError::UnsupportedFormatVersion(format_version));
         }
         let algo_id = r.u8().map_err(|_| FrameError::Truncated)?;
-        if algo_id < MIN_ALGO_ID || algo_id != ALGO_CLASSICAL_V1 {
+        if algo_id < MIN_ALGO_ID || algo_id != ALGO_V1 {
             return Err(FrameError::UnsupportedAlgo(algo_id));
         }
         let gen = r.u32().map_err(|_| FrameError::Truncated)?;

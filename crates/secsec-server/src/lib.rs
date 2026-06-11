@@ -12,8 +12,8 @@
 //!
 //! The server is **blind**: it stores opaque blobs by id and never verifies or reads their content
 //! (content-addressing is re-checked by *clients* on fetch, §9.2). `get`/`has`/`put`/`cas-head`/
-//! `roster-append` are all executed; the mutable ops CAS on a `BLAKE3` of the stored (encrypted) tip
-//! blob (§12, blind-server). `gc` (§15) is the remaining op and lands with the hardened-GC work (M6).
+//! `roster-append`/`gc` are all executed; the mutable ops CAS on a `BLAKE3` of the stored (encrypted)
+//! tip blob (§12, blind-server), and `gc` (§15) is a compare-and-swap against the server's state.
 //!
 //! The handler is pure and clock-injected (`now`), so the whole §12 pipeline is unit-testable by
 //! calling [`Server::handle`] directly — no sockets.

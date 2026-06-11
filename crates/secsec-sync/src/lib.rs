@@ -1,5 +1,5 @@
-//! `secsec-sync` — the sync plane (`secsec-Design.md` §10). This first slice is the **Head**: the
-//! per-ref, mutable, **signed + encrypted** pointer at `/refs/<H>` (§6, §9.8, §13).
+//! `secsec-sync` — the sync plane (`secsec-Design.md` §10). The **Head** is the per-ref, mutable,
+//! **signed + encrypted** pointer at `/refs/<H>` (§6, §9.8, §13).
 //!
 //! A head names the current commit of a ref. It is:
 //! - **signed** under [`secsec_sig::NS_HEAD`] over `ref ‖ commit_id ‖ head_version ‖ roster_seq ‖
@@ -15,9 +15,9 @@
 //!
 //! The rest of §10 lives in submodules: [`dag`] (commit-DAG ancestry), [`merge`] (per-path
 //! three-way merge), and [`rollback`] (the rollback-aware merge gates + fork detection). The
-//! `cas-head` client side ([`build_head`]/[`is_head_successor`]) is here in this module. What
-//! remains for the orchestration layer (needs transport): commit signing wiring, the actual
-//! server-side CAS (§12), and the multi-remote loop (§14).
+//! `cas-head` client side ([`build_head`]/[`is_head_successor`]) is here in this module; the
+//! orchestration that drives it (commit signing, the blind-server CAS, the sync loop) is in
+//! [`secsec-client`].
 
 #![forbid(unsafe_code)]
 

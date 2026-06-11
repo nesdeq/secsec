@@ -1,5 +1,5 @@
-//! `secsec-transport` — QUIC + TLS 1.3 transport (`secsec-Design.md` §11). This first slice is the
-//! **pinned host-key verifier** (risk **R1**, "the top ship-broken risk").
+//! `secsec-transport` — QUIC + TLS 1.3 transport (`secsec-Design.md` §11). The core is the **pinned
+//! host-key verifier** (risk **R1**, "the top ship-broken risk").
 //!
 //! The server self-signs a host key on first run (like `sshd`); there is **no CA**. The client pins
 //! the server's public key (TOFU, or `--host-fp` at init) and authenticates every later connection

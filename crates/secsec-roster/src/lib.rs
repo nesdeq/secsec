@@ -37,9 +37,8 @@ pub enum Op {
         pubkey: Vec<u8>,
         /// `mk_commit_1`.
         mk_commit: MkCommit,
-        /// The device's **X-Wing public key** bytes (§8.3/§17), published so a granter can wrap a
-        /// hybrid-PQ keyslot to it. Empty for a classical-only repo (the device's X25519 keyslot key
-        /// is derivable from its SSH public key). Opaque here — the keyslot layer interprets it.
+        /// The device's **X-Wing public key** bytes (§8.3/§17), published so a granter can wrap the
+        /// keyslot to it. Opaque here — the keyslot layer interprets it.
         enroll_pub: Vec<u8>,
     },
     /// Add a device: its canonical pubkey + the current generation's commitment.
@@ -48,8 +47,7 @@ pub enum Op {
         pubkey: Vec<u8>,
         /// `mk_commit_g` at the time of the grant.
         mk_commit: MkCommit,
-        /// The new device's **X-Wing public key** bytes (§8.3/§17), as in [`Op::Genesis`]; empty for
-        /// a classical-only enrollment.
+        /// The new device's **X-Wing public key** bytes (§8.3/§17), as in [`Op::Genesis`].
         enroll_pub: Vec<u8>,
     },
     /// Remove a device by id.
@@ -520,7 +518,7 @@ pub fn peel_data_keys(
 }
 
 /// Create the genesis entry (seq 0, self-signed by device-1). Returns `(entry, rfp)`. `enroll_pub` is
-/// device-1's X-Wing public key bytes (§8.3/§17), or empty for a classical-only repo.
+/// device-1's X-Wing public key bytes (§8.3/§17).
 pub fn genesis(
     device: &DeviceKey,
     enroll_pub: Vec<u8>,
@@ -602,8 +600,7 @@ pub struct State {
     /// For each member in [`added_by`], the `seq` of its (latest) `AddDevice` entry.
     pub added_at: BTreeMap<DeviceId, u64>,
     /// Per current member, the **X-Wing public key** bytes it published at enrollment (§8.3/§17), so
-    /// a granter/rotation can wrap a hybrid-PQ keyslot to it. Empty/absent for classical-only devices.
-    /// Cleared on revoke.
+    /// a granter/rotation can wrap its keyslot to it. Cleared on revoke.
     pub enroll_pubs: BTreeMap<DeviceId, Vec<u8>>,
 }
 
