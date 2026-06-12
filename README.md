@@ -89,10 +89,10 @@ secsec sync ~/Sync --server server.example:8899 --invite <code>
 # "sync: Cloned" → device 2 converges with device 1
 ```
 
-Both devices sync to the same repo under the default ref (`main`), so they converge even if the local
-folders are named differently. The invite code authenticates the join end-to-end through the blind
-server (which never learns it), so the server cannot substitute the new device's key or feed it a fake
-repository.
+Both devices sync to the same repo, so they converge even if the local folders are named differently
+(one repo holds one synced tree; an independent tree is an independent repo). The invite code
+authenticates the join end-to-end through the blind server (which never learns it), so the server
+cannot substitute the new device's key or feed it a fake repository.
 
 **Manage devices.** List the enrolled devices (with their SSH fingerprints, so you can tell which is
 which) and revoke a lost one over the wire from any enrolled device:

@@ -199,11 +199,11 @@ committed vectors, and `cargo-audit`. Reproducible static `musl` build via `xtas
 
 - **Automatic GC (`secsec-client::gc`, §15).** There is no `gc` command. `sync` records signed
   arrival receipts to a local log and runs one best-effort pass per session: it picks a grace-aged
-  `gc_gen` from **local** receipt times, fetches the reachable keep-set over **every ref of the repo
-  it knows** (a local per-repo ref registry, since the blind server has no `list`), and issues the
-  compare-and-swap sweep — **fail-safe**: any missing object (including another ref's closure absent
-  from the local cache) aborts the sweep rather than stranding data. The server serializes it against
-  concurrent writes via the `args_hash`.
+  `gc_gen` from **local** receipt times, fetches the reachable keep-set over the repo's single ref
+  (`main`), and issues the compare-and-swap sweep — **fail-safe**: any missing object aborts the sweep
+  rather than deleting. Completeness is also guaranteed by the CAS: the server recomputes
+  `all_heads_hash` over every stored ref, so a sweep that doesn't account for them all is rejected.
+  The server serializes it against concurrent writes via the `args_hash`.
 
 - **Devices / revoke (CLI + `rotate_repo_remote`).** `secsec devices` lists the folded roster with
   each device's `SHA256:…` SSH fingerprint and a self-marker; `secsec revoke <prefix>` resolves the

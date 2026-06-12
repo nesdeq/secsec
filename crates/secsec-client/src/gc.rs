@@ -167,13 +167,14 @@ pub fn put_epoch_from_log(log: &BTreeMap<Id, ReceiptRecord>) -> u64 {
 }
 
 /// Run a §15 GC sweep against `remote`. `ref_names` MUST be **every** ref of the repo (§15: the
-/// keep-set is the reachable closure over *all* rostered heads) — sweeping over a subset would delete
-/// the omitted refs' objects. The caller supplies the full set (the CLI keeps a per-repo ref
-/// registry); when a ref's closure is not in the local store the keep-set cannot be built and the
-/// sweep **fails safe** (errors, deletes nothing) rather than stranding that ref's data. `gc_gen` is
-/// the client-chosen generation (see [`gc_gen_from_receipts`]); `roster_seq`/`put_epoch` are the
-/// client's current view (bound into the CAS). Fetches each head, builds the keep-set from the local
-/// store (fail-safe on a missing object), computes `all_heads_hash` from the fetched head blobs, and
+/// keep-set is the reachable closure over *all* rostered heads). The secsec CLI uses exactly one ref
+/// per repo (`main`), so this is a single name; completeness is also enforced by the sweep's
+/// compare-and-swap — the server recomputes `all_heads_hash` over every stored ref, so a caller that
+/// omits a ref produces a mismatching `args_gc` and the sweep is rejected ([`GcOutcome::CasConflict`])
+/// rather than deleting the omitted ref's objects. `gc_gen` is the client-chosen generation (see
+/// [`gc_gen_from_receipts`]); `roster_seq`/`put_epoch` are the client's current view (bound into the
+/// CAS). Fetches each head, builds the keep-set from the local store (**fail-safe** on a missing
+/// object — aborts rather than sweeping), computes `all_heads_hash` from the fetched head blobs, and
 /// issues the sweep. Returns the [`GcOutcome`] ([`GcOutcome::CasConflict`] if the server's state moved
 /// — re-read and retry).
 pub async fn gc_collect<R: Remote, K: MasterKeys>(

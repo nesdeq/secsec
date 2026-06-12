@@ -33,12 +33,16 @@ dependencies, and assurance strategy are in `secsec-Implementation.md`.
   blind server. A hostile or dead server is an availability event only; the mitigation is that every
   enrolled device is a full plaintext replica and the SSH key is the backup (§21) — not server-side
   replication.
+- **Multiple synced trees per repo.** One repo holds **exactly one** synced tree, under the single
+  ref `main`; there is no `--name`/multi-ref capability. Two devices converge on `main` regardless of
+  their local folder names. An independent tree is an independent repo (its own genesis/RFP), which —
+  since one server store carries one roster sigchain — means its own server store.
 - Hiding the bounded metadata of §4.3 (sizes/timing/equality) — reduced, not eliminated.
 
 > **Scope.** secsec is single-host: `secsec sync` takes one `--server`, and every guarantee in §4
-> holds against that one blind server. The whole CLI is `serve · sync · invite · devices · revoke ·
-> hostpin · log · restore`. Fork detection is the same-server DAG-incomparable check in the merge
-> path (§10).
+> holds against that one blind server. One repo = one synced tree (ref `main`). The whole CLI is
+> `serve · sync · invite · devices · revoke · hostpin · log · restore`. Fork detection is the
+> same-server DAG-incomparable check in the merge path (§10).
 
 ## 3. Threat model
 
@@ -992,7 +996,7 @@ key. All repo state is opaque:
 ```
 /objects/<id>            packed encrypted blobs (chunk/tree/commit)
 /keyslots/<device_id>/<g> versioned authenticated keyslots per device per generation
-/refs/<H>                each device's signed head; H = BLAKE3::keyed_hash(ref_name_key, ref_name)
+/refs/<H>                the repo's single signed head (ref `main`); H = BLAKE3::keyed_hash(ref_name_key, ref_name)
 /roster-head             CAS-guarded sigchain tip
 /roster/<seq>            encrypted, signed sigchain entries
 /keyhist/<g>             data key-history wraps (§8.2)
@@ -1064,10 +1068,10 @@ operator runs their own server, and the device replicas are the redundancy.
 **GC is automatic and client-driven — there is no `gc` command.** The blind server cannot compute
 reachability (every head/commit/tree is ciphertext to it), so a client must initiate; but *which*
 client and *when* is not a decision to push onto the user. `secsec sync` therefore runs one
-best-effort GC pass per session (after the first sync): it fetches the reachable closure over **every
-ref of the repo it knows** (the keep-set, below), derives `gc_gen` from its own §15 arrival-receipt
-log (only generations whose every object has aged past the `GC_GRACE_WINDOW`), and issues the
-compare-and-swap `gc` op below. A failure is
+best-effort GC pass per session (after the first sync): it fetches the reachable closure over the
+repo's ref (the keep-set, below), derives `gc_gen` from its own §15 arrival-receipt log (only
+generations whose every object has aged past the `GC_GRACE_WINDOW`), and issues the compare-and-swap
+`gc` op below. A failure is
 logged and skipped — never fatal to the sync. Retention is keep-everything until an object both
 falls out of the keep-set and ages past the grace window; nothing is deleted silently. There is no
 `gc` command — the sync loop is the trigger.
@@ -1080,29 +1084,18 @@ This trims the *logical* object set; it does not by itself shrink the on-disk `r
 `redb` re-grows to its working size on the next write — reclaiming the file footprint needs the
 delta-scoped transfer that would let the local cache hold only the current snapshot.
 
-- **Keep-set** = reachable closure over the heads of **every ref in the repo** (each ref name is a
-  shared, per-name head at `/refs/<H>`, §13) — **all** refs, not merely the one being synced nor the
-  refs the server volunteers. Sweeping over a subset would delete objects reachable only from an
-  omitted ref. **Completeness is enforced by the `gc` compare-and-swap, not by trust:** the
+- **Keep-set** = reachable closure over the repo's **single ref `main`** (the shared per-name head at
+  `/refs/<H>`, §13). A repo holds exactly one synced tree (§2), so the keep-set covers the whole
+  repo. **Completeness is also enforced by the `gc` compare-and-swap, not by trust:** the
   `all_heads_hash` bound into `args_gc` (below) is computed by the **server over every stored ref**;
   a client whose keep-set omits a ref signs a different `all_heads_hash`, so the recomputed `args_gc`
-  fails signature verification and the sweep is **rejected** (`CasConflict`) rather than executed. GC
-  therefore runs **only** with a provably complete ref view, and can never delete an omitted ref's
-  objects — at worst it does not run. If any object (commit, tree, or subtree node) required during
-  keep-set traversal is unavailable in the local store, the client additionally **MUST abort GC**
-  (fail-safe) and **MUST NOT** proceed to a `gc()` call; server ref-hiding likewise cannot trick GC
-  into deleting (the hidden ref still changes the server's `all_heads_hash`). GC keep-set per call is
-  capped at 100,000 IDs (§12, §19); larger repos use generation-bounded batches.
-  - *Enumerating refs.* Because the server is blind and has **no `list` operation** (§12), ref
-    *names* live only in clients. A client gathers the repo's refs from a **local per-repo ref
-    registry** (the ref names it has synced, keyed by RFP) and builds the keep-set over all of them.
-    In a single-ref repo (the default, ref `main`) this is the complete set and GC reclaims normally.
-    In a multi-ref repo, a client that does not hold every ref's head+closure cannot form the matching
-    `all_heads_hash` and so its GC is a safe no-op (`CasConflict`) — the server does not reclaim space
-    for that repo, but **no data is lost** (§21 multi-ref-GC item). A repo-wide ref enumeration — e.g.
-    a `list-refs` op returning the opaque ref slots, which any member can open since the head AEAD key
-    is master-key-derived and the ref name lives inside the blob — would let any client run GC over
-    all refs; it is a deferred **reclamation** enhancement, not a safety fix.
+  fails signature verification and the sweep is **rejected** (`CasConflict`) rather than executed —
+  GC can never delete an out-of-keep-set ref's objects, it can only decline to run. If any object
+  (commit, tree, or subtree node) required during keep-set traversal is unavailable in the local
+  store, the client additionally **MUST abort GC** (fail-safe) and **MUST NOT** proceed to a `gc()`
+  call; server ref-hiding likewise cannot trick GC into deleting (a hidden ref still changes the
+  server's `all_heads_hash`). GC keep-set per call is capped at 100,000 IDs (§12, §19); larger repos
+  use generation-bounded batches.
 
 - **`keep_set_hash` canonical encoding:** `keep_set_hash = BLAKE3(canonical_id_list(keep_set))`
   where `canonical_id_list` encodes the keep-set as `le64(count) ‖ id[0] ‖ id[1] ‖ … ‖ id[count-1]`
@@ -1408,21 +1401,6 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
   Clients MUST therefore treat GC eligibility as a client-computed decision based on the signed
   sigchain frontier, not on server-supplied timestamps. This is a defence-in-depth residual:
   a cooperative server's timestamps are not load-bearing for correctness.
-
-- **Multi-ref GC reclamation (not a data-loss residual).** The GC keep-set must cover *every* ref of
-  the repo (§15), and completeness is **enforced** by the `gc` compare-and-swap: the server computes
-  `all_heads_hash` over **every** stored ref, so a client whose view omits a ref signs a mismatching
-  `args_gc` and the sweep is rejected (`CasConflict`). GC therefore never deletes an omitted ref's
-  objects — it simply does not run. Because the blind server has no `list` operation (§12), a client
-  enumerates refs only from its local per-repo registry; in a multi-ref repo it generally cannot form
-  the complete view, so its GC is a safe no-op and the **server does not reclaim space** for that repo
-  (orphans from cas-retries and old-generation objects accumulate). This is a **reclamation** residual,
-  not data loss: the data is intact and bounded only by disk. The default single-ref repo (one ref
-  `main`) reclaims normally. Closing it is a deferred enhancement — a read-only `list-refs` op that
-  returns the opaque ref slots (any member can open every head, since the head AEAD key is
-  master-key-derived and the ref name lives inside the blob), letting any client GC over all refs. It
-  was not built for v1 because it adds server API surface for an uncommon configuration whose only cost
-  today is unreclaimed space, not correctness.
 
 - **Key-rotation count and timing leakage.** The storage layout uses plaintext generation indices
   in `/keyslots/<device_id>/<g>` and `/keyhist/<g>`. A malicious server enumerating these paths

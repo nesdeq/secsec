@@ -4,9 +4,10 @@
 //! - `secsec serve [dir] [port]` — the blind server. Reads the operator's `~/.ssh/authorized_keys` as a
 //!   **mandatory** connection gate (re-read per connection); stores ciphertext under `dir`; defaults to
 //!   the current dir and udp/8899. The repository is created lazily by the first authorized device.
-//! - `secsec sync <dir> [--server host[:port]] [--invite code] [--name ref]` — link a folder to a repo
+//! - `secsec sync <dir> [--server host[:port]] [--invite code]` — link a folder to a repo
 //!   and keep it in continuous two-way sync. Name the server once (first device creates the repo;
 //!   joining devices pass `--invite`); afterwards just `secsec sync <dir>`. Uses `~/.ssh/id_ed25519`.
+//!   One repo holds one synced tree (the ref `main`); for an independent tree, run a separate repo.
 //! - `secsec invite <dir>` — on an enrolled device, print a one-time code and complete the pairing of a
 //!   new device over the wire.
 //! - `secsec devices <dir>` / `secsec revoke <device> <dir>` — list enrolled devices (with SSH
@@ -83,10 +84,6 @@ enum Cmd {
         /// A one-time invite code from an enrolled device (to join an existing repo).
         #[arg(long)]
         invite: Option<String>,
-        /// The ref name for this folder (default: "main", so differently-named folders converge).
-        /// Same name = same content across devices; use distinct names to keep several folders in one repo.
-        #[arg(long)]
-        name: Option<String>,
         /// Sync once and exit (default is to keep running and watch for changes).
         #[arg(long)]
         once: bool,
@@ -228,45 +225,6 @@ fn state_dir_for(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let sdir = home()?.join(".local/state/secsec").join(hex(h.as_bytes()));
     std::fs::create_dir_all(&sdir)?;
     Ok(sdir)
-}
-
-/// The per-repository (RFP-keyed) registry of ref names this machine has synced into one repo. The
-/// blind server has no `list` op and ref names live only in clients, so a single folder's sync cannot
-/// enumerate the repo's other refs — yet GC's keep-set must cover **all** of them (§15) or it could
-/// delete another ref's objects. This registry, shared across the per-folder state dirs of one repo,
-/// lets the auto-GC keep every ref this machine knows; an unknown other-machine ref makes GC fail safe
-/// (its objects aren't local, so the keep-set can't be built → no sweep). Ref names are not secret to
-/// this machine, so it is a plain local file (one name per line), like the §15 receipt log.
-fn repo_refs_path(rfp: &[u8; 32]) -> Result<PathBuf, Box<dyn Error>> {
-    let dir = home()?.join(".local/state/secsec/refs");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join(hex(rfp)))
-}
-
-/// The ref names this machine has synced into the repo anchored by `rfp` (empty if none/unreadable).
-fn read_repo_refs(rfp: &[u8; 32]) -> Vec<String> {
-    let Ok(path) = repo_refs_path(rfp) else {
-        return Vec::new();
-    };
-    std::fs::read_to_string(path)
-        .map(|s| {
-            s.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Record `ref_name` in the repo's ref registry (idempotent; the file stays sorted + deduplicated).
-fn record_repo_ref(rfp: &[u8; 32], ref_name: &str) -> Result<(), Box<dyn Error>> {
-    let mut refs: std::collections::BTreeSet<String> = read_repo_refs(rfp).into_iter().collect();
-    if refs.insert(ref_name.to_string()) {
-        let body: String = refs.iter().map(|r| format!("{r}\n")).collect();
-        std::fs::write(repo_refs_path(rfp)?, body)?;
-    }
-    Ok(())
 }
 
 /// Resolve `host[:port]` (default port 8899) to a socket address.
@@ -504,7 +462,6 @@ async fn run_sync(
     dir: PathBuf,
     server_opt: Option<String>,
     invite_opt: Option<String>,
-    name_opt: Option<String>,
     once: bool,
 ) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&dir)?;
@@ -517,11 +474,9 @@ async fn run_sync(
         .or_else(|| link.as_ref().map(|l| l.server.clone()))
         .ok_or("no server for this folder — pass --server host[:port] the first time")?;
     let addr = resolve_server(&server_str)?;
-    // The ref defaults to "main", so two devices syncing their (locally differently-named) folders to
-    // the same repo converge with zero flags. Use --name to keep several distinct folders in one repo.
-    let ref_name = name_opt
-        .or_else(|| link.as_ref().map(|l| l.ref_name.clone()))
-        .unwrap_or_else(|| "main".to_string());
+    // One repo holds exactly one synced tree under the ref `main`, so devices converge with zero
+    // flags regardless of their local folder names. (Independent trees use independent repos.)
+    let ref_name = "main".to_string();
 
     // Connect: pin the saved host key, or TOFU on first contact.
     let pinned = link.as_ref().map(|l| l.host_id);
@@ -590,10 +545,6 @@ async fn run_sync(
     )?;
     // The roster_seq stamped on commits/heads is the current sigchain tip (drives §10 gate 1).
     let mut roster_seq = anchor.max_seq;
-
-    // Record this folder's ref in the repo's ref registry so the auto-GC keep-set can cover every ref
-    // this machine syncs into the repo — never deleting another ref's objects (§15).
-    let _ = record_repo_ref(&rfp, &ref_name);
 
     let mut keyring = data_keyring_remote(&rem, &mk).await?;
     let store = Store::open(sdir.join("objects.secsec"))?;
@@ -833,18 +784,16 @@ async fn run_sync(
                                 let roster_seq =
                                     fetch_roster_entries(&rem).await?.len().saturating_sub(1)
                                         as u64;
-                                // Keep-set spans **every** ref this machine knows for the repo (§15):
-                                // with multiple refs whose objects are not all in this folder's cache,
-                                // `gc_collect` fails safe (can't build the full keep-set → no sweep)
-                                // rather than deleting another ref's objects.
-                                let names = read_repo_refs(&rfp);
-                                let name_refs: Vec<&str> = if names.is_empty() {
-                                    vec![ref_name.as_str()]
-                                } else {
-                                    names.iter().map(String::as_str).collect()
-                                };
+                                // One repo = one ref, so the keep-set over `main` is the complete set
+                                // (§15): the gc compare-and-swap's `all_heads_hash` matches the server's
+                                // single ref, so the sweep runs.
                                 secsec_client::gc::gc_collect(
-                                    &rem, &store, &keyring, &name_refs, gc_gen, roster_seq,
+                                    &rem,
+                                    &store,
+                                    &keyring,
+                                    &[ref_name.as_str()],
+                                    gc_gen,
+                                    roster_seq,
                                     put_epoch,
                                 )
                                 .await?;
@@ -1345,15 +1294,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             dir,
             server,
             invite,
-            name,
             once,
-        } => rt()?.block_on(run_sync(
-            dir.unwrap_or_else(cwd),
-            server,
-            invite,
-            name,
-            once,
-        )),
+        } => rt()?.block_on(run_sync(dir.unwrap_or_else(cwd), server, invite, once)),
         Cmd::Invite { dir } => rt()?.block_on(run_invite(dir.unwrap_or_else(cwd))),
         Cmd::Devices { dir } => rt()?.block_on(run_devices(dir.unwrap_or_else(cwd))),
         // hostpin is offline (reads the local link), so it needs no tokio runtime.
