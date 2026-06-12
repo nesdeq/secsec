@@ -816,7 +816,11 @@ The §8.5 local sealed-state blob uses this same construction with `key = local_
   snapshot, which would otherwise silently resurrect it). Reconciliation touches only the kinds
   secsec tracks: an untracked symlink or special file on disk is left in place (never deleted, never
   traversed), and a symlink is never followed when clearing a path to write a file. The keep-both
-  conflict copies are tree entries, so they survive reconciliation.
+  conflict copies are tree entries, so they survive reconciliation. **First contact is never a bare
+  restore:** a folder with no sync state (no base) clones only when it is **empty**; a non-empty
+  folder instead becomes a parentless commit that is three-way merged (empty common ancestor) with
+  the head — union + keep-both — because reconciling a tree that has never seen the folder's
+  local-only files would delete them.
 - **Live trigger:** `notify` (inotify/FSEvents/ReadDirectoryChangesW) drives commit-on-change;
   periodic commits set the snapshot cadence.
 

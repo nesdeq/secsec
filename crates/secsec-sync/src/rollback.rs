@@ -116,12 +116,18 @@ fn new_commits(parents: &ParentMap, our_head: &Id, sibling: &Id) -> BTreeSet<Id>
 }
 
 /// Run the §10 rollback gates against the persisted `frontier` and classify the sibling. `parents`
-/// and `commit_meta` MUST cover both our and the sibling's reachable history. Returns the decision,
-/// or the specific [`MergeReject`] to alarm on.
+/// and `commit_meta` MUST cover both our and the sibling's reachable history. `local_device` is the
+/// device running the gates: commits **it** authored are exempt from gate 2a — after a re-link or
+/// reinstall (fresh frontier, parentless local history) the genuine head legitimately contains this
+/// device's own earlier commits, which are history, not replays. A server replaying a stale **head**
+/// signed by this device is still caught by gate 2b (its `head_version` high-water), and ancestor
+/// authorship cannot be forged (each commit's id transitively pins its parents from the
+/// signature-verified head commit). Returns the decision, or the specific [`MergeReject`] to alarm on.
 pub fn evaluate_merge(
     frontier: &SyncFrontier,
     our_head: &Id,
     sibling: &SiblingHead,
+    local_device: &DeviceId,
     parents: &ParentMap,
     commit_meta: &BTreeMap<Id, CommitMeta>,
 ) -> Result<MergeDecision, MergeReject> {
@@ -142,9 +148,14 @@ pub fn evaluate_merge(
         });
     }
 
-    // Gate 2a: every newly-accepted commit's version must exceed that device's high-water.
+    // Gate 2a: every newly-accepted commit's version must exceed that device's high-water. Commits
+    // authored by the *local* device are exempt (see the fn docs): they appear as "new" only when our
+    // local history was lost (re-link/reinstall), and self-replay via a stale head is gate 2b's job.
     for c in new_commits(parents, our_head, &sibling.commit_id) {
         if let Some(meta) = commit_meta.get(&c) {
+            if meta.device_id == *local_device {
+                continue;
+            }
             let hwm = frontier
                 .commit_version_hwm
                 .get(&meta.device_id)
@@ -374,7 +385,14 @@ mod tests {
             commit_id: id(2),
         };
         assert_eq!(
-            evaluate_merge(&f, &id(1), &sib, &dag(&[(2, &[])]), &meta(&[(2, 2, 1)])),
+            evaluate_merge(
+                &f,
+                &id(1),
+                &sib,
+                &dev(9),
+                &dag(&[(2, &[])]),
+                &meta(&[(2, 2, 1)])
+            ),
             Err(MergeReject::RosterRollback {
                 sibling: 9,
                 frontier: 10
@@ -398,6 +416,7 @@ mod tests {
                 &f,
                 &id(3),
                 &sib,
+                &dev(9),
                 &g,
                 &meta(&[(1, 1, 1), (2, 2, 1), (3, 1, 2)])
             ),
@@ -422,7 +441,14 @@ mod tests {
             commit_id: id(2),
         };
         assert_eq!(
-            evaluate_merge(&f, &id(3), &sib, &g, &meta(&[(2, 2, 1), (3, 1, 2)])),
+            evaluate_merge(
+                &f,
+                &id(3),
+                &sib,
+                &dev(9),
+                &g,
+                &meta(&[(2, 2, 1), (3, 1, 2)])
+            ),
             Ok(MergeDecision::AlreadyHave)
         );
     }
@@ -439,7 +465,7 @@ mod tests {
             commit_id: id(2),
         };
         assert_eq!(
-            evaluate_merge(&f, &id(1), &sib, &g, &meta(&[(2, 2, 1)])),
+            evaluate_merge(&f, &id(1), &sib, &dev(9), &g, &meta(&[(2, 2, 1)])),
             Ok(MergeDecision::FastForward)
         );
     }
@@ -456,7 +482,7 @@ mod tests {
             commit_id: id(3),
         };
         assert_eq!(
-            evaluate_merge(&f, &id(2), &sib, &g, &meta(&[(3, 2, 1)])),
+            evaluate_merge(&f, &id(2), &sib, &dev(9), &g, &meta(&[(3, 2, 1)])),
             Ok(MergeDecision::Merge)
         );
     }
@@ -476,11 +502,48 @@ mod tests {
             commit_id: id(3),
         };
         assert_eq!(
-            evaluate_merge(&f, &id(2), &sib, &g, &meta(&[(3, 2, 1)])),
+            evaluate_merge(&f, &id(2), &sib, &dev(9), &g, &meta(&[(3, 2, 1)])),
             Err(MergeReject::CommitReplay {
                 device: dev(2),
                 version: 1,
                 hwm: 5
+            })
+        );
+    }
+
+    /// Re-link / reinstall (fresh frontier, parentless local commit): the genuine head contains the
+    /// local device's OWN earlier commits. Gate 2a must exempt them (history, not replays) — while a
+    /// peer's stale commit in the same history is still rejected for any other local device.
+    #[test]
+    fn gate2a_exempts_local_devices_own_history() {
+        // Disjoint roots: our fresh parentless commit 9 vs head 4, whose history holds our own old
+        // commits 2 (v1) → 3 (v2) and peer dev(2)'s commit 4 (v1) on top.
+        let g = dag(&[(3, &[2]), (4, &[3])]);
+        let sib = SiblingHead {
+            device_id: dev(2),
+            head_version: 7,
+            roster_seq: 0,
+            commit_id: id(4),
+        };
+        // Our frontier already carries our NEW commit's version (3 = old max 2 + 1), exactly as
+        // sync_once records it before merging.
+        let f = SyncFrontier {
+            commit_version_hwm: BTreeMap::from([(dev(1), 3)]),
+            ..Default::default()
+        };
+        let cm = meta(&[(2, 1, 1), (3, 1, 2), (4, 2, 1)]);
+        // As local device dev(1): its own old v1/v2 (≤ hwm 3) are exempt → the join merges.
+        assert_eq!(
+            evaluate_merge(&f, &id(9), &sib, &dev(1), &g, &cm),
+            Ok(MergeDecision::Merge)
+        );
+        // For any OTHER local device there is no exemption: dev(1)'s v1 ≤ hwm 3 is a replay.
+        assert_eq!(
+            evaluate_merge(&f, &id(9), &sib, &dev(9), &g, &cm),
+            Err(MergeReject::CommitReplay {
+                device: dev(1),
+                version: 1,
+                hwm: 3
             })
         );
     }
@@ -499,7 +562,7 @@ mod tests {
             commit_id: id(3),
         };
         assert_eq!(
-            evaluate_merge(&f, &id(2), &sib, &g, &meta(&[(3, 2, 9)])),
+            evaluate_merge(&f, &id(2), &sib, &dev(9), &g, &meta(&[(3, 2, 9)])),
             Err(MergeReject::HeadRollback {
                 device: dev(2),
                 head_version: 6,

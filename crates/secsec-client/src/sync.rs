@@ -5,7 +5,11 @@
 //! directory must *clone* (pull + restore) to establish a base before it ever commits — otherwise its
 //! "empty" snapshot would publish a deletion of everyone else's files. With the base tracked:
 //!
-//! - **no base, remote head exists** → clone (fetch + verify + restore), adopt the head as base.
+//! - **no base, remote head exists, empty folder** → clone (fetch + verify + restore), adopt the
+//!   head as base.
+//! - **no base, remote head exists, non-empty folder** → join-merge: the folder becomes a
+//!   parentless commit, three-way merged (empty ancestor) with the head — union + keep-both, so
+//!   neither side's files are deleted or silently overwritten.
 //! - **no base, no remote head** → first publish (we are the first writer).
 //! - **base, no local change** → fast-forward to a newer remote head (pull) or no-op.
 //! - **base, local change** → author a commit on the base and [`crate::sync_ref`] it (push or
@@ -76,6 +80,24 @@ fn author_key<'a>(
     members
         .get(&commit.device_id)
         .ok_or(ClientError::HeadNotMember)
+}
+
+/// Whether `dir` contains anything a snapshot would track (a regular file or a real directory).
+/// Symlinks and special files don't count — they are never synced, so a folder holding only those is
+/// "empty" for clone purposes. A missing `dir` is empty.
+fn has_tracked_entries(dir: &Path) -> Result<bool, ClientError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(ClientError::Io(e)),
+    };
+    for ent in entries {
+        let ft = ent?.file_type()?;
+        if ft.is_file() || ft.is_dir() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Pull a verified head into the working dir: resolve+verify the head signer, fetch its closure,
@@ -162,17 +184,25 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
     let device_id = device.device_id()?;
     let head = fetch_head(remote, keys, ref_name).await?;
 
-    // Fresh client with an existing repo → clone (never commit our unsynced dir).
+    // Fresh client with an existing repo. An **empty** folder clones (never commit an empty dir —
+    // that would publish a deletion of everything). A **non-empty** folder must NOT clone: the repo
+    // has never seen its local files, so materializing the head over it would delete them
+    // (reconcile) or silently overwrite same-named ones. It instead falls through to the normal path
+    // below: its content becomes a parentless commit that the rollback-gated three-way merge (empty
+    // common ancestor) unions with the head — same-name divergence is a keep-both conflict, nothing
+    // is lost. This is also the reinstall / re-link / server-rebuild re-join path (§14).
     if base.is_none() {
         if let Some((h, sig, _)) = &head {
-            let frontier = pull_to(remote, store, keys, frontier, members, h, sig, dir).await?;
-            return Ok(SyncOutcome {
-                kind: SyncKind::Cloned,
-                base: Some(h.commit_id),
-                frontier,
-                receipts: Vec::new(),
-                conflicts: Vec::new(),
-            });
+            if !has_tracked_entries(dir)? {
+                let frontier = pull_to(remote, store, keys, frontier, members, h, sig, dir).await?;
+                return Ok(SyncOutcome {
+                    kind: SyncKind::Cloned,
+                    base: Some(h.commit_id),
+                    frontier,
+                    receipts: Vec::new(),
+                    conflicts: Vec::new(),
+                });
+            }
         }
     }
 
@@ -215,13 +245,32 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
         };
     }
 
-    // Local changes: author a commit on the base.
-    let version = frontier
+    // Local changes: author a commit on the base. The version continues strictly after BOTH the
+    // persisted high-water AND any commits this device already published in the head's history: after
+    // a re-link / reinstall (fresh frontier) the head can contain our own earlier commits, and
+    // re-using one of their versions would trip every peer's replay gate (gate 2a) forever.
+    let mut own_high = frontier
         .commit_version_hwm
         .get(&device_id)
         .copied()
-        .unwrap_or(0)
-        + 1;
+        .unwrap_or(0);
+    if base.is_none() {
+        if let Some((h, _, _)) = &head {
+            // First contact with an existing head (the non-empty-folder join): bring its history
+            // local (the merge needs it anyway; idempotent, cached) and continue after our own
+            // highest published version in it.
+            fetch_closure(remote, store, keys, &h.commit_id).await?;
+            let (_, meta) = secsec_engine::load_commit_dag(&[h.commit_id], keys, store)?;
+            own_high = own_high.max(
+                meta.values()
+                    .filter(|m| m.device_id == device_id)
+                    .map(|m| m.version)
+                    .max()
+                    .unwrap_or(0),
+            );
+        }
+    }
+    let version = own_high + 1;
     let parents = base.map(|b| vec![b]).unwrap_or_default();
     let last_seen = head.as_ref().map_or(NO_PREV_HEAD, |(h, _, _)| h.commit_id);
     let commit = Commit {
@@ -326,6 +375,96 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    /// First contact of a **non-empty** folder with an existing repo must MERGE, never clone-restore:
+    /// local-only files survive (and propagate as additions), a same-named file with different
+    /// content becomes a keep-both conflict, and the repo's files land. Nothing is deleted or
+    /// silently overwritten. This is the join / reinstall / re-link / server-rebuild path.
+    #[tokio::test]
+    async fn joining_a_nonempty_folder_merges_and_loses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = MasterKey::new(1, [0x55; 32]);
+        let dev_a = DeviceKey::generate().unwrap();
+        let members: BTreeMap<DeviceId, DevicePublic> =
+            [(dev_a.device_id().unwrap(), dev_a.public())]
+                .into_iter()
+                .collect();
+        let remote = MemRemote::new(Store::open(dir.path().join("remote.redb")).unwrap());
+        let a_store = Store::open(dir.path().join("a.redb")).unwrap();
+        let b_store = Store::open(dir.path().join("b.redb")).unwrap();
+        let fr = SyncFrontier::default();
+        let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
+        let sync = |store, wdir, frontier, base| {
+            sync_once(
+                &remote, store, wdir, &m, &dev_a, &members, frontier, "main", 0, base, 0, &seal,
+            )
+        };
+
+        // A publishes {shared.txt:"from-A", a-only.txt}.
+        let a_dir = tempfile::tempdir().unwrap();
+        std::fs::write(a_dir.path().join("shared.txt"), b"from-A").unwrap();
+        std::fs::write(a_dir.path().join("a-only.txt"), b"a").unwrap();
+        let ra = sync(&a_store, a_dir.path(), &fr, None).await.unwrap();
+        assert_eq!(ra.kind, SyncKind::Published);
+
+        // B's folder ALREADY holds {shared.txt:"from-B" (divergent), b-only.txt}, no link (base=None).
+        // (Same device key as A — also covering the re-link case, where the head's history contains
+        // this very device's commits and the version sequence must continue, not restart.)
+        let b_dir = tempfile::tempdir().unwrap();
+        std::fs::write(b_dir.path().join("shared.txt"), b"from-B").unwrap();
+        std::fs::write(b_dir.path().join("b-only.txt"), b"b").unwrap();
+        let rb = sync(&b_store, b_dir.path(), &fr, None).await.unwrap();
+
+        // It merged (did not clone-restore): everything survives.
+        assert_eq!(
+            rb.kind,
+            SyncKind::Merged,
+            "non-empty first contact must merge"
+        );
+        assert_eq!(
+            std::fs::read(b_dir.path().join("b-only.txt")).unwrap(),
+            b"b",
+            "local-only file must survive the join"
+        );
+        assert_eq!(
+            std::fs::read(b_dir.path().join("a-only.txt")).unwrap(),
+            b"a",
+            "the repo's files land"
+        );
+        assert_eq!(
+            std::fs::read(b_dir.path().join("shared.txt")).unwrap(),
+            b"from-B",
+            "ours keeps the name on a divergent same-name file"
+        );
+        assert!(
+            std::fs::read_dir(b_dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_str().unwrap().to_owned())
+                .any(|n| n.starts_with("shared.conflict-")),
+            "divergent same-name content is kept-both"
+        );
+        assert_eq!(rb.conflicts, vec!["shared.txt".to_string()]);
+
+        // A pulls: B's local-only file and the conflict copy propagate; nothing of A's is gone.
+        let ra2 = sync(&a_store, a_dir.path(), &ra.frontier, ra.base)
+            .await
+            .unwrap();
+        assert_eq!(ra2.kind, SyncKind::Pulled);
+        assert_eq!(
+            std::fs::read(a_dir.path().join("b-only.txt")).unwrap(),
+            b"b"
+        );
+        assert_eq!(
+            std::fs::read(a_dir.path().join("a-only.txt")).unwrap(),
+            b"a"
+        );
+
+        // An EMPTY folder still takes the plain clone path.
+        let c_store = Store::open(dir.path().join("c.redb")).unwrap();
+        let c_dir = tempfile::tempdir().unwrap();
+        let rc = sync(&c_store, c_dir.path(), &fr, None).await.unwrap();
+        assert_eq!(rc.kind, SyncKind::Cloned, "empty folder clones");
     }
 
     /// A deletion on one device must propagate to the others (and must NOT resurrect): the working

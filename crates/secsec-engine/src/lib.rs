@@ -361,8 +361,16 @@ pub fn merge_heads<K: MasterKeys>(
     store: &Store,
 ) -> Result<SyncPlan, MergeError> {
     let (parents, meta) = load_commit_dag(&[*our_head_commit, sibling.commit_id], keys, store)?;
-    let decision = evaluate_merge(frontier, our_head_commit, sibling, &parents, &meta)
-        .map_err(MergeError::Rollback)?;
+    let local_device = author.device.device_id()?;
+    let decision = evaluate_merge(
+        frontier,
+        our_head_commit,
+        sibling,
+        &local_device,
+        &parents,
+        &meta,
+    )
+    .map_err(MergeError::Rollback)?;
 
     // The frontier advances by observing the sibling regardless of fast-forward vs merge (§10/§8.5).
     let mut new_frontier = frontier.clone();
