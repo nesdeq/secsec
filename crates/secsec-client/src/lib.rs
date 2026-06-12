@@ -29,7 +29,7 @@ mod testmem;
 
 use secsec_engine::{merge_heads, CommitAuthor, MergeError, SyncAction};
 use secsec_frame::ObjType;
-use secsec_kdf::{MasterKey, MasterKeys};
+use secsec_kdf::MasterKeys;
 use secsec_object::{open_object, Id, ObjError, PathSalt};
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
 use secsec_snapshot::{Entry, SnapError};
@@ -347,9 +347,9 @@ pub async fn push_objects<R: Remote, K: MasterKeys>(
 /// it onto the remote. `prev` is the `(head, stored_blob)` the client last observed for this ref
 /// (`None` for the first head); the old CAS token is `BLAKE3(prev_blob)` (or [`ABSENT_HEAD`]). Returns
 /// the new `(head, stored_blob)` to carry as `prev` next time. The caller pushes objects first.
-pub async fn push_head<R: Remote>(
+pub async fn push_head<R: Remote, K: MasterKeys>(
     remote: &R,
-    mk: &MasterKey,
+    keys: &K,
     device: &secsec_sig::DeviceKey,
     ref_name: &str,
     commit_id: Id,
@@ -359,8 +359,11 @@ pub async fn push_head<R: Remote>(
     let head = build_head(ref_name, commit_id, roster_seq, prev.map(|(h, _)| h));
     let sig = sign_head(device, &head)?;
     let nonce = random_nonce()?;
-    let rnk = mk.ref_name_key();
-    let blob = seal_head(mk, &rnk, &head, &sig, &nonce);
+    // The head is sealed under the **current** generation's `head_key_g` (forward secrecy of the head
+    // metadata), but addressed at the **generation-stable** ref path (§13), so it does not move on
+    // rotation.
+    let rnk = keys.ref_name_key();
+    let blob = seal_head(keys.current(), &rnk, &head, &sig, &nonce);
 
     let ref_h = ref_hash(&rnk, ref_name);
     let old = prev.map_or(ABSENT_HEAD, |(_, b)| *blake3::hash(b).as_bytes());
@@ -376,17 +379,19 @@ pub async fn push_head<R: Remote>(
 /// Fetch the stored head blob for `ref_name`, open it (§9.8: FRAME check, AEAD open, ref-slot binding,
 /// strict decode), and return `(head, sig, stored_blob)`. The caller MUST then [`verify_head`] against
 /// the signer's roster key and check the frontier (§8.5). `None` if the ref is absent.
-pub async fn fetch_head<R: Remote>(
+pub async fn fetch_head<R: Remote, K: MasterKeys>(
     remote: &R,
-    mk: &MasterKey,
+    keys: &K,
     ref_name: &str,
 ) -> Result<Option<(Head, Vec<u8>, Vec<u8>)>, ClientError> {
-    let rnk = mk.ref_name_key();
+    let rnk = keys.ref_name_key();
     let ref_h = ref_hash(&rnk, ref_name);
     let Some(blob) = remote.get_ref(&ref_h).await? else {
         return Ok(None);
     };
-    let (head, sig) = open_head(mk, &rnk, ref_name, &blob)?;
+    // `open_head` resolves the head's own generation against `keys` (§8.2 peel), so a head written
+    // before a rotation is still readable by a current member.
+    let (head, sig) = open_head(keys, &rnk, ref_name, &blob)?;
     Ok(Some((head, sig, blob)))
 }
 
@@ -532,8 +537,7 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
     let roster_seq = author.roster_seq;
 
     // 1. Fetch the remote head (current generation). Absent → we are the first writer for this ref.
-    let Some((remote_head, remote_sig, remote_blob)) =
-        fetch_head(remote, keys.current(), ref_name).await?
+    let Some((remote_head, remote_sig, remote_blob)) = fetch_head(remote, keys, ref_name).await?
     else {
         // §8.5: seal the frontier (carrying our commit's version, set by the caller) before the
         // ref-advancing push.
@@ -541,7 +545,7 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
         let receipts = push_objects(remote, store, keys, our_commit).await?;
         let (head, blob) = push_head(
             remote,
-            keys.current(),
+            keys,
             device,
             ref_name,
             *our_commit,
@@ -590,7 +594,7 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
         let receipts = push_objects(remote, store, keys, &commit_id).await?;
         let (head, blob) = push_head(
             remote,
-            keys.current(),
+            keys,
             device,
             ref_name,
             commit_id,
@@ -665,6 +669,7 @@ pub fn save_frontier(
 mod tests {
     use super::*;
     use crate::testmem::MemRemote;
+    use secsec_kdf::MasterKey;
     use secsec_sig::DeviceKey;
 
     fn mk() -> MasterKey {

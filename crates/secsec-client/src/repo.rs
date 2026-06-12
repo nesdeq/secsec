@@ -956,4 +956,55 @@ mod tests {
             "revoked device's keyslot was deleted"
         );
     }
+
+    /// C2 regression: a head published before a rotation must remain findable and readable afterward.
+    /// The ref path is generation-stable (§13), so it doesn't move when the master key rotates, and
+    /// `fetch_head` peels the key ring to open the head sealed under the prior generation (§8.2/§9.8).
+    /// Before the fix, a current-generation client looked at a moved (empty) ref path and would treat
+    /// the repo as headless — a fresh clone would then publish its empty directory as the head.
+    #[tokio::test]
+    async fn head_survives_a_rotation() {
+        use crate::testmem::MemRemote;
+        use crate::{fetch_head, push_head, push_objects};
+        let dir = tempfile::tempdir().unwrap();
+        let remote = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
+        let device = DeviceKey::generate().unwrap();
+
+        let rfp = init_repo(&remote.store, &device, 0).unwrap();
+        let (mk1, st1) = open_repo(&remote.store, &device, &rfp).unwrap();
+
+        // Publish a head at generation 1.
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f.txt"), b"v1").unwrap();
+        let (rt, rs) =
+            secsec_snapshot::snapshot_tree(src.path(), &mk1, &remote.store, None).unwrap();
+        let commit = secsec_snapshot::Commit {
+            root_tree: rt,
+            root_salt: rs,
+            parents: vec![],
+            device_id: device.device_id().unwrap(),
+            version: 1,
+            roster_seq: 0,
+            last_seen_head: [0u8; 32],
+            ts: 0,
+        };
+        let commit_id =
+            secsec_snapshot::seal_signed_commit(&mk1, &remote.store, &device, &commit).unwrap();
+        push_objects(&remote, &remote.store, &mk1, &commit_id)
+            .await
+            .unwrap();
+        push_head(&remote, &mk1, &device, "main", commit_id, 0, None)
+            .await
+            .unwrap();
+
+        // Rotate to generation 2 and build the peeled key ring a cold-started member would hold.
+        let (mk2, _st2) = rotate_repo(&remote.store, &device, &mk1, &st1, &rfp, None, 0).unwrap();
+        assert_eq!(mk2.generation(), 2);
+        let keyring = data_keyring(&remote.store, &mk2).unwrap();
+
+        // The head is still at the same path and opens under the peeled gen-1 key.
+        let found = fetch_head(&remote, &keyring, "main").await.unwrap();
+        let (head, _sig, _blob) = found.expect("head must survive a rotation");
+        assert_eq!(head.commit_id, commit_id);
+    }
 }

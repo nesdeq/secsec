@@ -181,15 +181,15 @@ pub async fn gc_collect<R: Remote, K: MasterKeys>(
     roster_seq: u64,
     put_epoch: u64,
 ) -> Result<GcOutcome, ClientError> {
-    // Heads + ref names are current-generation; the keep-set closure may span generations (§8.2).
-    let rnk = keys.current().ref_name_key();
+    // The ref path is generation-stable (§13); the keep-set closure may span generations (§8.2).
+    let rnk = keys.ref_name_key();
     let mut head_commits: Vec<Id> = Vec::new();
     let mut heads: Vec<(Id, [u8; 32])> = Vec::new();
 
     for name in ref_names {
         let ref_h = ref_hash(&rnk, name);
         // Fetch the raw head blob (for the all_heads_hash token) and open it (for its commit).
-        if let Some((head, _sig, blob)) = fetch_head(remote, keys.current(), name).await? {
+        if let Some((head, _sig, blob)) = fetch_head(remote, keys, name).await? {
             head_commits.push(head.commit_id);
             heads.push((ref_h, *blake3::hash(&blob).as_bytes()));
         }

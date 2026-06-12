@@ -529,7 +529,7 @@ async fn run_sync(
     // Cold-start over the wire (P7 anti-rollback: the fetched chain must extend the persisted anchor).
     let prev_anchor = link.as_ref().and_then(|l| l.anchor);
     let was_linked = link.is_some();
-    let (mut mk, mut st, mut anchor) = open_repo_remote(&rem, &device, &rfp, prev_anchor).await?;
+    let (mk, mut st, mut anchor) = open_repo_remote(&rem, &device, &rfp, prev_anchor).await?;
     // Persist the link with the advanced anti-rollback anchor.
     write_link(
         &sdir,
@@ -643,9 +643,11 @@ async fn run_sync(
             match open_repo_remote(&rem, &device, &rfp, Some(anchor)).await {
                 Ok((m, s, a)) => {
                     // Re-peel the data-key ring FIRST, so the roster update is all-or-nothing: never
-                    // advance the generation (`mk`) without its matching keyring (which would make the
+                    // advance the generation without its matching keyring (which would make the
                     // current head/objects unreadable until the next tick). On a peel failure (e.g. a
-                    // transient fetch glitch) keep the last-known roster and try again next cycle.
+                    // transient fetch glitch) keep the last-known roster and try again next cycle. The
+                    // keyring (peeled from `m`) is the source of truth downstream — it carries the
+                    // current generation as `keys.current()` and is generation-stable for the ref path.
                     match data_keyring_remote(&rem, &m).await {
                         Ok(k) => {
                             if a.max_seq != anchor.max_seq {
@@ -660,7 +662,6 @@ async fn run_sync(
                                     },
                                 );
                             }
-                            mk = m;
                             st = s;
                             anchor = a;
                             roster_seq = a.max_seq;
@@ -768,7 +769,7 @@ async fn run_sync(
                 if initial {
                     let gc = async {
                         if let Some((head, _, _)) =
-                            secsec_client::fetch_head(&rem, &mk, &ref_name).await?
+                            secsec_client::fetch_head(&rem, &keyring, &ref_name).await?
                         {
                             secsec_client::fetch_closure(&rem, &store, &keyring, &head.commit_id)
                                 .await?;
@@ -1023,7 +1024,7 @@ async fn run_log(path: Option<String>) -> Result<(), Box<dyn Error>> {
     let tmp = tempfile::tempdir()?;
     let store = Store::open(tmp.path().join("history.redb"))?;
     let now = unix_secs();
-    match secsec_client::fetch_head(&rem, &mk, &link.ref_name).await? {
+    match secsec_client::fetch_head(&rem, &keyring, &link.ref_name).await? {
         None => println!(
             "no history yet — nothing has been synced to '{}'.",
             link.ref_name
@@ -1082,7 +1083,7 @@ async fn run_restore(path: String, version: Option<String>) -> Result<(), Box<dy
 
     let tmp = tempfile::tempdir()?;
     let store = Store::open(tmp.path().join("history.redb"))?;
-    let head = secsec_client::fetch_head(&rem, &mk, &link.ref_name)
+    let head = secsec_client::fetch_head(&rem, &keyring, &link.ref_name)
         .await?
         .ok_or("no history yet — nothing to restore")?
         .0;

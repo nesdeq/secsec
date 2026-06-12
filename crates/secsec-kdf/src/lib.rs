@@ -149,6 +149,18 @@ pub trait MasterKeys {
     /// always use the current generation). For a single key this is itself; for a key ring it is the
     /// entry with the greatest generation.
     fn current(&self) -> &MasterKey;
+
+    /// The generation-stable ref-name key (§13). Derived from the **genesis** generation's master key
+    /// (gen 1), which every current member can recover (§8.2 peel) and which never changes across
+    /// rotations — so a ref's storage path `H = keyed_hash(ref_name_key, ref_name)` does **not** move
+    /// when the master key rotates (the head blob is still sealed under the current generation's
+    /// `head_key_g`, peeled on read). A full key ring always holds gen 1; a degenerate
+    /// single-generation resolver falls back to its own generation's key.
+    fn ref_name_key(&self) -> SecretKey {
+        self.for_gen(1)
+            .unwrap_or_else(|| self.current())
+            .ref_name_key()
+    }
 }
 
 impl MasterKeys for MasterKey {

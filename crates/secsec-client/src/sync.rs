@@ -160,7 +160,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
     // Writes (snapshot, commit, head) use the current generation; reads (closures, old commits) route
     // through `keys`, which resolves any past generation after a rotation (§8.2).
     let device_id = device.device_id()?;
-    let head = fetch_head(remote, keys.current(), ref_name).await?;
+    let head = fetch_head(remote, keys, ref_name).await?;
 
     // Fresh client with an existing repo → clone (never commit our unsynced dir).
     if base.is_none() {
@@ -244,16 +244,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
             // §8.5: seal the frontier (carrying our commit's version) before the ref-advancing push.
             seal(&f)?;
             let receipts = push_objects(remote, store, keys, &our_commit).await?;
-            push_head(
-                remote,
-                keys.current(),
-                device,
-                ref_name,
-                our_commit,
-                roster_seq,
-                None,
-            )
-            .await?;
+            push_head(remote, keys, device, ref_name, our_commit, roster_seq, None).await?;
             Ok(SyncOutcome {
                 kind: SyncKind::Published,
                 base: Some(our_commit),
@@ -335,6 +326,72 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    /// A deletion on one device must propagate to the others (and must NOT resurrect): the working
+    /// directory is reconciled to the synced tree, so a file removed upstream is removed locally and
+    /// does not reappear on the next snapshot.
+    #[tokio::test]
+    async fn deletion_propagates_and_does_not_resurrect() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = MasterKey::new(1, [0x55; 32]);
+        let dev_a = DeviceKey::generate().unwrap();
+        let members: BTreeMap<DeviceId, DevicePublic> =
+            [(dev_a.device_id().unwrap(), dev_a.public())]
+                .into_iter()
+                .collect();
+        let remote = MemRemote::new(Store::open(dir.path().join("remote.redb")).unwrap());
+        let a_store = Store::open(dir.path().join("a.redb")).unwrap();
+        let b_store = Store::open(dir.path().join("b.redb")).unwrap();
+        let fr = SyncFrontier::default();
+        let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
+        let sync = |store, wdir, frontier, base| {
+            sync_once(
+                &remote, store, wdir, &m, &dev_a, &members, frontier, "main", 0, base, 0, &seal,
+            )
+        };
+
+        // A publishes {keep.txt, gone.txt}.
+        let a_dir = tempfile::tempdir().unwrap();
+        std::fs::write(a_dir.path().join("keep.txt"), b"k").unwrap();
+        std::fs::write(a_dir.path().join("gone.txt"), b"g").unwrap();
+        let ra = sync(&a_store, a_dir.path(), &fr, None).await.unwrap();
+        assert_eq!(ra.kind, SyncKind::Published);
+
+        // B clones → has both files.
+        let b_dir = tempfile::tempdir().unwrap();
+        let rb = sync(&b_store, b_dir.path(), &fr, None).await.unwrap();
+        assert_eq!(rb.kind, SyncKind::Cloned);
+        assert!(b_dir.path().join("gone.txt").exists());
+
+        // A deletes gone.txt and syncs.
+        std::fs::remove_file(a_dir.path().join("gone.txt")).unwrap();
+        let ra2 = sync(&a_store, a_dir.path(), &ra.frontier, ra.base)
+            .await
+            .unwrap();
+        assert_eq!(ra2.kind, SyncKind::Pushed);
+
+        // B pulls → the deletion must apply to B's working dir.
+        let rb2 = sync(&b_store, b_dir.path(), &rb.frontier, rb.base)
+            .await
+            .unwrap();
+        assert_eq!(rb2.kind, SyncKind::Pulled);
+        assert!(
+            !b_dir.path().join("gone.txt").exists(),
+            "a file deleted upstream must be removed on pull"
+        );
+        assert!(b_dir.path().join("keep.txt").exists());
+
+        // And it must not resurrect: B re-syncs with no local change → UpToDate, not a re-add push.
+        let rb3 = sync(&b_store, b_dir.path(), &rb2.frontier, rb2.base)
+            .await
+            .unwrap();
+        assert_eq!(
+            rb3.kind,
+            SyncKind::UpToDate,
+            "the deletion must not bounce back as a new commit"
+        );
+        assert!(!b_dir.path().join("gone.txt").exists());
     }
 
     #[tokio::test]

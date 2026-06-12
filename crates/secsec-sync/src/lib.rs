@@ -27,7 +27,7 @@ pub mod rollback;
 
 use secsec_canon::{verify_reencode, CanonError, Reader, Writer};
 use secsec_frame::{Frame, FrameError, ObjType, FRAME_LEN, MAX_BLOB_SIZE};
-use secsec_kdf::MasterKey;
+use secsec_kdf::{MasterKey, MasterKeys};
 use secsec_sig::{DeviceKey, DevicePublic, NS_HEAD};
 
 /// A 256-bit content address (commit / prev-head id).
@@ -73,6 +73,9 @@ pub enum HeadError {
     Frame(FrameError),
     /// The §9.8 AEAD failed to open (wrong key/generation/ref, or tampered blob).
     Aead,
+    /// The head's authenticated `FRAME.gen` had no master key in the resolver — the caller lacks that
+    /// generation's key (peel the §8.2 key history), or a newer device rotated past it. Refold + retry.
+    UnknownGeneration(u32),
     /// Strict canonical decode failed (truncation, over-long field, trailing bytes, non-canonical).
     Canon(CanonError),
     /// A head field was not valid UTF-8 (ref name).
@@ -91,6 +94,12 @@ impl core::fmt::Display for HeadError {
             HeadError::BadBlobSize => f.write_str("head blob size out of bounds"),
             HeadError::Frame(e) => write!(f, "frame: {e}"),
             HeadError::Aead => f.write_str("head AEAD open failed"),
+            HeadError::UnknownGeneration(g) => {
+                write!(
+                    f,
+                    "no master key for head generation {g} (peel §8.2 keyhist)"
+                )
+            }
             HeadError::Canon(e) => write!(f, "canon: {e}"),
             HeadError::NonUtf8 => f.write_str("non-UTF-8 ref name"),
             HeadError::RefMismatch => {
@@ -277,15 +286,18 @@ pub fn seal_head(
     out
 }
 
-/// Open a stored head blob fetched from `/refs/<H>` for the ref named `ref_name`. Validates the
-/// FRAME against the expected `(gen, type=Head)` (§18), opens the §9.8 AEAD under `head_key_g` with
-/// AD = `FRAME ‖ H`, strictly decodes, and checks the decrypted ref name matches `ref_name`.
+/// Open a stored head blob fetched from `/refs/<H>` for the ref named `ref_name`. Resolves the head's
+/// authenticated `FRAME.gen` against `keys` (§8.2/§9.8 — a head is sealed under the generation current
+/// at write time; a member peels its key ring to read it after later rotations), opens the §9.8 AEAD
+/// under `head_key_g` with AD = `FRAME ‖ H`, strictly decodes, and checks the decrypted ref name
+/// matches `ref_name`. The ref path itself is generation-stable ([`MasterKeys::ref_name_key`], §13),
+/// so the head does not move when the master key rotates.
 ///
 /// Returns `(head, sig)`. The caller MUST then [`verify_head`] against the ref owner's roster key
 /// **and** check `head_version`/`roster_seq` against its persisted frontier (§8.5, §10) — this layer
 /// provides confidentiality + integrity + slot binding, not rollback/authorization.
-pub fn open_head(
-    mk: &MasterKey,
+pub fn open_head<K: MasterKeys>(
+    keys: &K,
     ref_name_key: &[u8; 32],
     ref_name: &str,
     blob: &[u8],
@@ -293,9 +305,11 @@ pub fn open_head(
     if blob.len() > MAX_BLOB_SIZE || blob.len() < FRAME_LEN + HEAD_NONCE_LEN + HEAD_TAG_LEN {
         return Err(HeadError::BadBlobSize);
     }
-    let expected = Frame::v1(mk.generation(), ObjType::Head);
     let frame = Frame::decode(&blob[..FRAME_LEN])?;
-    if frame != expected {
+    let mk = keys
+        .for_gen(frame.gen)
+        .ok_or(HeadError::UnknownGeneration(frame.gen))?;
+    if frame != Frame::v1(mk.generation(), ObjType::Head) {
         return Err(HeadError::Frame(FrameError::FrameMismatch));
     }
     let nonce: [u8; HEAD_NONCE_LEN] = blob[FRAME_LEN..FRAME_LEN + HEAD_NONCE_LEN]
@@ -329,6 +343,7 @@ pub fn random_nonce() -> Result<[u8; HEAD_NONCE_LEN], HeadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn mk(gen: u32) -> MasterKey {
         MasterKey::new(gen, [0x11; 32])
@@ -350,6 +365,52 @@ mod tests {
 
     fn hx(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// A rotation mints a fresh master key, so the **stable** ref-name key ([`MasterKeys::ref_name_key`])
+    /// must come from the genesis generation — keeping the ref's storage path fixed across rotations —
+    /// and `open_head` must **peel** the key ring to read a head sealed under a prior generation. (The
+    /// `mk(gen)` helper above reuses the same key bytes, hiding the rotation effect; real generations
+    /// have independent random keys.)
+    #[test]
+    fn head_survives_a_rotation_via_stable_path_and_peel() {
+        let g1 = MasterKey::new(1, [0x11; 32]);
+        let g2 = MasterKey::new(2, [0x22; 32]); // a real rotation: independent key bytes
+        let ring: BTreeMap<u32, MasterKey> = [
+            (1u32, MasterKey::new(1, [0x11; 32])),
+            (2u32, MasterKey::new(2, [0x22; 32])),
+        ]
+        .into_iter()
+        .collect();
+
+        // The per-generation key (the *bug*) moves the path; the stable key ring keeps it fixed.
+        assert_ne!(
+            ref_hash(&g1.ref_name_key(), "main"),
+            ref_hash(&g2.ref_name_key(), "main"),
+            "the per-generation ref key moves the path — must not be used for the ref slot"
+        );
+        assert_eq!(
+            ref_hash(&MasterKeys::ref_name_key(&ring), "main"),
+            ref_hash(&g1.ref_name_key(), "main"),
+            "the stable ref key is the genesis generation's, independent of the current generation"
+        );
+
+        // Seal a head under gen 1 at the stable path.
+        let dev = DeviceKey::generate().unwrap();
+        let head = sample_head();
+        let sig = sign_head(&dev, &head).unwrap();
+        let rnk = MasterKeys::ref_name_key(&ring);
+        let blob = seal_head(&g1, &rnk, &head, &sig, &[0x07; 12]);
+
+        // A member at gen 2 holding the key ring peels back and reads the gen-1 head (the fix).
+        let (got, _) = open_head(&ring, &rnk, "main", &blob).unwrap();
+        assert_eq!(got, head);
+
+        // A bare gen-2 key (no gen-1 in its resolver) genuinely cannot read it.
+        assert!(matches!(
+            open_head(&g2, &rnk, "main", &blob),
+            Err(HeadError::UnknownGeneration(1))
+        ));
     }
 
     #[test]
@@ -420,11 +481,12 @@ mod tests {
             Err(HeadError::Aead)
         ));
 
-        // wrong generation -> FRAME mismatch
+        // a resolver that lacks the head's generation cannot open it (no key to peel to) — the head
+        // was written under gen 1, and a bare gen-2 key holds no gen-1 key.
         let m2 = mk(2);
         assert!(matches!(
             open_head(&m2, &rnk, "main", &blob),
-            Err(HeadError::Frame(FrameError::FrameMismatch))
+            Err(HeadError::UnknownGeneration(1))
         ));
 
         // too-short blob

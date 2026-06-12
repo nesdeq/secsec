@@ -654,6 +654,22 @@ fn restore_tree<K: MasterKeys>(
     }
     let tree = decode_tree(&fetch_open(keys, ObjType::Tree, tree_salt, tree_id, store)?)?;
     std::fs::create_dir_all(dir)?;
+
+    // Reconcile the directory **to** the tree: remove any on-disk child whose name is not a tree
+    // entry. Without this, restore is additive — a file deleted upstream is never removed, and the
+    // next snapshot re-adds it (a deletion that silently resurrects). Classify each extra with
+    // `symlink_metadata` so a symlink-to-directory is unlinked, never traversed into.
+    let keep: std::collections::BTreeSet<&str> = tree.entries.iter().map(entry_name).collect();
+    for ent in std::fs::read_dir(dir)? {
+        let ent = ent?;
+        let on_disk = ent.file_name();
+        // A non-UTF-8 on-disk name can never be a (UTF-8) tree entry, so it is an extra → remove.
+        let is_kept = on_disk.to_str().is_some_and(|n| keep.contains(n));
+        if !is_kept {
+            remove_extra(&ent.path())?;
+        }
+    }
+
     for entry in &tree.entries {
         match entry {
             Entry::File {
@@ -673,6 +689,14 @@ fn restore_tree<K: MasterKeys>(
                     return Err(SnapError::Malformed("restored file size mismatch"));
                 }
                 let path = dir.join(name);
+                // A name that was a directory upstream but is now a file: clear the directory first
+                // (a plain `write` over a directory fails). Use `symlink_metadata` so a symlink there
+                // is removed as a link, not followed.
+                if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                    if meta.file_type().is_dir() {
+                        std::fs::remove_dir_all(&path)?;
+                    }
+                }
                 std::fs::write(&path, &data)?;
                 apply_metadata(&path, *mode, *mtime)?;
             }
@@ -684,11 +708,31 @@ fn restore_tree<K: MasterKeys>(
                 subtree_salt,
             } => {
                 let path = dir.join(name);
+                // A name that was a file/symlink upstream but is now a directory: remove it so
+                // `create_dir_all` inside the recursion can take its place.
+                if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                    if !meta.file_type().is_dir() {
+                        std::fs::remove_file(&path)?;
+                    }
+                }
                 restore_tree(subtree, subtree_salt, keys, store, &path, depth + 1)?;
                 // Set the dir's metadata AFTER populating it (writing children bumps its mtime).
                 apply_metadata(&path, *mode, *mtime)?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Remove an on-disk path that is not in the restored tree (a deletion to apply). A real directory is
+/// removed recursively; a file **or a symlink** (even one pointing at a directory) is unlinked with
+/// `remove_file`, so restore never follows a symlink out of the synced folder to delete its target.
+fn remove_extra(path: &Path) -> Result<(), SnapError> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
     }
     Ok(())
 }
