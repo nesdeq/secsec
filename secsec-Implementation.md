@@ -185,17 +185,24 @@ committed vectors, and `cargo-audit`. Reproducible static `musl` build via `xtas
   device create an empty repo while the roster is empty.
 
 - **Sync plane (`secsec-sync`/`secsec-engine`, §10).** Commit-on-change snapshots are pushed as an
-  object closure; the per-ref Head is signed *and* encrypted and advanced by a blind-server
-  compare-and-swap. A divergent sibling is admitted only through the rollback gates (roster_seq,
-  per-device commit-version and head-version high-waters) and then reconciled by a per-path three-way
-  merge that keeps both sides on a genuine conflict — **no silent data loss**. The cold-start carries
-  a persisted anti-rollback anchor (highest seq + tip-blob hash) that refuses a server-truncated or
-  re-forked sigchain (P7).
+  object closure; the per-ref Head is signed *and* encrypted, addressed at a **generation-stable** ref
+  path (the ref key is genesis-derived, so the head does not move on rotation; readers peel the key
+  ring to open a head sealed under an older generation), and advanced by a blind-server
+  compare-and-swap. A sibling already in our history is a no-op *before* the gates (so a peer that
+  folds the roster late does not trip the roster_seq gate); a genuinely new divergent sibling is
+  admitted only through the rollback gates (roster_seq, per-device commit-version and head-version
+  high-waters) and then reconciled by a per-path three-way merge that keeps both sides on a genuine
+  conflict — **no silent data loss**. Materializing the result back to the working folder reconciles
+  it to the tree, so an upstream **deletion is applied** (and not resurrected), while untracked
+  symlinks/special files are left alone. The cold-start carries a persisted anti-rollback anchor
+  (highest seq + tip-blob hash) that refuses a server-truncated or re-forked sigchain (P7).
 
 - **Automatic GC (`secsec-client::gc`, §15).** There is no `gc` command. `sync` records signed
   arrival receipts to a local log and runs one best-effort pass per session: it picks a grace-aged
-  `gc_gen` from **local** receipt times, fetches the reachable keep-set (fail-safe — aborts on any
-  missing object), and issues the compare-and-swap sweep, which the server serializes against
+  `gc_gen` from **local** receipt times, fetches the reachable keep-set over **every ref of the repo
+  it knows** (a local per-repo ref registry, since the blind server has no `list`), and issues the
+  compare-and-swap sweep — **fail-safe**: any missing object (including another ref's closure absent
+  from the local cache) aborts the sweep rather than stranding data. The server serializes it against
   concurrent writes via the `args_hash`.
 
 - **Devices / revoke (CLI + `rotate_repo_remote`).** `secsec devices` lists the folded roster with

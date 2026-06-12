@@ -129,6 +129,15 @@ All objects are content-addressed, framed, encrypted (§9.1).
 Files split by **keyed FastCDC** (§9.6); small chunks packed. Trees/commits/roster are blobs in
 the same store, so the server learns no structure beyond §4.3.
 
+The synced object model is **regular files and directories only**. A symlink, FIFO, socket, or
+device node in the working folder is **skipped** — not synced, and **not** an error (a single such
+entry must never fail the whole snapshot). The recorded `mode` is the 9 standard permission bits
+only: file-type bits are redundant (the entry kind already distinguishes file vs directory) and the
+**setuid / setgid / sticky** bits are deliberately dropped on both snapshot and restore (§18), so a
+compromised member cannot author a tree that plants a setuid/setgid file on every device. Tree entry
+names are a single path component: never empty, `.`/`..`, a path separator, or a control character
+(§9.2/§18 path-traversal and terminal-escape guards).
+
 ---
 
 ## 7. Trust bootstrap & device enrollment
@@ -557,7 +566,7 @@ cdc_seed[g]    = BLAKE3::derive_key("secsec-cdc-seed-v1",
 head_key_g     = BLAKE3::derive_key("secsec-head-enc-v1",
                                      master_key_g ‖ le32(g))   // mutable head-blob key (§9.8)
 roster_key_g   = BLAKE3::derive_key("secsec-roster-enc-v1", master_key_g)   // one per generation g
-ref_name_key   = BLAKE3::derive_key("secsec-ref-name-v1",  master_key_g)
+ref_name_key   = BLAKE3::derive_key("secsec-ref-name-v1",  master_key_1)   // GENESIS gen — stable across rotations
 
 // Roster entry per-sequence subkey (g = generation under which entry[seq] was written):
 k_roster_entry[g][seq] = BLAKE3::derive_key("secsec-roster-entry-v1",
@@ -589,6 +598,16 @@ listed above**.
 
 `roster_key_g` (= `derive_key("secsec-roster-enc-v1", master_key_g)`, **one per generation**)
 encrypts the sigchain entries written under generation `g` so the server cannot read them.
+
+`ref_name_key` is derived from `master_key_1` (the **genesis** generation), so it is **stable across
+rotations** — a ref's storage path `H = keyed_hash(ref_name_key, ref_name)` (§13) does **not** move
+when the master key rotates. (Every current member can recover `master_key_1` by peeling the §8.2
+data-key history; the server never holds it, so `H` leaks nothing it does not already see as the
+storage path.) The head *blob* is still sealed under the **current** generation's `head_key_g`, so a
+revoked device cannot read post-rotation head metadata (forward secrecy, §9.8); a reader at a newer
+generation peels its key ring to open a head written under an older one (§9.8). Were `ref_name_key`
+generation-scoped, a rotation would relocate the head ref to an empty slot until republished, and a
+fresh clone reaching that empty slot could mistakenly publish its empty directory as the head.
 
 **Roster entry AEAD (normative).** Each sigchain entry is encrypted under a per-entry subkey
 derived from the **generation-indexed** roster key and the entry's sequence number. `FRAME_roster`
@@ -716,7 +735,8 @@ authenticity against other devices and the server rests on the object's **signat
 symmetric tag.
 
 **Head blob (normative).** Stored at `/refs/<H>`, `H = BLAKE3::keyed_hash(ref_name_key, ref_name)`
-(§13). The head is **both signed and encrypted**:
+(§13), where `ref_name_key` is the **genesis-generation, rotation-stable** key of §9.5 — so a ref's
+slot does not move across rotations. The head is **both signed and encrypted**:
 
 ```
 sig        = SSHSIG("secsec-head-v1",                                  // §9.6
@@ -732,8 +752,13 @@ non-member from forging or substituting a head; the AEAD hides the ref→commit 
 counters from the server and binds the blob to its ref slot via `H`. `head_version` (per ref,
 strictly increasing, §8.5) is covered by the signature and checked against the client's persisted
 frontier and `per_device_head_version_hwm` (§8.5, §10) — replay/rollback of an old head is caught
-there, not by the AEAD. The generation `g` is read from the plaintext `FRAME.gen`; a current member
-already holds (or peels, §8.2) the `master_key_g` needed for `head_key_g`.
+there, not by the AEAD. The generation `g` of the head **blob** is read from the plaintext
+`FRAME.gen` and resolved against the reader's key ring: a head is sealed under the generation current
+at write time, and a current member opens it under that generation's `head_key_g`, **peeling** the
+§8.2 key history to read a head written before a rotation (the ref slot `H` itself does not move,
+because `ref_name_key` is genesis-derived, §9.5). A member that does not yet hold the head's
+generation (a newer device rotated past it) refolds and retries. New heads are always sealed under
+the **current** generation, so a revoked device cannot read post-rotation head metadata.
 
 The §8.5 local sealed-state blob uses this same construction with `key = local_seal_key` and
 `AD = device_id` (no `FRAME`, no signature — it is local-only and unsigned).
@@ -743,8 +768,12 @@ The §8.5 local sealed-state blob uses this same construction with `key = local_
 
 - **Commit on change:** snapshot → commit (strictly increasing per-device `version`, current
   `roster_seq`, `last_seen_head`) → sign → advance the per-ref head via `cas-head`.
-- **Rollback-aware merge** (closes replay-into-merge): before merging a server-presented sibling
-  the client checks:
+- **Rollback-aware merge** (closes replay-into-merge): a sibling that is an **ancestor of (or equal
+  to)** the client's head is already held and is accepted as a no-op **before** the gates below — a
+  commit already in the client's history can never be a rollback. The gates therefore apply only to
+  the adoption of *genuinely new* sibling state (so a peer that merely folds the roster later, and
+  thus stamps an **older** `roster_seq` on a commit the client already holds, does not trip gate 1).
+  For new sibling state the client checks:
   (1) `roster_seq` from the sibling ≥ the client's persisted `roster_seq` frontier. This guards
       against branches that predate known roster state, not against sibling branch rollbacks observed
       indirectly (see gate 2).
@@ -777,6 +806,13 @@ The §8.5 local sealed-state blob uses this same construction with `key = local_
   conflicting path is surfaced to the user. This same-server DAG-incomparable check is the wired fork
   handling. Detection is guaranteed on any reconvergence on the shared server; a sustained partition
   delays it (the SUNDR lower bound, §21) but does not prevent it.
+- **Materialize (normative):** writing a pulled or merged tree back to the working folder
+  **reconciles** the folder *to* the tree — a regular file or directory present on disk but **absent
+  from the tree is removed**, so an upstream deletion takes effect (and is not re-added by the next
+  snapshot, which would otherwise silently resurrect it). Reconciliation touches only the kinds
+  secsec tracks: an untracked symlink or special file on disk is left in place (never deleted, never
+  traversed), and a symlink is never followed when clearing a path to write a file. The keep-both
+  conflict copies are tree entries, so they survive reconciliation.
 - **Live trigger:** `notify` (inotify/FSEvents/ReadDirectoryChangesW) drives commit-on-change;
   periodic commits set the snapshot cadence.
 
@@ -839,9 +875,10 @@ The §8.5 local sealed-state blob uses this same construction with `key = local_
   immediately preceding the blob bytes. The server MUST reject any `put()` with
   `declared_size > 16 MiB` before reading the body. `declared_size` is included in the
   `secsec-write-v1` args hash: `args_hash = BLAKE3(canonical("put" ‖ id ‖ le32(declared_size)))`.
-- **DoS hardening:** QUIC Retry/address-validation (anti-amplification); request bodies accepted
-  only **after** the write-auth check; per-key storage quotas; connection rate limits; bounded
-  object sizes. (Values §19.)
+- **DoS hardening:** the server issues a stateless **QUIC Retry** to any un-validated source address
+  before allocating connection state (anti-amplification, and so the per-source-IP connection-rate
+  limit cannot be evaded by address spoofing); request bodies accepted only **after** the write-auth
+  check; per-key storage quotas; connection rate limits; bounded object sizes. (Values §19.)
 
 ---
 
@@ -929,10 +966,18 @@ too; this is purely a concurrency guard — the head's *authenticity* still rest
 signature inside the blob (§9.8), verified by readers against the roster.
 
 **Per-key storage quota and rate limits** (normative — server MUST enforce):
-- Per-key storage quota: 10 GiB default (configurable).
+- Per-key storage quota: 10 GiB default (configurable). **Scope:** the store is content-addressed and
+  deduplicated, so an object is not owned by the key that wrote it (another key's tree may reference
+  it) and a precise *durable* per-key byte attribution is undefined. This quota therefore bounds the
+  volume of **new** objects a single key introduces **per server session** (an anti-flood cap, reset
+  on restart; idempotent re-puts are not charged). Durable protection against disk exhaustion is the
+  operator's filesystem quota on the store directory — the standard control for a self-hosted,
+  single-user server (§14).
 - Per-key write rate: 100 MB/s sustained, burst 1 GiB.
 - Per-key read rate: 200 MB/s sustained.
 - Connection rate: 10 new connections/s per source IP; 3 concurrent connections per authenticated key.
+  Enforced after the **QUIC Retry** address validation (§11), so a spoofed source cannot exhaust the
+  per-IP budget.
 - `gc()` rate: 4 calls per key per hour; the server MUST reject excess calls with a `rate-limit` error before performing any object scan.
 
 These limits are checked after auth and before object storage. See §19.
@@ -971,10 +1016,11 @@ Path notes:
   key bytes are never exposed in a path; the keyslot blob itself carries the public key for
   verification. `device_id = BLAKE3(canonical(pubkey))` is already opaque.
 - `/refs/<H>` keys by a keyed hash `H = BLAKE3::keyed_hash(ref_name_key, ref_name)`, not the ref name
-  or device id, where `ref_name_key` is derived from `master_key` (§9.5). The head blob is **signed
-  and encrypted** (§9.8): the ref name lives **inside the encryption** (recoverable only by a client
-  holding `head_key_g`), so the server sees only the hash `H` and ciphertext. This closes the
-  ref-name leak.
+  or device id, where `ref_name_key` is derived from the **genesis** `master_key_1` (§9.5) so the path
+  is **stable across rotations** — the head ref does not relocate when the master key rotates. The
+  head blob is **signed and encrypted** (§9.8): the ref name lives **inside the encryption**
+  (recoverable only by a client holding the current `head_key_g`), so the server sees only the hash
+  `H` and ciphertext. This closes the ref-name leak.
 
 The server-side `redb` index holds **only** `{id, size, generation, pack-offset}` — never
 plaintext-derived metadata. One static binary; no external DB.
@@ -1018,9 +1064,10 @@ operator runs their own server, and the device replicas are the redundancy.
 **GC is automatic and client-driven — there is no `gc` command.** The blind server cannot compute
 reachability (every head/commit/tree is ciphertext to it), so a client must initiate; but *which*
 client and *when* is not a decision to push onto the user. `secsec sync` therefore runs one
-best-effort GC pass per session (after the first sync): it fetches the reachable closure over its
-ref, derives `gc_gen` from its own §15 arrival-receipt log (only generations whose every object has
-aged past the `GC_GRACE_WINDOW`), and issues the compare-and-swap `gc` op below. A failure is
+best-effort GC pass per session (after the first sync): it fetches the reachable closure over **every
+ref of the repo it knows** (the keep-set, below), derives `gc_gen` from its own §15 arrival-receipt
+log (only generations whose every object has aged past the `GC_GRACE_WINDOW`), and issues the
+compare-and-swap `gc` op below. A failure is
 logged and skipped — never fatal to the sync. Retention is keep-everything until an object both
 falls out of the keep-set and ages past the grace window; nothing is deleted silently. There is no
 `gc` command — the sync loop is the trigger.
@@ -1033,13 +1080,19 @@ This trims the *logical* object set; it does not by itself shrink the on-disk `r
 `redb` re-grows to its working size on the next write — reclaiming the file footprint needs the
 delta-scoped transfer that would let the local cache hold only the current snapshot.
 
-- **Keep-set** = reachable closure over the heads of **all devices in the RFP-anchored roster**
-  (each at `/refs/<H>`) — not merely the refs the server volunteers. If a rostered device's head is
-  unavailable, GC **fails safe** (keeps those objects) → server **ref-hiding cannot trick GC into
-  deleting**. If any object (commit, tree, or subtree node) required during keep-set traversal is
-  unavailable, the client **MUST abort GC** and report the missing object to the user. Partial
-  traversal **MUST NOT** proceed to a `gc()` call. GC keep-set per call is capped at 100,000 IDs
-  (§12, §19); larger repos use generation-bounded batches.
+- **Keep-set** = reachable closure over the heads of **every ref in the repo** (each ref name is a
+  shared, per-name head at `/refs/<H>`, §13) — **all** refs, not merely the one being synced nor the
+  refs the server volunteers. Sweeping over a subset would delete objects reachable only from an
+  omitted ref. Because the server is blind and has **no `list` operation** (§12), ref *names* live
+  only in clients; a client enumerates the repo's refs from a **local per-repo ref registry** (the
+  ref names it has synced into the repo, keyed by RFP) and keeps every one. If any ref's head, or any
+  object (commit, tree, or subtree node) required during keep-set traversal, is unavailable in the
+  local store, the client **MUST abort GC** (it cannot prove the keep-set is complete) and report it
+  — it **MUST NOT** proceed to a `gc()` call. This makes GC **fail safe**: server ref-hiding cannot
+  trick GC into deleting, and a multi-ref repo whose other refs are not all cached locally simply
+  skips the sweep rather than stranding their objects (a ref synced only from another machine is the
+  §21 multi-ref-GC residual — bounded by the grace window and the device replicas, §14). GC keep-set
+  per call is capped at 100,000 IDs (§12, §19); larger repos use generation-bounded batches.
 
 - **`keep_set_hash` canonical encoding:** `keep_set_hash = BLAKE3(canonical_id_list(keep_set))`
   where `canonical_id_list` encodes the keep-set as `le64(count) ‖ id[0] ‖ id[1] ‖ … ‖ id[count-1]`
@@ -1184,8 +1237,15 @@ X-Wing keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today
 - **Parsers:** size/depth/fan-out/length bounds enforced pre-allocation per §19 normative constants;
   `cargo-fuzz` targets for every decoder; reject non-canonical encodings.
 - **Secrets never logged;** structured redaction; no key material in error messages.
+- **Restore hygiene:** tree entry names are single path components with no separators, no `.`/`..`,
+  and **no control characters** (path-traversal + terminal-escape guards, enforced at decode); the
+  restored `mode` is the 9 standard permission bits only — **setuid / setgid / sticky are dropped**,
+  so a compromised member cannot plant a setuid/setgid file on every device. Writing a tree back to
+  the working folder reconciles it (upstream deletions applied), never following or deleting an
+  untracked symlink (§6, §10).
 - **Supply chain:** minimal pinned deps; `cargo-audit` + `cargo-vet` in CI; reproducible static
-  `musl` build; no OpenSSL.
+  `musl` build; no OpenSSL. (The PQ KEM rests on the formally-verified `libcrux-ml-kem`, pinned via
+  `Cargo.lock`; `cargo-audit` is clean of advisories.)
 - Do not trust returned FRAME fields; derive from expected `(gen, type)` and verify equality.
 
 ## 19. Constants _(normative — required for conformance)_
@@ -1200,7 +1260,7 @@ X-Wing keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today
 | GC grace window | 48 h | `GC_GRACE_WINDOW`; shields recent arrivals during multi-day offline periods; normative definition in §15 — this value MUST match §15 exactly |
 | Metadata padding buckets | powers of two | default-on (small objects) |
 | Chunk padding policy | power-of-two (default) / uniform (opt-in) / off (opt-out) | default pads to next power-of-two ≥ size (≤2× overhead) — *reduces* the boundary signal; uniform pads all chunks to one fixed size — *eliminates* it at higher cost; off saves space |
-| Per-key storage quota | 10 GiB default | configurable; server MUST enforce |
+| Per-key storage quota | 10 GiB default | configurable; per-session new-write anti-flood cap (dedup store has no durable per-key byte ownership, §11); durable disk limits are the operator's filesystem quota |
 | Per-key write rate | 100 MB/s sustained, burst 1 GiB | server MUST enforce after auth |
 | Per-key read rate | 200 MB/s sustained | server MUST enforce after auth; matches 2× write rate to allow sync catch-up without unbounded egress |
 | Connection rate limit | 10 new/s per source IP; 3 concurrent per authenticated key | server MUST enforce |
@@ -1338,6 +1398,16 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
   Clients MUST therefore treat GC eligibility as a client-computed decision based on the signed
   sigchain frontier, not on server-supplied timestamps. This is a defence-in-depth residual:
   a cooperative server's timestamps are not load-bearing for correctness.
+
+- **Multi-ref GC across machines.** The GC keep-set must cover *every* ref of the repo (§15), but the
+  blind server has no `list` operation (§12), so a client enumerates refs from a local per-repo
+  registry of the ref names it has synced. A ref synced **only from another machine** is unknown to
+  this machine's GC; rather than strand its objects, GC **fails safe** — that ref's closure is not in
+  the local cache, so the keep-set cannot be built and **no sweep runs**. The single-ref case (the
+  default, one ref `main`) is unaffected. The residual is reduced reclamation, never data loss:
+  unswept objects are bounded by the grace window and remain on every device replica (§14). A
+  repo-wide encrypted ref index would close the enumeration gap but is deferred (it would add a
+  read-modify-write sub-protocol on a path that, if buggy, deletes data).
 
 - **Key-rotation count and timing leakage.** The storage layout uses plaintext generation indices
   in `/keyslots/<device_id>/<g>` and `/keyhist/<g>`. A malicious server enumerating these paths
