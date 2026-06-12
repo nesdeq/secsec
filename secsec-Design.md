@@ -1083,16 +1083,26 @@ delta-scoped transfer that would let the local cache hold only the current snaps
 - **Keep-set** = reachable closure over the heads of **every ref in the repo** (each ref name is a
   shared, per-name head at `/refs/<H>`, §13) — **all** refs, not merely the one being synced nor the
   refs the server volunteers. Sweeping over a subset would delete objects reachable only from an
-  omitted ref. Because the server is blind and has **no `list` operation** (§12), ref *names* live
-  only in clients; a client enumerates the repo's refs from a **local per-repo ref registry** (the
-  ref names it has synced into the repo, keyed by RFP) and keeps every one. If any ref's head, or any
-  object (commit, tree, or subtree node) required during keep-set traversal, is unavailable in the
-  local store, the client **MUST abort GC** (it cannot prove the keep-set is complete) and report it
-  — it **MUST NOT** proceed to a `gc()` call. This makes GC **fail safe**: server ref-hiding cannot
-  trick GC into deleting, and a multi-ref repo whose other refs are not all cached locally simply
-  skips the sweep rather than stranding their objects (a ref synced only from another machine is the
-  §21 multi-ref-GC residual — bounded by the grace window and the device replicas, §14). GC keep-set
-  per call is capped at 100,000 IDs (§12, §19); larger repos use generation-bounded batches.
+  omitted ref. **Completeness is enforced by the `gc` compare-and-swap, not by trust:** the
+  `all_heads_hash` bound into `args_gc` (below) is computed by the **server over every stored ref**;
+  a client whose keep-set omits a ref signs a different `all_heads_hash`, so the recomputed `args_gc`
+  fails signature verification and the sweep is **rejected** (`CasConflict`) rather than executed. GC
+  therefore runs **only** with a provably complete ref view, and can never delete an omitted ref's
+  objects — at worst it does not run. If any object (commit, tree, or subtree node) required during
+  keep-set traversal is unavailable in the local store, the client additionally **MUST abort GC**
+  (fail-safe) and **MUST NOT** proceed to a `gc()` call; server ref-hiding likewise cannot trick GC
+  into deleting (the hidden ref still changes the server's `all_heads_hash`). GC keep-set per call is
+  capped at 100,000 IDs (§12, §19); larger repos use generation-bounded batches.
+  - *Enumerating refs.* Because the server is blind and has **no `list` operation** (§12), ref
+    *names* live only in clients. A client gathers the repo's refs from a **local per-repo ref
+    registry** (the ref names it has synced, keyed by RFP) and builds the keep-set over all of them.
+    In a single-ref repo (the default, ref `main`) this is the complete set and GC reclaims normally.
+    In a multi-ref repo, a client that does not hold every ref's head+closure cannot form the matching
+    `all_heads_hash` and so its GC is a safe no-op (`CasConflict`) — the server does not reclaim space
+    for that repo, but **no data is lost** (§21 multi-ref-GC item). A repo-wide ref enumeration — e.g.
+    a `list-refs` op returning the opaque ref slots, which any member can open since the head AEAD key
+    is master-key-derived and the ref name lives inside the blob — would let any client run GC over
+    all refs; it is a deferred **reclamation** enhancement, not a safety fix.
 
 - **`keep_set_hash` canonical encoding:** `keep_set_hash = BLAKE3(canonical_id_list(keep_set))`
   where `canonical_id_list` encodes the keep-set as `le64(count) ‖ id[0] ‖ id[1] ‖ … ‖ id[count-1]`
@@ -1399,15 +1409,20 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
   sigchain frontier, not on server-supplied timestamps. This is a defence-in-depth residual:
   a cooperative server's timestamps are not load-bearing for correctness.
 
-- **Multi-ref GC across machines.** The GC keep-set must cover *every* ref of the repo (§15), but the
-  blind server has no `list` operation (§12), so a client enumerates refs from a local per-repo
-  registry of the ref names it has synced. A ref synced **only from another machine** is unknown to
-  this machine's GC; rather than strand its objects, GC **fails safe** — that ref's closure is not in
-  the local cache, so the keep-set cannot be built and **no sweep runs**. The single-ref case (the
-  default, one ref `main`) is unaffected. The residual is reduced reclamation, never data loss:
-  unswept objects are bounded by the grace window and remain on every device replica (§14). A
-  repo-wide encrypted ref index would close the enumeration gap but is deferred (it would add a
-  read-modify-write sub-protocol on a path that, if buggy, deletes data).
+- **Multi-ref GC reclamation (not a data-loss residual).** The GC keep-set must cover *every* ref of
+  the repo (§15), and completeness is **enforced** by the `gc` compare-and-swap: the server computes
+  `all_heads_hash` over **every** stored ref, so a client whose view omits a ref signs a mismatching
+  `args_gc` and the sweep is rejected (`CasConflict`). GC therefore never deletes an omitted ref's
+  objects — it simply does not run. Because the blind server has no `list` operation (§12), a client
+  enumerates refs only from its local per-repo registry; in a multi-ref repo it generally cannot form
+  the complete view, so its GC is a safe no-op and the **server does not reclaim space** for that repo
+  (orphans from cas-retries and old-generation objects accumulate). This is a **reclamation** residual,
+  not data loss: the data is intact and bounded only by disk. The default single-ref repo (one ref
+  `main`) reclaims normally. Closing it is a deferred enhancement — a read-only `list-refs` op that
+  returns the opaque ref slots (any member can open every head, since the head AEAD key is
+  master-key-derived and the ref name lives inside the blob), letting any client GC over all refs. It
+  was not built for v1 because it adds server API surface for an uncommon configuration whose only cost
+  today is unreclaimed space, not correctness.
 
 - **Key-rotation count and timing leakage.** The storage layout uses plaintext generation indices
   in `/keyslots/<device_id>/<g>` and `/keyhist/<g>`. A malicious server enumerating these paths
