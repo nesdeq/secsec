@@ -1,13 +1,8 @@
-//! Repository history — the read side of `secsec log` / `secsec log <path>` (`secsec-Design.md` §10).
-//!
-//! The full history is already retained (keep-everything GC, and the head's whole ancestor chain is
-//! reachable) and readable across rotations (the caller passes a peeled key ring). This module walks
-//! the commit DAG over the existing object plane — no protocol, crypto, or server change.
-//!
-//! [`fetch_history`] brings the commit + tree objects local (skipping chunk blobs — listing and
-//! diffing only need the tree structure, and the diff compares chunk-id *lists*, not content).
-//! [`repo_log`] lists commits newest-first with the files each changed vs its first parent;
-//! [`path_history`] lists the versions of one file/folder. The restore side is
+//! Repository history — the read side of `secsec log` / `secsec restore` (`secsec-Design.md` §10),
+//! walking the commit DAG over the existing object plane (keep-everything GC retains it; a peeled
+//! key ring reads across rotations). [`fetch_history`] brings commits + trees local (no chunk blobs
+//! — listing/diffing only needs tree structure); [`repo_log`] lists commits newest-first with the
+//! files each changed; [`path_history`] lists one path's versions. The restore side is
 //! [`secsec_snapshot::restore_path`], driven by the CLI.
 
 use crate::{ClientError, Remote};

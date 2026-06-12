@@ -1,24 +1,11 @@
 //! `secsec-snapshot` — the object graph and directory snapshot/restore (`secsec-Design.md` §6, §9.2).
 //!
-//! A snapshot is a `Commit` pointing at a root `Tree`; trees list files (chunk-id lists) and
-//! subtrees, content-addressed via [`secsec_object`]. [`snapshot_tree`] walks a directory, chunks
-//! files with keyed FastCDC, and seals every chunk/tree, `put`ting them to a [`Store`];
-//! [`seal_signed_commit`] wraps the root tree in an SSHSIG-signed `Commit` (§6, §9.6 — commits are
-//! **always** signed). On the read side [`open_signed_commit`] fetches+verifies a commit and
-//! [`restore_commit_tree`] / [`restore_tree_into`] walk the tree back, `get`ting each object, opening
-//! it with full verification (§9.2 three-way check), un-padding, and rebuilding the directory
-//! byte-for-byte.
-//!
-//! **Per-path salts (§9.2/§9.7).** Each file's chunks and each subtree are addressed with a 16-byte
-//! `path_salt`; a tree stores the salt of each child, and the commit stores the root tree's salt.
-//! On restore the salts come from the parent object, so the id re-verification in
-//! [`secsec_object::open_object`] is meaningful.
-//!
-//! **Incremental snapshots.** A path's salt is generated once (first sync) and is **constant across
-//! all versions** (§9.7): [`snapshot_tree`] takes the previous root `(id, salt)` and reuses each
-//! path's salt from the prior tree, so an unchanged file re-chunks to the identical ids. That
-//! stability is what makes incremental upload/dedup and the three-way merge's content equality work
-//! — it is not an optimization but a correctness requirement of the sync model.
+//! A snapshot is an SSHSIG-signed `Commit` pointing at a root `Tree`; trees list files (chunk-id
+//! lists) and subtrees, sealed via [`secsec_object`]. Restore walks the tree back, verifying every
+//! object (§9.2), and rebuilds the directory byte-for-byte. Per-path salts ride in the parent
+//! object (root salt in the commit), and a path's salt is **constant across versions** (§9.7) —
+//! [`snapshot_tree`] reuses salts from the previous tree, which is what makes incremental
+//! upload/dedup and merge content-equality work (a correctness requirement, not an optimization).
 
 #![forbid(unsafe_code)]
 
@@ -236,22 +223,15 @@ fn encode_tree(tree: &Tree) -> Vec<u8> {
     w.finish()
 }
 
-/// Reject a tree entry name that could escape the synced folder on restore (§9.2/§18). A name MUST be
-/// a single, non-empty path component: never empty, `.`/`..`, or containing a path separator (`/`,
-/// `\`) or a NUL byte. `restore_tree`/`restore_path` join these names onto a destination directory, so
-/// an unchecked `..` or `/etc/...` (which `Path::join` resolves as an escape/absolute replacement)
-/// would let a malicious member's tree write arbitrary files outside the synced folder. Trees are
-/// keyed-hash content-addressed (a blind server cannot forge one), but a compromised/stolen member
-/// (§3) can author such a tree, so the guard is enforced here at decode for every restore path.
+/// Path-traversal guard, enforced at decode (§18): a name MUST be a single non-empty path
+/// component — never `.`/`..`, a separator, or a control character (terminal-escape injection). A
+/// compromised member (§3) can author a tree, so restore must never join an unchecked name.
 fn validate_entry_name(name: &str) -> Result<(), SnapError> {
     if name.is_empty()
         || name == "."
         || name == ".."
         || name.contains('/')
         || name.contains('\\')
-        // Reject all C0 control characters (incl. NUL) and DEL: a control byte in a restored name is
-        // almost never a legitimate file and is dangerous when the name is later printed (terminal
-        // escape injection) or written cross-platform (§18 hardening).
         || name.chars().any(|c| c.is_control())
     {
         return Err(SnapError::Malformed("unsafe tree entry name"));
@@ -270,9 +250,7 @@ fn decode_tree(bytes: &[u8]) -> Result<Tree, SnapError> {
         let kind = r.u8()?;
         let name =
             String::from_utf8(r.bytes(MAX_NAME)?.to_vec()).map_err(|_| SnapError::NonUtf8Name)?;
-        // Path-traversal guard (above) + canonical ordering (§9.3): entries MUST be strictly
-        // ascending by name, which also forbids duplicate names ("no duplicate keys"). `snapshot_dir`
-        // emits sorted, unique names, so an out-of-order or duplicate entry is a malformed/forged tree.
+        // Name guard + §9.3 canonical ordering: strictly ascending names (also bans duplicates).
         validate_entry_name(&name)?;
         if let Some(last) = entries.last() {
             if name.as_str() <= entry_name(last) {
@@ -405,9 +383,8 @@ pub fn __fuzz_decode_signed_commit(bytes: &[u8]) {
 // ---- commit signing (§9.6 secsec-commit-v1) ----
 
 impl Commit {
-    /// The canonical signed message — the commit's encoded fields (§9.3/§9.6). The `device_id`,
-    /// `version`, `roster_seq`, and `last_seen_head` are all covered, binding the commit to its
-    /// author, its replay counter, the roster state it assumed, and the head it last saw.
+    /// The canonical signed message — all commit fields, binding author, replay counter, roster
+    /// state, and last-seen head (§9.3/§9.6).
     #[must_use]
     pub fn signed_message(&self) -> Vec<u8> {
         encode_commit(self)
@@ -420,9 +397,8 @@ pub fn sign_commit(device: &secsec_sig::DeviceKey, commit: &Commit) -> Result<Ve
     Ok(device.sign(secsec_sig::NS_COMMIT, &commit.signed_message())?)
 }
 
-/// Verify a commit signature: the SSHSIG must be valid under `NS_COMMIT` **and** `pubkey` must be the
-/// commit's author (`pubkey.device_id() == commit.device_id`). The caller resolves `pubkey` from the
-/// RFP-anchored roster (§8) for `commit.device_id`, so a non-member cannot forge a commit (§9.6 P3).
+/// Verify a commit: valid SSHSIG under `NS_COMMIT` **and** `pubkey` is the named author. The caller
+/// resolves `pubkey` from the RFP-anchored roster (§8), so a non-member cannot forge a commit (P3).
 pub fn verify_commit(
     pubkey: &secsec_sig::DevicePublic,
     commit: &Commit,
@@ -438,11 +414,8 @@ pub fn verify_commit(
 
 // ---- snapshot ----
 
-/// The recorded permission bits for a path. Only the **9 standard permission bits** (`rwxrwxrwx`,
-/// `0o777`) are captured: the file-type bits are redundant (the entry kind already says file vs dir),
-/// and the **setuid / setgid / sticky** bits are deliberately dropped (§18, restore hardening) — a
-/// compromised member (§3) could otherwise author a tree that plants a setgid/setuid file on every
-/// device's disk. Masking here (snapshot) and in [`apply_metadata`] (restore) is symmetric, so
+/// The recorded permission bits: the 9 standard bits only — setuid/setgid/sticky are dropped (§18;
+/// a member-authored tree must not plant them). Masked symmetrically with [`apply_metadata`] so
 /// snapshot→restore→snapshot stays idempotent.
 #[cfg(unix)]
 fn mode_of(meta: &std::fs::Metadata) -> u32 {
@@ -461,15 +434,10 @@ fn mtime_of(meta: &std::fs::Metadata) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Snapshot the directory `root` into `store` under `mk` and return its root **tree** id and salt
-/// (no commit). This is the content half of a sync push; the orchestration wraps it in a signed
-/// commit (see [`seal_signed_commit`]) carrying the version/roster_seq/parent metadata (§10).
-///
-/// `prev` is the previous snapshot's root `(tree_id, salt)`, or `None` for the very first sync. When
-/// given, every path's salt is **reused** from the prior tree (§9.2/§9.7: a path's `path_salt` is
-/// generated once at first sync and is constant across all versions). This is what makes an
-/// unchanged file re-chunk to the **same** ids — the basis for incremental upload/dedup and for the
-/// three-way merge's content equality. Only genuinely new paths get a fresh random salt.
+/// Snapshot the directory `root` into `store`, returning its root tree `(id, salt)` — the content
+/// half of a sync push ([`seal_signed_commit`] wraps it). `prev` is the previous snapshot's root
+/// (`None` on first sync); each path's salt is reused from it (§9.7 — salts are constant across
+/// versions, the basis for dedup and merge content-equality), fresh salts only for new paths.
 pub fn snapshot_tree(
     root: &Path,
     mk: &MasterKey,
@@ -496,9 +464,8 @@ fn entry_name(e: &Entry) -> &str {
     }
 }
 
-/// Sign `commit` (under `NS_COMMIT`, §9.6), seal the signed-commit object (fields ‖ sig) under `mk`,
-/// store it, and return its content id. The signer must be `commit.device_id` (a member key); the
-/// content id is the commit id a Head points at. See [`open_signed_commit`] for the read side.
+/// Sign `commit` (§9.6), seal the signed-commit object (fields ‖ sig), store it, and return its
+/// content id — the commit id a Head points at. The signer must be `commit.device_id`.
 pub fn seal_signed_commit(
     mk: &MasterKey,
     store: &Store,
@@ -512,16 +479,14 @@ pub fn seal_signed_commit(
     Ok(id)
 }
 
-/// Fetch and open the signed-commit object `commit_id` from `store`, returning the decoded commit and
-/// its signature. The content id is re-verified by [`open_object`]; the caller still must
-/// [`verify_commit`] the signature against the author's roster key before trusting the commit (§9.6).
+/// Fetch and open the signed-commit object `commit_id`, returning `(commit, sig)`. The content id
+/// is re-verified by [`open_object`]; the caller must still [`verify_commit`] against the author's
+/// roster key (§9.6).
 pub fn open_signed_commit<K: MasterKeys>(
     commit_id: &Id,
     keys: &K,
     store: &Store,
 ) -> Result<(Commit, Vec<u8>), SnapError> {
-    // `fetch_open` resolves the commit's own generation (§8.2): a single `&MasterKey` resolves only
-    // its generation (no-rotation case); a peeled key ring resolves any past generation.
     decode_signed_commit(&fetch_open(
         keys,
         ObjType::Commit,
@@ -622,9 +587,7 @@ fn snapshot_dir(
                 subtree_salt,
             });
         }
-        // Anything else — a symlink, FIFO, socket, or device node — is **skipped**, not synced (the
-        // object model is regular files + directories only, §6). A single unsupported entry must not
-        // fail the whole snapshot; restore leaves any such on-disk entry on peers untouched.
+        // Symlinks/FIFOs/sockets/devices are skipped, never an error (§6: files + dirs only).
     }
 
     let tree = Tree { entries };
@@ -643,8 +606,6 @@ fn fetch_open<K: MasterKeys>(
     store: &Store,
 ) -> Result<Vec<u8>, SnapError> {
     let blob = store.get(id)?.ok_or(SnapError::Missing(*id))?;
-    // `open_object` resolves this object's authenticated generation against `keys` (§8.2): a single
-    // `&MasterKey` resolves only its own generation; a peeled key ring resolves any.
     Ok(open_object(keys, obj_type, salt, id, &blob)?)
 }
 
@@ -662,16 +623,14 @@ fn restore_tree<K: MasterKeys>(
     let tree = decode_tree(&fetch_open(keys, ObjType::Tree, tree_salt, tree_id, store)?)?;
     std::fs::create_dir_all(dir)?;
 
-    // Reconcile the directory **to** the tree: remove any on-disk child whose name is not a tree
-    // entry. Without this, restore is additive — a file deleted upstream is never removed, and the
-    // next snapshot re-adds it (a deletion that silently resurrects). Symlinks and special files are
-    // **not tracked** by snapshots (they are skipped), so they are left untouched here — only the
-    // regular files and real directories secsec actually syncs are reconciled.
+    // Reconcile the directory TO the tree (§10 Materialize): tracked-kind on-disk entries absent
+    // from the tree are removed, so upstream deletions apply instead of resurrecting. Untracked
+    // kinds (symlinks/special files) are left alone.
     let keep: std::collections::BTreeSet<&str> = tree.entries.iter().map(entry_name).collect();
     for ent in std::fs::read_dir(dir)? {
         let ent = ent?;
         let on_disk = ent.file_name();
-        // A non-UTF-8 on-disk name can never be a (UTF-8) tree entry, so it is an extra.
+        // A non-UTF-8 name can never be a (UTF-8) tree entry → extra.
         let is_kept = on_disk.to_str().is_some_and(|n| keep.contains(n));
         if !is_kept {
             remove_extra(&ent.path())?;
@@ -697,10 +656,8 @@ fn restore_tree<K: MasterKeys>(
                     return Err(SnapError::Malformed("restored file size mismatch"));
                 }
                 let path = dir.join(name);
-                // Clear anything at this path that is not already a regular file: a directory (upstream
-                // type-changed dir→file) is removed recursively, and a **symlink** is unlinked rather
-                // than followed — otherwise `write` would dereference the link and clobber its target
-                // outside the synced folder.
+                // Clear a non-file at this path first; a symlink is unlinked, never followed (the
+                // write must not dereference it onto a target outside the folder).
                 clear_for_regular_file(&path)?;
                 std::fs::write(&path, &data)?;
                 apply_metadata(&path, *mode, *mtime)?;
@@ -713,8 +670,7 @@ fn restore_tree<K: MasterKeys>(
                 subtree_salt,
             } => {
                 let path = dir.join(name);
-                // A name that was a file/symlink upstream but is now a directory: remove it (a symlink
-                // as a link, never followed) so `create_dir_all` inside the recursion can take its place.
+                // file/symlink → dir type change: remove the old entry (a symlink as a link).
                 if let Ok(meta) = std::fs::symlink_metadata(&path) {
                     if !meta.file_type().is_dir() {
                         std::fs::remove_file(&path)?;
@@ -729,10 +685,8 @@ fn restore_tree<K: MasterKeys>(
     Ok(())
 }
 
-/// Remove an on-disk path that is not in the restored tree (a deletion to apply). Only the kinds
-/// secsec tracks are removed: a regular **file** is unlinked and a real **directory** is removed
-/// recursively. A **symlink** or special file (FIFO/socket/device) is left untouched — snapshots skip
-/// those, so they were never synced and are not secsec's to delete (and a symlink is never traversed).
+/// Apply a deletion: remove a regular file or real directory not in the restored tree. Symlinks and
+/// special files are untouched (never synced, so never secsec's to delete; never traversed).
 fn remove_extra(path: &Path) -> Result<(), SnapError> {
     let ft = std::fs::symlink_metadata(path)?.file_type();
     if ft.is_dir() {
@@ -743,9 +697,8 @@ fn remove_extra(path: &Path) -> Result<(), SnapError> {
     Ok(())
 }
 
-/// Ensure `path` is free for writing a regular file: a real directory is removed recursively; a
-/// symlink or special file is unlinked (never followed). A path that is already a regular file, or
-/// absent, is left for `write` to overwrite/create.
+/// Free `path` for a regular-file write: remove a directory recursively, unlink a symlink/special
+/// file (never followed); an existing regular file or absent path is left for `write`.
 fn clear_for_regular_file(path: &Path) -> Result<(), SnapError> {
     if let Ok(ft) = std::fs::symlink_metadata(path).map(|m| m.file_type()) {
         if ft.is_dir() {
@@ -757,26 +710,20 @@ fn clear_for_regular_file(path: &Path) -> Result<(), SnapError> {
     Ok(())
 }
 
-/// Reproduce a tree entry's recorded `mode` (Unix perms) and `mtime` on the restored path, so that a
-/// snapshot → restore → snapshot round trip is **idempotent** (the tree id is content-addressed and
-/// includes mtime/mode, §6; if restore dropped them, every post-clone sync would see a phantom change
-/// and author a spurious commit). `mtime` is whole seconds (matching the snapshot's precision).
+/// Reproduce the recorded `mode`/`mtime` on the restored path — required for snapshot→restore→
+/// snapshot idempotence (the tree id covers them, §6; dropping them would spuriously re-commit).
 fn apply_metadata(path: &Path, mode: u32, mtime: u64) -> Result<(), SnapError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // Apply only the 9 standard permission bits; never restore setuid/setgid/sticky from a
-        // member-authored tree (§18 — matches the mask in `mode_of`).
+        // 9 standard permission bits only — never restore setuid/setgid/sticky (§18, matches mode_of).
         if mode != 0 {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o0777))?;
         }
     }
     #[cfg(not(unix))]
     let _ = mode;
-    // `mtime` is attacker-influenced (decoded from a member-authored tree); saturate at i64::MAX so a
-    // hostile value cannot wrap to a negative (pre-1970) time, which would break snapshot→restore
-    // idempotence (re-snapshot reads back the OS-clamped value, not the stored one) and spuriously
-    // re-commit. Snapshots only ever record real file mtimes, so this never affects honest data.
+    // mtime is member-authored: saturate so a hostile value can't wrap negative and break idempotence.
     let secs = i64::try_from(mtime).unwrap_or(i64::MAX);
     filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(secs, 0))?;
     Ok(())
@@ -822,11 +769,9 @@ pub fn restore_tree_into<K: MasterKeys>(
 
 // ---- reachable closure (GC keep-set, §15) ----
 
-/// The full set of object ids reachable from `heads` (commit ids): each head, its transitive commit
-/// parents, every tree/subtree, and every chunk (§15 keep-set). Each commit/tree is fetched, opened
-/// (so §9.2 content-addressing is re-verified), and decoded; a **missing** object anywhere in the
-/// closure returns [`SnapError::Missing`] so GC **fails safe** (never deletes when the keep-set is
-/// incomplete, §15). The caller hashes the result with `secsec_proto::gc::keep_set_hash`.
+/// All object ids reachable from `heads` (commits + parents + trees + chunks) — the §15 keep-set.
+/// Every object is opened (§9.2 re-verified); a missing object returns [`SnapError::Missing`] so GC
+/// **fails safe** on an incomplete closure.
 pub fn reachable_objects<K: MasterKeys>(
     keys: &K,
     store: &Store,
@@ -842,9 +787,6 @@ pub fn reachable_objects<K: MasterKeys>(
             continue;
         }
         reachable.insert(cid);
-        // A chain that spans a rotation has parents under older generations; `fetch_open`/`collect_tree`
-        // resolve each object's generation against `keys` (§8.2). A single-generation member resolves
-        // to its own key throughout.
         let (commit, _sig) =
             decode_signed_commit(&fetch_open(keys, ObjType::Commit, &ZERO_SALT, &cid, store)?)?;
         collect_tree(
@@ -1457,9 +1399,8 @@ mod tests {
         let (root_tree, root_salt) = snapshot_tree(src.path(), &m, &store, None).unwrap();
         restore_tree_into(&root_tree, &root_salt, &m, &store, dst.path()).unwrap();
 
-        // restore→snapshot is idempotent: re-snapshotting the restored tree on top of the same base
-        // yields the IDENTICAL root id (mtimes/modes preserved). Without it, a phantom mtime change
-        // would make every post-clone sync author a spurious commit (the CommitReplay bug).
+        // restore→snapshot idempotence: identical root id (mtimes/modes preserved), else every
+        // post-clone sync would author a spurious commit.
         let (resnap, _) =
             snapshot_tree(dst.path(), &m, &store, Some((&root_tree, &root_salt))).unwrap();
         assert_eq!(resnap, root_tree, "restore→snapshot must be idempotent");

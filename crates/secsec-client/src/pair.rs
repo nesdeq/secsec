@@ -1,23 +1,10 @@
-//! §7 invite-onboarding pairing — the secsec-Design.md SAS, automated via a carried code.
-//!
-//! A new device joins by carrying one short, single-use **invite code** from an already-enrolled
-//! device (the one out-of-band step zero-trust onboarding requires). The code is the shared secret
-//! that authenticates a key exchange **through** the blind server, so the server — which never learns
-//! the code — cannot MITM, swap the joiner's key, or feed it a fake repository.
-//!
-//! Protocol (all blobs relayed via the server's transient pairing mailbox, [`Remote::pair_put`] /
-//! [`Remote::pair_get`]; slot ids are `derive_key(label, code)`, so the server can't reverse them):
-//!
-//! 1. **Joiner D** posts `{D_pubkey, D_xwing_pub, tag_d}` to slot `d`, where
-//!    `tag_d = keyed_hash(mac_key, "d" ‖ D_pubkey ‖ D_xwing_pub)` and `mac_key = derive_key("…mac…",
-//!    code)`. Only a holder of the code can produce `tag_d`, so the server can't substitute a key.
-//! 2. **Host E** (the inviting member, online) reads slot `d`, verifies `tag_d` with its copy of the
-//!    code, then runs [`crate::repo::grant_device_remote`] (append `AddDevice` + wrap the master key
-//!    to `D_xwing_pub`), and posts `{RFP, host_id, tag_e}` to slot `e`
-//!    (`tag_e = keyed_hash(mac_key, "e" ‖ RFP ‖ host_id)`).
-//! 3. **D** reads slot `e`, verifies `tag_e`, learns the genuine RFP + host pin (so it can't be fed a
-//!    fake repo and can confirm the server it connected to), then cold-starts ([`open_repo_remote`])
-//!    and unwraps the keyslot E just wrote — verifying it against `mk_commit` (§7). Enrolled.
+//! §7 invite-onboarding pairing: a joiner carries one short, single-use **invite code** from an
+//! enrolled device — the shared secret authenticating a key exchange **through** the blind server,
+//! which never learns the code and so cannot MITM, swap keys, or feed a fake repo. All blobs are
+//! code-MAC'd and relayed via the transient pairing mailbox (slot ids = `derive_key(label, code)`):
+//! joiner D posts `{D_pubkey, D_xwing_pub}` to slot `d`; host E verifies the MAC, grants
+//! ([`crate::repo::grant_device_remote`]), and posts `{RFP, host_id}` to slot `e`; D verifies, then
+//! cold-starts and checks its new keyslot against `mk_commit` (§7).
 
 use crate::repo::{device_xwing_pub, grant_device_remote};
 use crate::{Remote, RemoteError};

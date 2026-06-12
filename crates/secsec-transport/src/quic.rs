@@ -1,16 +1,7 @@
-//! QUIC endpoints (`secsec-Design.md` §11). Wires [`crate::PinnedServerVerifier`] into real `quinn`
-//! client/server endpoints over TLS 1.3, with the pinned self-signed host key as the only trust
-//! anchor (no CA).
-//!
-//! - [`server_config`] builds a `quinn::ServerConfig` from the server's self-signed cert + key.
-//! - [`client_config`] builds a `quinn::ClientConfig` whose certificate verifier is the SPKI pin —
-//!   so a connection only completes against the pinned host key (a MITM with another key fails the
-//!   handshake).
-//!
-//! Both pin TLS 1.3 + the §19 transport tuning (30 s idle, 10 s keepalive). The application-layer
-//! auth handshake (session transcript + `secsec-auth-v1`, [`crate::auth`]) runs on the first stream
-//! after the QUIC handshake ([`crate::handshake`]); per-op requests are dispatched on later streams
-//! ([`crate::rpc`]).
+//! QUIC endpoint configs (`secsec-Design.md` §11): [`client_config`] verifies via the SPKI pin (a
+//! MITM key fails the handshake), [`server_config`] presents the self-signed host key. Both pin
+//! TLS 1.3 and the §19 tuning. The app-layer auth handshake is [`crate::handshake`]; per-op RPC is
+//! [`crate::rpc`].
 
 use crate::{HostPin, PinnedServerVerifier};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -86,10 +77,8 @@ pub fn client_config(pin: HostPin) -> Result<ClientConfig, ConfigError> {
 /// Shared cell into which a TOFU handshake records the server's captured `host_id` (§11).
 pub type CapturedHostPin = Arc<std::sync::Mutex<Option<[u8; 32]>>>;
 
-/// Build a **trust-on-first-use** `quinn::ClientConfig` for the first contact with a not-yet-pinned
-/// server (§11): it accepts any host key and records its `host_id` into the returned cell. After the
-/// handshake the caller reads the cell, confirms the fingerprint out-of-band, and pins it. Use
-/// [`client_config`] for every subsequent connection.
+/// TOFU `ClientConfig` for first contact (§11): accepts any host key, records its `host_id` into
+/// the returned cell; the caller confirms out-of-band and pins it ([`client_config`] thereafter).
 pub fn client_config_tofu() -> Result<(ClientConfig, CapturedHostPin), ConfigError> {
     let captured = Arc::new(std::sync::Mutex::new(None));
     let rcc = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))

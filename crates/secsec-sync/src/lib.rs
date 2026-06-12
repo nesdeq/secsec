@@ -1,23 +1,9 @@
-//! `secsec-sync` — the sync plane (`secsec-Design.md` §10). The **Head** is the per-ref, mutable,
-//! **signed + encrypted** pointer at `/refs/<H>` (§6, §9.8, §13).
-//!
-//! A head names the current commit of a ref. It is:
-//! - **signed** under [`secsec_sig::NS_HEAD`] over `ref ‖ commit_id ‖ head_version ‖ roster_seq ‖
-//!   prev_head` (§9.6) — authenticity, verified against the RFP-anchored roster (§8);
-//! - **encrypted** with the §9.8 mutable-object AEAD (fresh nonce per write) under `head_key_g`,
-//!   AD = `FRAME ‖ H` — confidentiality of the ref→commit linkage and the counters;
-//! - stored at `/refs/<H>` where `H = BLAKE3::keyed_hash(ref_name_key, ref_name)` (§13), so the
-//!   server never sees the ref name.
-//!
-//! The head is **mutable** (re-pointed on each commit), so it uses the fresh-nonce construction of
-//! §9.8 — **not** the content-addressed `nonce=0` AEAD of §9.4. Rollback/replay of an old head is
-//! caught by the per-ref `head_version` frontier and HWM checks (§8.5, §10, [`rollback`]).
-//!
-//! The rest of §10 lives in submodules: [`dag`] (commit-DAG ancestry), [`merge`] (per-path
-//! three-way merge), and [`rollback`] (the rollback-aware merge gates + fork detection). The
-//! `cas-head` client side ([`build_head`]/[`is_head_successor`]) is here in this module; the
-//! orchestration that drives it (commit signing, the blind-server CAS, the sync loop) is in
-//! [`secsec-client`].
+//! `secsec-sync` — the sync plane (`secsec-Design.md` §10). This module: the **Head**, the per-ref
+//! mutable pointer at `/refs/<H>` — **signed** (`NS_HEAD`, §9.6) and **encrypted** (§9.8
+//! fresh-nonce AEAD under `head_key_g`, AD = `FRAME ‖ H`), with `H = keyed_hash(ref_name_key,
+//! ref_name)` hiding the ref name (§13). Head rollback/replay is caught by the §8.5 frontier, not
+//! the AEAD. Submodules: [`dag`] (ancestry), [`merge`] (three-way merge), [`rollback`] (merge
+//! gates + fork detection). Orchestration lives in `secsec-client`.
 
 #![forbid(unsafe_code)]
 
@@ -165,17 +151,15 @@ pub fn verify_head(pubkey: &DevicePublic, head: &Head, sig: &[u8]) -> Result<(),
         .map_err(|_| HeadError::BadSignature)
 }
 
-/// The deterministic identity of a head pointer: `BLAKE3` over its canonical signed content (§6).
-/// Used to chain heads via [`Head::prev_head`] and as the `last_seen_head` referent. Deterministic
-/// (unlike the random-nonce stored blob), so two clients agree on a head's id.
+/// Deterministic head identity: `BLAKE3` of the canonical signed content (§6) — chains heads via
+/// `prev_head` (the stored blob is nonce-randomized, so it cannot serve as the id).
 #[must_use]
 pub fn head_id(head: &Head) -> Id {
     *blake3::hash(&head.signed_message()).as_bytes()
 }
 
-/// Build the next head for a ref (`cas-head` client side, §10): version `+1`, `prev_head` = the id of
-/// `prev` (or [`NO_PREV_HEAD`] for the first head), pointing at `commit_id` under `roster_seq`. The
-/// caller then [`sign_head`]s and [`seal_head`]s it, and the transport performs the atomic CAS (§12).
+/// Build the next head for a ref (§10): version `+1`, `prev_head` = id of `prev` (or
+/// [`NO_PREV_HEAD`]). The caller signs, seals, and CASes it (§12).
 #[must_use]
 pub fn build_head(
     ref_name: impl Into<String>,
@@ -192,10 +176,8 @@ pub fn build_head(
     }
 }
 
-/// Validate that `new` is a well-formed successor of `prev` on the same ref (the head-chain
-/// anti-rollback link, complementing the §8.5 `head_version` frontier): for the first head, version
-/// 1 with no predecessor; otherwise `head_version` increments by one and `prev_head` is exactly the
-/// id of `prev`, on the same ref.
+/// Whether `new` is a well-formed successor of `prev` on the same ref: version +1 and
+/// `prev_head == head_id(prev)` (first head: version 1, no predecessor). Complements §8.5.
 #[must_use]
 pub fn is_head_successor(prev: Option<&Head>, new: &Head) -> bool {
     match prev {
@@ -260,10 +242,8 @@ fn head_ad(frame: &Frame, ref_hash: &RefHash) -> [u8; FRAME_LEN + 32] {
     ad
 }
 
-/// Seal a signed head into its stored blob `FRAME ‖ nonce ‖ tag ‖ ct` (§9.8), under `mk`'s
-/// generation `head_key_g`, for the ref `head.ref_name` (keyed by `ref_name_key`).
-///
-/// `nonce` MUST be freshly random per write (§9.8); use [`random_nonce`] in production.
+/// Seal a signed head into its stored blob `FRAME ‖ nonce ‖ tag ‖ ct` (§9.8) under `mk`'s
+/// `head_key_g`. `nonce` MUST be fresh per write ([`random_nonce`]).
 #[must_use]
 pub fn seal_head(
     mk: &MasterKey,
@@ -286,16 +266,10 @@ pub fn seal_head(
     out
 }
 
-/// Open a stored head blob fetched from `/refs/<H>` for the ref named `ref_name`. Resolves the head's
-/// authenticated `FRAME.gen` against `keys` (§8.2/§9.8 — a head is sealed under the generation current
-/// at write time; a member peels its key ring to read it after later rotations), opens the §9.8 AEAD
-/// under `head_key_g` with AD = `FRAME ‖ H`, strictly decodes, and checks the decrypted ref name
-/// matches `ref_name`. The ref path itself is generation-stable ([`MasterKeys::ref_name_key`], §13),
-/// so the head does not move when the master key rotates.
-///
-/// Returns `(head, sig)`. The caller MUST then [`verify_head`] against the ref owner's roster key
-/// **and** check `head_version`/`roster_seq` against its persisted frontier (§8.5, §10) — this layer
-/// provides confidentiality + integrity + slot binding, not rollback/authorization.
+/// Open a stored head blob for `ref_name`: resolve its `FRAME.gen` against `keys` (peel across
+/// rotations, §9.8), AEAD-open under that generation's `head_key_g`, strictly decode, and check the
+/// decrypted ref name. Returns `(head, sig)`. The caller MUST still [`verify_head`] against the
+/// roster and check the §8.5 frontier — this layer gives confidentiality + slot binding only.
 pub fn open_head<K: MasterKeys>(
     keys: &K,
     ref_name_key: &[u8; 32],
@@ -367,15 +341,13 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
-    /// A rotation mints a fresh master key, so the **stable** ref-name key ([`MasterKeys::ref_name_key`])
-    /// must come from the genesis generation — keeping the ref's storage path fixed across rotations —
-    /// and `open_head` must **peel** the key ring to read a head sealed under a prior generation. (The
-    /// `mk(gen)` helper above reuses the same key bytes, hiding the rotation effect; real generations
-    /// have independent random keys.)
+    /// Across a rotation the ref path must stay fixed (genesis-derived [`MasterKeys::ref_name_key`])
+    /// and `open_head` must peel the key ring to read an older-generation head.
     #[test]
     fn head_survives_a_rotation_via_stable_path_and_peel() {
+        // Independent key bytes per generation, as a real Rotate mints (mk(gen) above reuses bytes).
         let g1 = MasterKey::new(1, [0x11; 32]);
-        let g2 = MasterKey::new(2, [0x22; 32]); // a real rotation: independent key bytes
+        let g2 = MasterKey::new(2, [0x22; 32]);
         let ring: BTreeMap<u32, MasterKey> = [
             (1u32, MasterKey::new(1, [0x11; 32])),
             (2u32, MasterKey::new(2, [0x22; 32])),
@@ -565,10 +537,8 @@ mod tests {
         assert_ne!(head_id(&h1), head_id(&h2));
     }
 
-    /// Frozen KATs, mirrored in `vectors/secsec-kat-v1.txt [head]`. `ref_name_key` is from the
-    /// `master_key=[0x11;32]` kdf vector; the blob uses a fixed nonce + a fixed (dummy) signature so
-    /// the §9.8 wire format is pinned deterministically (the real signature path is covered by the
-    /// round-trip test).
+    /// Frozen KATs, mirrored in `vectors/secsec-kat-v1.txt [head]` (fixed nonce + dummy sig pin the
+    /// §9.8 wire format deterministically).
     #[test]
     fn head_kat() {
         let m = mk(1);

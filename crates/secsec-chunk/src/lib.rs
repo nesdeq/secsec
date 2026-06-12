@@ -1,17 +1,8 @@
-//! `secsec-chunk` — **keyed** FastCDC content-defined chunking (`secsec-Design.md` §9.7).
+//! `secsec-chunk` — keyed FastCDC content-defined chunking (`secsec-Design.md` §9.7).
 //!
-//! Standard FastCDC uses a fixed, canonical gear table so that every implementation cuts at the
-//! same boundaries. secsec deliberately does the opposite: the 256-entry gear table is derived
-//! from the per-generation secret `cdc_seed`, so chunk boundaries are **repo-specific** and a
-//! cross-repo size-fingerprint database does not apply. (Boundary privacy is only partial — a
-//! chosen-plaintext archiver can recover the gear key, Alexeev et al. ePrint 2025/532 — so the
-//! load-bearing privacy mechanism is default-on chunk padding, §9.7/§21; keyed chunking is
-//! defense-in-depth against the *offline* dictionary.)
-//!
-//! The cut-point algorithm is FastCDC v2020 normalized chunking (Xia et al.): a Gear rolling hash
-//! `fp = (fp << 1) + gear[b]`, a minimum-size skip, a stricter mask before the average point and a
-//! looser mask after it (normalization), and a hard maximum. Only the gear table is keyed; the
-//! algorithm is otherwise standard. Determinism: same `cdc_seed` + same input ⇒ same cut points.
+//! Standard FastCDC v2020 normalized chunking, except the 256-entry gear table is derived from the
+//! per-generation secret `cdc_seed`, making boundaries repo-specific (privacy limits + the role of
+//! default-on padding: §9.7/§21). Deterministic: same seed + same input ⇒ same cut points.
 
 #![forbid(unsafe_code)]
 

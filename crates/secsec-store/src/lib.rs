@@ -1,16 +1,7 @@
-//! `secsec-store` — the server's content-addressed blob store (`secsec-Design.md` §13).
-//!
-//! Objects are opaque, content-addressed ciphertext blobs keyed by their 32-byte id. They are
-//! stored in a single embedded `redb` database (its B-tree *is* the packing — the server is never
-//! flooded with tiny files). The store holds opaque blobs (`{id, blob, arrival put_epoch}`) and the
-//! per-device **keyslots** (§13 `/keyslots/<device_id>/<g>`); it never sees plaintext or
-//! plaintext-derived metadata (device_ids and keyslot blobs are all opaque).
-//!
-//! Operations are the read/write primitives behind the §11/§12 server API: [`Store::put`]
-//! (idempotent by id), [`Store::get`], [`Store::has`], and the keyslot store
-//! ([`Store::put_keyslot`] / [`Store::get_keyslot`] / [`Store::keyslot_exists`] /
-//! [`Store::delete_keyslot`] — the latter drives the §12 keyslot-existence auth check and §8.4
-//! revocation). The monotonic `put_epoch` counter underpins the GC serialization of §15.
+//! `secsec-store` — the server's content-addressed blob store (`secsec-Design.md` §13): one
+//! embedded `redb` database holding only opaque ciphertext (objects, keyslots, refs, sigchain,
+//! key-history wraps). These are the read/write primitives behind the §11/§12 server API; the
+//! monotonic `put_epoch` counter underpins the §15 GC serialization.
 
 #![forbid(unsafe_code)]
 
@@ -30,12 +21,9 @@ const KEYSLOTS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("k
 const REFS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("refs");
 /// `be64(seq)` → encrypted roster sigchain entry blob (§13 `/roster/<seq>`); the tip is CAS-guarded.
 const ROSTER: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("roster");
-/// `gen(u32)` → roster-key-history wrap (§8.2 `/roster-keyhist/<g>`; never trimmed). Lets a current
-/// member peel `roster_key_g` for every generation to fold the whole sigchain (§8.1 cold-start).
+/// `gen(u32)` → roster-key-history wrap (§8.2 `/roster-keyhist/<g>`; never trimmed).
 const ROSTER_KEYHIST: TableDefinition<'static, u32, &[u8]> = TableDefinition::new("roster_keyhist");
-/// `gen(u32)` → DATA key-history wrap (§8.2 `/keyhist/<g>`). Wraps `master_key_g` under
-/// `master_key_{g+1}` so a current member can peel old master keys and read pre-rotation **object**
-/// content (distinct from `ROSTER_KEYHIST`, which is only for sigchain folding).
+/// `gen(u32)` → DATA key-history wrap (§8.2 `/keyhist/<g>`).
 const KEYHIST: TableDefinition<'static, u32, &[u8]> = TableDefinition::new("keyhist");
 
 const PUT_EPOCH: &str = "put_epoch";
@@ -146,8 +134,7 @@ impl Store {
         Ok(t.get(g)?.map(|v| v.value().to_vec()))
     }
 
-    /// Store the DATA key-history wrap for generation `g` (§8.2 `/keyhist/<g>`): `master_key_g` sealed
-    /// under `master_key_{g+1}`, so a current member can recover it to read pre-rotation objects.
+    /// Store the DATA key-history wrap for generation `g` (§8.2 `/keyhist/<g>`).
     pub fn put_keyhist(&self, g: u32, wrap: &[u8]) -> Result<(), StoreError> {
         let wtx = self.db.begin_write()?;
         {
@@ -165,12 +152,9 @@ impl Store {
         Ok(t.get(g)?.map(|v| v.value().to_vec()))
     }
 
-    /// Append a sigchain entry, CAS-guarded by the `/roster-head` tip (§8.1). In one write
-    /// transaction: compute the current tip token (`BLAKE3` of the last entry blob, or
-    /// [`ABSENT_HEAD`] when empty); only if it equals `expected_old_tip`, store `entry` at the next
-    /// `seq` and return `Ok(Some(seq))`. A mismatch (a concurrent append happened) returns `Ok(None)`
-    /// — the client re-folds onto the new tip and retries (§8.1), so a racing append can never poison
-    /// the chain with a non-chaining entry.
+    /// Append a sigchain entry CAS-guarded by the `/roster-head` tip (§8.1), in one write
+    /// transaction. `Ok(Some(seq))` on success; `Ok(None)` on a tip mismatch (concurrent append —
+    /// the client re-folds and retries).
     pub fn append_roster(
         &self,
         expected_old_tip: &[u8; 32],
@@ -207,10 +191,8 @@ impl Store {
         Ok(refs.get(&ref_h[..])?.map(|g| g.value().to_vec()))
     }
 
-    /// Every active ref as `(ref_h, BLAKE3(stored head blob))` (§15 `all_heads_hash` input). The blob
-    /// hash is the **server-visible** per-ref token (the same one `cas-head` compares on); both the
-    /// blind server and the client compute it from the stored bytes, so a `gc` can be CAS-serialized
-    /// against a concurrent `cas-head`.
+    /// Every active ref as `(ref_h, BLAKE3(stored head blob))` — the §15 `all_heads_hash` input
+    /// (the server-visible per-ref token `cas-head` also compares on).
     pub fn ref_blob_hashes(&self) -> Result<Vec<RefBlobHash>, StoreError> {
         let rtx = self.db.begin_read()?;
         let refs = rtx.open_table(REFS)?;
@@ -224,11 +206,9 @@ impl Store {
         Ok(out)
     }
 
-    /// Atomic `cas-head` (§12): if `BLAKE3(current stored blob)` (or [`ABSENT_HEAD`] when the ref is
-    /// absent) equals `expected_old`, replace the ref with `new_blob` and return `Ok(true)`;
-    /// otherwise leave it unchanged and return `Ok(false)` (CAS conflict). The whole compare-and-swap
-    /// runs in one write transaction. `new_blob`'s authenticity is the client's `secsec-head-v1`
-    /// signature inside it (§9.8) — the store only guards concurrency.
+    /// Atomic `cas-head` (§12), one write transaction: swap iff `BLAKE3(current blob)` (or
+    /// [`ABSENT_HEAD`]) equals `expected_old`; `Ok(false)` = CAS conflict. Authenticity is the
+    /// head's signature (§9.8); the store guards concurrency only.
     pub fn cas_ref(
         &self,
         ref_h: &[u8; 32],
@@ -307,9 +287,8 @@ impl Store {
         Ok(ks.range(&lo[..]..=&hi[..])?.next().is_some())
     }
 
-    /// Store an object idempotently by `id`. Returns `Ok(true)` if newly stored, `Ok(false)` if an
-    /// object with this id already existed (content addressing makes the stored bytes identical, so
-    /// a duplicate `put` is a no-op).
+    /// Store an object idempotently by `id`: `Ok(true)` if newly stored, `Ok(false)` if already
+    /// present (a duplicate `put` is a no-op).
     pub fn put(&self, id: &[u8; 32], blob: &[u8]) -> Result<bool, StoreError> {
         let wtx = self.db.begin_write()?;
         let newly;
@@ -363,11 +342,9 @@ impl Store {
         Ok(arrival.get(&id[..])?.map(|v| v.value()))
     }
 
-    /// Execute a GC sweep (§15): delete every object whose arrival `put_epoch` ≤ `gc_gen` **and**
-    /// whose id is **not** in `keep_set`. Returns the number deleted. The arrival-generation +
-    /// grace-window eligibility is the client's responsibility — it chooses `gc_gen` so only objects
-    /// past the grace window are swept (§15); the `keep_set` is the reachable closure over all
-    /// rostered heads. Newer arrivals (`> gc_gen`) are always shielded. Runs in one write transaction.
+    /// §15 GC sweep, one write transaction: delete every object with arrival `put_epoch` ≤ `gc_gen`
+    /// and not in `keep_set`; newer arrivals are always shielded. Returns the number deleted.
+    /// Choosing a grace-aged `gc_gen` and a complete keep-set is the client's job (§15).
     pub fn gc(&self, keep_set: &BTreeSet<[u8; 32]>, gc_gen: u64) -> Result<u64, StoreError> {
         let wtx = self.db.begin_write()?;
         // Collect deletable ids first (can't mutate the table mid-iteration).
@@ -404,11 +381,8 @@ impl Store {
         Ok(objs.len()?)
     }
 
-    /// Compact the database file, returning freed pages to the OS — reclaims the space left by a
-    /// [`Store::gc`] sweep (deleted objects) and by redb's copy-on-write churn. Returns `true` if it
-    /// shrank the file. Requires **exclusive** access (no other live read/write transaction), so call
-    /// it at startup before any other work. Best-effort at the call site: a failure leaves the store
-    /// fully usable, just not compacted.
+    /// Compact the database file (reclaims GC'd pages); `true` if it shrank. Requires exclusive
+    /// access — call at startup. Best-effort: failure leaves the store usable.
     pub fn compact(&mut self) -> Result<bool, StoreError> {
         Ok(self.db.compact()?)
     }

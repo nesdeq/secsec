@@ -1,27 +1,8 @@
-//! `secsec` — the CLI binary (`secsec-Design.md` §11, §12).
-//!
-//! Two everyday commands and one onboarding command:
-//! - `secsec serve [dir] [port]` — the blind server. Reads the operator's `~/.ssh/authorized_keys` as a
-//!   **mandatory** connection gate (re-read per connection); stores ciphertext under `dir`; defaults to
-//!   the current dir and udp/8899. The repository is created lazily by the first authorized device.
-//! - `secsec sync <dir> [--server host[:port]] [--invite code]` — link a folder to a repo
-//!   and keep it in continuous two-way sync. Name the server once (first device creates the repo;
-//!   joining devices pass `--invite`); afterwards just `secsec sync <dir>`. Uses `~/.ssh/id_ed25519`.
-//!   One repo holds one synced tree (the ref `main`); for an independent tree, run a separate repo.
-//! - `secsec invite <dir>` — on an enrolled device, print a one-time code and complete the pairing of a
-//!   new device over the wire.
-//! - `secsec devices <dir>` / `secsec revoke <device> <dir>` — list enrolled devices (with SSH
-//!   fingerprints) and revoke one over the wire (§8.4: rotate the key away from a stolen device).
-//! - `secsec hostpin <dir>` — print the server host fingerprint this folder pinned, to compare
-//!   out-of-band against the `host pin` the server prints on startup (§11 TOFU verification).
-//! - `secsec log [path]` / `secsec restore <path> [version]` — browse the change history (whole repo
-//!   or one file/folder) and restore a historic version into the working folder, which the next sync
-//!   propagates like any edit. Run inside the synced folder; read-side over the existing object plane.
-//! - `secsec reset [dir]` — wipe secsec's local state where it is run (the client link/cache for a
-//!   synced folder and/or a blind server's repo + host key in a serve dir), leaving your files and
-//!   your `~/.ssh` key untouched. Start-over button after a botched link or for decommissioning.
-//!
-//! Garbage collection (§15) runs automatically inside `sync`; there is no manual command.
+//! `secsec` — the CLI binary (`secsec-Design.md` §11, §12): `serve` (the blind server, gated on the
+//! operator's `authorized_keys`), `sync` (link a folder and keep it in continuous two-way sync; one
+//! repo = one tree under the ref `main`), `invite` / `devices` / `revoke` (enrollment lifecycle,
+//! §7/§8.4), `hostpin` (§11 TOFU verification), `log` / `restore` (history), and `reset` (wipe local
+//! secsec state). Garbage collection (§15) runs automatically inside `sync`. Usage: README.md.
 
 #![allow(missing_docs)] // a binary crate exports no public API
 
@@ -177,10 +158,8 @@ fn home() -> Result<PathBuf, Box<dyn Error>> {
         .ok_or_else(|| "HOME is not set".into())
 }
 
-/// Load this device's SSH key from `~/.ssh/id_ed25519`. If the key is passphrase-encrypted, prompt
-/// for the passphrase (no echo) and decrypt it in memory — secsec needs the raw key, not just an
-/// agent, so the passphrase is required, but the on-disk key stays encrypted (see
-/// [`DeviceKey::from_openssh_passphrase`]).
+/// Load this device's SSH key from `~/.ssh/id_ed25519`, prompting (no echo) to decrypt a
+/// passphrase-protected key in memory — the on-disk key stays encrypted.
 fn default_device() -> Result<DeviceKey, Box<dyn Error>> {
     let path = home()?.join(".ssh/id_ed25519");
     let pem = std::fs::read_to_string(&path)
@@ -192,9 +171,8 @@ fn default_device() -> Result<DeviceKey, Box<dyn Error>> {
     }
 }
 
-/// The device key is passphrase-encrypted: prompt on the terminal with no echo (up to 3 attempts) and
-/// decrypt it in RAM. The typed passphrase is zeroized after each try and the on-disk key is never
-/// modified.
+/// Prompt for the passphrase (up to 3 attempts, no echo) and decrypt the key in RAM; the typed
+/// passphrase is zeroized after each try and the on-disk key is never modified.
 fn decrypt_device(pem: &str, path: &Path) -> Result<DeviceKey, Box<dyn Error>> {
     const MAX_TRIES: usize = 3;
     for attempt in 1..=MAX_TRIES {
@@ -246,10 +224,9 @@ fn resolve_server(s: &str) -> Result<SocketAddr, Box<dyn Error>> {
         .ok_or_else(|| format!("cannot resolve server address '{s}'").into())
 }
 
-/// A folder's link to its repo (the git-remote analogue): server address, pinned host id, RFP anchor,
-/// ref name, and the §8.1 sigchain anti-rollback anchor (`roster_seq` + tip hash, P7). Stored at
-/// `<state>/link`; the synced folder stays clean. The anchor lives client-side so a malicious **server**
-/// cannot roll the roster back (a disk-level rewrite is the §21 client-compromise residual).
+/// A folder's link to its repo (the git-remote analogue): server address, pinned host id, RFP, ref
+/// name, and the §8.1 anti-rollback anchor (P7). Stored at `<state>/link` — client-side, so a
+/// malicious **server** cannot roll the roster back.
 struct Link {
     server: String,
     host_id: [u8; 32],
@@ -277,8 +254,7 @@ fn read_link(sdir: &Path) -> Option<Link> {
             rtip = parse_hex32(v).ok();
         }
     }
-    // None until the first successful cold-start records one (there is nothing to roll back against
-    // on the very first open of a folder — the create/join itself establishes the anchor).
+    // None until the first successful cold-start records one — the create/join establishes it.
     let anchor = match (rseq, rtip) {
         (Some(max_seq), Some(tip_hash)) => Some(RosterAnchor { max_seq, tip_hash }),
         _ => None,
@@ -420,10 +396,9 @@ async fn run_serve(dir: PathBuf, port: u16) -> Result<(), Box<dyn Error>> {
     let mut last_prune = 0u64;
     while let Some(incoming) = endpoint.accept().await {
         let now = unix_secs();
-        // §11 DoS hardening: validate the source address with a stateless QUIC Retry before allocating
-        // connection state or trusting the per-IP rate counter. Until the client echoes a Retry token,
-        // its source address is unverified (spoofable), so this both provides anti-amplification and
-        // makes the per-source-IP rate limit meaningful (a spoofed IP cannot exhaust another's budget).
+        // §11 DoS hardening: validate the source address with a stateless QUIC Retry before
+        // allocating connection state — anti-amplification, and a spoofed IP cannot exhaust
+        // another's per-IP rate budget.
         if !incoming.remote_address_validated() {
             let _ = incoming.retry();
             continue;
@@ -493,10 +468,9 @@ async fn run_sync(
     } else if let Some(l) = &link {
         l.rfp
     } else {
-        // First device: attempt to create the repo. The genesis bootstrap is permitted only while the
-        // roster is empty, so if the repo already exists this fails — and an unenrolled device must
-        // instead join with an invite. (We can't pre-probe: reads require enrollment, which we don't
-        // have yet.)
+        // First device: attempt to create the repo. Genesis is permitted only while the roster is
+        // empty, so if the repo already exists this fails and the device must join with an invite.
+        // (No pre-probe: reads require enrollment, which we don't have yet.)
         if pinned.is_none() {
             println!(
                 "server host fingerprint (verify out-of-band): {}",
@@ -571,11 +545,9 @@ async fn run_sync(
         Err(_) => None,
     };
 
-    // Startup store hygiene, once per session — the local mirror of the server's §15 keep-everything
-    // GC, so both ends prune identically: drop objects unreachable from our last-synced head (orphans
-    // from cas-conflict retries / aborted pushes), keeping the full reachable history. Best-effort:
-    // never blocks syncing. (This trims the logical object set; it does not shrink the redb file,
-    // which redb re-grows to its working size on the next write — a real footprint cut needs §15+ work.)
+    // Startup store hygiene, once per session: drop local objects unreachable from our last-synced
+    // head (orphans from cas-conflict retries / aborted pushes). Best-effort, never blocks syncing.
+    // (Trims the logical set; redb re-grows its file to working size on the next write.)
     if let Some(b) = base {
         match secsec_client::gc::local_sweep(&keyring, &store, &b) {
             Ok(n) if n > 0 => eprintln!("local GC: dropped {n} unreachable object(s)"),
@@ -644,12 +616,10 @@ async fn run_sync(
             want_refold = false;
             match open_repo_remote(&rem, &device, &rfp, Some(anchor)).await {
                 Ok((m, s, a)) => {
-                    // Re-peel the data-key ring FIRST, so the roster update is all-or-nothing: never
-                    // advance the generation without its matching keyring (which would make the
-                    // current head/objects unreadable until the next tick). On a peel failure (e.g. a
-                    // transient fetch glitch) keep the last-known roster and try again next cycle. The
-                    // keyring (peeled from `m`) is the source of truth downstream — it carries the
-                    // current generation as `keys.current()` and is generation-stable for the ref path.
+                    // Re-peel the data keyring FIRST so the roster update is all-or-nothing: never
+                    // advance the generation without its matching keyring (the head/objects would be
+                    // unreadable until the next tick). On a peel failure keep the last-known roster
+                    // and retry next cycle.
                     match data_keyring_remote(&rem, &m).await {
                         Ok(k) => {
                             if a.max_seq != anchor.max_seq {
@@ -676,9 +646,8 @@ async fn run_sync(
                         }
                     }
                 }
-                // A genuine server rollback/reset: the fetched chain does not extend our persisted
-                // anti-rollback anchor (P7). Only this is fatal; other roster-fold errors are treated as
-                // transient below — a glitchy or partial fetch must not permanently stop syncing.
+                // A genuine server rollback/reset (P7): only this is fatal; other fold errors are
+                // transient below — a glitchy fetch must not permanently stop syncing.
                 Err(RepoError::Rollback) => {
                     eprintln!(
                         "ALARM: the repo on {server_str} no longer extends this folder's anti-rollback \
@@ -695,9 +664,8 @@ async fn run_sync(
             }
         }
 
-        // §8.5: seal the advanced frontier to disk BEFORE any ref-advancing head push. `sync_once`
-        // invokes this immediately before publishing, so a crash post-push can't leave a published
-        // head uncovered by the persisted anti-rollback frontier.
+        // §8.5: seal the advanced frontier to disk BEFORE any ref-advancing head push — a crash
+        // post-push must not leave a published head uncovered by the persisted frontier.
         let seal = |fr: &SyncFrontier| save_frontier(&frontier_path, fr, &device);
         match sync_once(
             &rem,
@@ -723,9 +691,8 @@ async fn run_sync(
                     std::fs::write(&base_path, hex(&b))?;
                 }
                 if !outcome.receipts.is_empty() {
-                    // §15: verify each arrival receipt's signature against the pinned host before
-                    // recording it — a forged `put_epoch`/`arrival_gen` must not enter the GC log
-                    // (defence-in-depth; GC eligibility still rests on local receipt times, not these).
+                    // §15 defence-in-depth: verify each receipt's signature against the pinned host
+                    // before recording — a forged arrival must not enter the GC log.
                     let verified: Vec<_> = outcome
                         .receipts
                         .iter()
@@ -784,9 +751,8 @@ async fn run_sync(
                                 let roster_seq =
                                     fetch_roster_entries(&rem).await?.len().saturating_sub(1)
                                         as u64;
-                                // One repo = one ref, so the keep-set over `main` is the complete set
-                                // (§15): the gc compare-and-swap's `all_heads_hash` matches the server's
-                                // single ref, so the sweep runs.
+                                // One repo = one ref, so the keep-set over `main` is complete (§15)
+                                // and the gc CAS's all_heads_hash matches the server's single ref.
                                 secsec_client::gc::gc_collect(
                                     &rem,
                                     &store,
@@ -919,10 +885,8 @@ async fn run_devices(dir: PathBuf) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Print the server host fingerprint this folder pinned (TOFU, §11). It is `BLAKE3(SPKI)` of the
-/// server's self-signed cert — the same value the server prints as `host pin` on startup — so an
-/// operator can compare the two **out-of-band** to confirm there was no first-contact MITM. Offline:
-/// it reads the pinned value from the folder's local link, it does not reach the server.
+/// Print the server host fingerprint this folder pinned (TOFU, §11) — the same `host pin` the
+/// server prints on startup, for **out-of-band** comparison. Offline: reads the local link only.
 fn run_hostpin(dir: PathBuf) -> Result<(), Box<dyn Error>> {
     let sdir = state_dir_for(&dir)?;
     let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
@@ -1116,10 +1080,9 @@ async fn run_restore(path: String, version: Option<String>) -> Result<(), Box<dy
         None => {
             let hist =
                 secsec_client::history::path_history(&keyring, &store, &head.commit_id, &path)?;
-            // If the path is gone from disk (deleted), bring back the most recent version where it
-            // existed — true undo-delete, whether or not the deletion has been synced yet. If it is
-            // still present, "previous version" means the one before the current (undo the last edit):
-            // history[0] is the current content's commit, history[1] the version before it.
+            // Path gone from disk → bring back the most recent version where it existed
+            // (undo-delete). Still present → "previous" = the one before the current content:
+            // hist[0] is the current commit, hist[1] the version before it.
             let chosen = if dir.join(&path).exists() {
                 hist.get(1).map(|v| v.commit_id)
             } else {
@@ -1199,16 +1162,10 @@ async fn run_revoke(device_prefix: String, dir: PathBuf) -> Result<(), Box<dyn E
 
 // ---- reset ----
 
-/// `secsec reset [dir]` — remove all secsec-owned state at a location and start clean, **without**
-/// touching your files or your `~/.ssh` key. Deletes whichever of these exist here:
-///   * the client sync state for the folder — the link, object cache, and rollback cursor, kept
-///     out-of-tree under `~/.local/state/secsec/<hash>` (so the folder itself stays just your files);
-///   * a blind server's `repo.secsec` (the whole encrypted store) and `hostkey/` (host + receipt key).
-///
-/// A synced folder yields only the first; a serve dir only the latter — they don't overlap. Prompts
-/// with the exact paths before deleting (skip with `--yes`). Afterwards the next `sync` re-clones as a
-/// fresh device, and the next `serve` mints a new host key (clients re-TOFU). Stop a running
-/// sync/serve before resetting so it isn't operating on a store you just unlinked.
+/// `secsec reset [dir]` — remove all secsec-owned state at a location, **without** touching your
+/// files or your `~/.ssh` key: the folder's out-of-tree client sync state, and/or a serve dir's
+/// `repo.secsec` + `hostkey/`. Prompts with the exact paths before deleting (`--yes` skips). The
+/// next `sync` re-clones as a fresh device; the next `serve` mints a new host key (clients re-TOFU).
 fn run_reset(dir: PathBuf, yes: bool) -> Result<(), Box<dyn Error>> {
     // (path, what-it-is, is_dir) for each piece of secsec state that actually exists at `dir`.
     let mut targets: Vec<(PathBuf, &str, bool)> = Vec::new();

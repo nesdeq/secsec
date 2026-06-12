@@ -1,17 +1,10 @@
-//! `secsec-roster` — the roster sigchain: entries, fold/succession, and key-history
-//! (`secsec-Design.md` §8.1). This is the real ACL.
+//! `secsec-roster` — the roster sigchain, the real ACL (`secsec-Design.md` §8).
 //!
-//! An append-only, hash-chained, SSHSIG-signed log. Each entry is `{seq, prev, op, ts, signer}`
-//! signed under [`secsec_sig::NS_ROSTER`]; `prev` is the BLAKE3 of the full previous entry, and the
-//! genesis entry's hash is the repository's **RFP** (§5). [`fold`] replays the chain with
-//! **succession**: entry `n` is valid only if its signer is a *current member* of the state folded
-//! from entries `0..n-1` — so a non-member or revoked device cannot extend the chain. The §8.1
-//! anti-rollback frontier (highest accepted seq + stored tip-blob hash) is enforced by the client
-//! cold-start ([`secsec-client`]'s `open_repo_remote`), which persists it in the per-folder link.
-//!
-//! Beyond the plaintext sigchain (entries, codec, fold/succession) this crate also holds the layers
-//! that wrap it: the per-entry AEAD under `roster_key_g` (§9.5), the never-trimmed roster-key history
-//! and its peel (§8.2), the cold-start bootstrap fold (§8.1), and the revoke⇒rotate op builder (§8.4).
+//! An append-only, hash-chained, SSHSIG-signed log; genesis hashes to the RFP (§5). [`fold`]
+//! enforces **succession** (each entry's signer must be a current member of the prefix). Also here:
+//! the per-entry AEAD (§9.5), the never-trimmed key histories and their peels (§8.2), the
+//! cold-start bootstrap fold (§8.1), and the revoke⇒rotate op builder (§8.4). The anti-rollback
+//! anchor is enforced by the client cold-start.
 
 #![forbid(unsafe_code)]
 
@@ -287,14 +280,9 @@ pub fn entry_hash(e: &Entry) -> [u8; 32] {
     *blake3::hash(&encode_entry(e)).as_bytes()
 }
 
-// ---------------------------------------------------------------------------
-// Per-entry AEAD (§9.5 "Roster entry AEAD"): the entries are stored on the
-// untrusted server encrypted under a per-sequence subkey of `roster_key_g`.
-// ---------------------------------------------------------------------------
+// ---- per-entry AEAD (§9.5 "Roster entry AEAD") ----
 
-/// `AD_roster = FRAME_roster ‖ le64(seq)` (§9.5). The 11-byte FRAME binds `type=roster` and the
-/// generation `g`; `seq` is appended because the FRAME does not carry it. This is the analogue of
-/// the object AEAD's `FRAME ‖ id`.
+/// `AD_roster = FRAME_roster ‖ le64(seq)` (§9.5) — the FRAME binds type+gen, `seq` is appended.
 fn ad_roster(frame: &Frame, seq: u64) -> [u8; FRAME_LEN + 8] {
     let mut ad = [0u8; FRAME_LEN + 8];
     ad[..FRAME_LEN].copy_from_slice(&frame.encode());
@@ -302,10 +290,8 @@ fn ad_roster(frame: &Frame, seq: u64) -> [u8; FRAME_LEN + 8] {
     ad
 }
 
-/// Encrypt a canonical entry plaintext ([`encode_entry`] bytes) for storage under generation `gen`
-/// at sequence `seq`, using `roster_key_g`. Returns the stored blob `FRAME ‖ ctx_tag ‖ ciphertext`
-/// (§9.1/§9.5). The per-entry key `k_roster_entry[g][seq]` is unique per `(roster_key_g, seq)`, so
-/// the fixed zero nonce is safe; the CTX construction gives CMT-4.
+/// Seal a canonical entry plaintext at `(gen, seq)` under `roster_key_g` → stored blob
+/// `FRAME ‖ ctx_tag ‖ ct` (§9.5; the per-(key,seq) entry key makes the zero nonce safe).
 #[must_use]
 pub fn seal_entry(roster_key_g: &[u8; 32], gen: u32, seq: u64, entry_plaintext: &[u8]) -> Vec<u8> {
     let k = roster_entry_key(roster_key_g, seq);
@@ -315,13 +301,8 @@ pub fn seal_entry(roster_key_g: &[u8; 32], gen: u32, seq: u64, entry_plaintext: 
     assemble_blob(&frame, &ctx_tag, &ct)
 }
 
-/// Decrypt a stored roster entry blob written under generation `gen` at sequence `seq`, using
-/// `roster_key_g`. Validates the stored FRAME against the expected `(gen, type=roster)` (§18) before
-/// any AEAD work, then opens with `AD_roster`. Returns the canonical entry plaintext on success.
-///
-/// The caller is responsible for deriving `roster_key_g` for the `gen` carried in the blob's
-/// (plaintext, server-readable) FRAME — typically via the §8.2 key-history peel — and then for
-/// [`decode_entry`]-ing and chain-verifying the returned bytes.
+/// Open a stored roster entry blob at `(gen, seq)`: expected-FRAME check (§18) then AEAD open.
+/// The caller derives `roster_key_g` (peel, §8.2) and [`decode_entry`]s + chain-verifies the result.
 pub fn open_entry(
     roster_key_g: &[u8; 32],
     gen: u32,
@@ -335,19 +316,12 @@ pub fn open_entry(
     secsec_aead::open(&k, &ad, ctx_tag, ct).map_err(|_| RosterError::Aead)
 }
 
-// ---------------------------------------------------------------------------
-// Roster-key history (§8.2 "Roster-key history (never trimmed)"): a forward
-// chain of wraps that lets a current member peel `roster_key_current → … →
-// roster_key_1`, so the *whole* sigchain (every generation) can be decrypted
-// and signature-verified at cold start. A revoked device, lacking the current
-// roster key, cannot peel forward — roster forward secrecy (P11).
-// ---------------------------------------------------------------------------
+// ---- roster-key history (§8.2; never trimmed — peels roster_key_current → roster_key_1) ----
 
 /// A 256-bit roster key, the plaintext wrapped by the roster-key history.
 const ROSTER_KEY_LEN: usize = 32;
-/// Stored size of one `roster_keyhist_g` wrap: `ctx_tag(32) ‖ ct(32)` (§8.2, "64 bytes total").
-/// Unlike a normal blob there is **no** FRAME prefix — `g` is known from the storage path and the
-/// `FRAME_rkh` AD is reconstructed by the reader.
+/// Stored size of one `roster_keyhist_g` wrap: `ctx_tag(32) ‖ ct(32)` (§8.2). No FRAME prefix —
+/// `g` comes from the storage path and the AD is reconstructed by the reader.
 pub const ROSTER_KEYHIST_LEN: usize = CTX_TAG_LEN + ROSTER_KEY_LEN;
 
 /// Wrap `roster_key_g` so it can be recovered by a holder of `roster_key_{g+1}` (the next
@@ -396,14 +370,9 @@ pub fn open_roster_keyhist(
     Ok(out)
 }
 
-/// Peel the entire roster-key history: starting from `roster_key_current` (generation
-/// `current_gen`), recover `roster_key_g` for every `g` in `1..current_gen` using the wraps in
-/// `history` (keyed by generation `g`, each [`ROSTER_KEYHIST_LEN`] bytes). Returns a map of
-/// `g → roster_key_g` for all `1..=current_gen` (including `current_gen` itself).
-///
-/// `history` MUST contain a wrap for every `g` in `1..current_gen`; a missing or unopenable wrap
-/// aborts the peel (a current member can always produce the never-trimmed chain). The peel proceeds
-/// downward because decrypting `roster_keyhist_g` requires `roster_key_{g+1}`.
+/// Peel the roster-key history downward from `roster_key_current`: returns `g → roster_key_g` for
+/// all `1..=current_gen`. `history` MUST hold a wrap for every `g` in `1..current_gen`; a missing
+/// or unopenable wrap aborts (a current member can always produce the never-trimmed chain).
 pub fn peel_roster_keys(
     roster_key_current: &[u8; 32],
     current_gen: u32,
@@ -424,25 +393,14 @@ pub fn peel_roster_keys(
     Ok(keys)
 }
 
-// ---------------------------------------------------------------------------
-// DATA key-history (§8.2 "Master-key generations & history"): a forward chain
-// of wraps of `master_key_g` under `master_key_{g+1}`, so a current member can
-// peel `master_key_current → … → master_key_1` and read **object** content
-// sealed under any past generation. Parallel to the roster-key history above
-// (which exists for sigchain folding); this one exists for old-data readability.
-// A revoked device, lacking the current master key, cannot peel forward → the
-// pre-rotation ciphertext it can still decrypt is only what it cached (§21).
-// ---------------------------------------------------------------------------
+// ---- DATA key-history (§8.2; peels master_key_current → master_key_1 for old-object reads) ----
 
-/// Stored size of one DATA `keyhist_g` wrap: `ctx_tag(32) ‖ ct(32)` (§8.2) — the same CTX layout as
-/// the roster-key history, wrapping the 32-byte `master_key_g` instead of a roster key. No FRAME
-/// prefix: `g` is known from the storage path and the AD is reconstructed by the reader.
+/// Stored size of one DATA `keyhist_g` wrap: `ctx_tag(32) ‖ ct(32)` (§8.2). Same layout as the
+/// roster-key history; no FRAME prefix (`g` comes from the storage path).
 pub const DATA_KEYHIST_LEN: usize = CTX_TAG_LEN + 32;
 
-/// Wrap `master_key_g` so a holder of `master_key_{g+1}` (the next generation) can recover it (§8.2).
-/// Keyed by `k_keyhist_g = data_keyhist_key(master_key_{g+1}, g)`, AD = `FRAME(type=keyhist, gen=g)`;
-/// returns the bare [`DATA_KEYHIST_LEN`]-byte `ctx_tag ‖ ct`. The CTX/CMT-4 construction binds the
-/// plaintext `master_key_g`, closing partitioning-oracle attacks at the data-key-history layer.
+/// Wrap `master_key_g` under `master_key_{g+1}` (§8.2): the CTX/CMT-4 seal with
+/// AD = `FRAME(type=keyhist, gen=g)`; returns the bare `ctx_tag ‖ ct`.
 #[must_use]
 pub fn seal_data_keyhist(
     master_key_next: &[u8; 32],
@@ -485,12 +443,8 @@ pub fn open_data_keyhist(
     Ok(MasterKey::new(g, *key))
 }
 
-/// Peel the entire DATA key-history: from `master_key_current` (generation `current_gen`), recover
-/// `master_key_g` for every `g` in `1..current_gen` using the wraps in `history` (keyed by gen `g`,
-/// each [`DATA_KEYHIST_LEN`] bytes). Returns a map `g → master_key_g` for all `1..=current_gen`
-/// (including `current_gen`). A missing or unopenable wrap aborts the peel (a current member can
-/// always produce the chain). The peel proceeds downward because decrypting `keyhist_g` requires
-/// `master_key_{g+1}`.
+/// Peel the DATA key-history downward from `master_key_current`: returns `g → master_key_g` for
+/// all `1..=current_gen`. A missing or unopenable wrap aborts.
 pub fn peel_data_keys(
     master_key_current: &[u8; 32],
     current_gen: u32,
@@ -605,10 +559,7 @@ pub struct State {
 }
 
 impl State {
-    /// Whether `device` is a current member — the roster-layer read/write-auth predicate (§9.6,
-    /// §12). The per-op signature binding (`secsec-write-v1`/`secsec-read-v1` over
-    /// `op ‖ args_hash ‖ session_transcript ‖ server_nonce`) is enforced at the transport layer;
-    /// this is the membership half it checks against.
+    /// Whether `device` is a current member — the membership half of per-op auth (§9.6, §12).
     #[must_use]
     pub fn is_member(&self, device: &DeviceId) -> bool {
         self.members.contains_key(device)
@@ -720,24 +671,12 @@ pub fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterError> {
     Ok(st)
 }
 
-/// Bootstrap the roster from cold: the full §8.1 "cold-start fold order" for a device with no local
-/// state (fresh enrollment or reinstall). Given the keyslot-recovered **candidate** `master_key`
-/// for the current generation `g_cur`, the pinned `rfp`, the never-trimmed roster-key history, and
-/// the encrypted sigchain blobs `/roster/<seq>` (index = seq), this:
-///
-/// 1. derives `roster_key_{g_cur}` and peels the history back to `roster_key_1` ([`peel_roster_keys`]);
-/// 2. for each stored entry, reads its plaintext `FRAME.gen`, decrypts it with the matching
-///    `roster_key_g` ([`open_entry`]) and strictly decodes it ([`decode_entry`]);
-/// 3. [`fold`]s the recovered chain — which enforces genesis = RFP, the `prev` hash chain, every
-///    signature, and succession;
-/// 4. verifies the candidate against `mk_commit_{g_cur}` recorded in that RFP-anchored chain (§7
-///    step 3) — closing the forged-keyslot / fake-key attack.
-///
-/// Returns the folded [`State`] and the now-**authenticated** [`MasterKey`]. A forged keyslot key
-/// either fails to decrypt the real chain (AEAD), or — if the server also serves a self-consistent
-/// fake universe — fails the genesis-vs-RFP check in [`fold`]; a wrong-but-decrypting key fails the
-/// `mk_commit` check here. The caller performs the HPKE keyslot open (it owns the device secret) and
-/// reads `g_cur` from the tip blob's `FRAME.gen` before calling.
+/// The §8.1 cold-start fold for a device with no local state: peel the roster keys, decrypt +
+/// strictly decode every stored entry by its authenticated `FRAME.gen`, [`fold`] (RFP + chain +
+/// signatures + succession), then verify the keyslot-recovered candidate against `mk_commit_{g_cur}`
+/// (§7 step 3 — the forged-keyslot / fake-universe defense). Returns the folded [`State`] and the
+/// now-authenticated [`MasterKey`]. The caller unwraps the keyslot and reads `g_cur` from the tip's
+/// `FRAME.gen` first.
 pub fn cold_start_fold(
     candidate_master_key: &[u8; 32],
     g_cur: u32,
@@ -786,14 +725,9 @@ pub fn cold_start_fold(
     Ok((state, mk))
 }
 
-/// The revoke-before-add closure (§8.1, §8.4 step 1): the current members that `revoked` granted at
-/// or after `after_seq`. When revoking a device B, the revoking device MUST also revoke every device
-/// in this set, because B could have added a colluding device just before being revoked. `after_seq`
-/// is the revoking device's last-authored-or-witnessed `seq` — grants B made before that point were
-/// already accepted under the prior trusted state and are out of scope.
-///
-/// The returned ids are sorted (the `State` maps are `BTreeMap`s), so the follow-on `RevokeDevice`
-/// entries are produced deterministically.
+/// One level of the revoke-before-add closure (§8.1, §8.4 step 1): current members `revoked`
+/// granted at/after `after_seq` (the revoker's last-authored-or-witnessed seq). Sorted, so the
+/// follow-on `RevokeDevice` entries are deterministic.
 #[must_use]
 pub fn devices_added_by(state: &State, revoked: &DeviceId, after_seq: u64) -> Vec<DeviceId> {
     state
@@ -807,32 +741,22 @@ pub fn devices_added_by(state: &State, revoked: &DeviceId, after_seq: u64) -> Ve
 }
 
 /// The **transitive** revoke-before-add closure (§8.1, §8.4 step 1): every current member reachable
-/// from `revoked` through the add-by graph whose own grant is at/after `after_seq` — devices `revoked`
-/// granted, devices *they* granted, and so on. Returns the set **excluding** `revoked` itself, sorted.
-///
-/// One level is not enough: a compromised device B can add C and have C add E, so revoking only B's
-/// direct grants leaves the nested sleeper E to survive the rotation. The traversal therefore walks
-/// the **whole** add-by subtree — *through* an out-of-scope (pre-`after_seq`) child to reach its
-/// post-`after_seq` descendants — but only **collects** grants at/after `after_seq`. A grant made
-/// before the revoker's reference point was already witnessed and accepted under prior trust, so it is
-/// retained; one of *its* later grants is not, and is swept. (Applying the `after_seq` filter to the
-/// *traversal* rather than only the *collection* would let a pre-reference child shield its
-/// post-reference subtree — the bug this avoids.) With `after_seq == 0` (the wired `revoke⇒rotate`
-/// callers) every reachable device is collected — the whole subtree is swept.
+/// from `revoked` through the add-by graph whose own grant is at/after `after_seq` (one level misses
+/// the nested sleeper, §8.1). The traversal walks the whole subtree — through pre-`after_seq`
+/// children — but collects only at/after-`after_seq` grants; filtering the *traversal* instead
+/// would let a pre-reference child shield its post-reference subtree. Excludes `revoked`; sorted.
 #[must_use]
 pub fn revoke_closure(state: &State, revoked: &DeviceId, after_seq: u64) -> Vec<DeviceId> {
     let mut result: BTreeSet<DeviceId> = BTreeSet::new();
     let mut seen: BTreeSet<DeviceId> = BTreeSet::new();
     let mut work = vec![*revoked];
     while let Some(cur) = work.pop() {
-        // Walk the entire add-by subtree (after_seq = 0 ⇒ all children of `cur`), even through
-        // out-of-scope children, so a post-reference descendant of a pre-reference child is reached.
+        // after_seq = 0 here: traverse everything, collect selectively below.
         for d in devices_added_by(state, &cur, 0) {
             if !seen.insert(d) {
                 continue;
             }
             work.push(d);
-            // Collect only grants at/after the revoker's reference point.
             if state.added_at.get(&d).is_some_and(|s| *s >= after_seq) {
                 result.insert(d);
             }
@@ -841,11 +765,9 @@ pub fn revoke_closure(state: &State, revoked: &DeviceId, after_seq: u64) -> Vec<
     result.into_iter().collect()
 }
 
-/// Build the ordered op sequence for `revoke⇒rotate` (§8.4): `RevokeDevice(revoked)`, then a
-/// `RevokeDevice` for every device in the transitive [`revoke_closure`], then `Rotate` to the next
-/// generation. `after_seq` is the revoking device's last-authored-or-witnessed `seq` (§8.4 step 1);
-/// `next_mk_commit` is `mk_commit_{g+1}`. The caller signs these into entries (e.g. via
-/// [`append_many`]) and performs the keyslot re-wrap / deletion (§8.4 steps 2–4) on top.
+/// The ordered `revoke⇒rotate` op sequence (§8.4): `RevokeDevice(revoked)`, the transitive
+/// [`revoke_closure`], then `Rotate(next_mk_commit)`. The caller signs these ([`append_many`]) and
+/// performs the keyslot re-wrap/deletion (§8.4 steps 2–4).
 #[must_use]
 pub fn revoke_rotate_ops(
     state: &State,

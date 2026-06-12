@@ -1,41 +1,18 @@
-//! `secsec-aead` — the per-object **fully-committing (CMT-4)** AEAD of `secsec-Design.md` §9.4,
-//! built as the CTX construction (Chan & Rogaway, ESORICS 2022) over ChaCha20-Poly1305.
-//!
-//! # Construction
+//! `secsec-aead` — the fully-committing (CMT-4) per-object AEAD of `secsec-Design.md` §9.4: the
+//! CTX construction (Chan & Rogaway) over raw ChaCha20-Poly1305.
 //!
 //! ```text
-//! nonce   = 0                                   // safe ONLY because `key` is unique per object
+//! nonce   = 0                                   // sound ONLY because `key` is unique per object
 //! ct, T   = ChaCha20Poly1305_raw(key, 0, AD, plaintext)   // T = raw 16-byte Poly1305 tag
 //! ctx_tag = BLAKE3::keyed_hash(key, "secsec-ctx-v1" ‖ AD ‖ T)
 //! stored  = ctx_tag(32) ‖ ct                    // T is NOT stored
 //! ```
 //!
-//! On open, `T` is **recomputed** from `(AD, ct)` (it depends only on the ciphertext and AD, not
-//! the plaintext), `ctx_tag` is recomputed and compared in constant time, and only then is the
-//! ciphertext decrypted. There is no stored `T` and the high-level AEAD "open" is never used.
-//!
-//! `ctx_tag` binds the key, the associated data, and — via `T` — the plaintext, so no ciphertext
-//! opens under two distinct `(key, AD)` pairs (CMT-4). This closes partitioning-oracle /
-//! invisible-salamander attacks across the multi-generation, multi-recipient surface.
-//!
-//! # Contract
-//!
-//! `key` is `k_obj` from §9.4 and **MUST be unique per sealed object**. The 96-bit nonce is fixed
-//! at zero; that is sound *only* under this uniqueness (a unique key ⇒ a unique keystream). Never
-//! call [`seal`] twice with the same `key` and different plaintext. Key *lifecycle* (zeroization
-//! of `key` itself) is owned by the caller / key-management layer (§18); this crate zeroizes only
-//! its own secret transient (the Poly1305 one-time key).
-//!
-//! `AD` here is `FRAME ‖ id` (a fixed 43-byte string in secsec). The commitment input
-//! `"secsec-ctx-v1" ‖ AD ‖ T` is unambiguous because the label is a fixed prefix and `T` is a
-//! fixed 16-byte suffix, so the triple `(AD, T)` is recovered injectively.
-//!
-//! # Mutable variant (§9.8)
-//!
-//! [`seal_mut`] / [`open_mut`] are plain RFC 8439 ChaCha20-Poly1305 with a **caller-supplied fresh
-//! nonce**, for *mutable* objects re-encrypted under a stable key (the per-ref Head, §9.8; local
-//! sealed state, §8.5). They store the raw Poly1305 tag and are deliberately **not** key-committing.
-//! Their contract is the inverse of [`seal`]'s: a fresh random *nonce* per write, not a unique key.
+//! Open recomputes `T` from `(AD, ct)`, constant-time-compares the recomputed `ctx_tag`, and only
+//! then decrypts (full procedure: §9.4). **Contract:** `key` MUST be unique per sealed object —
+//! never [`seal`] twice with the same key. The caller owns key zeroization (§18); this crate
+//! zeroizes only its Poly1305 one-time key. [`seal_mut`]/[`open_mut`] are the §9.8 mutable-object
+//! variant: plain RFC 8439 with a caller-supplied **fresh nonce per write**, not key-committing.
 
 #![forbid(unsafe_code)]
 
@@ -93,12 +70,8 @@ fn ctx_commit(key: &[u8; 32], ad: &[u8], t: &[u8; 16]) -> CtxTag {
     *h.finalize().as_bytes()
 }
 
-/// Seal `plaintext` under a unique per-object `key` with associated data `ad`.
-///
-/// Returns `(ctx_tag, ciphertext)`. The raw Poly1305 tag is folded into `ctx_tag` and discarded —
-/// it is never stored. The blob layout (§9.1) places `ctx_tag` before `ciphertext`.
-///
-/// See the crate docs for the **uniqueness contract** on `key`.
+/// Seal `plaintext` under a **unique per-object** `key` (the crate-doc contract) with AD `ad`.
+/// Returns `(ctx_tag, ciphertext)`; the raw Poly1305 tag is folded into `ctx_tag`, never stored.
 #[must_use]
 pub fn seal(key: &[u8; 32], ad: &[u8], plaintext: &[u8]) -> (CtxTag, Vec<u8>) {
     let mut cipher = ChaCha20::new_from_slices(key, &NONCE).expect("32-byte key / 12-byte nonce");
@@ -115,9 +88,8 @@ pub fn seal(key: &[u8; 32], ad: &[u8], plaintext: &[u8]) -> (CtxTag, Vec<u8>) {
     (ctx_tag, ct)
 }
 
-/// Open a sealed object. Recomputes the Poly1305 tag over `(ad, ciphertext)` **without decrypting**,
-/// recomputes the commitment, compares it to `ctx_tag` in constant time, and only on a match
-/// decrypts and returns the plaintext. Any mismatch returns [`AeadError`] with no plaintext released.
+/// Open a sealed object: recompute `T` over `(ad, ct)`, constant-time-compare the commitment, and
+/// only on a match decrypt (§9.4 three-phase open). Mismatch ⇒ [`AeadError`], no plaintext.
 pub fn open(
     key: &[u8; 32],
     ad: &[u8],
@@ -143,17 +115,9 @@ pub fn open(
     Ok(pt)
 }
 
-/// Standard RFC 8439 ChaCha20-Poly1305 with a **caller-supplied nonce** — the §9.8 *mutable-object*
-/// AEAD, for objects re-encrypted in place under a stable key (the per-ref Head, §6/§9.8; local
-/// sealed state, §8.5). Returns `(tag, ciphertext)` with the **raw 16-byte Poly1305 tag stored**
-/// (unlike [`seal`], which folds the tag into a BLAKE3 commitment).
-///
-/// # Contract
-/// The caller **MUST** pass a **fresh random nonce on every call** with a given `key` (OS CSPRNG,
-/// never a counter). Reusing `(key, nonce)` across two plaintexts is catastrophic. This is the
-/// opposite contract to [`seal`], which requires a unique *key* and fixes the nonce at zero. This
-/// construction is **not** key-committing (§9.8); authenticity against other parties rests on the
-/// object's signature, not this tag.
+/// The §9.8 mutable-object AEAD: plain RFC 8439 ChaCha20-Poly1305, raw tag stored. **Contract:**
+/// the caller MUST pass a fresh OS-CSPRNG nonce on every call with a given `key` — `(key, nonce)`
+/// reuse is catastrophic. Not key-committing; authenticity rests on the object's signature (§9.8).
 #[must_use]
 pub fn seal_mut(
     key: &[u8; 32],
@@ -216,11 +180,8 @@ mod tests {
         assert_eq!(open(&key, b"", &tag, &ct).unwrap(), b"");
     }
 
-    /// Cross-check: our raw ChaCha20 keystream (block 1+) and our RFC 8439 Poly1305 tag must match
-    /// the audited reference `chacha20poly1305` crate exactly. This validates that our hand-rolled
-    /// tag framing is RFC-correct (the fiddly part of building CTX from raw primitives); it is what
-    /// independently anchors the *ciphertext* half of the frozen `ctx_kat` vector — only the 32-byte
-    /// BLAKE3 commitment tag in that KAT is a self-captured golden value.
+    /// Our raw keystream + Poly1305 tag must match the audited `chacha20poly1305` crate exactly —
+    /// this anchors the ciphertext half of the frozen `ctx_kat` against an external reference.
     #[test]
     fn ciphertext_and_tag_match_reference() {
         use chacha20poly1305::aead::AeadInPlace;

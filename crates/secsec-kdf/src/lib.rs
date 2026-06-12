@@ -1,15 +1,8 @@
-//! `secsec-kdf` — the key-derivation hierarchy of `secsec-Design.md` §5 and §9.5.
+//! `secsec-kdf` — the key-derivation hierarchy (`secsec-Design.md` §5, §9.5).
 //!
-//! Every subkey is `BLAKE3::derive_key(context_label, IKM)` with a **distinct, hardcoded** context
-//! label (the domain separation of §9.5) and the secret in the IKM/message role. The IKM is built
-//! with [`secsec_canon::Writer`] so the fixed-width little-endian `gen`/`seq`/`type` encodings match
-//! the rest of the codebase exactly. The sole exception is `mk_commit_g`, which uses
-//! `BLAKE3::keyed_hash(master_key_g, …)` — the one place the master key occupies the PRF *key* role
-//! (§9.5 note); it is a public commitment, not a secret.
-//!
-//! All secret outputs are [`Zeroizing`]; the master key itself is RAM-only and zeroized on drop
-//! (§18). Key *generation/storage* policy lives in the key-management layer; this crate is pure
-//! derivation.
+//! Every subkey is `BLAKE3::derive_key(label, IKM)` with a distinct hardcoded label and the secret
+//! in the IKM role; `mk_commit_g` is the sole `keyed_hash` exception (§9.5 note). All secret
+//! outputs are [`Zeroizing`]; the master key is RAM-only (§18).
 
 #![forbid(unsafe_code)]
 
@@ -62,10 +55,8 @@ impl MasterKey {
         self.generation
     }
 
-    /// The raw 32-byte master-key material. **Deliberate, narrow accessor** for the operations that
-    /// genuinely need the bytes (keyslot wrapping, §8.3) — the same material `keyslot::unwrap` produces
-    /// and `keyslot::wrap` consumes. Anyone holding a `MasterKey` already has full read access, so this
-    /// exposes nothing new; everything else derives subkeys instead.
+    /// The raw 32-byte master-key material — only for keyslot wrapping (§8.3); everything else
+    /// derives subkeys instead.
     #[must_use]
     pub fn expose_secret(&self) -> &[u8; 32] {
         &self.key
@@ -120,12 +111,8 @@ impl MasterKey {
         })
     }
 
-    /// `mk_commit_g` — the hiding, binding generation commitment (§5).
-    ///
-    /// **Public**, not secret: it is recorded in the sigchain and lets any holder of a candidate
-    /// key prove it is the genuine generation-`g` master key. Uses `keyed_hash` with the master key
-    /// as the PRF key — the only such use in the hierarchy (§9.5 note). The generation is bound into
-    /// the message, closing the generation-rollback attack.
+    /// `mk_commit_g` — the public, hiding, binding generation commitment (§5). The one `keyed_hash`
+    /// in the hierarchy (§9.5 note); `g` is bound into the message (generation-rollback guard).
     #[must_use]
     pub fn mk_commit(&self) -> [u8; 32] {
         let mut w = Writer::new();
@@ -137,25 +124,17 @@ impl MasterKey {
     }
 }
 
-/// A resolver from a master-key **generation** to the [`MasterKey`] for it — the read-side key ring
-/// that lets a current member open objects sealed under any past generation (§8.2 cross-rotation
-/// reads). Implemented for a single [`MasterKey`] (resolves only its own generation — the
-/// genesis/no-rotation case) and for a `BTreeMap<u32, MasterKey>` (the peeled DATA key-history), so
-/// read/traversal paths stay generic and single-generation call sites pass `&mk` unchanged.
+/// Generation → [`MasterKey`] resolver — the read-side key ring for §8.2 cross-rotation reads.
+/// Implemented for a single [`MasterKey`] (its own generation only) and for
+/// `BTreeMap<u32, MasterKey>` (the peeled key history).
 pub trait MasterKeys {
     /// The master key for generation `g`, or `None` if this resolver does not hold it.
     fn for_gen(&self, g: u32) -> Option<&MasterKey>;
-    /// The **current** (highest) generation's master key — what new objects are sealed under (writes
-    /// always use the current generation). For a single key this is itself; for a key ring it is the
-    /// entry with the greatest generation.
+    /// The current (highest) generation's master key — what new objects are sealed under.
     fn current(&self) -> &MasterKey;
 
-    /// The generation-stable ref-name key (§13). Derived from the **genesis** generation's master key
-    /// (gen 1), which every current member can recover (§8.2 peel) and which never changes across
-    /// rotations — so a ref's storage path `H = keyed_hash(ref_name_key, ref_name)` does **not** move
-    /// when the master key rotates (the head blob is still sealed under the current generation's
-    /// `head_key_g`, peeled on read). A full key ring always holds gen 1; a degenerate
-    /// single-generation resolver falls back to its own generation's key.
+    /// The rotation-stable ref-name key (§9.5/§13): derived from the **genesis** generation so the
+    /// ref path never moves on rotation. A single-generation resolver falls back to its own key.
     fn ref_name_key(&self) -> SecretKey {
         self.for_gen(1)
             .unwrap_or_else(|| self.current())
@@ -204,9 +183,7 @@ pub fn roster_entry_key(roster_key_g: &[u8; 32], seq: u64) -> SecretKey {
     })
 }
 
-/// `k_rkh_g` (§8.2): the forward-wrap key for the never-trimmed roster-key history, derived from
-/// the *next* generation's roster key `roster_key_{g+1}` so a current member can peel back to
-/// `roster_key_1` independently of data-history reanchoring.
+/// `k_rkh_g` (§8.2): roster-key-history forward-wrap key, derived from `roster_key_{g+1}`.
 #[must_use]
 pub fn roster_keyhist_key(roster_key_next: &[u8; 32], g: u32) -> SecretKey {
     derive(L_ROSTER_KEYHIST, |w| {
@@ -214,11 +191,8 @@ pub fn roster_keyhist_key(roster_key_next: &[u8; 32], g: u32) -> SecretKey {
     })
 }
 
-/// `k_keyhist_g` (§8.2 **DATA** key-history): the forward-wrap key for `master_key_g`, derived from
-/// the *next* generation's **master key** `master_key_{g+1}` so a current member can peel
-/// `master_key_g … master_key_1` and read pre-rotation **object** content. Distinct from
-/// [`roster_keyhist_key`] (which wraps roster keys for sigchain folding); the two are keyed by
-/// different IKM (master key vs roster key) under distinct labels.
+/// `k_keyhist_g` (§8.2): DATA-key-history forward-wrap key, derived from `master_key_{g+1}` —
+/// distinct label and IKM from [`roster_keyhist_key`].
 #[must_use]
 pub fn data_keyhist_key(master_key_next: &[u8; 32], g: u32) -> SecretKey {
     derive(L_KEYHIST, |w| {
@@ -248,13 +222,10 @@ mod tests {
         assert_eq!(mk.mk_commit(), mk.mk_commit());
     }
 
-    /// Every derivation family / parameterization must yield a distinct key — this is the §9.5
-    /// domain-separation guarantee. Collect a pile of outputs and assert they are all unique.
+    /// Every derivation family/parameterization yields a distinct key (§9.5 domain separation).
     #[test]
     fn domain_separation_all_distinct() {
-        // Distinct generations have distinct *random* master keys in reality (each Rotate mints a
-        // fresh one). roster_key/ref_name_key bind only master_key_g (no gen index, §9.5), so the
-        // test must reflect that by giving g2 different key bytes — not reuse g1's.
+        // g2 gets different key bytes, as a real Rotate mints a fresh random master key.
         let g1 = MasterKey::new(1, MK);
         let g2 = MasterKey::new(2, [0x22; 32]);
         let rk1 = g1.roster_key();
@@ -329,10 +300,8 @@ mod tests {
         );
     }
 
-    /// Frozen known-answer vectors for `master_key = [0x11; 32]`. These pin the exact derivation
-    /// outputs so any future change to labels/encodings is caught (the §9.5 "test vectors must be
-    /// provided" requirement). Exported to `vectors/secsec-kat-v1.txt [kdf]` and cross-checked by
-    /// `cargo xtask vectors --check`, so the inline test and the committed export can never drift.
+    /// Frozen §9.5 KATs for `master_key = [0x11; 32]`, mirrored in `vectors/secsec-kat-v1.txt [kdf]`
+    /// (drift-checked by `cargo xtask vectors --check`).
     #[test]
     fn kat_frozen() {
         let g1 = MasterKey::new(1, MK);

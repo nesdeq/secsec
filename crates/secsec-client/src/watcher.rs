@@ -1,12 +1,7 @@
-//! Filesystem watcher — the §10 live trigger for commit-on-change. Wraps `notify`
-//! (inotify/FSEvents/ReadDirectoryChangesW) and **debounces** a burst of events into a single
-//! "directory changed" callback, so a multi-file save or an editor's write-rename dance produces one
-//! commit, not dozens.
-//!
-//! The debounce window is a **caller-supplied** `Duration` (no baked-in cadence — §19 leaves the
-//! snapshot cadence to configuration); the loop fires `on_change` once the directory has been quiet
-//! for that long. `on_change` returns `true` to keep watching or `false` to stop (a clean shutdown
-//! hook); the loop also returns when the watcher is dropped.
+//! Filesystem watcher — the §10 live trigger for commit-on-change. Wraps `notify` and **debounces**
+//! a burst of events into a single "directory changed" callback, so an editor's write-rename dance
+//! produces one commit, not dozens. The debounce window is caller-supplied (§19 leaves the cadence
+//! to configuration); `on_change` returns `true` to keep watching, `false` to stop.
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;

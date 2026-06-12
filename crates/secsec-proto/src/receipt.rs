@@ -1,15 +1,7 @@
-//! Signed arrival receipts (`secsec-Design.md` §15, defence-in-depth per §21).
-//!
-//! On each successful `put`, a cooperative server signs a receipt
-//! `SIG_hostkey(id ‖ host_id ‖ arrival_gen ‖ put_epoch ‖ ts)` with a dedicated Ed25519 **host receipt
-//! key**, domain-separated under `"secsec-receipt-v1"`. The client verifies it against the host's
-//! receipt public key (delivered alongside the receipt and TOFU-bound to `host_id` over the
-//! already-host-pinned connection). This gives the client durable, attributable evidence of what the
-//! server claimed about each object's arrival — useful for GC dispute/audit.
-//!
-//! **Not load-bearing (§21):** GC eligibility is a client-computed decision from the signed sigchain
-//! frontier, never from server timestamps. A *malicious* server controls its own receipts; this
-//! defends against a *cooperative* server's bookkeeping errors and gives the client a paper trail.
+//! Signed arrival receipts (`secsec-Design.md` §15; defence-in-depth, §21): on each `put` the server
+//! signs `id ‖ host_id ‖ arrival_gen ‖ put_epoch ‖ ts` with a dedicated Ed25519 receipt key. **Not
+//! load-bearing** — GC eligibility is always client-computed; this is an audit trail against a
+//! cooperative server's bookkeeping errors.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use secsec_canon::Writer;

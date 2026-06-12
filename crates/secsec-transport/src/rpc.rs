@@ -87,10 +87,9 @@ pub async fn request(
     .await
 }
 
-/// Issue a §15 `gc` request. Unlike other writes, gc's `args_hash` binds the client's view of the
-/// server's mutable state — `all_heads_hash`/`roster_seq`/`put_epoch` (a compare-and-swap, §15) — so
-/// the signature is built from the full `args_gc`, not the generic `op_and_args` placeholder. The
-/// server recomputes `args_gc` from its own state; a mismatch (concurrent mutation) fails the sig.
+/// Issue a §15 `gc` request: its `args_hash` binds the client's view of the server's mutable state
+/// (`all_heads_hash`/`roster_seq`/`put_epoch` — the §15 CAS), so it signs the full `args_gc` rather
+/// than the generic `op_and_args` binding.
 #[allow(clippy::too_many_arguments)]
 pub async fn request_gc(
     conn: &Connection,

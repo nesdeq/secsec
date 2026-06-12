@@ -1,10 +1,7 @@
-//! The authenticated serve loop (`secsec-Design.md` §11/§12): run the application handshake on a QUIC
-//! connection, confirm the client is rostered (keyslot existence), then dispatch each per-op request
-//! stream through [`Server::handle`].
-//!
-//! Per request stream: issue a fresh `server_nonce`, send it, read the [`AuthedRequest`], run the §12
-//! pipeline, reply with the [`Response`]. The handshake binds the connection to one authenticated
-//! key + transcript; every request reuses that transcript and a fresh single-use nonce.
+//! The authenticated serve loop (`secsec-Design.md` §11/§12): handshake the QUIC connection (binding
+//! it to one authenticated key + transcript), then dispatch each per-op request stream through
+//! [`Server::handle`] — per stream: issue a fresh single-use `server_nonce`, read the
+//! [`AuthedRequest`], run the §12 pipeline, reply.
 
 use crate::{Incoming, Server};
 use quinn::Connection;
@@ -66,11 +63,9 @@ fn random32() -> [u8; 32] {
     n
 }
 
-/// Handshake the connection and serve its request streams until it closes. `host_id` is the server's
-/// own `host_id`; `now` is a clock (unix seconds) read fresh per request (so nonce TTLs stay current
-/// on a long-lived connection). `server` is shared via `&Server` (typically `Arc<Server>`) and serves
-/// many connections concurrently — its store is lock-free and only the small replay/rate-limit state
-/// is briefly mutex-guarded inside [`Server::handle`].
+/// Handshake the connection and serve its request streams until it closes. `now` (unix seconds) is
+/// read fresh per request so nonce TTLs stay current on a long-lived connection; `server` is shared
+/// (typically `Arc<Server>`) and serves many connections concurrently.
 pub async fn serve_connection<F>(
     conn: &Connection,
     server: &Server,
@@ -100,10 +95,8 @@ where
     }
     let _conn_guard = ConnGuard { server, device_id };
 
-    // Membership (read/write) is enforced **per op** inside `Server::handle` (§12 keyslot-existence
-    // check): an authorized-but-unenrolled key may complete the handshake and run only the §7
-    // pairing-mailbox ops (to get enrolled); every other op is rejected with `NotEnrolled`. We do not
-    // reject the connection on enrollment here, so a joining device (no keyslot yet) can pair.
+    // Membership is enforced per op inside `Server::handle` (§12 keyslot check) — NOT here, so an
+    // authorized-but-unenrolled joiner can still run the §7 pairing ops to get enrolled.
 
     // Request loop: one bidi stream per op.
     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
@@ -241,10 +234,8 @@ mod tests {
         });
     }
 
-    /// **Concurrency:** two clients are served at the same time. One holds an idle connection (no
-    /// request in flight) while the other completes a put+get — proving the per-request lock is
-    /// released between requests, so an idle connection never blocks another (the bug that made the
-    /// server one-client-at-a-time).
+    /// Two clients are served at the same time: one holds an idle connection while the other
+    /// completes a put+get — an idle connection must never block another client.
     #[test]
     fn serves_two_clients_concurrently() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -330,10 +321,8 @@ mod tests {
         });
     }
 
-    /// **Racing writers:** two clients `cas-head` the same ref (both expecting it absent) at the same
-    /// time. The blind-CAS over the redb write txn must let **exactly one** win; the other gets
-    /// `CasConflict` (and would re-fetch + merge, §10). This is the concurrency-correctness guarantee
-    /// the whole sync model rests on.
+    /// Two clients race `cas-head` on the same ref (both expecting absent): exactly one must win;
+    /// the other gets `CasConflict` and would re-fetch + merge (§10).
     #[test]
     fn two_clients_racing_cas_head_one_wins() {
         let rt = tokio::runtime::Builder::new_current_thread()

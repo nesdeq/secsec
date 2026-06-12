@@ -1,19 +1,8 @@
-//! The application-layer handshake over a live QUIC connection (`secsec-Design.md` §11). After the
-//! pinned TLS handshake ([`crate::PinnedServerVerifier`]) the two ends run this on a control stream:
-//!
-//! 1. client → `ClientHello {version, client_nonce}`;
-//! 2. server → `ServerHello {version, server_nonce, host_id}`;
-//! 3. both build the [`SessionTranscript`] over the two hellos;
-//! 4. both derive `channel_binding` from the TLS keying-material **exporter**
-//!    (`EXPORTER-Channel-Binding`, §11) — identical on both ends, binding the app auth to *this* TLS
-//!    channel;
-//! 5. client → `ClientAuth {pubkey, sig}` where `sig` is the `secsec-auth-v1` signature over
-//!    `channel_binding ‖ host_id ‖ session_transcript ‖ server_nonce` ([`ConnectionAuth`]);
-//! 6. server verifies `sig` against the presented `pubkey` (and the caller then checks that key owns
-//!    a keyslot, §12).
-//!
-//! Both sides return the per-connection `session_transcript`, which every later per-op request signs
-//! (§9.6). The server also returns the authenticated client [`DevicePublic`].
+//! The §11 application-layer handshake on a control stream after the pinned TLS handshake:
+//! ClientHello → ServerHello → both build the [`SessionTranscript`] and the TLS-exporter channel
+//! binding → client sends `ClientAuth` (the `secsec-auth-v1` signature, [`ConnectionAuth`]) →
+//! server verifies. Both sides return the transcript every later per-op request signs (§9.6); the
+//! server also returns the authenticated client key (keyslot check is the caller's, §12).
 
 use crate::auth::{ConnectionAuth, SessionTranscript, NONCE_LEN, SECSEC_VERSION};
 use crate::frame::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};

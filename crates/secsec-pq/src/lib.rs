@@ -1,32 +1,16 @@
-//! Hybrid post-quantum keyslot — **X-Wing** (`secsec-Design.md` §17).
-//!
-//! Wraps `master_key_g` to a device under the X-Wing KEM (ML-KEM-768 ⊕ X25519), so the harvestable
-//! asymmetric keyslot wrap is PQ-secure (the symmetric data plane is already PQ-safe). This is a
-//! **byte-faithful** X-Wing per draft-connolly-cfrg-xwing-kem-10 / ePrint 2024/039:
+//! Hybrid post-quantum keyslot — byte-faithful X-Wing (ML-KEM-768 ⊕ X25519) per
+//! draft-connolly-cfrg-xwing-kem-10; full normative construction, seed form, and rationale in
+//! `secsec-Design.md` §17.
 //!
 //! ```text
-//! // key generation (draft-10 §6 expandDecapsulationKey): a single 32-byte seed `sk`
-//! expanded = SHAKE256(sk, 96)
-//! (d, z)   = expanded[0:32], expanded[32:64]   // ML-KEM-768 KeyGen_internal seed
-//! sk_X     = expanded[64:96]                    // X25519 static secret
-//!
-//! // combiner (draft-10 §6 Combiner) — the XWingLabel is placed **LAST**:
-//! ss = SHA3-256( ss_MLKEM(32) ‖ ss_X25519(32) ‖ ct_X(32) ‖ pk_X(32) ‖ XWingLabel(6) )
-//! keyslot_ct = ct_MLKEM(1088) ‖ ct_X(32)                                       // 1120 bytes
+//! expanded = SHAKE256(sk, 96)            // (d,z) = [0:64] ML-KEM seed, sk_X = [64:96]
+//! ss = SHA3-256( ss_MLKEM ‖ ss_X25519 ‖ ct_X ‖ pk_X ‖ XWingLabel )   // label LAST
+//! keyslot_ct = ct_MLKEM(1088) ‖ ct_X(32)
 //! ```
 //!
-//! The X-Wing secret key is the 32-byte `sk` seed alone; the ML-KEM `(d,z)` seed and the X25519
-//! secret are *derived* from it (FIPS 203 §7.1 seed form for ML-KEM, required to avoid
-//! MAL-BIND-K-CT / MAL-BIND-K-PK failures — Schmieg, ePrint 2024/523). The X-Wing shared secret then
-//! keys the §9.4 CTX committing AEAD to wrap the master key; authenticity rests on the §7 `mk_commit`
-//! check, not the wrap.
-//!
-//! ## Conformance (§17, normative)
-//!
-//! [`xwing_kat`] asserts a byte-identical shared secret against the draft-10 Appendix C test vector
-//! (the published `(seed, eseed) → ss`), exercising keygen, encapsulation, and the combiner end to
-//! end against the formally-verified [`libcrux_ml_kem`] ML-KEM-768 and X25519. §17 mandates this
-//! gate "before any implementation is accepted as conformant"; it runs in normal CI (not `#[ignore]`d).
+//! The shared secret keys the §9.4 CTX AEAD over the master key; authenticity rests on the §7
+//! `mk_commit` check, not the wrap. [`xwing_kat`] is the §17 conformance gate (byte-identity
+//! against the draft-10 Appendix C vector), run in normal CI.
 
 #![forbid(unsafe_code)]
 
@@ -131,9 +115,8 @@ impl XWingSecret {
         Ok((secret, public))
     }
 
-    /// Construct from a stored 32-byte X-Wing seed — key **loading** (a recovered decapsulation key,
-    /// or the §17 conformance vector), not key generation, so the §7.1 consistency check (a
-    /// key-generation step) is not re-run.
+    /// Load a stored 32-byte X-Wing seed. Key *loading*, not generation — the §7.1 consistency
+    /// check (a keygen step) is not re-run.
     #[must_use]
     pub fn from_seed(seed: [u8; XWING_SEED_LEN]) -> Self {
         Self {
@@ -152,10 +135,8 @@ impl XWingSecret {
         }
     }
 
-    /// FIPS 203 §7.1 pairwise consistency check (§17): the freshly-generated ML-KEM keypair must
-    /// encapsulate/decapsulate to the same shared secret. Catches a faulty keygen / RNG before the
-    /// key is ever used. The X25519 half is checked structurally by [`expand`] deriving the public
-    /// from the secret.
+    /// FIPS 203 §7.1 pairwise consistency check (§17): a fresh ML-KEM keypair must encaps/decaps to
+    /// the same secret — catches faulty keygen/RNG before first use.
     fn pairwise_consistency_check(&self) -> Result<(), PqError> {
         let (mlkem_seed, _x) = expand(&self.seed);
         let kp = mlkem768::generate_key_pair(*mlkem_seed);
@@ -216,10 +197,8 @@ fn combine(
     out
 }
 
-/// X-Wing `EncapsulateDerand(pk, eseed)` (draft-10 §6) with the explicit 64-byte `eseed`: `m =
-/// eseed[0:32]` is the ML-KEM encapsulation randomness, `ek_X = eseed[32:64]` is the X25519 ephemeral
-/// secret. Returns `(keyslot_ct = ct_MLKEM ‖ ct_X, ss)`. Deterministic in `eseed` — the conformance
-/// vector and the per-op randomized [`encapsulate`] both route through here.
+/// X-Wing `EncapsulateDerand(pk, eseed)` (draft-10 §6): `m = eseed[0:32]`, `ek_X = eseed[32:64]`.
+/// Deterministic in `eseed` — both the KAT and the randomized [`encapsulate`] route through here.
 fn encapsulate_derand(
     recipient: &XWingPublic,
     eseed: &[u8; XWING_ESEED_LEN],
@@ -433,11 +412,8 @@ mod tests {
         ));
     }
 
-    /// §17 CONFORMANCE GATE: byte-identical X-Wing shared secret vs the published draft-10 Appendix C
-    /// test vector (the first vector; `seed`/`eseed` → `ss`). Asserting `ss` exercises keygen
-    /// (SHAKE256 seed-expand → ML-KEM `(d,z)` + X25519 `sk_X`), `EncapsulateDerand`, and the
-    /// label-**last** combiner end to end against the formally-verified ML-KEM-768. This is what makes
-    /// the keyslot *conformant* X-Wing rather than a self-consistent look-alike.
+    /// §17 conformance gate: byte-identical shared secret vs the draft-10 Appendix C vector —
+    /// exercises keygen, `EncapsulateDerand`, and the label-last combiner end to end.
     #[test]
     fn xwing_kat() {
         let seed: [u8; XWING_SEED_LEN] =

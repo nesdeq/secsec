@@ -1,16 +1,7 @@
-//! `secsec-engine` — sync orchestration (`secsec-Design.md` §10).
-//!
-//! This crate is the bridge between the stored object graph ([`secsec_snapshot`]) and the pure,
-//! storage-free three-way merge ([`secsec_sync::merge`]). The merge operates on an in-memory
-//! [`Node`] tree; the engine materializes a stored tree into `Node`s ([`load_nodes`]), runs the
-//! merge, and re-seals the result back into the store ([`seal_nodes`]) — preserving each file's
-//! chunk list and `path_salt` (so chunk ids still re-verify, §9.2) and each subdir's advisory mode.
-//!
-//! [`reconcile`] ties them together: given the three commit trees (common ancestor `base`, `ours`,
-//! `theirs`), it produces a single merged tree in the store and the conflict list, with no silent
-//! data loss (divergent files are kept-both, §10). The rollback **gates** that decide *whether* to
-//! merge at all (roster_seq / version / head_version frontiers) live in [`secsec_sync::rollback`]
-//! and are applied by the caller before invoking this.
+//! `secsec-engine` — the bridge between the stored object graph ([`secsec_snapshot`]) and the pure
+//! three-way merge ([`secsec_sync::merge`]), `secsec-Design.md` §10: materialize stored trees into
+//! [`Node`]s, merge, re-seal the result (chunk lists + salts preserved so ids re-verify, §9.2), and
+//! author the signed merge commit. The rollback gates live in [`secsec_sync::rollback`].
 
 #![forbid(unsafe_code)]
 
@@ -26,9 +17,8 @@ use secsec_sync::rollback::{
 };
 use std::collections::BTreeMap;
 
-/// Maximum directory nesting the engine will materialize, matching the snapshot producer's cap
-/// (`secsec_frame::MAX_TREE_DEPTH`). Trees are content-addressed (acyclic by construction); this
-/// bounds stack depth against a maliciously deep chain from an untrusted store.
+/// Maximum directory nesting the engine materializes (= the §19 producer cap; bounds stack depth
+/// against a maliciously deep chain).
 const MAX_TREE_DEPTH: usize = secsec_frame::MAX_TREE_DEPTH;
 
 /// A 16-byte per-path salt (§9.2).
@@ -58,10 +48,8 @@ impl From<SnapError> for EngineError {
     }
 }
 
-/// Materialize the stored tree `(tree_id, tree_salt)` into an in-memory [`Node`] map (the merge
-/// model), recursing into subtrees. Each level is fetched, opened (content address re-verified,
-/// §9.2), and decoded by [`secsec_snapshot::load_tree`]. A missing object surfaces as
-/// [`SnapError::Missing`]; the engine adds only the depth bound.
+/// Materialize the stored tree into an in-memory [`Node`] map, recursing into subtrees (each level
+/// §9.2-verified). A missing object surfaces as [`SnapError::Missing`].
 pub fn load_nodes<K: MasterKeys>(
     tree_id: &Id,
     tree_salt: &PathSalt,
@@ -126,11 +114,8 @@ fn load_nodes_inner<K: MasterKeys>(
     Ok(out)
 }
 
-/// Seal an in-memory [`Node`] map back into the store as a tree object, recursing into subdirs
-/// (children sealed first so each `Entry::Dir` records its subtree's id+salt). Files reuse their
-/// existing `chunks` and `path_salt` (the chunks already live in the store from one of the merge
-/// sides; nothing is re-chunked), so the produced tree restores byte-identically. Returns the root
-/// tree's `(id, salt)`.
+/// Seal a [`Node`] map back into the store (children first). Files reuse their `chunks` and
+/// `path_salt` — nothing is re-chunked, so the tree restores byte-identically. Returns `(id, salt)`.
 pub fn seal_nodes(
     nodes: &BTreeMap<String, Node>,
     mk: &MasterKey,
@@ -185,10 +170,9 @@ pub struct Reconciled {
     pub conflicts: Vec<Conflict>,
 }
 
-/// Three-way reconcile of two divergent commit trees against their common ancestor, materializing the
-/// merged tree into `store`. `base`/`ours`/`theirs` are `(root_tree_id, root_salt)` of the merge-base
-/// commit and the two heads; `their_label` is the keep-both suffix for the incoming side
-/// (`<device>-<commit_id_hex12>`, §10). The chunks of both sides must already be present in `store`.
+/// Three-way reconcile of two divergent commit trees against their common ancestor (each a
+/// `(root_tree_id, root_salt)`), materializing the merged tree into `store`. `their_label` is the
+/// §10 keep-both suffix. Both sides' chunks must already be in `store`.
 pub fn reconcile<K: MasterKeys>(
     base: (&Id, &PathSalt),
     ours: (&Id, &PathSalt),
@@ -197,8 +181,7 @@ pub fn reconcile<K: MasterKeys>(
     keys: &K,
     store: &Store,
 ) -> Result<Reconciled, EngineError> {
-    // Reads resolve each input tree's own generation (§8.2 — `base` may predate a rotation); the merged
-    // result is sealed under the current generation (`keys.current()`).
+    // Reads resolve each tree's own generation (§8.2); the result seals under the current one.
     let b = load_nodes(base.0, base.1, keys, store)?;
     let o = load_nodes(ours.0, ours.1, keys, store)?;
     let t = load_nodes(theirs.0, theirs.1, keys, store)?;
@@ -263,11 +246,8 @@ impl From<SigError> for MergeError {
     }
 }
 
-/// Load the commit parent-DAG and per-commit gate metadata for the histories reachable from `heads`,
-/// fetching each commit from `store` (content address re-verified, §9.2). A missing ancestor is an
-/// error, so the rollback gates never run on a truncated history (fail-safe). The caller is
-/// responsible for having verified each head/commit signature against the roster (§9.6) — this builds
-/// the structural inputs the gates need.
+/// Load the parent-DAG + per-commit gate metadata reachable from `heads` (each commit §9.2-verified
+/// from `store`). A missing ancestor errors, so the gates never run on a truncated history.
 pub fn load_commit_dag<K: MasterKeys>(
     heads: &[Id],
     keys: &K,
@@ -345,13 +325,10 @@ fn hex12(b: &[u8; 32]) -> String {
     b[..6].iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Drive the §10 rollback-aware merge for one sibling head against our current head. Loads the commit
-/// DAG, runs [`evaluate_merge`] (the rollback gates — a rejection is [`MergeError::Rollback`], an
-/// alarm), and on [`MergeDecision::Merge`] reconciles the two trees against their lowest common
-/// ancestor and writes a signed merge commit. Returns the action and the advanced frontier.
-///
-/// Precondition: the caller has signature-verified `sibling` and the reachable commits against the
-/// roster (§9.6); this enforces content addressing and the rollback frontier, not authorship.
+/// Drive the §10 rollback-aware merge of one sibling head: load the DAG, run the gates (rejection =
+/// [`MergeError::Rollback`], an alarm), and on Merge reconcile against the lowest common ancestor
+/// and author a signed merge commit. Precondition: the caller signature-verified the sibling and
+/// reachable commits against the roster (§9.6).
 pub fn merge_heads<K: MasterKeys>(
     frontier: &SyncFrontier,
     our_head_commit: &Id,

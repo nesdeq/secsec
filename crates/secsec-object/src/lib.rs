@@ -1,18 +1,9 @@
-//! `secsec-object` — the object plane: content addressing, authenticated seal/open with
-//! re-verification, and chunk padding (`secsec-Design.md` §9.2, §9.4, §9.7).
+//! `secsec-object` — content addressing, authenticated seal/open, chunk padding (`secsec-Design.md`
+//! §9.2, §9.4, §9.7).
 //!
-//! This crate composes the foundation: `secsec-kdf` (keys), `secsec-frame` (framing + AD),
-//! `secsec-aead` (committing AEAD). An object is stored as `FRAME ‖ ctx_tag ‖ ciphertext`,
-//! content-addressed by
-//!
-//! ```text
-//! id = BLAKE3::keyed_hash(id_key[gen][type], FRAME ‖ path_salt ‖ plaintext)   // §9.2
-//! ```
-//!
-//! On fetch, substitution is caught **three independent ways** (§9.2): the AEAD/CTX tag fails for
-//! the wrong key (the per-object key is derived from the requested id), the FRAME must equal what
-//! the client expected (§18), and the id is **re-derived from the recovered plaintext** and
-//! constant-time compared to the requested id.
+//! `id = BLAKE3::keyed_hash(id_key[gen][type], FRAME ‖ path_salt ‖ plaintext)` (§9.2). On fetch,
+//! substitution is caught three independent ways: AEAD/CTX tag, expected-FRAME match (§18), and id
+//! re-derivation from the recovered plaintext.
 
 #![forbid(unsafe_code)]
 
@@ -36,9 +27,8 @@ pub const ZERO_SALT: PathSalt = [0u8; 16];
 pub enum Padding {
     /// No padding — stored size equals plaintext size (opt-out; convergent/space-saving).
     None,
-    /// Pad to the next power-of-two ≥ `len + 1` with reversible ISO/IEC 7816-4 bit padding
-    /// (`0x80` then zeros). Bounded ≤2× overhead; **reduces** (does not fully eliminate) the
-    /// boundary signal. This is the default.
+    /// Pad to the next power-of-two ≥ `len + 1` (ISO/IEC 7816-4: `0x80` then zeros). Default;
+    /// ≤2× overhead; reduces the boundary signal (§9.7).
     #[default]
     PowerOfTwo,
 }
@@ -117,12 +107,9 @@ pub fn seal_object(
     (id, blob)
 }
 
-/// Open and fully verify a fetched `blob` that the client requested by `requested_id`.
-///
-/// Verifies (1) the FRAME equals what the client expects for `(gen, type)` (§18), (2) the AEAD/CTX
-/// tag under the per-object key derived from `requested_id`, and (3) the id re-derived from the
-/// recovered plaintext equals `requested_id` (§9.2). `path_salt` must be the salt the client holds
-/// for this object (from the parent tree, or [`ZERO_SALT`] for non-path objects).
+/// Open and fully verify a fetched `blob` requested by `requested_id`: expected-FRAME match (§18),
+/// AEAD/CTX tag under the id-derived key, and id re-derivation from the plaintext (§9.2).
+/// `path_salt` comes from the parent tree ([`ZERO_SALT`] for non-path objects).
 pub fn open_object<K: MasterKeys>(
     keys: &K,
     obj_type: ObjType,
@@ -130,9 +117,7 @@ pub fn open_object<K: MasterKeys>(
     requested_id: &Id,
     blob: &[u8],
 ) -> Result<Vec<u8>, ObjError> {
-    // (0) Resolve the object's authenticated generation (§8.2): a single `&MasterKey` resolves only
-    // its own generation (no-rotation case); a peeled key ring resolves any past generation. The
-    // `parse_blob` FRAME check below still rejects any blob whose generation differs from `mk`'s.
+    // Resolve the blob's generation against the key ring (§8.2); parse_blob still enforces equality.
     let head = blob
         .get(..FRAME_LEN)
         .ok_or(ObjError::Frame(FrameError::ShortBlob))?;

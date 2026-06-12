@@ -1,14 +1,7 @@
-//! Server-side enforcement (`secsec-Design.md` §11, §12, §19). Pure, deterministic policy the QUIC
-//! serve loop drives — kept clock-injected (every method takes `now`, unix seconds) so the security
-//! state machines are unit-testable without sockets or a real clock.
-//!
-//! - [`NonceStore`] — `server_nonce` freshness + single-use replay defense (§11): the server issues
-//!   a fresh nonce per challenge and consumes it exactly once within the TTL.
-//! - [`TokenBucket`] — byte/connection rate limits (§19 per-key write/read rate + burst).
-//! - [`WindowCounter`] — "N events per rolling window" caps (§19 `gc` 4/hr, sigchain 60/hr).
-//! - [`StorageQuota`] — the per-key storage cap (§19).
-//!
-//! Keyslot-existence enforcement (§12) is a store lookup and lives with the server's object store.
+//! Server-side enforcement policy (`secsec-Design.md` §11, §12, §19), pure and clock-injected
+//! (every method takes `now`) so it is testable without sockets: [`NonceStore`] (single-use nonce
+//! replay defense), [`TokenBucket`] (byte rates), [`WindowCounter`] (per-hour caps),
+//! [`StorageQuota`]. Keyslot-existence enforcement lives with the store (§12).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -71,13 +64,9 @@ impl NonceStore {
         }
     }
 
-    /// Record a freshly-issued `nonce`, valid until `now + ttl`. (The caller draws `nonce` from the
-    /// OS CSPRNG.)
-    ///
-    /// A nonce is removed by [`consume`](Self::consume) on use, but read ops and abandoned writes
-    /// never consume their issued nonce — so without housekeeping the live set would grow with every
-    /// stream. We therefore sweep expired entries at most once per TTL window on issue, bounding the
-    /// live set to roughly one TTL's worth of issuance. This reuses `ttl` (no separate cap constant).
+    /// Record a freshly-issued OS-CSPRNG `nonce`, valid until `now + ttl`. Issue also sweeps expired
+    /// entries once per TTL window — never-consumed nonces (reads, abandoned writes) would otherwise
+    /// grow the live set unboundedly.
     pub fn issue(&mut self, nonce: [u8; 32], now: u64) {
         if now.saturating_sub(self.last_evict) >= self.ttl {
             self.evict_expired(now);
@@ -207,10 +196,8 @@ impl WindowCounter {
         }
     }
 
-    /// Undo the most recent [`try_record`](Self::try_record) — for an op that was counted but then did
-    /// no work (e.g. it lost a downstream compare-and-swap). Pops the latest event; a no-op if empty.
-    /// Events are interchangeable timestamps, so popping the back restores the count correctly even
-    /// under interleaved records on the same counter.
+    /// Undo the most recent [`try_record`](Self::try_record) — for an op that was counted but did no
+    /// work (e.g. lost a downstream CAS). Pops the latest event; no-op if empty.
     pub fn refund(&mut self) {
         self.events.pop_back();
     }
@@ -222,17 +209,9 @@ impl WindowCounter {
     }
 }
 
-/// A per-key **new-write** accumulator against a fixed `limit` (§19 per-key quota), tracking the
-/// bytes a key has introduced **this server session**.
-///
-/// Scope (normative). The store is content-addressed and deduplicated, so an object is not owned by
-/// the key that wrote it (another key's tree may reference it) — a precise durable per-key byte
-/// attribution is therefore undefined. This quota instead bounds the volume of *new* objects a single
-/// key introduces within one server lifetime (an anti-flood cap), and is reset on restart. Durable
-/// protection against disk exhaustion is the operator's responsibility via an OS/filesystem quota on
-/// the store directory (the standard control for a self-hosted single-user server, §14); the §19
-/// per-key value is this session cap. Idempotent re-puts are not charged (the server only calls
-/// [`Self::try_add`] for genuinely new objects).
+/// Per-key **new-write** quota for one server session (§11/§19): an anti-flood cap on bytes a key
+/// introduces, reset on restart. A dedup store has no durable per-key byte ownership — durable disk
+/// limits are the operator's filesystem quota (§11). Idempotent re-puts are not charged.
 #[derive(Debug, Clone)]
 pub struct StorageQuota {
     limit: u64,

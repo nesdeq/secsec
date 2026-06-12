@@ -1,12 +1,9 @@
-//! Decoder fuzz harness (`secsec-Design.md` §3, §18). One `fuzz_*` entry per decoder that parses
-//! **untrusted** bytes (from the network or disk). Each MUST be **total** on arbitrary input — never
-//! panic, never OOM (the §19 pre-allocation bounds guard against alloc/recursion/decompression bombs).
-//!
-//! These functions are the bodies of the `cargo-fuzz` targets under `../../fuzz/` (run with
-//! `cargo +nightly fuzz run <target>`). They are **also** exercised on **stable** by the
-//! [`tests::every_decoder_survives_arbitrary_input`] test below, which hammers each with a large
-//! deterministic corpus (zeros, ones, counters, pseudo-random, and mutations of valid encodings), so
-//! the robustness property is checked in normal CI even without the fuzz toolchain.
+//! Decoder fuzz harness (`secsec-Design.md` §3, §18): one `fuzz_*` entry per decoder that parses
+//! **untrusted** bytes. Each MUST be total on arbitrary input — never panic, never OOM (§19
+//! pre-allocation bounds). These are the bodies of the `cargo-fuzz` targets under `../../fuzz/`
+//! (`cargo +nightly fuzz run <target>`) and are also exercised on stable by
+//! [`tests::every_decoder_survives_arbitrary_input`], so CI checks robustness without the fuzz
+//! toolchain.
 
 #![forbid(unsafe_code)]
 
@@ -137,8 +134,7 @@ mod tests {
 
         for (name, f) in DECODERS {
             for input in &corpus {
-                // If any decoder panics, the test fails, naming the decoder via the assert message
-                // through the panic location; we also guard with catch_unwind to report which one.
+                // catch_unwind so the failure names which decoder panicked.
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(input)));
                 assert!(
                     r.is_ok(),

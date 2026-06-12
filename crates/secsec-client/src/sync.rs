@@ -1,22 +1,11 @@
 //! One-shot bidirectional sync of a working directory against a remote ref (`secsec-Design.md` §10).
-//!
-//! [`sync_once`] reconciles a local working directory with `/refs/<ref>` on a [`Remote`], using a
-//! **base** (the last-synced commit) to avoid the classic data-loss trap: a fresh client with an empty
-//! directory must *clone* (pull + restore) to establish a base before it ever commits — otherwise its
-//! "empty" snapshot would publish a deletion of everyone else's files. With the base tracked:
-//!
-//! - **no base, remote head exists, empty folder** → clone (fetch + verify + restore), adopt the
-//!   head as base.
-//! - **no base, remote head exists, non-empty folder** → join-merge: the folder becomes a
-//!   parentless commit, three-way merged (empty ancestor) with the head — union + keep-both, so
-//!   neither side's files are deleted or silently overwritten.
-//! - **no base, no remote head** → first publish (we are the first writer).
-//! - **base, no local change** → fast-forward to a newer remote head (pull) or no-op.
-//! - **base, local change** → author a commit on the base and [`crate::sync_ref`] it (push or
-//!   rollback-gated three-way merge), restoring the reconciled result.
-//!
-//! The base is returned for the caller to persist (sealed under the device key, §8.5); on the next
-//! sync it is fed back in. Versions come from the frontier's per-device high-water (replay-safe, §8.5).
+//! [`sync_once`] tracks a **base** (the last-synced commit) so a fresh client never publishes its
+//! empty dir as a deletion of everyone's files. Cases: no base + remote head → clone if the folder
+//! is empty, else join-merge (parentless commit, three-way merge with an empty ancestor — union +
+//! keep-both, nothing lost); no base + no head → first publish; base + no local change →
+//! fast-forward pull or no-op; base + local change → commit on the base and [`crate::sync_ref`] it.
+//! The returned base is persisted by the caller (§8.5); versions come from the frontier's
+//! per-device high-water.
 
 use crate::{
     fetch_closure, fetch_head, push_head, push_objects, resolve_head_signer, sync_ref, ClientError,
@@ -115,12 +104,10 @@ async fn pull_to<R: Remote, K: MasterKeys>(
 ) -> Result<SyncFrontier, ClientError> {
     let signer = resolve_head_signer(members, head, head_sig).ok_or(ClientError::HeadNotMember)?;
 
-    // §8.5/§10 anti-rollback on the **pull** path (clone / no-local-change fast-forward). The merge
-    // path runs these gates inside `merge_heads`; a head adopted-and-restored here must clear them too,
-    // or a malicious server could replay an older member-signed head and silently roll this device's
-    // working dir back to it (and the §10 `observe` below would then be operating on rolled-back
-    // state). On a fresh clone the frontier is empty, so both gates pass; a genuinely newer head also
-    // passes. Only a head whose counters regress below the persisted frontier is rejected (alarm).
+    // §8.5/§10 anti-rollback on the PULL path (the merge path runs these gates inside
+    // `merge_heads`): without them a malicious server could replay an older member-signed head and
+    // silently roll this device's working dir back. A fresh clone (empty frontier) passes; only a
+    // head whose counters regress below the persisted frontier is rejected (alarm).
     if head.roster_seq < frontier.roster_seq {
         return Err(ClientError::Merge(MergeError::Rollback(
             MergeReject::RosterRollback {
@@ -158,12 +145,10 @@ async fn pull_to<R: Remote, K: MasterKeys>(
     Ok(f)
 }
 
-/// Reconcile `dir` with `/refs/<ref_name>` once (§10). See the module docs for the four cases. `base`
-/// is the last-synced commit (`None` on a fresh client / new repo); `roster_seq` is the current
-/// sigchain sequence the commit is written under. `seal` persists the advanced frontier and is invoked
-/// **before** any head push that advances the ref (§8.5 seal-before-write); a `seal` failure aborts
-/// before publishing. Returns the action, the new base to persist, and the advanced frontier (which
-/// the caller should also persist after the call, to capture our own commit's high-water).
+/// Reconcile `dir` with `/refs/<ref_name>` once (§10; cases in the module docs). `base` is the
+/// last-synced commit (`None` on a fresh client); `seal` persists the advanced frontier and runs
+/// **before** any ref-advancing push (§8.5) — a failure aborts the publish. Returns the action, the
+/// new base, and the advanced frontier (the caller persists both after the call).
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_once<R: Remote, K: MasterKeys>(
     remote: &R,
@@ -184,13 +169,11 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
     let device_id = device.device_id()?;
     let head = fetch_head(remote, keys, ref_name).await?;
 
-    // Fresh client with an existing repo. An **empty** folder clones (never commit an empty dir —
-    // that would publish a deletion of everything). A **non-empty** folder must NOT clone: the repo
-    // has never seen its local files, so materializing the head over it would delete them
-    // (reconcile) or silently overwrite same-named ones. It instead falls through to the normal path
-    // below: its content becomes a parentless commit that the rollback-gated three-way merge (empty
-    // common ancestor) unions with the head — same-name divergence is a keep-both conflict, nothing
-    // is lost. This is also the reinstall / re-link / server-rebuild re-join path (§14).
+    // Fresh client with an existing repo: an EMPTY folder clones (never commit an empty dir — that
+    // publishes a deletion of everything). A NON-EMPTY folder must NOT clone (materializing the head
+    // would delete/overwrite its local files); it falls through to become a parentless commit that
+    // the three-way merge (empty ancestor) unions with the head — keep-both on same-name divergence,
+    // nothing lost. Also the reinstall / re-link / server-rebuild re-join path (§14).
     if base.is_none() {
         if let Some((h, sig, _)) = &head {
             if !has_tracked_entries(dir)? {
@@ -246,9 +229,9 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
     }
 
     // Local changes: author a commit on the base. The version continues strictly after BOTH the
-    // persisted high-water AND any commits this device already published in the head's history: after
-    // a re-link / reinstall (fresh frontier) the head can contain our own earlier commits, and
-    // re-using one of their versions would trip every peer's replay gate (gate 2a) forever.
+    // persisted high-water AND our own commits already in the head's history — after a re-link /
+    // reinstall the head can contain them, and re-using a version trips every peer's replay gate
+    // (2a) forever.
     let mut own_high = frontier
         .commit_version_hwm
         .get(&device_id)
@@ -256,9 +239,8 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
         .unwrap_or(0);
     if base.is_none() {
         if let Some((h, _, _)) = &head {
-            // First contact with an existing head (the non-empty-folder join): bring its history
-            // local (the merge needs it anyway; idempotent, cached) and continue after our own
-            // highest published version in it.
+            // First contact with an existing head (the non-empty join): bring its history local
+            // (idempotent; the merge needs it anyway) and continue after our own highest version in it.
             fetch_closure(remote, store, keys, &h.commit_id).await?;
             let (_, meta) = secsec_engine::load_commit_dag(&[h.commit_id], keys, store)?;
             own_high = own_high.max(
@@ -377,10 +359,9 @@ mod tests {
         out
     }
 
-    /// First contact of a **non-empty** folder with an existing repo must MERGE, never clone-restore:
-    /// local-only files survive (and propagate as additions), a same-named file with different
-    /// content becomes a keep-both conflict, and the repo's files land. Nothing is deleted or
-    /// silently overwritten. This is the join / reinstall / re-link / server-rebuild path.
+    /// First contact of a **non-empty** folder with an existing repo must MERGE, never
+    /// clone-restore: local-only files survive, same-name divergence is keep-both, the repo's files
+    /// land — nothing deleted or overwritten. The join / reinstall / re-link / server-rebuild path.
     #[tokio::test]
     async fn joining_a_nonempty_folder_merges_and_loses_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -710,10 +691,9 @@ mod tests {
         );
     }
 
-    /// §8.5/§10: the pull path must reject a replayed head whose `head_version` is below the persisted
-    /// per-device high-water — otherwise a malicious server could silently roll a no-local-change
-    /// client's working dir back to an older (still member-signed) head. The gate runs before any
-    /// closure fetch, so an empty remote is enough to exercise it.
+    /// §8.5/§10: the pull path must reject a replayed head whose `head_version` is below the
+    /// persisted per-device high-water — else a malicious server could roll a no-local-change
+    /// client's working dir back to an older member-signed head.
     #[tokio::test]
     async fn pull_to_rejects_head_below_frontier_high_water() {
         use secsec_engine::MergeError;

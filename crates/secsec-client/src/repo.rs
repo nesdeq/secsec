@@ -1,24 +1,13 @@
-//! Repository genesis and cold-start open (`secsec-Design.md` §7 `init`, §8.1 cold-start fold).
+//! Repository genesis, cold-start open, and rotation (`secsec-Design.md` §7, §8.1, §8.4).
 //!
-//! [`init_repo`] creates a fresh repo for device 1: generate `master_key_1`, write the self-signed
-//! **genesis** sigchain entry (the RFP anchor, §5/§7) and device-1's **keyslot** wrapping the master
-//! key, both into a [`Store`]. The master key is dropped after wrapping — the keyslot is its durable
-//! form. [`open_repo`] reverses it (§8.1): unwrap the keyslot to a candidate, peel roster keys,
-//! decrypt + fold the chain, and verify both the RFP anchor and the candidate against `mk_commit`.
-//!
-//! [`rotate_repo`] mints a new generation (§8.4): it extends **both** §8.2 key-histories (roster-key
-//! for sigchain folding, data-key for old-object readability via [`data_keyring`]), appends the
-//! `Rotate` entry (with the transitive revoke closure when revoking), and re-wraps every remaining
-//! member's keyslot at the repo's `min_algo` (§16). [`open_repo`]/[`open_repo_remote`] handle **any**
-//! generation — peeling the roster-key history back to genesis to fold the whole chain.
-//!
-//! Keyslots are **algo-tagged** (`algo_id(1B) ‖ body`, §9.1): X-Wing (`algo_id = 1`, §8.3/§17) is the
-//! keyslot KEM — post-quantum, so the one harvestable asymmetric exposure is PQ-safe. A device's
-//! X-Wing keypair is derived from its SSH private **seed** ([`secsec_sig::DeviceKey::xwing_seed`] —
-//! the seed, not the clamped scalar, so it is quantum-hard to recover from the public Ed25519 key)
-//! and its X-Wing public is published in the roster (`Genesis`/`AddDevice`), so a granter/rotation
-//! can wrap to it. The cold-start unwrap checks the `algo_id` and enforces the §16 `min_algo` floor
-//! after folding.
+//! [`init_repo`] mints `master_key_1` and writes the self-signed genesis entry (the RFP anchor,
+//! §5/§7) plus device-1's keyslot — the keyslot is the master key's durable form. [`open_repo`] /
+//! [`open_repo_remote`] reverse it for **any** generation (§8.1): unwrap the keyslot, peel roster
+//! keys back to genesis, fold the chain, verify RFP + `mk_commit`. [`rotate_repo`] mints a new
+//! generation (§8.4), extending **both** §8.2 key-histories and re-wrapping every remaining
+//! member's keyslot. Keyslots are algo-tagged (`algo_id(1B) ‖ body`, §9.1); X-Wing (§8.3/§17) is
+//! the KEM, derived from the SSH private **seed** so the one harvestable asymmetric exposure is
+//! PQ-safe. The §16 `min_algo` floor is enforced after folding.
 
 use crate::{Remote, RemoteError};
 use secsec_frame::{Frame, FRAME_LEN};
@@ -35,24 +24,20 @@ use secsec_store::{Store, StoreError, ABSENT_HEAD};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
-/// Keyslot KEM algorithm id (`secsec-Design.md` §9.1 / §8.3): a stored keyslot is `algo_id(1B) ‖ body`.
-/// X-Wing (§17) is the keyslot KEM — post-quantum, so the one harvestable asymmetric exposure is
-/// PQ-safe. The 1-byte tag plus the §16 `min_algo` floor give the protocol crypto agility; a keyslot
-/// whose `algo_id` is below the chain's `min_algo` is rejected at cold-start.
+/// X-Wing keyslot KEM algorithm id (§9.1/§8.3): a stored keyslot is `algo_id(1B) ‖ body`. The tag
+/// plus the §16 `min_algo` floor give the protocol crypto agility.
 pub const ALGO_XWING: u8 = 1;
 
-/// A device's X-Wing keypair, derived from its SSH private **seed** (§8.3): no extra stored PQ key
-/// material — "the SSH key is the only credential" (§1). Derived from the seed, not the scalar, so a
-/// quantum adversary cannot reconstruct it from the public Ed25519 key (see `DeviceKey::xwing_seed`).
+/// A device's X-Wing keypair, derived from its SSH private **seed** (§8.3) — no extra stored PQ key
+/// material, and not reconstructible from the public Ed25519 key (see `DeviceKey::xwing_seed`).
 fn xwing_keypair(device: &DeviceKey) -> Result<(XWingSecret, XWingPublic), RepoError> {
     let sk = XWingSecret::from_seed(*device.xwing_seed()?);
     let pk = sk.public();
     Ok((sk, pk))
 }
 
-/// A device's published **X-Wing public key** bytes (§8.3/§17) — recorded in the roster
-/// (`Genesis`/`AddDevice`) so a granter or rotation can wrap `master_key_g` to it. Public so the CLI
-/// (`enroll-pubkey`) can print it for the granter during enrollment (§7).
+/// A device's published X-Wing public key (§8.3/§17) — recorded in the roster so a granter or
+/// rotation can wrap `master_key_g` to it; the CLI prints it during enrollment (§7).
 pub fn device_xwing_pub(device: &DeviceKey) -> Result<Vec<u8>, RepoError> {
     Ok(xwing_keypair(device)?.1.to_bytes())
 }
@@ -109,9 +94,8 @@ pub enum RepoError {
     NotInitialized,
     /// `init` was run on a store that already has a roster tip.
     AlreadyInitialized,
-    /// `init_repo_remote` was called by a device that already owns a keyslot (it is already enrolled).
-    /// Running genesis again would overwrite — and on losing the genesis race, delete — that live
-    /// keyslot, locking the device out of its own repo; the create flow refuses instead (§7).
+    /// `init_repo_remote` was called by a device that already owns a keyslot. Re-running genesis
+    /// would overwrite — and on a lost race delete — that live keyslot (self-lockout); refuse (§7).
     AlreadyEnrolled,
     /// A roster entry expected in `0..roster_len` was missing.
     MissingEntry(u64),
@@ -246,11 +230,9 @@ pub fn init_repo(store: &Store, device: &DeviceKey, ts: u64) -> Result<[u8; 32],
     Ok(rfp)
 }
 
-/// §7 `init` over a [`Remote`] — the network counterpart of [`init_repo`]. The first device to reach an
-/// empty repo creates it **over the wire**: it mints `master_key_1` (RAM-only, never sent), pushes the
-/// self-signed genesis entry via `roster-append` and its own keyslot via `put-keyslot`, and returns the
-/// **RFP**. The master key never touches the server — only the genesis blob + the opaque keyslot do.
-/// Returns [`RepoError::AlreadyInitialized`] if another device won the genesis `roster-append` race.
+/// §7 `init` over a [`Remote`] — the network counterpart of [`init_repo`]: mint `master_key_1`
+/// (RAM-only, never sent), push the self-signed genesis entry + the creator's own keyslot, return
+/// the **RFP**. [`RepoError::AlreadyInitialized`] if another device won the genesis append race.
 pub async fn init_repo_remote<R: Remote>(
     remote: &R,
     device: &DeviceKey,
@@ -265,32 +247,25 @@ pub async fn init_repo_remote<R: Remote>(
     let roster_key = mk.roster_key();
     let blob = seal_entry(&roster_key, 1, 0, &encode_entry(&entry));
 
-    // Refuse to run genesis if this device is already enrolled (it already owns a gen-1 keyslot).
-    // The keyslot path is /keyslots/<device_id>/1, so the put_keyslot below would OVERWRITE the live
-    // keyslot, and the lost-genesis-race cleanup would then DELETE it — self-lockout. This bites when
-    // an enrolled device runs `sync` on a new, unlinked folder with no --invite (it falls into the
-    // create path). Only `Ok(Some(_))` — we can actually read our own keyslot — means enrolled: a
-    // genuinely fresh device's keyslot read is gated by the server (NotEnrolled ⇒ Err), which we treat
-    // as not-enrolled, the legitimate genesis path. Catching the enrolled case leaves the live keyslot
-    // untouched and makes the cleanup delete below safe (now only reached for a keyslot we just wrote).
+    // Refuse genesis if this device already owns a gen-1 keyslot: the put_keyslot below would
+    // OVERWRITE the live keyslot and the lost-race cleanup would DELETE it — self-lockout (e.g. an
+    // enrolled device running `sync` on a new unlinked folder with no --invite). Only `Ok(Some(_))`
+    // means enrolled; a fresh device's read is server-gated (Err) → the legitimate genesis path.
     let device_id = device.device_id()?;
     if matches!(remote.get_keyslot(&device_id, 1).await, Ok(Some(_))) {
         return Err(RepoError::AlreadyEnrolled);
     }
 
-    // Write the creator's own keyslot FIRST (allowed pre-enrollment only while the roster is empty —
-    // the server's genesis-bootstrap exception), so that by the time the genesis entry is appended the
-    // creator is already enrolled.
+    // Write the creator's own keyslot FIRST (allowed only while the roster is empty — the server's
+    // genesis-bootstrap exception), so the genesis append happens already-enrolled.
     let keyslot = wrap_keyslot(&key, 1, &device_id, &xwing_pub)?;
     remote.put_keyslot(&device_id, 1, &keyslot).await?;
 
     // Genesis CAS: `old_tip` is the all-zero sentinel ("expect empty"); a `false` return means another
     // device already created the repo.
     if !remote.roster_append(&ABSENT_HEAD, &blob).await? {
-        // We lost the genesis race. The keyslot we just wrote (under the empty-roster bootstrap
-        // exception) is now an orphan — it wraps *our* master_key_1, which has nothing to do with the
-        // winner's genesis, so it fails the winner's `mk_commit` at cold-start. Delete it (best-effort)
-        // so it neither accumulates on retry nor lingers as a gate-passing keyslot for a non-member.
+        // Lost the genesis race: the keyslot we just wrote wraps OUR master_key_1, useless under the
+        // winner's genesis (fails its mk_commit). Best-effort delete so it doesn't linger.
         let _ = remote.delete_keyslot(&device_id, 1).await;
         return Err(RepoError::AlreadyInitialized);
     }
@@ -305,9 +280,8 @@ fn frame_gen(blob: &[u8]) -> Result<u32, RepoError> {
 }
 
 /// §8.1 cold-start open: recover the live `MasterKey` and folded roster [`State`] for `device` from
-/// `store`, verifying the pinned `rfp` anchor. Reads the genesis..tip roster entries and this device's
-/// keyslot, X-Wing-unwraps the candidate, then `cold_start_fold` peels keys, decrypts + folds the
-/// chain, and verifies the RFP and `mk_commit` (§7 step 3). Genesis generation only (see module note).
+/// `store`. Reads genesis..tip + this device's keyslot, X-Wing-unwraps the candidate, then
+/// `cold_start_fold` peels keys, folds the chain, and verifies `rfp` + `mk_commit` (§7 step 3).
 pub fn open_repo(
     store: &Store,
     device: &DeviceKey,
@@ -363,10 +337,9 @@ fn enforce_min_algo(keyslot: &[u8], state: &State) -> Result<(), RepoError> {
     Ok(())
 }
 
-/// Build the §8.2 DATA key-history keyring from the **local** store: peel `master_key_g` for every
-/// generation `1..=mk.generation()`, so the caller can open objects sealed under any past generation
-/// (pre-rotation content readability). Returns `g → master_key_g`. A missing `/keyhist/<g>` wrap is
-/// [`RepoError::MissingDataKeyhist`]. At generation 1 the map is just `{1: mk}` (no history to peel).
+/// Build the §8.2 DATA keyring from the **local** store: peel `master_key_g` for every generation
+/// `1..=mk.generation()` so objects sealed under any past generation stay readable. Returns
+/// `g → master_key_g`; at generation 1 the map is just `{1: mk}`.
 pub fn data_keyring(store: &Store, mk: &MasterKey) -> Result<BTreeMap<u32, MasterKey>, RepoError> {
     let g_cur = mk.generation();
     let mut hist: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
@@ -397,17 +370,11 @@ pub async fn data_keyring_remote<R: Remote>(
     Ok(peel_data_keys(mk.expose_secret(), g_cur, &hist)?)
 }
 
-/// §8.4 rotation: mint `master_key_{g+1}`, extend the never-trimmed roster-key history (§8.2), append
-/// the `Rotate` entry (plus the transitive revoke closure when `revoke` is set), and re-wrap every
-/// remaining member's keyslot to the new generation. Returns the new live `(MasterKey, State)`.
-///
-/// `device` (a current member) signs the appended entries. `mk`/`state` are the current generation's;
-/// `rfp` is the pinned anchor. When `revoke` is `Some(b)`, `b` and its transitive add-by closure
-/// (§8.1, conservative: all grants) are revoked before the rotate and their keyslots deleted — the
-/// `revoke ⇒ rotate` forward-secrecy flow (P6/P11). It writes **both** §8.2 key-histories: the
-/// roster-key history (sigchain folding) **and** the DATA key-history (`/keyhist/<g>`, wrapping
-/// `master_key_g` under `master_key_{g+1}`) so a current member can later [`data_keyring`]-peel old
-/// master keys and read pre-rotation **object** content.
+/// §8.4 rotation: mint `master_key_{g+1}`, extend **both** never-trimmed §8.2 key-histories
+/// (roster-key for folding, DATA for old-object readability), append the `Rotate` entry, and re-wrap
+/// every remaining member's keyslot to the new generation. When `revoke` is `Some(b)`, `b` and its
+/// transitive add-by closure are revoked first and their keyslots deleted — the `revoke ⇒ rotate`
+/// forward-secrecy flow (P6/P11). Returns the new live `(MasterKey, State)`.
 pub fn rotate_repo(
     store: &Store,
     device: &DeviceKey,
@@ -431,9 +398,8 @@ pub fn rotate_repo(
     let wrap = seal_roster_keyhist(&rk_g1, g, &rk_g);
     store.put_roster_keyhist(g, &wrap)?;
 
-    // §8.2 DATA key-history: wrap master_key_g under master_key_{g+1} so a current member can peel it
-    // back and read pre-rotation OBJECT content. (The roster-key history above is for sigchain
-    // folding; this one is for old-data readability — both never-trimmed.)
+    // §8.2 DATA key-history: wrap master_key_g under master_key_{g+1} so a current member can peel
+    // back and read pre-rotation OBJECT content (the roster-key history above is for folding).
     let data_wrap = seal_data_keyhist(&newkey, g, mk.expose_secret());
     store.put_keyhist(g, &data_wrap)?;
 
@@ -482,8 +448,6 @@ pub fn rotate_repo(
         }
         None => std::collections::BTreeSet::new(),
     };
-    // Re-wrap every remaining member's keyslot to the new generation under X-Wing (§8.3/§17, PQ
-    // mandatory), using the member's published X-Wing public (§8.2); delete revoked devices' keyslots.
     for id in state.members.keys() {
         if revoked.contains(id) {
             store.delete_keyslot(id, g)?;
@@ -498,11 +462,9 @@ pub fn rotate_repo(
     open_repo(store, device, rfp)
 }
 
-/// §8.4 rotation over a [`Remote`] — the network counterpart of [`rotate_repo`], used by `revoke`.
-/// Mints `master_key_{g+1}`, pushes both §8.2 key-history wraps, appends the `Rotate` (+ revoke
-/// closure) entries, re-wraps every remaining member's keyslot, and deletes the revoked devices'
-/// keyslots — all over the wire — then cold-starts the new generation. `revoke = Some(b)` removes `b`
-/// and its transitive add-by closure (forward secrecy, P6/P11).
+/// §8.4 rotation over a [`Remote`] — the network counterpart of [`rotate_repo`], used by `revoke`:
+/// the same flow over the wire, then a cold-start onto the new generation. `revoke = Some(b)`
+/// removes `b` and its transitive add-by closure (forward secrecy, P6/P11).
 pub async fn rotate_repo_remote<R: Remote>(
     remote: &R,
     device: &DeviceKey,
@@ -591,10 +553,9 @@ pub async fn rotate_repo_remote<R: Remote>(
         .map(|(mk, st, _)| (mk, st))
 }
 
-/// §7 `grant` over a [`Remote`] — the network half of enrollment, run by a current member while
-/// completing an invite pairing ([`crate::pair`]). Fetches the sigchain tip, appends an `AddDevice`
-/// entry (publishing D's X-Wing public), and wraps `master_key_g` to D's keyslot, all over the wire
-/// (`roster-append` + `put-keyslot`). D's keys are authenticated by the invite-code MAC (§7). On a
+/// §7 `grant` over a [`Remote`] — the network half of enrollment, run by a current member during
+/// invite pairing ([`crate::pair`]): append an `AddDevice` entry (publishing D's X-Wing public) and
+/// wrap `master_key_g` to D's keyslot. D's keys are authenticated by the invite-code MAC (§7); on a
 /// CAS race the caller re-folds and retries.
 pub async fn grant_device_remote<R: Remote>(
     remote: &R,
@@ -659,12 +620,10 @@ pub async fn fetch_roster_entries<R: Remote>(remote: &R) -> Result<Vec<Vec<u8>>,
     Ok(entries)
 }
 
-/// A persisted **anti-rollback anchor** for a folder's sigchain (§8.1, P7): the highest roster `seq`
-/// this device has accepted and the BLAKE3 of the *stored* (sealed) entry blob at that seq. The sealed
-/// blob is deterministic (nonce=0 under a key-committing AEAD with a derived key), so its hash is a
-/// stable per-seq token re-derivable **without** decrypting. Every cold-start MUST extend this anchor;
-/// a shorter or re-forked chain is a server rollback (e.g. dropping a `RevokeDevice`+`Rotate`) and is
-/// refused. Persisted per folder; the returned anchor is saved after each successful open.
+/// A persisted **anti-rollback anchor** for a folder's sigchain (§8.1, P7): the highest accepted
+/// roster `seq` + the BLAKE3 of the stored (sealed) entry blob at it (the seal is deterministic, so
+/// the hash is re-derivable without decrypting). Every cold-start MUST extend this anchor; a shorter
+/// or re-forked chain is a server rollback (e.g. dropping a revocation) and is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RosterAnchor {
     /// Highest accepted sequence number (`= entries.len() - 1`).
@@ -673,13 +632,11 @@ pub struct RosterAnchor {
     pub tip_hash: [u8; 32],
 }
 
-/// §8.1 cold-start open against a **remote** (the network counterpart of [`open_repo`]). Fetches the
-/// sigchain entries (`seq = 0, 1, … `until absent, bounded by the §19 cap), this device's keyslot, and
-/// the §8.2 roster-key history over the [`Remote`], then runs the same `cold_start_fold` (peel,
-/// decrypt, fold, verify RFP + `mk_commit`). `prev` is the persisted [`RosterAnchor`] (`None` on a
-/// fresh link); the fetched chain is rejected with [`RepoError::Rollback`] if it does not extend it
-/// (P7 anti-rollback). Recovers the **identity** (master key + roster) and the new anchor to persist;
-/// objects are fetched separately by the sync loop.
+/// §8.1 cold-start open against a **remote** (the network counterpart of [`open_repo`]): fetch the
+/// sigchain, this device's keyslot, and the §8.2 roster-key history, then run the same fold. `prev`
+/// is the persisted [`RosterAnchor`] (`None` on a fresh link); a chain that does not extend it is
+/// [`RepoError::Rollback`] (P7). Recovers the identity (master key + roster) and the new anchor to
+/// persist; objects are fetched separately by the sync loop.
 pub async fn open_repo_remote<R: Remote>(
     remote: &R,
     device: &DeviceKey,
@@ -690,10 +647,9 @@ pub async fn open_repo_remote<R: Remote>(
     if entries.is_empty() {
         return Err(RepoError::NotInitialized);
     }
-    // §8.1 anti-rollback (P7): the fetched chain MUST extend the persisted anchor — at least as long,
-    // and the stored blob at the anchor's seq must still hash to the recorded tip (the tip-hash
-    // consistency check catches a chain re-forked from an earlier point). This refuses a server that
-    // truncates or re-forks the sigchain to undo a revocation. No decryption needed for the check.
+    // §8.1 anti-rollback (P7): the fetched chain MUST extend the persisted anchor — at least as
+    // long, and the blob at the anchor's seq must still hash to the recorded tip (catches a chain
+    // re-forked from an earlier point). No decryption needed.
     if let Some(p) = prev {
         let idx = p.max_seq as usize;
         if entries.len() <= idx || *blake3::hash(&entries[idx]).as_bytes() != p.tip_hash {
@@ -733,11 +689,9 @@ pub async fn open_repo_remote<R: Remote>(
 mod tests {
     use super::*;
 
-    /// A device that already owns a keyslot must not be able to destroy it by re-running genesis. An
-    /// enrolled device that re-enters `init_repo_remote` (e.g. `sync` on a new, unlinked folder with no
-    /// `--invite`, which falls into the create path) MUST be refused with `AlreadyEnrolled` and keep
-    /// its live keyslot — otherwise the genesis `put-keyslot` would overwrite it and the lost-race
-    /// cleanup would delete it, locking the device out of its own repo.
+    /// An enrolled device re-entering `init_repo_remote` (e.g. `sync` on a new unlinked folder with
+    /// no `--invite`) MUST be refused with `AlreadyEnrolled` and keep its live keyslot — otherwise
+    /// genesis would overwrite it and the lost-race cleanup would delete it (self-lockout).
     #[tokio::test]
     async fn init_remote_refuses_an_enrolled_device_and_keeps_its_keyslot() {
         use crate::testmem::MemRemote;
@@ -957,11 +911,9 @@ mod tests {
         );
     }
 
-    /// C2 regression: a head published before a rotation must remain findable and readable afterward.
-    /// The ref path is generation-stable (§13), so it doesn't move when the master key rotates, and
-    /// `fetch_head` peels the key ring to open the head sealed under the prior generation (§8.2/§9.8).
-    /// Before the fix, a current-generation client looked at a moved (empty) ref path and would treat
-    /// the repo as headless — a fresh clone would then publish its empty directory as the head.
+    /// A head published before a rotation must remain findable and readable afterward: the ref path
+    /// is generation-stable (§13) and `fetch_head` peels the key ring to open a head sealed under a
+    /// prior generation (§8.2/§9.8) — else a post-rotation client would treat the repo as headless.
     #[tokio::test]
     async fn head_survives_a_rotation() {
         use crate::testmem::MemRemote;

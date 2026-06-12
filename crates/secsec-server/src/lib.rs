@@ -1,22 +1,9 @@
-//! `secsec-server` — the server request handler (`secsec-Design.md` §12, §19). The §12 authorization
-//! pipeline a `secsec serve` loop runs for every per-op request, over the content-addressed object
-//! store ([`secsec_store::Store`]):
-//!
-//! 1. **keyslot existence** — the connecting key must own a keyslot (be rostered); else `not-enrolled`;
-//! 2. **per-op authorization** — verify the `secsec-write-v1` / `secsec-read-v1` signature over the
-//!    op's `args_hash` + the session transcript (+ `server_nonce` for writes), recomputing `args_hash`
-//!    from the request so the client can't lie about what it signed;
-//! 3. **nonce freshness** — consume the `server_nonce` exactly once (writes), defeating replay;
-//! 4. **limits** — per-key write byte-rate + burst and storage quota (§19), the `has` id cap;
-//! 5. **execute** — against the blob store.
-//!
-//! The server is **blind**: it stores opaque blobs by id and never verifies or reads their content
-//! (content-addressing is re-checked by *clients* on fetch, §9.2). `get`/`has`/`put`/`cas-head`/
-//! `roster-append`/`gc` are all executed; the mutable ops CAS on a `BLAKE3` of the stored (encrypted)
-//! tip blob (§12, blind-server), and `gc` (§15) is a compare-and-swap against the server's state.
-//!
-//! The handler is pure and clock-injected (`now`), so the whole §12 pipeline is unit-testable by
-//! calling [`Server::handle`] directly — no sockets.
+//! `secsec-server` — the §12 per-op request handler over the content-addressed store
+//! (`secsec-Design.md` §12, §19). Pipeline: keyslot existence → per-op signature over the recomputed
+//! `args_hash` + session transcript (+ single-use `server_nonce` for writes) → §19 limits → execute.
+//! The server is **blind**: blobs are opaque (clients re-check content addresses on fetch, §9.2),
+//! mutable ops CAS on the `BLAKE3` of the stored tip blob, and `gc` is a CAS against server state
+//! (§15). The handler is pure and clock-injected (`now`) — [`Server::handle`] unit-tests, no sockets.
 
 #![forbid(unsafe_code)]
 
@@ -54,10 +41,8 @@ pub struct Incoming<'a> {
     pub server_nonce: Option<[u8; 32]>,
 }
 
-/// The brief, mutable rate-limit / replay state — the only thing that needs synchronizing between
-/// concurrent requests. Held behind a fast `std::sync::Mutex` and locked only for the duration of a
-/// counter update (no I/O, no `await`), so it never blocks the redb store, which is itself
-/// transactional and accessed lock-free.
+/// The mutable rate-limit / replay state, behind a fast `std::sync::Mutex` locked only for counter
+/// updates (no I/O, no `await`); the redb store is transactional and accessed lock-free.
 #[derive(Default)]
 struct ServerState {
     nonces: NonceStore,
@@ -138,9 +123,8 @@ impl ServerState {
             .try_record(now)
     }
 
-    /// Refund a sigchain-append slot charged by [`sigchain_record`](Self::sigchain_record) when the
-    /// append then lost the tip CAS — a CAS-losing racer should not burn one of its 60/hr slots (§8.1:
-    /// retried revocations must still succeed within the window).
+    /// Refund a slot charged by [`sigchain_record`](Self::sigchain_record) when the append lost the
+    /// tip CAS — a benign racer must not burn one of its 60/hr slots (§8.1).
     fn sigchain_refund(&mut self, d: DeviceId) {
         if let Some(w) = self.sigchain_calls.get_mut(&d) {
             w.refund();
@@ -155,9 +139,8 @@ impl ServerState {
     }
 }
 
-/// The server's per-op handler. The §12 keyslot-existence check and all object ops read/write the
-/// redb store **without a lock** (redb is transactional); only the small replay/rate-limit
-/// [`ServerState`] is mutex-guarded. `handle` takes `&self`, so the whole server is shared via
+/// The server's per-op handler. Object ops hit the redb store lock-free (redb is transactional);
+/// only [`ServerState`] is mutex-guarded. `handle` takes `&self`, so the server is shared via
 /// `Arc<Server>` and serves requests concurrently.
 pub struct Server {
     store: Store,
@@ -165,11 +148,9 @@ pub struct Server {
     /// Optional host receipt key + this server's `host_id` (§15 signed receipts). `None` ⇒ receipts
     /// are returned unsigned (all-zero pubkey/signature).
     receipts: Option<(ed25519_dalek::SigningKey, [u8; 32])>,
-    /// The **mandatory** connection allow-list (the operator's `~/.ssh/authorized_keys`): a connecting
-    /// key not on it cannot open a session at all — including to pair (§7). It is re-read per connection
-    /// ([`Authorized::File`]) so adding a key takes effect with no restart. (Tests use [`Authorized::Any`]
-    /// / [`Authorized::Static`].) This gates *who can talk to the server*; membership/decryption is the
-    /// separate crypto roster + keyslots (§8) — both layers are required.
+    /// The **mandatory** connection allow-list (the operator's `authorized_keys`), re-read per
+    /// connection so adding a key needs no restart. Gates who can talk at all, including pairing
+    /// (§7); membership/decryption is the separate crypto roster + keyslots (§8).
     authorized: Authorized,
 }
 
@@ -333,9 +314,8 @@ impl Server {
         }
     }
 
-    /// Charge a read against the §19 per-key read byte-rate, returning the blob response or a
-    /// `RateLimit` error when the bucket is exhausted (the cheap store lookup has already run; the
-    /// bucket simply gates sustained egress).
+    /// Charge a read against the §19 per-key read byte-rate; `RateLimit` when the bucket is
+    /// exhausted.
     fn read_charged(
         &self,
         d: DeviceId,
@@ -365,11 +345,9 @@ impl Server {
         self.state.lock().expect("server state").pair_get(slot, now)
     }
 
-    /// §7 invite-onboarding pairing mailbox. Allowed **pre-enrollment** (a joining device owns no
-    /// keyslot yet), so it is dispatched before the keyslot-existence check. Authenticated only by the
-    /// read-auth signature (proving the connecting key holds its private SSH key); the payload is MAC'd
-    /// under the invite code end to end, so the blind server merely relays + TTLs it. Slot ids are
-    /// `BLAKE3::derive_key(label, code)`, so the server never learns the code.
+    /// §7 pairing mailbox, dispatched **pre-enrollment** (a joiner owns no keyslot yet). Read-auth
+    /// proves the connecting key; the payload is MAC'd under the invite code end to end and slot ids
+    /// are `BLAKE3::derive_key(label, code)`, so the blind server only relays + TTLs.
     fn handle_pair(&self, inc: Incoming<'_>, now: u64) -> Response {
         let (op_label, args_hash, _) = op_and_args(&inc.request);
         let ra = ReadAuth {
@@ -431,23 +409,17 @@ impl Server {
             return self.handle_pair(inc, now);
         }
 
-        // (1) keyslot existence: the connecting key must be rostered (enrolled), with a
-        // **genesis-bootstrap exception**: the first device creating an *empty* repo has no prior
-        // keyslot, so it may write its own keyslot and the genesis roster entry while the roster is
-        // still empty (`roster_len == 0`). Every other op requires enrollment. (Connection-level
-        // access — e.g. an `authorized_keys` allow-list — is enforced one layer up in `serve`.)
+        // (1) keyslot existence: the connecting key must be rostered, with the genesis-bootstrap
+        // exception below. (Connection-level access via authorized_keys is enforced up in `serve`.)
         let device_id = match inc.pubkey.device_id() {
             Ok(d) => d,
             Err(_) => return Response::Err(ErrorCode::BadRequest),
         };
         // keyslot presence only (no decryption) — a store error fails closed.
         if !self.store.keyslot_exists(&device_id).unwrap_or(false) {
-            // Genesis-bootstrap exception (§7/§12): while the roster is empty, the first device may
-            // write the genesis sigchain entry and **its own** keyslot. A `put-keyslot` here is bound
-            // to the authenticated device's own id, so a listed-but-unenrolled key cannot squat a
-            // keyslot for an *arbitrary* device_id during the genesis window. (The normal grant path,
-            // where an enrolled member writes a joiner's keyslot, takes the `keyslot_exists` branch and
-            // is unaffected.)
+            // Genesis exception (§7/§12): while the roster is empty, the first device may write the
+            // genesis sigchain entry and ITS OWN keyslot only — `owner == device_id` stops an
+            // unenrolled key squatting a keyslot for an arbitrary device_id.
             let genesis_bootstrap = self.store.roster_len().map(|n| n == 0).unwrap_or(false)
                 && match &inc.request {
                     Request::RosterAppend { .. } => true,
@@ -534,9 +506,8 @@ impl Server {
                 declared_size,
                 blob,
             } => {
-                // §11/§12 (normative): reject an over-large `declared_size` outright before doing any
-                // work. The wire decoder already caps the *actual* blob at MAX_BLOB_SIZE; this makes
-                // the spec's "MUST reject any put() with declared_size > 16 MiB" an explicit gate.
+                // §11/§12 normative: MUST reject declared_size > 16 MiB outright (the wire decoder
+                // already caps the actual blob).
                 if declared_size as usize > MAX_BLOB_SIZE {
                     return Response::Err(ErrorCode::BadRequest);
                 }
@@ -552,8 +523,7 @@ impl Server {
                 if !present && !self.add_quota(device_id, blob.len() as u64) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
-                // Store, then return the §15 arrival receipt (the object's arrival generation + the
-                // server's current global put_epoch) so the client can derive gc_gen and bind the gc CAS.
+                // Store, then return the §15 arrival receipt (drives client gc_gen + the gc CAS).
                 match self.store.put(&id, &blob) {
                     Ok(_) => match (self.store.arrival_epoch(&id), self.store.put_epoch()) {
                         (Ok(Some(arrival_gen)), Ok(put_epoch)) => {
@@ -588,9 +558,7 @@ impl Server {
                 if !self.take_write(device_id, entry.len() as u64, now) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
-                // §8.1 sigchain volume limits (server MUST enforce): ≤ 60 appends per connection
-                // identity per hour, and a hard cap on total chain length. Both bound abuse without
-                // weakening anti-rollback (retried revocations still succeed within the window).
+                // §8.1 server-enforced volume limits: ≤ 60 appends/key/hour + a total chain cap.
                 if !self.sigchain_allow(device_id, now) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
@@ -604,8 +572,8 @@ impl Server {
                 // Append CAS-guarded by the /roster-head tip (§8.1): a racing append loses.
                 match self.store.append_roster(&old_tip, &entry) {
                     Ok(Some(_seq)) => Response::Ok,
-                    // A CAS loss did not grow the chain; refund the slot so a benign race doesn't
-                    // exhaust the device's hourly budget and block a legitimate retried revocation.
+                    // A CAS loss didn't grow the chain — refund so a benign race can't exhaust the
+                    // hourly budget and block a retried revocation (§8.1).
                     Ok(None) => {
                         self.sigchain_refund(device_id);
                         Response::Err(ErrorCode::CasConflict)
@@ -613,9 +581,8 @@ impl Server {
                     Err(_) => Response::Err(ErrorCode::Internal),
                 }
             }
-            // The network half of enrollment (§7/§8.4): an authorized member writes another device's
-            // keyslot. The blob is opaque; its authenticity rests on the recipient's `mk_commit` check
-            // (§7), so the blind server only stores it (a forged keyslot fails that check, not here).
+            // Enrollment write (§7/§8.4): opaque blob; authenticity is the recipient's `mk_commit`
+            // check, not the server's.
             Request::PutKeyslot {
                 device_id: owner_id,
                 gen,
@@ -663,11 +630,10 @@ impl Server {
         }
     }
 
-    /// The §15 `gc` pipeline. The `args_hash` is recomputed from the **server's** current mutable state
-    /// (`all_heads_hash` over the stored head blobs, `roster_seq`, `put_epoch`); verifying the client's
-    /// `secsec-write-v1` signature over that message **is** the compare-and-swap — a concurrent
-    /// `cas-head`/`roster-append`/`put` changes a bound value, so the recomputed message differs and the
-    /// signature fails (`BadAuth`), aborting the sweep rather than deleting against stale state.
+    /// §15 `gc`: `args_hash` is recomputed from the **server's** current state (`all_heads_hash` /
+    /// `roster_seq` / `put_epoch`), so verifying the client's signature over it **is** the
+    /// compare-and-swap — any concurrent mutation changes the recomputed message and the sweep
+    /// aborts (`BadAuth`) instead of deleting against stale state.
     fn handle_gc(&self, inc: Incoming<'_>, device_id: DeviceId, now: u64) -> Response {
         let Request::Gc { keep_set, gc_gen } = inc.request else {
             return Response::Err(ErrorCode::Internal);
@@ -704,8 +670,7 @@ impl Server {
             server_nonce: nonce,
         };
         if wa.verify(inc.pubkey, &inc.op_sig).is_err() {
-            // Bad signature OR the client's view of all_heads_hash/roster_seq/put_epoch != the
-            // server's (a concurrent mutation since the client computed it) — the §15 CAS failed.
+            // Bad signature OR a stale client view of the bound state — the §15 CAS failed.
             return Response::Err(ErrorCode::BadAuth);
         }
         if !self.consume_nonce(&nonce, now) {

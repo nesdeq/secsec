@@ -1,17 +1,9 @@
-//! `secsec-client` — client orchestration over a [`Remote`] (`secsec-Design.md` §10, §12).
-//!
-//! This crate plumbs the proven cores to a remote store: it pushes the reachable **object closure**
-//! of a commit, advances the per-ref **head** via the blind-server compare-and-swap (§12), and on the
-//! read side fetches a head, fetches a commit's closure **verifying every object on arrival** (§9.2),
-//! and restores it. The remote is abstracted as the [`Remote`] trait so the orchestration is exercised
-//! against the real blind-CAS storage semantics in-process; the QUIC adapter (over `secsec-transport`)
-//! is a thin layer on top.
-//!
-//! **Cross-device sync** ([`sync_ref`]): fetch the remote head, [`resolve_head_signer`] against the
-//! folded roster (the head carries no `device_id`, so the signer is the one member key that verifies
-//! it), bring the remote closure local, run the rollback-gated three-way merge
-//! ([`secsec_engine::merge_heads`]), and push the merge — two devices reconciling through one blind
-//! server with no silent data loss.
+//! `secsec-client` — client orchestration over a [`Remote`] (`secsec-Design.md` §10, §12): push the
+//! reachable object closure of a commit, advance the per-ref head via the blind-server CAS, and on
+//! the read side fetch a head + closure **verifying every object on arrival** (§9.2). Cross-device
+//! sync ([`sync_ref`]): fetch the remote head, [`resolve_head_signer`] against the folded roster,
+//! bring the closure local, run the rollback-gated merge ([`secsec_engine::merge_heads`]), push.
+//! The [`Remote`] trait abstracts the server; the QUIC adapter is a thin layer on top.
 
 #![forbid(unsafe_code)]
 
@@ -55,11 +47,9 @@ impl core::fmt::Display for RemoteError {
 }
 impl std::error::Error for RemoteError {}
 
-/// A §15 arrival receipt returned on a successful `put`: the object's arrival generation and the
-/// server's current global `put_epoch`. The client records these to choose a safe `gc_gen` (objects
-/// whose `arrival_gen` is old enough) and to bind the `gc` compare-and-swap to `put_epoch`. The
-/// receipt is **signed** by the host receipt key (§15 defence-in-depth); `receipt_pubkey`/`signature`
-/// are all-zero when the server signs no receipts (e.g. the in-process backend).
+/// A §15 arrival receipt returned on a successful `put`. The client records it to choose a safe
+/// `gc_gen` and to bind the `gc` CAS to `put_epoch`. Signed by the host receipt key (§15
+/// defence-in-depth); all-zero pubkey/signature when unsigned (e.g. the in-process backend).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Receipt {
     /// The object's arrival generation (the `put_epoch` it first landed at).
@@ -275,8 +265,7 @@ impl From<secsec_engine::EngineError> for ClientError {
 }
 impl From<repo::RepoError> for ClientError {
     fn from(e: repo::RepoError) -> Self {
-        // Reuse the Remote variant — a RepoError surfaced from a cold-start/rotate over the remote is,
-        // from the orchestration's view, "the server's repository state was unusable".
+        // From the orchestration's view a cold-start/rotate RepoError is a remote-state failure.
         ClientError::Remote(RemoteError(e.to_string()))
     }
 }
@@ -359,9 +348,8 @@ pub async fn push_head<R: Remote, K: MasterKeys>(
     let head = build_head(ref_name, commit_id, roster_seq, prev.map(|(h, _)| h));
     let sig = sign_head(device, &head)?;
     let nonce = random_nonce()?;
-    // The head is sealed under the **current** generation's `head_key_g` (forward secrecy of the head
-    // metadata), but addressed at the **generation-stable** ref path (§13), so it does not move on
-    // rotation.
+    // Sealed under the current generation's `head_key_g`, but addressed at the generation-stable
+    // ref path (§13), so the ref does not move on rotation.
     let rnk = keys.ref_name_key();
     let blob = seal_head(keys.current(), &rnk, &head, &sig, &nonce);
 
@@ -403,11 +391,9 @@ enum Work {
     Chunk(Id, PathSalt),
 }
 
-/// Fetch the full reachable object closure of `commit_id` from `remote` into `store`, **verifying
-/// every object on arrival** (§9.2): each commit/tree is opened (re-deriving and checking its id) to
-/// discover its children, and each chunk is opened under its file's `path_salt`. A missing object is
-/// [`ClientError::MissingRemote`]. Idempotent: already-present objects are skipped. Returns the count
-/// fetched this call.
+/// Fetch the full reachable closure of `commit_id` from `remote` into `store`, **verifying every
+/// object on arrival** (§9.2): commits/trees are opened to discover their children, chunks under
+/// their file's `path_salt`. Idempotent (present objects skipped); returns the count fetched.
 pub async fn fetch_closure<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
@@ -463,9 +449,8 @@ pub async fn fetch_closure<R: Remote, K: MasterKeys>(
                 }
             }
             Work::Chunk(_, salt) => {
-                // Verify the chunk's content address (§9.2); leaf, no children. `open_object` resolves
-                // the chunk's own generation from `keys` (§8.2), so a history that spans a rotation
-                // verifies under each object's authoring key.
+                // Leaf: verify the chunk's content address (§9.2); `open_object` resolves its
+                // generation from `keys` (§8.2).
                 let blob = store.get(&id)?.ok_or(ClientError::MissingLocal(id))?;
                 open_object(keys, ObjType::Chunk, &salt, &id, &blob)?;
             }
@@ -476,11 +461,9 @@ pub async fn fetch_closure<R: Remote, K: MasterKeys>(
 
 // ---- cross-device sync (fetch → resolve signer → rollback-gated merge → push) ----
 
-/// Resolve which roster member signed `head` by trying each member's key. The head carries no
-/// `device_id` (§9.6's signed message omits it) and refs are shared-per-name (§13 `H` keys only the
-/// ref name), so the signer is identified by the **one** member key that verifies the signature.
-/// Returns that member's `device_id`, or `None` if no current member signed it (forged / stale-roster
-/// head).
+/// Resolve which roster member signed `head` by trying each member's key — the head carries no
+/// `device_id` (§9.6), so the signer is the one member key that verifies. `None` if no current
+/// member signed it (forged / stale-roster head).
 #[must_use]
 pub fn resolve_head_signer(
     members: &BTreeMap<DeviceId, DevicePublic>,
@@ -506,21 +489,15 @@ pub struct SyncReport {
     pub receipts: Vec<(Id, Receipt)>,
 }
 
-/// Reconcile our local `our_commit` for `ref_name` against the remote, end-to-end (§10):
-/// 1. fetch the remote head; if absent, this is the first head — push `our_commit` and create it.
-/// 2. resolve the head's signer against `members` and bring the remote commit's closure local.
-/// 3. run the rollback-gated [`merge_heads`] (a gate rejection is a §10 alarm, surfaced as
-///    [`ClientError::Merge`]).
-/// 4. **Merge** → push the merge commit and advance the ref; **AlreadyHave** (we are ahead) → push
-///    `our_commit` and advance; **FastForward** (remote is ahead) → adopt it, no write.
+/// Reconcile our local `our_commit` for `ref_name` against the remote (§10): fetch the remote head
+/// (absent → push ours and create it), resolve its signer, bring the closure local, run the
+/// rollback-gated [`merge_heads`], then push whatever we authored and advance the ref (or adopt a
+/// remote fast-forward). A gate rejection surfaces as [`ClientError::Merge`] — a §10 alarm.
 ///
-/// `author` stamps any commit/head we author. `seal` persists the advanced frontier and is invoked
-/// **before** any head push that advances the ref (§8.5: seal the new frontier first, only then write
-/// the head) — a `seal` failure aborts before publishing. Restoring the working tree is the caller's
-/// step (it holds the destination path).
-// The arguments are all distinct, caller-supplied inputs (remote / local store / key / roster /
-// frontier / ref / commit / authorship / seal) with no cohesive subgroup; a parameter object here
-// would only exist to satisfy the lint.
+/// `seal` persists the advanced frontier and is invoked **before** any ref-advancing push (§8.5);
+/// a `seal` failure aborts before publishing. Restoring the working tree is the caller's step.
+// All distinct caller-supplied inputs with no cohesive subgroup; a parameter object would only
+// exist to satisfy the lint.
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_ref<R: Remote, K: MasterKeys>(
     remote: &R,
@@ -587,9 +564,8 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
     };
 
     let (wrote, receipts) = if let Some(commit_id) = new_commit {
-        // §8.5: seal the observed frontier (the merge's sibling/commit high-waters) before publishing
-        // a head that descends from those observations, so a crash post-push can't leave a published
-        // head uncovered by the persisted anti-rollback frontier.
+        // §8.5: seal the observed frontier BEFORE publishing a head that descends from those
+        // observations — a crash post-push must not leave the head uncovered by the frontier.
         seal(&plan.frontier)?;
         let receipts = push_objects(remote, store, keys, &commit_id).await?;
         let (head, blob) = push_head(
@@ -620,18 +596,16 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
 /// The result of [`load_frontier`].
 #[derive(Debug)]
 pub enum FrontierLoad {
-    /// No state file present. On a genuine first run this means "start from a default frontier"; for a
-    /// repo known to have been initialized, a *missing* file is itself a §8.5 lost-frontier event —
-    /// distinguishing the two is the caller's policy (it knows whether the repo was set up before).
+    /// No state file. A genuine first run starts from a default frontier; for a repo known to be
+    /// initialized, a missing file is itself a §8.5 lost-frontier event — the caller's policy.
     Absent,
     /// Loaded and authenticated against `device`.
     Loaded(SyncFrontier),
 }
 
-/// Load `device`'s sealed frontier from `path` (§8.5/§9.8). A missing file is [`FrontierLoad::Absent`];
-/// a present-but-unopenable file (corrupt / tampered / MAC-fail / sealed by another device) is the
-/// §8.5 lost-frontier event [`ClientError::FrontierLost`] — the caller MUST alarm and treat the
-/// session as a reinstall (authenticity still holds via RFP + `mk_commit`, but freshness does not).
+/// Load `device`'s sealed frontier from `path` (§8.5/§9.8). Missing file → [`FrontierLoad::Absent`];
+/// present-but-unopenable → [`ClientError::FrontierLost`], the §8.5 lost-frontier event: the caller
+/// MUST alarm and treat the session as a reinstall.
 pub fn load_frontier(path: &Path, device: &DeviceKey) -> Result<FrontierLoad, ClientError> {
     let blob = match std::fs::read(path) {
         Ok(b) => b,
@@ -647,8 +621,8 @@ pub fn load_frontier(path: &Path, device: &DeviceKey) -> Result<FrontierLoad, Cl
 }
 
 /// Seal `frontier` under `device`'s local-seal key (§8.5) and write it to `path` **atomically**
-/// (temp file + rename), so a crash mid-write cannot leave a torn, unopenable state file. Per §8.5 the
-/// caller persists the advanced frontier *before* writing the merge commit/head it authorized.
+/// (temp file + rename, so a crash can't tear it). Per §8.5 the caller persists the advanced
+/// frontier *before* publishing the head it authorized.
 pub fn save_frontier(
     path: &Path,
     frontier: &SyncFrontier,

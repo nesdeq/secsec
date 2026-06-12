@@ -1,22 +1,7 @@
-//! `secsec-transport` — QUIC + TLS 1.3 transport (`secsec-Design.md` §11). The core is the **pinned
-//! host-key verifier** (risk **R1**, "the top ship-broken risk").
-//!
-//! The server self-signs a host key on first run (like `sshd`); there is **no CA**. The client pins
-//! the server's public key (TOFU, or `--host-fp` at init) and authenticates every later connection
-//! against that pin. The pin is the server certificate's **SubjectPublicKeyInfo** (SPKI) DER, and
-//! `host_id = BLAKE3(SPKI)` (§11) is the value bound into the connection-auth signature (§9.6).
-//!
-//! The verifier is the part most likely to be silently broken (a `return Ok(())` or a stubbed
-//! signature check disables authentication entirely), so it follows the **safe pattern** mandated by
-//! the build plan:
-//! - [`PinnedServerVerifier::verify_server_cert`] compares the leaf SPKI to the pin in constant time
-//!   and asserts nothing else (no CA chain, no name check — identity rests on the pin);
-//! - [`PinnedServerVerifier::verify_tls13_signature`] **delegates** to the provider's
-//!   `verify_tls13_signature` helper — it is never stubbed;
-//! - TLS 1.2 is refused outright (the connection is pinned to TLS 1.3, §11).
-//!
-//! The mandatory negative tests (wrong pin fails; a tampered/garbage handshake signature fails) live
-//! in this crate and gate CI.
+//! `secsec-transport` — QUIC + TLS 1.3 with a pinned, self-signed host key; no CA (`secsec-Design.md`
+//! §11; risk R1). The pin is the cert's SPKI DER; `host_id = BLAKE3(SPKI)`. The verifier follows the
+//! R1 safe pattern: SPKI-pin compare only (no chain/name checks), `verify_tls13_signature`
+//! **delegated, never stubbed**, TLS 1.2 refused. Mandatory negative tests live here and gate CI.
 
 #![forbid(unsafe_code)]
 
@@ -34,10 +19,8 @@ use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 use subtle::ConstantTimeEq;
 use x509_cert::der::{Decode, Encode};
 
-/// The server's pinned identity, anchored on `host_id = BLAKE3(SPKI)` (§11). A pin can be built from
-/// the full server cert/SPKI (TOFU at `init`) **or** from just the `host_id` fingerprint (`--host-fp`).
-/// The verifier compares `BLAKE3(presented SPKI)` to the pinned `host_id` — equivalent to a full-SPKI
-/// compare (BLAKE3 collision resistance) but pinnable from the 32-byte fingerprint alone.
+/// The server's pinned identity, anchored on `host_id = BLAKE3(SPKI)` (§11) — buildable from a
+/// cert/SPKI or from the 32-byte fingerprint alone (the verifier compares the hash either way).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostPin {
     host_id: [u8; 32],
@@ -134,10 +117,8 @@ impl ServerCertVerifier for PinnedServerVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        // Pin check: BLAKE3(leaf SPKI) must equal the pinned `host_id`, compared in constant time. No
-        // chain building, no name verification — the pin *is* the trust anchor (§11). Hashing the SPKI
-        // (rather than comparing SPKI bytes) lets a client pin from just the `host_id` fingerprint
-        // (--host-fp) and is equivalent under BLAKE3 collision resistance.
+        // Constant-time pin check: BLAKE3(leaf SPKI) == pinned host_id. No chain, no name — the pin
+        // IS the trust anchor (§11); hashing lets a fingerprint-only pin work.
         let presented = spki_of(end_entity)
             .map_err(|_| Error::General("malformed server certificate".into()))?;
         let presented_id = *blake3::hash(&presented).as_bytes();
@@ -155,8 +136,7 @@ impl ServerCertVerifier for PinnedServerVerifier {
         _cert: &CertificateDer<'_>,
         _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        // The connection is pinned to TLS 1.3 (§11). Refuse 1.2 outright — a downgrade guard, and a
-        // mandatory negative test.
+        // TLS 1.2 refused outright (§11 downgrade guard; mandatory negative test).
         Err(Error::PeerIncompatible(
             rustls::PeerIncompatible::Tls12NotOffered,
         ))
@@ -168,8 +148,7 @@ impl ServerCertVerifier for PinnedServerVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        // DELEGATE to the provider's verified implementation — never stubbed (R1). This checks the
-        // handshake signature against the pinned leaf's public key using the supported algorithms.
+        // DELEGATED to the provider — never stubbed (R1).
         verify_tls13_signature(message, cert, dss, &self.supported)
     }
 
@@ -178,11 +157,9 @@ impl ServerCertVerifier for PinnedServerVerifier {
     }
 }
 
-/// A **trust-on-first-use** verifier (§11): it accepts *any* server certificate and **captures** its
-/// `host_id = BLAKE3(SPKI)` into a shared cell, for the very first connection to a not-yet-pinned
-/// server. The caller reads the captured `host_id` afterward, shows the user its fingerprint to
-/// confirm, and pins it (via [`HostPin::from_host_id`]) for every future connection. Used only when no
-/// pin is known yet — exactly the `ssh` `known_hosts` first-contact model, with the same one-time risk.
+/// Trust-on-first-use verifier (§11): accepts any cert and captures its `host_id` into a shared
+/// cell; the caller confirms the fingerprint out-of-band and pins it for every later connection.
+/// The ssh `known_hosts` first-contact model, with the same one-time risk.
 #[derive(Debug)]
 pub struct TofuVerifier {
     captured: std::sync::Arc<std::sync::Mutex<Option<[u8; 32]>>>,

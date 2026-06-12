@@ -1,12 +1,8 @@
-//! Client-driven garbage collection (`secsec-Design.md` §15). The client is the sole GC driver: it
-//! computes the **keep-set** (the reachable object closure over the rostered heads), picks a safe
-//! **`gc_gen`** from its own signed arrival receipts (never a server-asserted counter), binds its view
-//! of the server's mutable state (`all_heads_hash`/`roster_seq`/`put_epoch`), and sends the sweep — a
-//! compare-and-swap the server can only execute if nothing changed since (§15).
-//!
-//! Retention is **keep-everything** by default; a `gc` is explicit and opt-in. GC **fails safe**: if
-//! any object in the keep-set traversal is unavailable, [`secsec_snapshot::reachable_objects`] errors
-//! and no sweep is issued.
+//! Client-driven garbage collection (`secsec-Design.md` §15): the client computes the keep-set (the
+//! reachable closure over the rostered heads), picks a safe `gc_gen` from its own arrival receipts
+//! (never a server counter), and binds its view of the server's mutable state — the sweep is a
+//! compare-and-swap. Retention is keep-everything by default; GC is explicit, opt-in, and **fails
+//! safe** (an incomplete keep-set traversal errors and no sweep is issued).
 
 use crate::{fetch_head, ClientError, GcOutcome, Receipt, Remote};
 use secsec_kdf::MasterKeys;
@@ -22,10 +18,9 @@ use std::collections::BTreeMap;
 pub const GC_GRACE_WINDOW_SECS: u64 = 48 * 60 * 60;
 
 /// Choose a safe `gc_gen` from arrival `receipts` (§15): the **largest** `arrival_gen` such that
-/// **every** object at that generation (and below) was received before the grace cutoff
-/// (`local_time < now − GC_GRACE_WINDOW`). `receipts` is `(arrival_gen, local_receipt_time)` per
-/// object, recorded when the receipt arrived (the client's own clock, never the server's `timestamp`).
-/// Returns 0 (sweep nothing) if no generation is fully past the grace window.
+/// **every** object at or below it was received before the grace cutoff. `receipts` is
+/// `(arrival_gen, local_receipt_time)` per object — the client's own clock, never the server's.
+/// Returns 0 (sweep nothing) if no generation is fully aged.
 #[must_use]
 pub fn gc_gen_from_receipts(receipts: &[(u64, u64)], now: u64) -> u64 {
     let cutoff = now.saturating_sub(GC_GRACE_WINDOW_SECS);
@@ -55,11 +50,10 @@ pub fn put_epoch_from_receipts(receipts: &[(Id, Receipt)]) -> u64 {
     receipts.iter().map(|(_, r)| r.put_epoch).max().unwrap_or(0)
 }
 
-/// A persisted per-object arrival record (§15): the object's `arrival_gen`, the **local** time the
-/// client first recorded its receipt (the client's own clock — never the server's `timestamp`, §15/§21),
-/// and the highest `put_epoch` observed for it. The receipt log is the client's durable GC state across
-/// runs; it is the input to [`gc_gen_from_log`]/[`put_epoch_from_log`]. Not secret — object ids are
-/// public and the file is local-only — so it is stored as plain text, like the §7 grant log.
+/// A persisted per-object arrival record (§15): `arrival_gen`, the **local** time the receipt was
+/// first recorded (the client's clock, never the server's, §15/§21), and the highest observed
+/// `put_epoch`. The log is the client's durable GC state; not secret (object ids are public), so
+/// stored as plain text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiptRecord {
     /// The generation the object first landed at (its arrival `put_epoch`).
@@ -131,10 +125,9 @@ pub fn serialize_receipt_log(log: &BTreeMap<Id, ReceiptRecord>) -> String {
     s
 }
 
-/// Merge fresh arrival `receipts` (from a sync) into the persisted `log` at client-local time `now`.
-/// A first-seen object records `first_local_time = now` (its aging clock); a re-seen object keeps its
-/// original `first_local_time` and `arrival_gen` (re-pushing an idempotent object does not reset its
-/// age) but advances `put_epoch` to the max observed (the client's view of the server's global epoch).
+/// Merge fresh arrival `receipts` into the persisted `log` at client-local time `now`: a first-seen
+/// object records `first_local_time = now`; a re-seen object keeps its original age and
+/// `arrival_gen` (an idempotent re-push does not reset aging) but advances `put_epoch` to the max.
 pub fn merge_receipts(log: &mut BTreeMap<Id, ReceiptRecord>, receipts: &[(Id, Receipt)], now: u64) {
     for (id, r) in receipts {
         log.entry(*id)
@@ -166,17 +159,12 @@ pub fn put_epoch_from_log(log: &BTreeMap<Id, ReceiptRecord>) -> u64 {
     log.values().map(|r| r.put_epoch).max().unwrap_or(0)
 }
 
-/// Run a §15 GC sweep against `remote`. `ref_names` MUST be **every** ref of the repo (§15: the
-/// keep-set is the reachable closure over *all* rostered heads). The secsec CLI uses exactly one ref
-/// per repo (`main`), so this is a single name; completeness is also enforced by the sweep's
-/// compare-and-swap — the server recomputes `all_heads_hash` over every stored ref, so a caller that
-/// omits a ref produces a mismatching `args_gc` and the sweep is rejected ([`GcOutcome::CasConflict`])
-/// rather than deleting the omitted ref's objects. `gc_gen` is the client-chosen generation (see
-/// [`gc_gen_from_receipts`]); `roster_seq`/`put_epoch` are the client's current view (bound into the
-/// CAS). Fetches each head, builds the keep-set from the local store (**fail-safe** on a missing
-/// object — aborts rather than sweeping), computes `all_heads_hash` from the fetched head blobs, and
-/// issues the sweep. Returns the [`GcOutcome`] ([`GcOutcome::CasConflict`] if the server's state moved
-/// — re-read and retry).
+/// Run a §15 GC sweep against `remote`. `ref_names` MUST be **every** ref of the repo (the keep-set
+/// is the closure over *all* rostered heads); the CLI uses exactly one (`main`), and completeness is
+/// also enforced by the CAS — the server recomputes `all_heads_hash` over every stored ref, so an
+/// omitted ref yields [`GcOutcome::CasConflict`], never deletion. Builds the keep-set **fail-safe**
+/// (a missing object aborts, nothing swept) and issues the sweep; on `CasConflict` the caller
+/// re-reads state and retries.
 pub async fn gc_collect<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
@@ -210,12 +198,10 @@ pub async fn gc_collect<R: Remote, K: MasterKeys>(
         .await?)
 }
 
-/// Keep-everything sweep of the client's **own** object cache — the local mirror of the server's §15
-/// sweep, so both ends prune identically. Delete every object **unreachable** from `head` (the orphans
-/// left by cas-conflict retries and aborted pushes), keeping the full reachable history. Unlike the
-/// server sweep there is **no grace window**: this cache serves only the local device, so anything
-/// unreachable from our head is pure garbage. Returns the number of objects dropped. **Fail-safe**: if
-/// the reachable closure can't be built (a missing object), it errors and deletes nothing.
+/// Keep-everything sweep of the client's **own** object cache: delete every object unreachable from
+/// `head` (orphans from cas-conflict retries and aborted pushes). No grace window — the cache serves
+/// only this device. **Fail-safe**: an unbuildable closure errors and deletes nothing. Returns the
+/// number of objects dropped.
 pub fn local_sweep<K: MasterKeys>(keys: &K, store: &Store, head: &Id) -> Result<u64, ClientError> {
     let keep = reachable_objects(keys, store, &[*head])?;
     Ok(store.gc(&keep, u64::MAX)?)

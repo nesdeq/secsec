@@ -1,12 +1,6 @@
-//! Commit-DAG ancestry (`secsec-Design.md` §10). Pure graph logic over the commit parent-DAG — the
-//! shared foundation for **fork detection** ("`H_B` is DAG-incomparable to `H_A`") and the
-//! **rollback-aware three-way merge** ("merge vs the common ancestor").
-//!
-//! Commits are content-addressed (§9.2), so the parent relation is acyclic by construction; the
-//! traversals here additionally carry a `visited` set, so a malformed/cyclic input map can never
-//! loop forever — it just terminates. The DAG is supplied as a map `commit id → parent ids`, which
-//! decouples this module from how commits are stored or fetched (the caller builds it from the
-//! reachable [`secsec_snapshot::Commit`]s).
+//! Commit-DAG ancestry (`secsec-Design.md` §10): pure graph logic for fork detection
+//! (DAG-incomparability) and the merge base (lowest common ancestors). The DAG comes in as
+//! `commit id → parents`; traversals carry a visited set, so even a malformed cyclic map terminates.
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,13 +1,9 @@
 //! `secsec-sig` — device identity and SSHSIG signatures (`secsec-Design.md` §5, §9.6).
 //!
-//! A device is an **Ed25519** SSH keypair. Its `device_id` is `BLAKE3` over the canonical SSH
-//! public-key encoding, so the id is cryptographically bound to the key (§5). All signatures are
-//! OpenSSH "sshsig" with a **distinct namespace** per purpose (§9.6); the namespace is carried in
-//! the signature and checked on verify, so a signature for one purpose is invalid for any other.
-//!
-//! **Ed25519-only**: this crate enables only `ssh-key`'s `ed25519` feature, so non-Ed25519
-//! keys do not parse, and [`DevicePublic::verify`] additionally rejects any non-Ed25519 key or
-//! signature algorithm (the §9.6 downgrade guard).
+//! A device is an Ed25519 SSH keypair; `device_id = BLAKE3(canonical pubkey)`. All signatures are
+//! OpenSSH sshsig with a distinct namespace per purpose (§9.6). Ed25519-only: non-Ed25519 keys do
+//! not parse, and [`DevicePublic::verify`] rejects any other key/signature algorithm (§9.6
+//! downgrade guard).
 
 #![forbid(unsafe_code)]
 
@@ -99,14 +95,9 @@ impl DeviceKey {
         Self::finish(PrivateKey::from_openssh(pem)?)
     }
 
-    /// Load a device key from an OpenSSH-format private key (PEM), decrypting it in memory with
-    /// `passphrase` when the key is encrypted (a no-op for an unencrypted key).
-    ///
-    /// secsec needs the **raw** private key, not just a signing oracle: the X-Wing keyslot
-    /// decapsulation seed ([`Self::xwing_seed`]) and the local-seal key ([`Self::local_seal_key`])
-    /// are derived from it (§5/§8.3), so an ssh-agent cannot stand in. The decrypted key lives only
-    /// in this process (zeroized on drop, like every other secret here) and is never written back to
-    /// disk — the on-disk key stays encrypted.
+    /// Load an OpenSSH private key (PEM), decrypting in memory with `passphrase` if encrypted.
+    /// secsec derives keys from the raw private key ([`Self::xwing_seed`], [`Self::local_seal_key`]),
+    /// so an ssh-agent cannot stand in; the on-disk key is never modified.
     pub fn from_openssh_passphrase(pem: &str, passphrase: &str) -> Result<Self, SigError> {
         let key = PrivateKey::from_openssh(pem)?;
         let key = if key.is_encrypted() {
@@ -151,12 +142,9 @@ impl DeviceKey {
         }
     }
 
-    /// This device's X25519 secret scalar (the Ed25519→X25519 / `age` map): the **raw clamped**
-    /// `SHA-512(seed)[..32]` used for keyslot ECDH (§8.3). Also the `device_ed25519_scalar_clamped`
-    /// of §8.5. Zeroized on drop.
-    ///
-    /// Note: this is the raw clamped value, *not* `SigningKey::to_scalar()` — the latter reduces
-    /// mod the group order, which X25519 clamping would then corrupt.
+    /// The X25519 secret scalar (Ed25519→X25519 map, §8.3): raw clamped `SHA-512(seed)[..32]` —
+    /// the §8.5 `device_ed25519_scalar_clamped`. NOT `SigningKey::to_scalar()` (that reduces mod
+    /// the group order, which clamping would then corrupt). Zeroized on drop.
     pub fn x25519_secret(&self) -> Result<Zeroizing<[u8; 32]>, SigError> {
         use sha2::{Digest, Sha512};
         let seed = self.ed25519_seed()?;
@@ -175,11 +163,8 @@ impl DeviceKey {
         self.public().x25519_public()
     }
 
-    /// The §8.5 local-seal key: `BLAKE3::derive_key("secsec-local-seal-v1",
-    /// device_ed25519_scalar_clamped)`. Derived from the **private** clamped scalar
-    /// ([`Self::x25519_secret`]) — never the public key, which is recoverable from the
-    /// sigchain-published Ed25519 key via the birational map (§8.5 note). Re-derived at startup, never
-    /// stored. Used to seal the local frontier/state file (§9.8).
+    /// The §8.5 local-seal key, derived from the **private** clamped scalar (never the public key —
+    /// §8.5 note). Re-derived at startup, never stored; seals the local frontier file (§9.8).
     pub fn local_seal_key(&self) -> Result<Zeroizing<[u8; 32]>, SigError> {
         let scalar = self.x25519_secret()?;
         Ok(Zeroizing::new(blake3::derive_key(
@@ -188,18 +173,10 @@ impl DeviceKey {
         )))
     }
 
-    /// The device's **X-Wing decapsulation-key seed** (§8.3/§17): `BLAKE3::derive_key(
-    /// "secsec-xwing-seed-v1", ed25519_private_seed)`. Under "the SSH key is the only credential" (§1)
-    /// the device's hybrid-PQ keypair needs **no extra stored material** — re-derived at runtime.
-    ///
-    /// **Critically, this derives from the raw 32-byte Ed25519 *seed*, NOT the clamped scalar
-    /// `a = clamp(SHA-512(seed)[..32])`** ([`Self::x25519_secret`]). The scalar is what a quantum
-    /// adversary recovers from the device's *public* Ed25519 key via Shor (discrete log), so deriving
-    /// the PQ keyslot key from it would let that adversary reconstruct the X-Wing secret from public
-    /// data alone — voiding the post-quantum property. The seed is not recoverable from the public key
-    /// (SHA-512 preimage resistance, quantum-hard), so the ML-KEM half of X-Wing stays secret against a
-    /// quantum attacker. The caller builds `secsec_pq::XWingSecret::from_seed(seed)`; the X-Wing public
-    /// key is published in the roster (`AddDevice`/`Genesis`, §8.3) so a granter can wrap to it.
+    /// The X-Wing decapsulation-key seed (§8.3/§17), re-derived at runtime (no extra stored
+    /// material, §1). MUST derive from the raw Ed25519 **seed**, never the clamped scalar — the
+    /// scalar is quantum-recoverable from the public key, which would void the PQ property (the
+    /// full argument is §8.3). The X-Wing public is published in the roster so granters can wrap.
     pub fn xwing_seed(&self) -> Result<Zeroizing<[u8; 32]>, SigError> {
         let seed = self.ed25519_seed()?;
         Ok(Zeroizing::new(blake3::derive_key(

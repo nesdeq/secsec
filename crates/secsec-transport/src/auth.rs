@@ -1,18 +1,7 @@
-//! Connection authentication (`secsec-Design.md` §11, §9.6). The pure-crypto core of the client→server
-//! handshake auth: the **session transcript** and the `secsec-auth-v1` signed payload that binds the
-//! client to this specific session, server identity, and channel.
-//!
-//! After the TLS 1.3 handshake (verified by the pinned [`crate::PinnedServerVerifier`]), the client
-//! signs, under [`secsec_sig::NS_AUTH`], the §9.6 payload
-//! `channel_binding ‖ host_id ‖ session_transcript ‖ server_nonce`, where:
-//! - `channel_binding` is the TLS keying-material exporter — supplied by the transport at runtime;
-//! - `host_id = BLAKE3(SPKI)` ([`crate::HostPin::host_id`]) — pins the server identity;
-//! - `session_transcript` is the running BLAKE3 over the ordered handshake messages ([`SessionTranscript`]);
-//! - `server_nonce` is the server's fresh single-use challenge.
-//!
-//! The server verifies this against a **keyslot-owning** (rostered) public key and checks nonce
-//! freshness (§11/§12); that enforcement is server state and lives in the proto/server layer — this
-//! module provides the message construction and the signature.
+//! Connection authentication, pure-crypto core (`secsec-Design.md` §11, §9.6): the client signs the
+//! `secsec-auth-v1` payload `channel_binding ‖ host_id ‖ session_transcript ‖ server_nonce`, binding
+//! it to this session, server, and TLS channel. Nonce-freshness/keyslot enforcement is server state
+//! and lives in proto/server.
 
 use secsec_canon::Writer;
 use secsec_sig::{DeviceKey, DevicePublic, NS_AUTH};
@@ -22,12 +11,8 @@ pub const SECSEC_VERSION: u16 = 1;
 /// Handshake nonce length (client/server), in bytes (§11).
 pub const NONCE_LEN: usize = 32;
 
-/// The §11 **session transcript**: a running BLAKE3 over the ordered, length-prefixed handshake
-/// messages — exactly the client hello and the server hello (no raw pubkeys are injected — server
-/// identity is bound via `host_id`, the channel via the TLS exporter).
-///
-/// Both ends MUST feed identical bytes in this fixed order; [`Self::finalize`] yields the 32-byte
-/// transcript bound into the connection-auth signature.
+/// The §11 session transcript: a running BLAKE3 over exactly the two ordered, length-prefixed
+/// hellos. Both ends MUST feed identical bytes in this fixed order.
 #[derive(Clone, Default)]
 pub struct SessionTranscript {
     hasher: blake3::Hasher,

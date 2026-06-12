@@ -1,23 +1,8 @@
-//! Rollback-aware merge gates and fork detection (`secsec-Design.md` §10, §8.5; risk R4).
-//!
-//! Before a client merges a server-presented sibling head it must clear three gates (§10), checked
-//! against its **persisted frontier** ([`SyncFrontier`], the §8.5 counters) so a malicious server
-//! cannot replay an old branch into the merge:
-//!
-//! 1. the sibling's `roster_seq` ≥ the persisted `roster_seq` frontier;
-//! 2. every **new** commit's per-device `version` exceeds that device's high-water mark, **and** the
-//!    sibling device's `head_version` ≥ its persisted high-water;
-//! 3. the sibling is genuinely DAG-incomparable (otherwise it is a fast-forward or already held).
-//!
-//! [`evaluate_merge`] returns the decision or the specific rollback rejection. After acceptance the
-//! caller updates the frontier with [`SyncFrontier::observe`] (the §10 HWM update rule: bump the
-//! direct sibling **and** every device in the sibling's transitively reachable commit chain) — and,
-//! per §8.5, MUST seal the new frontier *before* writing the local merge commit.
-//!
-//! **`last_seen_head`** (embedded in commits, §10) is a **commit id**, so the fork condition and the
-//! ancestor relations are all over the commit parent-DAG ([`crate::dag`]): gate 3 routes a
-//! DAG-incomparable sibling to the three-way keep-both merge ([`crate::merge`]) — the wired
-//! same-server fork handling.
+//! Rollback-aware merge gates + fork detection (`secsec-Design.md` §10, §8.5; risk R4):
+//! [`evaluate_merge`] runs the three §10 gates against the persisted frontier so a malicious server
+//! cannot replay an old branch into a merge; a DAG-incomparable sibling routes to the keep-both
+//! merge. After acceptance the caller applies [`SyncFrontier::observe`] and MUST seal the frontier
+//! before writing the merge commit (§8.5). The sealed local-state codec is also here.
 
 use crate::dag::{self, Id, ParentMap};
 use secsec_canon::{CanonError, Reader, Writer};
@@ -115,14 +100,11 @@ fn new_commits(parents: &ParentMap, our_head: &Id, sibling: &Id) -> BTreeSet<Id>
         .collect()
 }
 
-/// Run the §10 rollback gates against the persisted `frontier` and classify the sibling. `parents`
-/// and `commit_meta` MUST cover both our and the sibling's reachable history. `local_device` is the
-/// device running the gates: commits **it** authored are exempt from gate 2a — after a re-link or
-/// reinstall (fresh frontier, parentless local history) the genuine head legitimately contains this
-/// device's own earlier commits, which are history, not replays. A server replaying a stale **head**
-/// signed by this device is still caught by gate 2b (its `head_version` high-water), and ancestor
-/// authorship cannot be forged (each commit's id transitively pins its parents from the
-/// signature-verified head commit). Returns the decision, or the specific [`MergeReject`] to alarm on.
+/// Run the §10 gates against the persisted `frontier` and classify the sibling; `parents`/
+/// `commit_meta` MUST cover both reachable histories. Commits authored by `local_device` are exempt
+/// from gate 2a (§10: own history re-encountered after a re-link is not a replay; self-replay via a
+/// stale head is gate 2b's job, and ancestor authorship is pinned by the verified head's
+/// content-address chain). Returns the decision or the [`MergeReject`] to alarm on.
 pub fn evaluate_merge(
     frontier: &SyncFrontier,
     our_head: &Id,
@@ -131,11 +113,8 @@ pub fn evaluate_merge(
     parents: &ParentMap,
     commit_meta: &BTreeMap<Id, CommitMeta>,
 ) -> Result<MergeDecision, MergeReject> {
-    // Nothing new to accept: the sibling is an ancestor of (or equal to) our head, so adopting it
-    // changes no state. This is checked **before** the gates: a commit we already contain can never
-    // be a rollback, and a device that merely folds the roster later than we do (so it stamps an older
-    // `roster_seq` on a head we already hold) must not trip the gate-1 alarm. Gate 1 only guards the
-    // adoption of genuinely *new* sibling state below.
+    // Before the gates: a sibling already in our history is a no-op, never a rollback (a peer that
+    // folds the roster late, stamping an older roster_seq on a held commit, must not alarm).
     if dag::is_ancestor(parents, &sibling.commit_id, our_head) {
         return Ok(MergeDecision::AlreadyHave);
     }
@@ -148,9 +127,8 @@ pub fn evaluate_merge(
         });
     }
 
-    // Gate 2a: every newly-accepted commit's version must exceed that device's high-water. Commits
-    // authored by the *local* device are exempt (see the fn docs): they appear as "new" only when our
-    // local history was lost (re-link/reinstall), and self-replay via a stale head is gate 2b's job.
+    // Gate 2a: every newly-accepted commit's version must exceed its device's high-water; the local
+    // device's own commits are exempt (fn docs).
     for c in new_commits(parents, our_head, &sibling.commit_id) {
         if let Some(meta) = commit_meta.get(&c) {
             if meta.device_id == *local_device {
@@ -194,10 +172,9 @@ pub fn evaluate_merge(
 }
 
 impl SyncFrontier {
-    /// Apply the §10 HWM update rule after accepting `sibling`: raise `roster_seq`, the sibling
-    /// device's `head_version` high-water, and the commit-`version` high-water of **every** device in
-    /// the sibling's transitively reachable commit chain (indirect observations count). Per §8.5 the
-    /// caller MUST seal the updated frontier before writing the local merge commit.
+    /// The §10 HWM update rule: raise `roster_seq`, the sibling's `head_version` high-water, and the
+    /// commit-version high-water of every device in its reachable chain. The caller MUST seal the
+    /// updated frontier before writing the merge commit (§8.5).
     pub fn observe(
         &mut self,
         sibling: &SiblingHead,
@@ -296,10 +273,8 @@ impl SyncFrontier {
     }
 }
 
-/// Seal the frontier as the §8.5 local-state blob `nonce(12) ‖ tag(16) ‖ ct` using the §9.8
-/// mutable-object AEAD (fresh OS-CSPRNG nonce per write — reuse is fatal) under `local_seal_key`
-/// ([`secsec_sig::DeviceKey::local_seal_key`]), with `device_id` as the AD (no FRAME, no signature —
-/// it is local-only and unsigned). Returns `None` on OS-RNG failure.
+/// Seal the frontier as the §8.5 local-state blob `nonce(12) ‖ tag(16) ‖ ct` (§9.8 AEAD, fresh
+/// OS-CSPRNG nonce per write, AD = `device_id`). `None` on RNG failure.
 #[must_use]
 pub fn seal_frontier(
     frontier: &SyncFrontier,
@@ -316,9 +291,8 @@ pub fn seal_frontier(
     Some(out)
 }
 
-/// Open a sealed frontier blob. A size/AEAD/canonical failure is a §8.5 **lost-frontier event** the
-/// caller must surface to the user (alarm + treat the session as a reinstall). The `device_id` AD
-/// binds the blob to this device, so another device's (or a tampered) state will not open.
+/// Open a sealed frontier blob. Any failure is a §8.5 **lost-frontier event**: the caller must
+/// alarm and treat the session as a reinstall. The `device_id` AD binds the blob to this device.
 pub fn open_frontier(
     local_seal_key: &[u8; 32],
     device_id: &DeviceId,

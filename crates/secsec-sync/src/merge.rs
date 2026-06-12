@@ -1,18 +1,7 @@
-//! Per-path three-way merge (`secsec-Design.md` §10). The data half of the rollback-aware merge: given
-//! a common-ancestor tree (`base`) and two divergent trees (`ours`, `theirs`), produce the merged
-//! tree and the list of conflicts, with **no silent data loss**.
-//!
-//! Per path (§10): a one-sided change is taken; an identical change on both sides is taken; a genuine
-//! divergence is a **keep-both conflict** — both versions are retained, the incoming one renamed
-//! `name.conflict-<label>.ext`. Directories that diverge are merged **recursively** rather than
-//! conflicted; only leaf/type divergences conflict. Timestamps are never trusted (§10): equality is
-//! by **content** (a file's chunk-id list, a directory's recursive content), so a pure mtime
-//! difference is not a conflict.
-//!
-//! This operates on an in-memory [`Node`] tree (the caller inlines fetched [`secsec_snapshot`] trees
-//! into it and re-seals the result); it is deliberately storage-free so the merge logic is pure and
-//! exhaustively testable. The rollback **gates** (roster_seq / version / head_version frontiers,
-//! §8.5/§10) and the ancestor-unavailable→all-keep-both fallback are separate concerns.
+//! Per-path three-way merge (`secsec-Design.md` §10), storage-free over in-memory [`Node`] trees.
+//! One-sided or identical change → take; genuine divergence → **keep-both conflict**
+//! (`name.conflict-<label>.ext`); divergent directories merge recursively. Equality is by content
+//! (chunk lists), never timestamps. The rollback gates live in [`crate::rollback`].
 
 use std::collections::BTreeMap;
 
@@ -33,9 +22,8 @@ pub enum Node {
         mtime: u64,
         /// Plaintext size.
         size: u64,
-        /// Per-file path salt that the `chunks` were sealed under — load-bearing for chunk-id
-        /// re-verification on restore (§9.2), so it rides with the file through merge/keep-both. Not
-        /// used for merge equality (content identity is the chunk list alone).
+        /// The salt the `chunks` were sealed under (needed to re-verify on restore, §9.2); rides
+        /// along, never part of merge equality.
         path_salt: PathSalt,
         /// Ordered chunk ids — the file's content identity.
         chunks: Vec<Id>,

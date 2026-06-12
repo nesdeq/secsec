@@ -1,9 +1,6 @@
-//! GC serialization hashes (`secsec-Design.md` §15). The canonical encodings that bind a `gc` call to
-//! the client's complete view of mutable state, so the server can only execute a sweep the client
-//! actually authorized (a compare-and-swap against `all_heads_hash`, `roster_seq`, `put_epoch`).
-//!
-//! All inputs are **order-canonicalized** here (ids sorted byte-lexicographically; head pairs sorted
-//! by ref hash), so the caller need not pre-sort and two clients with the same logical set agree.
+//! §15 GC serialization hashes: the canonical encodings binding a `gc` call to the client's view of
+//! the server's mutable state (the compare-and-swap). Inputs are order-canonicalized here, so two
+//! clients with the same logical set agree.
 
 use crate::{op, Id};
 use secsec_canon::Writer;
@@ -23,12 +20,9 @@ pub fn keep_set_hash(ids: &[Id]) -> [u8; 32] {
     *blake3::hash(&w.finish()).as_bytes()
 }
 
-/// `all_heads_hash = BLAKE3(le64(n) ‖ (ref_H[0] ‖ head_blob_hash[0]) ‖ …)` over all active refs, pairs
-/// **sorted by `ref_H`** ascending byte-lexicographically (§15). `head_blob_hash = BLAKE3(stored §9.8
-/// head blob)` is the **server-visible** per-ref token (the same value `cas-head` compares on) — it
-/// MUST be the blob hash, not the encrypted `head_version`, so the blind server can recompute it to
-/// verify the `gc` compare-and-swap. A single scalar can't serialize a multi-ref repo; this aggregate
-/// does. Duplicate ref hashes are folded (last wins after the stable sort by key).
+/// `all_heads_hash = BLAKE3(le64(n) ‖ (ref_H ‖ head_blob_hash)…)` over all active refs, sorted by
+/// `ref_H` (§15). MUST use the blob hash — the server-visible token it can recompute — never the
+/// encrypted `head_version`. Duplicate ref hashes fold.
 #[must_use]
 pub fn all_heads_hash(heads: &[(Id, [u8; 32])]) -> [u8; 32] {
     let mut sorted: Vec<(Id, [u8; 32])> = heads.to_vec();

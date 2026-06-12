@@ -1,15 +1,9 @@
 //! `secsec-frame` — object framing, type tags, and decoder bounds (`secsec-Design.md` §9.1, §19).
 //!
-//! Every stored object is `blob = FRAME ‖ ctx_tag(32) ‖ ciphertext`, where
-//! `FRAME = MAGIC(4) ‖ format_version(u8) ‖ algo_id(u8) ‖ gen(u32) ‖ type(u8)` (11 bytes).
-//!
-//! The `FRAME` doubles as the AEAD associated data (`AD = FRAME ‖ id`, §9.4), so framing,
-//! key derivation (`type`/`gen` feed `secsec-kdf`), and the committing AEAD are bound together.
-//!
-//! Two hard rules from the spec are enforced here:
-//! - **Don't trust attacker-set FRAME fields** (§18): [`parse_blob`] takes the `Frame` the client
-//!   *expects* for the id it requested and rejects any blob whose decoded FRAME differs.
-//! - **Bounds before allocation** (§9.1/§19): sizes are range-checked before any work.
+//! `blob = FRAME ‖ ctx_tag(32) ‖ ciphertext`; `FRAME = MAGIC ‖ format_version ‖ algo_id ‖ gen ‖
+//! type` (11 bytes), doubling as the AEAD AD (§9.4). Enforced here: never trust attacker-set FRAME
+//! fields ([`parse_blob`] checks against the *expected* frame, §18), and §19 bounds before
+//! allocation.
 
 #![forbid(unsafe_code)]
 

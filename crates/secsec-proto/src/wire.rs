@@ -478,12 +478,8 @@ pub enum Response {
     Exists(Vec<bool>),
     /// The write op (`cas-head`/`roster-append`/`gc`) was accepted.
     Ok,
-    /// A `put` was accepted, with its **arrival receipt** (§15): `arrival_gen` is the object's arrival
-    /// generation (the `put_epoch` it first landed at), `put_epoch` is the server's current global
-    /// counter. The client records these to derive a safe `gc_gen` and to bind the `gc` CAS. The
-    /// receipt is **signed** by the host receipt key (§15 defence-in-depth): `receipt_pubkey` is the
-    /// host's Ed25519 receipt key (all-zero if the server signs no receipts) and `signature` covers
-    /// `id ‖ host_id ‖ arrival_gen ‖ put_epoch ‖ ts` (see [`crate::receipt`]).
+    /// A `put` was accepted, with its signed §15 arrival receipt ([`crate::receipt`]) — the client
+    /// records it to derive `gc_gen` and bind the gc CAS.
     Stored {
         /// The object's arrival generation (its first-`put` epoch; idempotent puts keep the original).
         arrival_gen: u64,

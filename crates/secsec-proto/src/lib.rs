@@ -1,19 +1,9 @@
 //! `secsec-proto` — per-operation authorization for the server API (`secsec-Design.md` §12, §9.6).
 //!
-//! **Every** repo operation — including reads — requires a per-op signature from a key that owns a
-//! keyslot (a rostered device); connection-level auth alone is not enough (§12). This crate builds
-//! the two signed payloads and the per-op `args_hash` that binds the exact operation:
-//!
-//! - **Write** ops (`put`, `cas-head`, `roster-append`, `gc`): sign under [`secsec_sig::NS_WRITE`]
-//!   over `op ‖ args_hash ‖ session_transcript ‖ server_nonce` (§9.6). The server supplies only the
-//!   fresh single-use `server_nonce`; the client constructs `op`/`args`.
-//! - **Read** ops (`get`, `has`): sign under [`secsec_sig::NS_READ`] over
-//!   `op ‖ args_hash ‖ session_transcript`. No `server_nonce` — `session_transcript` provides
-//!   per-connection freshness (§9.6).
-//!
-//! The `args_hash` per op is the normative §12 binding: `put`/`cas-head`/`roster-append`/`get`/`has`
-//! here, and `gc`'s §15 serialization (`keep_set_hash`, `all_heads_hash`, `args_gc`) in [`gc`]. The
-//! GC *executor* (keep-set traversal, generation/grace sweep) lives in `secsec-store`/`secsec-server`.
+//! Every repo op — reads included — requires a per-op signature from a keyslot-owning key. Writes
+//! sign `op ‖ args_hash ‖ session_transcript ‖ server_nonce` (`NS_WRITE`); reads drop the nonce
+//! (`NS_READ`). The per-op `args_hash` bindings are the normative §12 set; gc's §15 state-bound
+//! serialization is in [`gc`]; the GC executor lives in `secsec-store`/`secsec-server`.
 
 #![forbid(unsafe_code)]
 
@@ -178,10 +168,8 @@ pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
             w.raw(op::GET_KEYHIST.as_bytes()).u32(*gen);
             (op::GET_KEYHIST, blake3_of(&w.finish()), false)
         }
-        // gc's real args_hash binds the SERVER's all_heads_hash/roster_seq/put_epoch (a §15
-        // compare-and-swap), so it is computed in the server's gc handler and the client's gc driver,
-        // NOT here. `handle` dispatches Gc before reaching op_and_args; this keep_set+gc_gen-only
-        // binding is never the gc authorization source.
+        // gc's REAL binding is the state-bound args_gc (§15), computed in the server's gc handler
+        // and the client's gc driver — never this placeholder (handle dispatches Gc before here).
         Request::Gc { keep_set, gc_gen } => {
             let mut w = Writer::new();
             w.raw(op::GC.as_bytes())

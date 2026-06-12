@@ -1,20 +1,9 @@
-//! `secsec-canon` — canonical, deterministic wire encoding for hashed / signed /
-//! content-addressed structures (`secsec-Design.md` §9.3).
+//! `secsec-canon` — canonical, deterministic wire encoding (`secsec-Design.md` §9.3).
 //!
-//! Guarantees this layer provides:
-//!
-//! - **Deterministic.** Two encoders produce byte-identical output for the same value — ids
-//!   and signatures depend on it.
-//! - **Canonical by construction.** Fixed-width little-endian integers (no varints, hence no
-//!   non-minimal integer encodings), a fixed field order set by the calling code, no floats,
-//!   and no self-describing type tags.
-//! - **Strict decode.** Every length prefix is bounded by an explicit caller-supplied maximum
-//!   (alloc-bomb guard, §9.1/§19), truncated input is rejected, and a fully decoded buffer MUST
-//!   be exhausted via [`Reader::finish`] — trailing bytes are an error.
-//!
-//! ids and signatures are computed over the exact bytes produced by [`Writer`]. On the verify
-//! path, [`verify_reencode`] confirms a decoded value re-encodes to the bytes that were actually
-//! received, closing the malleability gap (§9.3 "two encoders must produce identical bytes").
+//! Fixed-width little-endian integers, fixed field order, no floats, no type tags. Decoding is
+//! strict: length prefixes are bounded before allocation (§19), truncation is rejected, and a
+//! decoded buffer must be exhausted via [`Reader::finish`]. [`verify_reencode`] is the §9.3
+//! malleability guard on the verify path.
 
 #![forbid(unsafe_code)]
 
@@ -68,9 +57,8 @@ impl fmt::Display for CanonError {
 
 impl std::error::Error for CanonError {}
 
-/// Canonical encoder. Append fields in a fixed order; the resulting byte layout *is* the
-/// encoding. There is no schema metadata on the wire, so the decoder must read the same fields
-/// in the same order.
+/// Canonical encoder. Append fields in a fixed order; the byte layout *is* the encoding (no
+/// schema on the wire — the decoder reads the same fields in the same order).
 #[derive(Debug, Default, Clone)]
 pub struct Writer {
     buf: Vec<u8>,
@@ -231,13 +219,9 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Malleability guard for the verify path. Confirms that re-encoding `value` with `encode`
-/// reproduces the exact `received` bytes; returns [`CanonError::NonCanonical`] otherwise.
-///
-/// Use this before trusting a signature or id that was computed over `received`: it ensures the
-/// bytes we verified are the unique canonical encoding of the value we parsed, so an attacker
-/// cannot present a second, non-canonical encoding of the same logical value. The comparison is
-/// over public serialized bytes (no secrets), so a non-constant-time compare is appropriate.
+/// §9.3 malleability guard: re-encoding `value` must reproduce the exact `received` bytes, else
+/// [`CanonError::NonCanonical`]. Call before trusting a signature/id computed over `received`.
+/// Public bytes only, so a non-constant-time compare is fine.
 pub fn verify_reencode<T>(
     received: &[u8],
     value: &T,
