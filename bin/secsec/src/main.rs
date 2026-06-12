@@ -462,6 +462,14 @@ async fn run_serve(dir: PathBuf, port: u16) -> Result<(), Box<dyn Error>> {
     let mut last_prune = 0u64;
     while let Some(incoming) = endpoint.accept().await {
         let now = unix_secs();
+        // §11 DoS hardening: validate the source address with a stateless QUIC Retry before allocating
+        // connection state or trusting the per-IP rate counter. Until the client echoes a Retry token,
+        // its source address is unverified (spoofable), so this both provides anti-amplification and
+        // makes the per-source-IP rate limit meaningful (a spoofed IP cannot exhaust another's budget).
+        if !incoming.remote_address_validated() {
+            let _ = incoming.retry();
+            continue;
+        }
         let ip = incoming.remote_address().ip();
         if now.saturating_sub(last_prune) >= 1 {
             ip_rate.retain(|_, c| c.count(now) > 0);

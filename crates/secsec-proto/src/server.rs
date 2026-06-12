@@ -222,7 +222,17 @@ impl WindowCounter {
     }
 }
 
-/// A simple per-key storage accumulator against a fixed `limit` (§19 per-key quota).
+/// A per-key **new-write** accumulator against a fixed `limit` (§19 per-key quota), tracking the
+/// bytes a key has introduced **this server session**.
+///
+/// Scope (normative). The store is content-addressed and deduplicated, so an object is not owned by
+/// the key that wrote it (another key's tree may reference it) — a precise durable per-key byte
+/// attribution is therefore undefined. This quota instead bounds the volume of *new* objects a single
+/// key introduces within one server lifetime (an anti-flood cap), and is reset on restart. Durable
+/// protection against disk exhaustion is the operator's responsibility via an OS/filesystem quota on
+/// the store directory (the standard control for a self-hosted single-user server, §14); the §19
+/// per-key value is this session cap. Idempotent re-puts are not charged (the server only calls
+/// [`Self::try_add`] for genuinely new objects).
 #[derive(Debug, Clone)]
 pub struct StorageQuota {
     limit: u64,

@@ -249,7 +249,10 @@ fn validate_entry_name(name: &str) -> Result<(), SnapError> {
         || name == ".."
         || name.contains('/')
         || name.contains('\\')
-        || name.contains('\0')
+        // Reject all C0 control characters (incl. NUL) and DEL: a control byte in a restored name is
+        // almost never a legitimate file and is dangerous when the name is later printed (terminal
+        // escape injection) or written cross-platform (§18 hardening).
+        || name.chars().any(|c| c.is_control())
     {
         return Err(SnapError::Malformed("unsafe tree entry name"));
     }
@@ -435,10 +438,16 @@ pub fn verify_commit(
 
 // ---- snapshot ----
 
+/// The recorded permission bits for a path. Only the **9 standard permission bits** (`rwxrwxrwx`,
+/// `0o777`) are captured: the file-type bits are redundant (the entry kind already says file vs dir),
+/// and the **setuid / setgid / sticky** bits are deliberately dropped (§18, restore hardening) — a
+/// compromised member (§3) could otherwise author a tree that plants a setgid/setuid file on every
+/// device's disk. Masking here (snapshot) and in [`apply_metadata`] (restore) is symmetric, so
+/// snapshot→restore→snapshot stays idempotent.
 #[cfg(unix)]
 fn mode_of(meta: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode()
+    meta.permissions().mode() & 0o0777
 }
 #[cfg(not(unix))]
 fn mode_of(_meta: &std::fs::Metadata) -> u32 {
@@ -756,8 +765,10 @@ fn apply_metadata(path: &Path, mode: u32, mtime: u64) -> Result<(), SnapError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Apply only the 9 standard permission bits; never restore setuid/setgid/sticky from a
+        // member-authored tree (§18 — matches the mask in `mode_of`).
         if mode != 0 {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o0777))?;
         }
     }
     #[cfg(not(unix))]
@@ -1277,6 +1288,10 @@ mod tests {
             "/abs",
             "back\\slash",
             "nul\0byte",
+            "tab\there", // control characters are rejected (terminal-escape / cross-platform safety)
+            "bell\x07",
+            "esc\x1b[2J",
+            "del\x7f",
         ] {
             assert!(
                 matches!(
@@ -1288,6 +1303,38 @@ mod tests {
         }
         // a benign single-component name still decodes.
         assert!(decode_tree(&encode_tree(&one("ok.txt"))).is_ok());
+    }
+
+    /// Restore hardening (§18): setuid / setgid / sticky bits in a member-authored tree are stripped —
+    /// only the 9 standard permission bits are applied, so a compromised member cannot plant a
+    /// setgid/setuid file on every device.
+    #[cfg(unix)]
+    #[test]
+    fn restore_strips_setuid_setgid_sticky() {
+        use std::os::unix::fs::PermissionsExt;
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let m = mk();
+        // A hand-built tree entry carrying setuid+setgid+sticky (0o7000) plus rwxr-xr-x.
+        let tree = Tree {
+            entries: vec![Entry::File {
+                name: "x".into(),
+                mode: 0o7755,
+                mtime: 0,
+                size: 0,
+                path_salt: [0u8; 16],
+                chunks: vec![],
+            }],
+        };
+        let (id, salt) = seal_tree(&tree, &m, &store).unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        restore_tree_into(&id, &salt, &m, &store, dst.path()).unwrap();
+        let mode = std::fs::metadata(dst.path().join("x"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7000, 0, "setuid/setgid/sticky must be stripped");
+        assert_eq!(mode & 0o0777, 0o0755, "standard permission bits preserved");
     }
 
     /// Canonical ordering (§9.3 "no duplicate keys", deterministic order): `decode_tree` MUST reject
