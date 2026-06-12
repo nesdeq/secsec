@@ -125,17 +125,21 @@ pub fn evaluate_merge(
     parents: &ParentMap,
     commit_meta: &BTreeMap<Id, CommitMeta>,
 ) -> Result<MergeDecision, MergeReject> {
-    // Gate 1: roster_seq frontier.
+    // Nothing new to accept: the sibling is an ancestor of (or equal to) our head, so adopting it
+    // changes no state. This is checked **before** the gates: a commit we already contain can never
+    // be a rollback, and a device that merely folds the roster later than we do (so it stamps an older
+    // `roster_seq` on a head we already hold) must not trip the gate-1 alarm. Gate 1 only guards the
+    // adoption of genuinely *new* sibling state below.
+    if dag::is_ancestor(parents, &sibling.commit_id, our_head) {
+        return Ok(MergeDecision::AlreadyHave);
+    }
+
+    // Gate 1: roster_seq frontier — reject sibling state authored under a roster older than ours.
     if sibling.roster_seq < frontier.roster_seq {
         return Err(MergeReject::RosterRollback {
             sibling: sibling.roster_seq,
             frontier: frontier.roster_seq,
         });
-    }
-
-    // Nothing new to accept: the sibling is behind or equal.
-    if dag::is_ancestor(parents, &sibling.commit_id, our_head) {
-        return Ok(MergeDecision::AlreadyHave);
     }
 
     // Gate 2a: every newly-accepted commit's version must exceed that device's high-water.
@@ -397,6 +401,28 @@ mod tests {
                 &g,
                 &meta(&[(1, 1, 1), (2, 2, 1), (3, 1, 2)])
             ),
+            Ok(MergeDecision::AlreadyHave)
+        );
+    }
+
+    /// A sibling we already contain must be `AlreadyHave` even when it carries an **older** `roster_seq`
+    /// than our frontier (a peer that folded the roster later than we did). It must NOT trip gate 1's
+    /// rollback alarm — adopting a commit already in our history changes nothing (regression for M3).
+    #[test]
+    fn already_held_ancestor_with_stale_roster_seq_is_not_a_rollback() {
+        let g = dag(&[(2, &[1]), (3, &[2])]); // our head 3 descends from sibling 2
+        let f = SyncFrontier {
+            roster_seq: 7, // we have advanced past the sibling's roster_seq
+            ..Default::default()
+        };
+        let sib = SiblingHead {
+            device_id: dev(2),
+            head_version: 1,
+            roster_seq: 4, // below our frontier — would trip gate 1 if checked first
+            commit_id: id(2),
+        };
+        assert_eq!(
+            evaluate_merge(&f, &id(3), &sib, &g, &meta(&[(2, 2, 1), (3, 1, 2)])),
             Ok(MergeDecision::AlreadyHave)
         );
     }

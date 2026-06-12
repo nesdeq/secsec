@@ -756,30 +756,57 @@ mod tests {
         let store = Store::open(dir.path().join("s.redb")).unwrap();
         let m = mk();
         let dev_a = DeviceKey::generate().unwrap();
+        let dev_b = DeviceKey::generate().unwrap();
 
+        // base, then our commit and a DIVERGENT sibling commit — gate 1 only applies to genuinely new
+        // sibling state (a sibling we already hold short-circuits to AlreadyHave, not a rollback).
         let base = tempfile::tempdir().unwrap();
         std::fs::write(base.path().join("f"), b"0").unwrap();
-        let (base_id, _, _) =
+        let (base_id, bt, bs) =
             commit_dir(base.path(), None, &dev_a, 1, vec![], [0u8; 32], &m, &store);
+        let ours = tempfile::tempdir().unwrap();
+        std::fs::write(ours.path().join("f"), b"a").unwrap();
+        let (ours_id, _, _) = commit_dir(
+            ours.path(),
+            Some((&bt, &bs)),
+            &dev_a,
+            2,
+            vec![base_id],
+            base_id,
+            &m,
+            &store,
+        );
+        let theirs = tempfile::tempdir().unwrap();
+        std::fs::write(theirs.path().join("f"), b"b").unwrap();
+        let (theirs_id, _, _) = commit_dir(
+            theirs.path(),
+            Some((&bt, &bs)),
+            &dev_b,
+            1,
+            vec![base_id],
+            base_id,
+            &m,
+            &store,
+        );
 
-        // frontier roster_seq=5; sibling presents roster_seq=4 → gate 1 alarm.
+        // frontier roster_seq=5; the divergent sibling presents roster_seq=4 → gate 1 alarm.
         let frontier = SyncFrontier {
             roster_seq: 5,
             ..Default::default()
         };
         let sibling = SiblingHead {
-            device_id: dev_a.device_id().unwrap(),
+            device_id: dev_b.device_id().unwrap(),
             head_version: 1,
             roster_seq: 4,
-            commit_id: base_id,
+            commit_id: theirs_id,
         };
         let author = CommitAuthor {
             device: &dev_a,
-            version: 2,
+            version: 3,
             roster_seq: 4,
             ts: 0,
         };
-        let err = merge_heads(&frontier, &base_id, &sibling, author, &m, &store).unwrap_err();
+        let err = merge_heads(&frontier, &ours_id, &sibling, author, &m, &store).unwrap_err();
         assert!(matches!(
             err,
             MergeError::Rollback(MergeReject::RosterRollback {

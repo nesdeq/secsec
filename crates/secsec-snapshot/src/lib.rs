@@ -113,8 +113,6 @@ pub enum SnapError {
     Malformed(&'static str),
     /// Tree nesting exceeded `MAX_TREE_DEPTH`.
     DepthExceeded,
-    /// A directory entry was neither a regular file nor a directory.
-    UnsupportedFileType,
     /// A file name was not valid UTF-8.
     NonUtf8Name,
     /// OS RNG failure.
@@ -137,7 +135,6 @@ impl core::fmt::Display for SnapError {
             SnapError::Missing(_) => f.write_str("required object missing from store"),
             SnapError::Malformed(s) => write!(f, "malformed: {s}"),
             SnapError::DepthExceeded => f.write_str("tree nesting too deep"),
-            SnapError::UnsupportedFileType => f.write_str("unsupported file type"),
             SnapError::NonUtf8Name => f.write_str("non-UTF-8 file name"),
             SnapError::Rng => f.write_str("OS RNG failure"),
             SnapError::BadSignature => f.write_str("commit signature invalid or wrong author"),
@@ -615,9 +612,10 @@ fn snapshot_dir(
                 subtree,
                 subtree_salt,
             });
-        } else {
-            return Err(SnapError::UnsupportedFileType);
         }
+        // Anything else — a symlink, FIFO, socket, or device node — is **skipped**, not synced (the
+        // object model is regular files + directories only, §6). A single unsupported entry must not
+        // fail the whole snapshot; restore leaves any such on-disk entry on peers untouched.
     }
 
     let tree = Tree { entries };
@@ -657,13 +655,14 @@ fn restore_tree<K: MasterKeys>(
 
     // Reconcile the directory **to** the tree: remove any on-disk child whose name is not a tree
     // entry. Without this, restore is additive — a file deleted upstream is never removed, and the
-    // next snapshot re-adds it (a deletion that silently resurrects). Classify each extra with
-    // `symlink_metadata` so a symlink-to-directory is unlinked, never traversed into.
+    // next snapshot re-adds it (a deletion that silently resurrects). Symlinks and special files are
+    // **not tracked** by snapshots (they are skipped), so they are left untouched here — only the
+    // regular files and real directories secsec actually syncs are reconciled.
     let keep: std::collections::BTreeSet<&str> = tree.entries.iter().map(entry_name).collect();
     for ent in std::fs::read_dir(dir)? {
         let ent = ent?;
         let on_disk = ent.file_name();
-        // A non-UTF-8 on-disk name can never be a (UTF-8) tree entry, so it is an extra → remove.
+        // A non-UTF-8 on-disk name can never be a (UTF-8) tree entry, so it is an extra.
         let is_kept = on_disk.to_str().is_some_and(|n| keep.contains(n));
         if !is_kept {
             remove_extra(&ent.path())?;
@@ -689,14 +688,11 @@ fn restore_tree<K: MasterKeys>(
                     return Err(SnapError::Malformed("restored file size mismatch"));
                 }
                 let path = dir.join(name);
-                // A name that was a directory upstream but is now a file: clear the directory first
-                // (a plain `write` over a directory fails). Use `symlink_metadata` so a symlink there
-                // is removed as a link, not followed.
-                if let Ok(meta) = std::fs::symlink_metadata(&path) {
-                    if meta.file_type().is_dir() {
-                        std::fs::remove_dir_all(&path)?;
-                    }
-                }
+                // Clear anything at this path that is not already a regular file: a directory (upstream
+                // type-changed dir→file) is removed recursively, and a **symlink** is unlinked rather
+                // than followed — otherwise `write` would dereference the link and clobber its target
+                // outside the synced folder.
+                clear_for_regular_file(&path)?;
                 std::fs::write(&path, &data)?;
                 apply_metadata(&path, *mode, *mtime)?;
             }
@@ -708,8 +704,8 @@ fn restore_tree<K: MasterKeys>(
                 subtree_salt,
             } => {
                 let path = dir.join(name);
-                // A name that was a file/symlink upstream but is now a directory: remove it so
-                // `create_dir_all` inside the recursion can take its place.
+                // A name that was a file/symlink upstream but is now a directory: remove it (a symlink
+                // as a link, never followed) so `create_dir_all` inside the recursion can take its place.
                 if let Ok(meta) = std::fs::symlink_metadata(&path) {
                     if !meta.file_type().is_dir() {
                         std::fs::remove_file(&path)?;
@@ -724,15 +720,30 @@ fn restore_tree<K: MasterKeys>(
     Ok(())
 }
 
-/// Remove an on-disk path that is not in the restored tree (a deletion to apply). A real directory is
-/// removed recursively; a file **or a symlink** (even one pointing at a directory) is unlinked with
-/// `remove_file`, so restore never follows a symlink out of the synced folder to delete its target.
+/// Remove an on-disk path that is not in the restored tree (a deletion to apply). Only the kinds
+/// secsec tracks are removed: a regular **file** is unlinked and a real **directory** is removed
+/// recursively. A **symlink** or special file (FIFO/socket/device) is left untouched — snapshots skip
+/// those, so they were never synced and are not secsec's to delete (and a symlink is never traversed).
 fn remove_extra(path: &Path) -> Result<(), SnapError> {
-    let meta = std::fs::symlink_metadata(path)?;
-    if meta.file_type().is_dir() {
+    let ft = std::fs::symlink_metadata(path)?.file_type();
+    if ft.is_dir() {
         std::fs::remove_dir_all(path)?;
-    } else {
+    } else if ft.is_file() {
         std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+/// Ensure `path` is free for writing a regular file: a real directory is removed recursively; a
+/// symlink or special file is unlinked (never followed). A path that is already a regular file, or
+/// absent, is left for `write` to overwrite/create.
+fn clear_for_regular_file(path: &Path) -> Result<(), SnapError> {
+    if let Ok(ft) = std::fs::symlink_metadata(path).map(|m| m.file_type()) {
+        if ft.is_dir() {
+            std::fs::remove_dir_all(path)?;
+        } else if !ft.is_file() {
+            std::fs::remove_file(path)?;
+        }
     }
     Ok(())
 }
@@ -1643,5 +1654,46 @@ mod tests {
             ts: 0,
         };
         seal_signed_commit(m, store, &dev, &commit).unwrap()
+    }
+
+    /// A symlink (or special file) must not fail the whole snapshot — it is skipped, not synced. And on
+    /// restore, an untracked symlink in the destination is left alone (snapshots never tracked it), while
+    /// a tracked file that disappeared upstream is removed.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_skipped_and_untracked_ones_survive_restore() {
+        use std::os::unix::fs::symlink;
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let m = mk();
+
+        // Source: a real file plus a symlink — the snapshot must succeed and track only the file.
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("real.txt"), b"data").unwrap();
+        symlink("real.txt", src.path().join("link")).unwrap();
+        let (rt, rs) = snapshot_tree(src.path(), &m, &store, None).unwrap();
+        let tree = load_tree(&rt, &rs, &m, &store).unwrap();
+        let names: Vec<&str> = tree.entries.iter().map(entry_name).collect();
+        assert_eq!(
+            names,
+            vec!["real.txt"],
+            "the symlink is skipped, the file is tracked"
+        );
+
+        // Destination already holds its own untracked symlink and a now-deleted-upstream file.
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(dst.path().join("stale.txt"), b"old").unwrap();
+        symlink("/nonexistent-target", dst.path().join("mylink")).unwrap();
+        restore_tree_into(&rt, &rs, &m, &store, dst.path()).unwrap();
+
+        assert_eq!(std::fs::read(dst.path().join("real.txt")).unwrap(), b"data");
+        assert!(
+            !dst.path().join("stale.txt").exists(),
+            "a tracked file gone upstream is removed on restore"
+        );
+        assert!(
+            std::fs::symlink_metadata(dst.path().join("mylink")).is_ok(),
+            "an untracked symlink in the destination is preserved (never secsec's to delete)"
+        );
     }
 }

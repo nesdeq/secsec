@@ -230,6 +230,45 @@ fn state_dir_for(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
     Ok(sdir)
 }
 
+/// The per-repository (RFP-keyed) registry of ref names this machine has synced into one repo. The
+/// blind server has no `list` op and ref names live only in clients, so a single folder's sync cannot
+/// enumerate the repo's other refs — yet GC's keep-set must cover **all** of them (§15) or it could
+/// delete another ref's objects. This registry, shared across the per-folder state dirs of one repo,
+/// lets the auto-GC keep every ref this machine knows; an unknown other-machine ref makes GC fail safe
+/// (its objects aren't local, so the keep-set can't be built → no sweep). Ref names are not secret to
+/// this machine, so it is a plain local file (one name per line), like the §15 receipt log.
+fn repo_refs_path(rfp: &[u8; 32]) -> Result<PathBuf, Box<dyn Error>> {
+    let dir = home()?.join(".local/state/secsec/refs");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join(hex(rfp)))
+}
+
+/// The ref names this machine has synced into the repo anchored by `rfp` (empty if none/unreadable).
+fn read_repo_refs(rfp: &[u8; 32]) -> Vec<String> {
+    let Ok(path) = repo_refs_path(rfp) else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(path)
+        .map(|s| {
+            s.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Record `ref_name` in the repo's ref registry (idempotent; the file stays sorted + deduplicated).
+fn record_repo_ref(rfp: &[u8; 32], ref_name: &str) -> Result<(), Box<dyn Error>> {
+    let mut refs: std::collections::BTreeSet<String> = read_repo_refs(rfp).into_iter().collect();
+    if refs.insert(ref_name.to_string()) {
+        let body: String = refs.iter().map(|r| format!("{r}\n")).collect();
+        std::fs::write(repo_refs_path(rfp)?, body)?;
+    }
+    Ok(())
+}
+
 /// Resolve `host[:port]` (default port 8899) to a socket address.
 fn resolve_server(s: &str) -> Result<SocketAddr, Box<dyn Error>> {
     let with_port = if s
@@ -544,6 +583,10 @@ async fn run_sync(
     // The roster_seq stamped on commits/heads is the current sigchain tip (drives §10 gate 1).
     let mut roster_seq = anchor.max_seq;
 
+    // Record this folder's ref in the repo's ref registry so the auto-GC keep-set can cover every ref
+    // this machine syncs into the repo — never deleting another ref's objects (§15).
+    let _ = record_repo_ref(&rfp, &ref_name);
+
     let mut keyring = data_keyring_remote(&rem, &mk).await?;
     let store = Store::open(sdir.join("objects.secsec"))?;
     let frontier_path = sdir.join("frontier");
@@ -782,13 +825,18 @@ async fn run_sync(
                                 let roster_seq =
                                     fetch_roster_entries(&rem).await?.len().saturating_sub(1)
                                         as u64;
+                                // Keep-set spans **every** ref this machine knows for the repo (§15):
+                                // with multiple refs whose objects are not all in this folder's cache,
+                                // `gc_collect` fails safe (can't build the full keep-set → no sweep)
+                                // rather than deleting another ref's objects.
+                                let names = read_repo_refs(&rfp);
+                                let name_refs: Vec<&str> = if names.is_empty() {
+                                    vec![ref_name.as_str()]
+                                } else {
+                                    names.iter().map(String::as_str).collect()
+                                };
                                 secsec_client::gc::gc_collect(
-                                    &rem,
-                                    &store,
-                                    &keyring,
-                                    &[ref_name.as_str()],
-                                    gc_gen,
-                                    roster_seq,
+                                    &rem, &store, &keyring, &name_refs, gc_gen, roster_seq,
                                     put_epoch,
                                 )
                                 .await?;
