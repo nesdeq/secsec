@@ -1,8 +1,8 @@
 # secsec
 
-**Self-hosted, zero-knowledge, end-to-end-encrypted, live two-way file sync.** One static Rust
-binary is both server and client. The server is **blind**: it stores only ciphertext and can neither
-read nor forge your data. The only credential is your **SSH key**.
+**Self-hosted, zero-knowledge, end-to-end-encrypted, live two-way file sync.** One static binary is
+both server and client. The server is **blind**: it stores only ciphertext and can neither read nor
+forge your data. The only credential is your **SSH key**.
 
 - **Zero-knowledge server** — content *and* metadata (names, structure, sizes within padding bounds)
   are encrypted; the server holds opaque, content-addressed blobs.
@@ -21,54 +21,161 @@ assurance strategy are in [`secsec-Implementation.md`](secsec-Implementation.md)
 > professional cryptographic review** — do not trust it with irreplaceable data until it has.
 > Durability rests on your device replicas and SSH-key backup, not on server replication.
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nesdeq/secsec/main/install.sh | sh
+```
+
+Detects OS/arch (Linux/macOS, x86_64/aarch64), fetches the latest
+[release](https://github.com/nesdeq/secsec/releases), verifies its checksum, and installs to
+`/usr/local/bin` or `~/.local/bin` (override with `SECSEC_INSTALL_DIR`). Windows: download the
+`.zip` from the releases page. Building from source instead: `cargo build --release`.
+
 ## Quick start
 
+All examples use `server.example` as the server and the default port (udp/8899). Conventions:
+`<arg>` is required, `[arg]` is optional, `[dir]` defaults to the current directory.
+
+**Device keys.** Each device uses its standard SSH key, `~/.ssh/id_ed25519`. A device that doesn't
+have one yet generates it the usual way (it's a normal SSH key — usable for ssh too; a passphrase is
+fine, secsec prompts for it):
+
 ```sh
-cargo build --release        # → target/release/secsec
+ssh-keygen -t ed25519               # creates ~/.ssh/id_ed25519 and ~/.ssh/id_ed25519.pub
 ```
 
-**1 — Server.** List each device's *public* key in `~/.ssh/authorized_keys` (standard OpenSSH
-format; re-read on every connection, so changes need no restart), then:
+**Server.** The connection gate is the `~/.ssh/authorized_keys` of the user running `secsec serve` —
+the same file sshd uses, so any key that can already SSH into that account is **accepted by
+default**. Append only the keys not already in it (each device's `id_ed25519.pub`); the file is
+re-read on every connection (no restart needed).
 
 ```sh
-secsec serve /srv/data            # prints the host pin — verify it out-of-band
+cat laptop.pub phone.pub >> ~/.ssh/authorized_keys   # the devices' id_ed25519.pub files
+secsec serve /srv/data                               # prints the host pin
 ```
 
-**2 — First device.** The first device to sync creates the repository:
+**First device** — creates the repository:
 
 ```sh
-secsec sync ~/Sync --server server.example:8899
-# "created new repository" → continuous sync; Ctrl-C to stop. Later just: secsec sync ~/Sync
+secsec sync ~/Sync --server server.example
 ```
 
-Compare the fingerprint it prints (`secsec hostpin ~/Sync` re-shows it) against the server's
-`host pin` to rule out a first-contact MITM.
+Compare the fingerprint it prints against the server's `host pin` out-of-band (later:
+`secsec hostpin ~/Sync`) to rule out a first-contact MITM.
 
-**3 — More devices.** Add the new device's public key to the server's `authorized_keys`, then:
+**Every further device** — authorize its key on the server (above), then pair with a one-time code:
 
 ```sh
-secsec invite ~/Sync                                            # on an enrolled device: prints a one-time code, waits
-secsec sync ~/Sync --server server.example:8899 --invite <code> # on the new device
+secsec invite ~/Sync                                          # on an enrolled device: prints a code, waits
+secsec sync ~/Sync --server server.example --invite <code>    # on the new device
 ```
 
 The code authenticates the join end-to-end through the blind server (which never learns it), so the
-server cannot swap the new device's key or serve a fake repository.
+server cannot swap the new device's key or serve a fake repository. From then on, each device just
+runs `secsec sync ~/Sync`.
 
-## Command reference
+## Commands
 
-`<arg>` required · `[arg]` optional · `[dir]` defaults to the current directory.
+### `secsec serve [dir] [port]`
 
-| Command | What it does |
-|---|---|
-| `serve [dir] [port]` | Run the blind server. Stores the encrypted repo (`repo.secsec`) and host key under `dir`; listens on UDP `port` (default 8899). Refuses to start without a usable `~/.ssh/authorized_keys`. |
-| `sync [dir] [--server host[:port]] [--invite code] [--once]` | Link `dir` to a repo and sync continuously. `--server` is required only the first time; `--invite` joins an existing repo; `--once` syncs once and exits instead of watching. |
-| `invite [dir]` | Print a one-time invite code and wait for the new device to pair. Run on an enrolled device. |
-| `devices [dir]` | List enrolled devices: short id + `SHA256:…` SSH fingerprint, with a marker for the current device. |
-| `revoke <device> [dir]` | Revoke a device by id prefix (from `devices`): rotates the master key away from it so it cannot read anything written afterward. Then remove its key from the server's `authorized_keys`. Self-revocation is refused. |
-| `hostpin [dir]` | Show the host pin this folder trusts (offline), for out-of-band comparison with the server's printed `host pin`. |
-| `log [path]` | Change log of the whole repo, or the version history of one file/folder. Run **inside** the synced folder. |
-| `restore <path> [version]` | Write a historic version of `path` back into the working folder; the next sync propagates it like any edit. `version` is a commit-id prefix from `log`; omit it for the previous version (or, if `path` was deleted, the last version that existed). Run **inside** the synced folder. |
-| `reset [dir] [-y/--yes]` | Wipe secsec's state at `dir` — the client link/cache of a synced folder and/or a server's repo + host key — leaving your files and `~/.ssh` untouched. Prompts unless `-y`. Stop a running sync/serve first. |
+Run the blind server. Stores the encrypted repo (`repo.secsec`) and host key under `dir`; refuses to
+start without a usable `~/.ssh/authorized_keys`.
+
+```sh
+secsec serve                        # serve ./ on udp/8899
+secsec serve /srv/data              # serve /srv/data on udp/8899
+secsec serve /srv/data 9000         # custom port
+```
+
+### `secsec sync [dir] [--server host[:port]] [--invite code] [--once]`
+
+Link a folder to a repo and keep it in continuous two-way sync (watches for changes; Ctrl-C stops).
+`--server` is needed only the first time — the link is remembered per folder. The first device to
+reach an empty server creates the repository; joining an existing one requires `--invite`.
+
+```sh
+secsec sync                                                   # sync ./ (already linked)
+secsec sync ~/Sync                                            # sync a linked folder
+secsec sync ~/Sync --server server.example                    # first time: create the repo
+secsec sync ~/Sync --server server.example --invite <code>    # first time: join an existing repo
+secsec sync ~/Sync --once                                     # one pass, then exit (cron/scripts)
+```
+
+### `secsec invite [dir]`
+
+Print a one-time invite code and wait for the new device to pair (it runs `sync --invite`). Run on
+an enrolled device.
+
+```sh
+secsec invite                       # invite into the repo ./ is linked to
+secsec invite ~/Sync                # invite into the repo ~/Sync is linked to
+```
+
+### `secsec devices [dir]`
+
+List enrolled devices: short device id + `SHA256:…` SSH fingerprint (as `ssh-keygen -lf` prints it),
+with a marker for the current device.
+
+```sh
+secsec devices
+secsec devices ~/Sync
+```
+
+### `secsec revoke <device> [dir]`
+
+Revoke a device by id prefix (from `devices`): rotates the master key away from it, so it cannot
+read anything written afterward. Self-revocation is refused. Afterwards, remove its key from the
+server's `authorized_keys` so it cannot reconnect.
+
+```sh
+secsec revoke 3fa8                  # device-id prefix; repo of ./
+secsec revoke 3fa8 ~/Sync           # repo of ~/Sync
+```
+
+### `secsec hostpin [dir]`
+
+Show the host pin this folder trusts (offline — reads the local link). Compare it out-of-band with
+the `host pin` the server prints on startup.
+
+```sh
+secsec hostpin
+secsec hostpin ~/Sync
+```
+
+### `secsec log [path]`
+
+Change log of the whole repo, or the version history of one file/folder. Run **inside** the synced
+folder.
+
+```sh
+secsec log                          # whole repo, newest first
+secsec log notes.md                 # one file's versions
+secsec log docs/                    # one folder's versions
+```
+
+### `secsec restore <path> [version]`
+
+Write a historic version of `path` back into the working folder; the next sync propagates it like
+any edit. Without `version`: the previous version — or, if `path` was deleted, the last version that
+existed (undo-delete). Run **inside** the synced folder.
+
+```sh
+secsec restore notes.md             # previous version (or undo a deletion)
+secsec restore notes.md 3fa8b2      # version at a commit-id prefix from `secsec log notes.md`
+secsec restore docs/                # restore a whole folder
+```
+
+### `secsec reset [dir] [-y|--yes]`
+
+Wipe secsec's state at `dir` — the client link/cache of a synced folder, and/or a server's
+`repo.secsec` + host key — leaving your files and `~/.ssh` untouched. Prompts with the exact paths
+unless `-y`. Stop a running sync/serve first.
+
+```sh
+secsec reset                        # reset ./ (asks first)
+secsec reset ~/Sync -y              # no prompt
+```
 
 Every command supports `--help`. There is no `gc` command — garbage collection runs automatically
 inside `sync` (deletes nothing newer than 48 h, never anything reachable).
