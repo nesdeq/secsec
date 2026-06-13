@@ -69,3 +69,52 @@ case ":$PATH:" in
     *":$dir:"*) ;;
     *) echo "note: $dir is not on your PATH — add it to your shell profile" ;;
 esac
+
+# systemd user units (Linux). Two templates, installed disabled. The instance is the folder to sync
+# (or the store dir to serve), systemd-escaped. An optional per-instance EnvironmentFile carries
+# extra flags (e.g. --key, --server on first link, a custom port) via $SECSEC_OPTS; with no such file
+# the service just runs `secsec sync|serve <dir>`. serve needs no passphrase; for a headless sync,
+# point SECSEC_OPTS at an unencrypted key with --key.
+if [ "$os" = linux ] && [ -n "${HOME:-}" ] && command -v systemctl >/dev/null 2>&1; then
+    unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    mkdir -p "$unit_dir"
+
+    cat > "$unit_dir/secsec-sync@.service" <<EOF
+[Unit]
+Description=secsec continuous two-way sync of %I
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/secsec/sync@%i.conf
+ExecStart=$dir/secsec sync %I \$SECSEC_OPTS
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+EOF
+
+    cat > "$unit_dir/secsec-serve@.service" <<EOF
+[Unit]
+Description=secsec blind sync server, store %I
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/secsec/serve@%i.conf
+ExecStart=$dir/secsec serve %I \$SECSEC_OPTS
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+EOF
+
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    echo "systemd user units installed in $unit_dir:"
+    echo "  client (folder already linked):"
+    echo "    systemctl --user enable --now secsec-sync@\$(systemd-escape -p ~/Sync).service"
+    echo "  server:"
+    echo "    systemctl --user enable --now secsec-serve@\$(systemd-escape -p /srv/data).service"
+    echo "  extra flags: set SECSEC_OPTS=... in ~/.config/secsec/{sync,serve}@<escaped>.conf"
+    echo "  start without an active login (boot/headless): sudo loginctl enable-linger $(id -un)"
+fi

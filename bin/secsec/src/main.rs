@@ -68,16 +68,25 @@ enum Cmd {
         /// Sync once and exit (default is to keep running and watch for changes).
         #[arg(long)]
         once: bool,
+        /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
+        #[arg(long, value_name = "FILE")]
+        key: Option<PathBuf>,
     },
     /// On an enrolled device, print a one-time invite code and pair a new device over the wire.
     Invite {
         /// A folder already linked to the repo (default: current directory).
         dir: Option<PathBuf>,
+        /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
+        #[arg(long, value_name = "FILE")]
+        key: Option<PathBuf>,
     },
     /// List the devices enrolled in a linked folder's repo (with their SSH key fingerprints).
     Devices {
         /// A folder already linked to the repo (default: current directory).
         dir: Option<PathBuf>,
+        /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
+        #[arg(long, value_name = "FILE")]
+        key: Option<PathBuf>,
     },
     /// Show the pinned server host fingerprint for a folder, to compare out-of-band against the
     /// `host pin` the server prints on startup (TOFU first-contact verification).
@@ -89,6 +98,9 @@ enum Cmd {
     Log {
         /// A file or folder within the repo (relative to the synced folder root). Omit for the whole repo.
         path: Option<String>,
+        /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
+        #[arg(long, value_name = "FILE")]
+        key: Option<PathBuf>,
     },
     /// Restore a historic version of a file/folder into the working folder; the next sync propagates it
     /// to other devices (like copying the old file over the current one). Run inside the synced folder.
@@ -97,6 +109,9 @@ enum Cmd {
         path: String,
         /// The version: a commit-id prefix from `secsec log <path>`. Omit for the previous version.
         version: Option<String>,
+        /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
+        #[arg(long, value_name = "FILE")]
+        key: Option<PathBuf>,
     },
     /// Revoke a device (e.g. a stolen one): rotate the key away from it so it can't read new data.
     Revoke {
@@ -104,6 +119,9 @@ enum Cmd {
         device: String,
         /// A folder already linked to the repo (default: current directory).
         dir: Option<PathBuf>,
+        /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
+        #[arg(long, value_name = "FILE")]
+        key: Option<PathBuf>,
     },
     /// Wipe secsec's local state at a location (client link/cache and/or server repo + host key) and
     /// start over — your files and your `~/.ssh` key are left untouched. Stop a running sync/serve first.
@@ -158,10 +176,14 @@ fn home() -> Result<PathBuf, Box<dyn Error>> {
         .ok_or_else(|| "HOME is not set".into())
 }
 
-/// Load this device's SSH key from `~/.ssh/id_ed25519`, prompting (no echo) to decrypt a
-/// passphrase-protected key in memory — the on-disk key stays encrypted.
-fn default_device() -> Result<DeviceKey, Box<dyn Error>> {
-    let path = home()?.join(".ssh/id_ed25519");
+/// Load this device's SSH key — the `--key <file>` override if given, else the default
+/// `~/.ssh/id_ed25519` (current behaviour when the flag is absent) — prompting (no echo) to decrypt
+/// a passphrase-protected key in memory; the on-disk key stays encrypted.
+fn load_device(key_path: Option<PathBuf>) -> Result<DeviceKey, Box<dyn Error>> {
+    let path = match key_path {
+        Some(p) => p,
+        None => home()?.join(".ssh/id_ed25519"),
+    };
     let pem = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read device key {}: {e}", path.display()))?;
     match DeviceKey::from_openssh(&pem) {
@@ -438,10 +460,11 @@ async fn run_sync(
     server_opt: Option<String>,
     invite_opt: Option<String>,
     once: bool,
+    key: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&dir)?;
     let sdir = state_dir_for(&dir)?;
-    let device = default_device()?;
+    let device = load_device(key)?;
     let link = read_link(&sdir);
 
     let server_str = server_opt
@@ -822,11 +845,11 @@ async fn reconnect_session(
 
 // ---- invite ----
 
-async fn run_invite(dir: PathBuf) -> Result<(), Box<dyn Error>> {
+async fn run_invite(dir: PathBuf, key: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     let sdir = state_dir_for(&dir)?;
     let link = read_link(&sdir)
         .ok_or("this folder isn't linked to a repo yet — run `secsec sync` on it first")?;
-    let device = default_device()?;
+    let device = load_device(key)?;
     let addr = resolve_server(&link.server)?;
     let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
@@ -862,10 +885,10 @@ async fn run_invite(dir: PathBuf) -> Result<(), Box<dyn Error>> {
 /// List the repo's enrolled devices: a short device id, the device's SSH key fingerprint (the
 /// `SHA256:…` string `ssh-keygen -lf` prints, so you can match it to a physical device), and a marker
 /// for the current device.
-async fn run_devices(dir: PathBuf) -> Result<(), Box<dyn Error>> {
+async fn run_devices(dir: PathBuf, key: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     let sdir = state_dir_for(&dir)?;
     let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
-    let device = default_device()?;
+    let device = load_device(key)?;
     let me = device.device_id()?;
     let addr = resolve_server(&link.server)?;
     let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
@@ -974,7 +997,7 @@ fn print_path_version(v: &secsec_client::history::PathVersion, now: u64) {
 /// `secsec log [path]` — the repo's change history, or one file/folder's version history. Run inside
 /// the synced folder. Reads history over the wire into a throwaway store (the shared object cache may
 /// be held by a running `sync`), so it works alongside a live sync.
-async fn run_log(path: Option<String>) -> Result<(), Box<dyn Error>> {
+async fn run_log(path: Option<String>, key: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     let dir = std::env::current_dir()?;
     let sdir = state_dir_for(&dir)?;
     let link = read_link(&sdir).ok_or(
@@ -982,7 +1005,7 @@ async fn run_log(path: Option<String>) -> Result<(), Box<dyn Error>> {
     )?;
     let path = path.map(|p| normalize_repo_path(&p)).transpose()?;
 
-    let device = default_device()?;
+    let device = load_device(key)?;
     let addr = resolve_server(&link.server)?;
     let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
@@ -1031,7 +1054,11 @@ async fn run_log(path: Option<String>) -> Result<(), Box<dyn Error>> {
 /// `secsec restore <path> [version]` — write a historic version of a file/folder into the working
 /// folder. With no version, restores the *previous* version of that path. The change then propagates
 /// via the normal sync (a running `secsec sync` picks it up), exactly like copying an old file over.
-async fn run_restore(path: String, version: Option<String>) -> Result<(), Box<dyn Error>> {
+async fn run_restore(
+    path: String,
+    version: Option<String>,
+    key: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
     let dir = std::env::current_dir()?;
     let sdir = state_dir_for(&dir)?;
     let link = read_link(&sdir).ok_or(
@@ -1042,7 +1069,7 @@ async fn run_restore(path: String, version: Option<String>) -> Result<(), Box<dy
         return Err("specify a file or folder to restore".into());
     }
 
-    let device = default_device()?;
+    let device = load_device(key)?;
     let addr = resolve_server(&link.server)?;
     let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
@@ -1107,10 +1134,14 @@ async fn run_restore(path: String, version: Option<String>) -> Result<(), Box<dy
 /// Revoke a device by a (prefix of its) device id: rotate the master key away from it (and its
 /// add-by closure) over the wire, so it can't decrypt anything written afterward. Also reminds the
 /// operator to remove its key from the server's `authorized_keys`.
-async fn run_revoke(device_prefix: String, dir: PathBuf) -> Result<(), Box<dyn Error>> {
+async fn run_revoke(
+    device_prefix: String,
+    dir: PathBuf,
+    key: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
     let sdir = state_dir_for(&dir)?;
     let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
-    let device = default_device()?;
+    let device = load_device(key)?;
     let addr = resolve_server(&link.server)?;
     let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
@@ -1252,14 +1283,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             server,
             invite,
             once,
-        } => rt()?.block_on(run_sync(dir.unwrap_or_else(cwd), server, invite, once)),
-        Cmd::Invite { dir } => rt()?.block_on(run_invite(dir.unwrap_or_else(cwd))),
-        Cmd::Devices { dir } => rt()?.block_on(run_devices(dir.unwrap_or_else(cwd))),
+            key,
+        } => rt()?.block_on(run_sync(dir.unwrap_or_else(cwd), server, invite, once, key)),
+        Cmd::Invite { dir, key } => rt()?.block_on(run_invite(dir.unwrap_or_else(cwd), key)),
+        Cmd::Devices { dir, key } => rt()?.block_on(run_devices(dir.unwrap_or_else(cwd), key)),
         // hostpin is offline (reads the local link), so it needs no tokio runtime.
         Cmd::Hostpin { dir } => run_hostpin(dir.unwrap_or_else(cwd)),
-        Cmd::Log { path } => rt()?.block_on(run_log(path)),
-        Cmd::Restore { path, version } => rt()?.block_on(run_restore(path, version)),
-        Cmd::Revoke { device, dir } => rt()?.block_on(run_revoke(device, dir.unwrap_or_else(cwd))),
+        Cmd::Log { path, key } => rt()?.block_on(run_log(path, key)),
+        Cmd::Restore { path, version, key } => rt()?.block_on(run_restore(path, version, key)),
+        Cmd::Revoke { device, dir, key } => {
+            rt()?.block_on(run_revoke(device, dir.unwrap_or_else(cwd), key))
+        }
         // reset is pure filesystem cleanup (no network), so it needs no tokio runtime.
         Cmd::Reset { dir, yes } => run_reset(dir.unwrap_or_else(cwd), yes),
     }

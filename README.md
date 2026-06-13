@@ -1,8 +1,11 @@
 # secsec
 
-**Self-hosted, zero-knowledge, end-to-end-encrypted, live two-way file sync.** One static binary is
+**Self-hosted, zero-knowledge, end-to-end-encrypted, live two-way file sync.** A single binary is
 both server and client. The server is **blind**: it stores only ciphertext and can neither read nor
-forge your data. The only credential is your **SSH key**.
+forge your data. The only credential is your **SSH key**. It's the only genuinely open-source, fully
+encrypted, no-frills alternative to iCloud, OneDrive, or Google Drive — piggybacking on proven
+technology (your SSH keys, for both encryption *and* authentication) instead of a bespoke crypto
+stack. If you already host a box with SSH access somewhere, this is it.
 
 - **Zero-knowledge server** — content *and* metadata (names, structure, sizes within padding bounds)
   are encrypted; the server holds opaque, content-addressed blobs.
@@ -75,6 +78,46 @@ The code authenticates the join end-to-end through the blind server (which never
 server cannot swap the new device's key or serve a fake repository. From then on, each device just
 runs `secsec sync ~/Sync`.
 
+## Run as a service (systemd)
+
+On Linux the installer drops two **user** templates in `~/.config/systemd/user/` (manage with
+`systemctl --user`, never root), disabled — enable the one this machine needs. The `@`-instance is
+the store dir to serve, or the folder to sync. (macOS: run secsec from a launchd agent or login item.)
+
+**Server** — no key, no enrollment. It needs only your `~/.ssh/authorized_keys` (≥1 ed25519 key, or
+it won't start) and a store dir the service's user can write — `secsec serve` creates the dir when it
+can:
+
+```sh
+systemctl --user enable --now secsec-serve@$(systemd-escape -p /srv/data).service
+```
+
+**Client** — enroll the device once by hand, as in **Quick start** above: that interactive run links
+the folder, enrolls the device, and prints the host pin to verify. A service can't do this — joining
+needs a one-time invite code, and the first connection must be checked. Then daemonize the
+steady-state sync:
+
+```sh
+systemctl --user enable --now secsec-sync@$(systemd-escape -p ~/Sync).service
+```
+
+A service has no terminal to type a passphrase into, so a **headless client's key must have an empty
+passphrase**. If your `~/.ssh/id_ed25519` has one, leave it alone and use a dedicated key: generate
+it, enroll with `--key` in the Quick-start step, then point the unit at the same key.
+
+```sh
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519_secsec    # dedicated, empty-passphrase
+mkdir -p ~/.config/secsec
+printf 'SECSEC_OPTS=--key %s/.ssh/id_ed25519_secsec\n' "$HOME" \
+  > ~/.config/secsec/sync@$(systemd-escape -p ~/Sync).conf
+```
+
+**At boot / without a login:** `sudo loginctl enable-linger $USER` — the one privileged step; the
+services themselves run as your user. **Logs:** `journalctl --user -u <unit> -f` — the server's host
+pin, and any startup failure (usually a non-writable store dir or a missing `authorized_keys`), show
+up here. Units restart on failure after 30 s; a custom serve port goes in the serve `.conf` as
+`SECSEC_OPTS=9000`.
+
 ## Commands
 
 ### `secsec serve [dir] [port]`
@@ -88,7 +131,7 @@ secsec serve /srv/data              # serve /srv/data on udp/8899
 secsec serve /srv/data 9000         # custom port
 ```
 
-### `secsec sync [dir] [--server host[:port]] [--invite code] [--once]`
+### `secsec sync [dir] [--server host[:port]] [--invite code] [--once] [--key file]`
 
 Link a folder to a repo and keep it in continuous two-way sync (watches for changes; Ctrl-C stops).
 `--server` is needed only the first time — the link is remembered per folder. The first device to
@@ -102,7 +145,7 @@ secsec sync ~/Sync --server server.example --invite <code>    # first time: join
 secsec sync ~/Sync --once                                     # one pass, then exit (cron/scripts)
 ```
 
-### `secsec invite [dir]`
+### `secsec invite [dir] [--key file]`
 
 Print a one-time invite code and wait for the new device to pair (it runs `sync --invite`). Run on
 an enrolled device.
@@ -112,7 +155,7 @@ secsec invite                       # invite into the repo ./ is linked to
 secsec invite ~/Sync                # invite into the repo ~/Sync is linked to
 ```
 
-### `secsec devices [dir]`
+### `secsec devices [dir] [--key file]`
 
 List enrolled devices: short device id + `SHA256:…` SSH fingerprint (as `ssh-keygen -lf` prints it),
 with a marker for the current device.
@@ -122,7 +165,7 @@ secsec devices
 secsec devices ~/Sync
 ```
 
-### `secsec revoke <device> [dir]`
+### `secsec revoke <device> [dir] [--key file]`
 
 Revoke a device by id prefix (from `devices`): rotates the master key away from it, so it cannot
 read anything written afterward. Self-revocation is refused. Afterwards, remove its key from the
@@ -143,7 +186,7 @@ secsec hostpin
 secsec hostpin ~/Sync
 ```
 
-### `secsec log [path]`
+### `secsec log [path] [--key file]`
 
 Change log of the whole repo, or the version history of one file/folder. Run **inside** the synced
 folder.
@@ -154,7 +197,7 @@ secsec log notes.md                 # one file's versions
 secsec log docs/                    # one folder's versions
 ```
 
-### `secsec restore <path> [version]`
+### `secsec restore <path> [version] [--key file]`
 
 Write a historic version of `path` back into the working folder; the next sync propagates it like
 any edit. Without `version`: the previous version — or, if `path` was deleted, the last version that
@@ -180,11 +223,13 @@ secsec reset ~/Sync -y              # no prompt
 Every command supports `--help`. There is no `gc` command — garbage collection runs automatically
 inside `sync` (deletes nothing newer than 48 h, never anything reachable).
 
-## Behaviour notes
+## Behavior notes
 
-- **Device key:** `~/.ssh/id_ed25519` (Ed25519 only). A passphrase-encrypted key is prompted for and
-  decrypted in memory; the on-disk key is never modified. An ssh-agent is not enough — secsec derives
-  encryption keys from the private key itself.
+- **Device key:** `~/.ssh/id_ed25519` (Ed25519 only) by default; every client command takes `--key
+  <file>` to point at a different private key instead (the identity is whichever key is loaded — a
+  different key is a different device). A passphrase-encrypted key is prompted for and decrypted in
+  memory; the on-disk key is never modified. An ssh-agent is not enough — secsec derives encryption
+  keys from the private key itself.
 - **What syncs:** regular files and directories. Symlinks, FIFOs, sockets, and devices are skipped
   (never an error, never deleted on peers). setuid/setgid/sticky bits are not preserved.
 - **Deletions propagate.** A file deleted on one device is removed on the others.
