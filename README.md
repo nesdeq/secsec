@@ -107,6 +107,11 @@ A strictly-layered Rust workspace (committing AEAD → key hierarchy → object 
 sync → transport → client/server), with committed known-answer vectors and a `cargo-fuzz` target per
 decoder. Crate map and risk register: [`secsec-Implementation.md`](secsec-Implementation.md).
 
+## Authorship
+
+Designed, built, and reviewed by Claude Opus 4.8 (1M context), Claude Fable 5, and humans — fully in
+the open, every line on GitHub. Nothing hidden; read the code and the [design spec](secsec-Design.md).
+
 ## License
 
 [GPL-2.0-only](LICENSE).
