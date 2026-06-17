@@ -254,7 +254,9 @@ fn decrypt_device_stdin(pem: &str) -> Result<DeviceKey, Box<dyn Error>> {
     let passphrase = read_passphrase_stdin()?;
     match DeviceKey::from_openssh_passphrase(pem, &passphrase) {
         Ok(device) => Ok(device),
-        Err(secsec_sig::SigError::BadPassphrase) => Err("wrong passphrase (read from stdin)".into()),
+        Err(secsec_sig::SigError::BadPassphrase) => {
+            Err("wrong passphrase (read from stdin)".into())
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -1423,7 +1425,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             dir,
             key,
             passphrase_stdin,
-        } => rt()?.block_on(run_revoke(device, dir.unwrap_or_else(cwd), key, passphrase_stdin)),
+        } => rt()?.block_on(run_revoke(
+            device,
+            dir.unwrap_or_else(cwd),
+            key,
+            passphrase_stdin,
+        )),
         // reset is pure filesystem cleanup (no network), so it needs no tokio runtime.
         Cmd::Reset { dir, yes } => run_reset(dir.unwrap_or_else(cwd), yes),
     }
