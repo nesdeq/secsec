@@ -1,0 +1,7 @@
+{
+  "uuid": "secsec@nesdeq.github.io",
+  "name": "secsec",
+  "description": "Menu-bar control for secsec. Prompts for your SSH-key passphrase at login, runs `secsec sync` in the background (passphrase fed over a pipe — never the command line), and shows its live status. The folder to sync is read from ~/.config/secsec/ui.conf.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/nesdeq/secsec"
+}

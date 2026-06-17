@@ -31,6 +31,9 @@ curl -fsSL https://raw.githubusercontent.com/nesdeq/secsec/main/install.sh | sh
 Linux/macOS, x86_64/aarch64. Windows: download the `.zip` from
 [releases](https://github.com/nesdeq/secsec/releases). From source: `cargo build --release`.
 
+The installer puts `secsec` on your `PATH` and, on Linux, adds `systemctl --user` service templates;
+`--binary` / `--systemd` / `--all` select components (`--help` lists them).
+
 ## Quick start
 
 Every device authenticates with its own SSH key (`~/.ssh/id_ed25519`; run `ssh-keygen -t ed25519` if
@@ -42,21 +45,21 @@ cat device.pub >> ~/.ssh/authorized_keys
 secsec serve /srv/data                       # prints a host fingerprint to verify out-of-band
 
 # First device — creates the repository
-secsec sync ~/Sync --server server.example
+secsec sync ~/cloud --server server.example
 
 # Another device — pair with a one-time invite code
-secsec invite ~/Sync                                       # on an enrolled device
-secsec sync ~/Sync --server server.example --invite CODE   # on the new device
+secsec invite ~/cloud                                       # on an enrolled device
+secsec sync ~/cloud --server server.example --invite CODE   # on the new device
 ```
 
-A folder is remembered after its first sync — afterwards, just `secsec sync ~/Sync`.
+A folder is remembered after its first sync — afterwards, just `secsec sync ~/cloud`.
 
 ## Commands
 
 | Command | |
 |---|---|
 | `secsec serve [dir] [port]` | Run the blind server (gated on `~/.ssh/authorized_keys`). |
-| `secsec sync [dir] [--server H] [--invite C] [--once] [--key F]` | Link a folder and sync continuously. |
+| `secsec sync [dir] [--server H] [--invite C] [--once] [--key F] [--passphrase-stdin]` | Link a folder and sync continuously. |
 | `secsec invite [dir]` | Print a one-time code to enroll another device. |
 | `secsec devices [dir]` | List enrolled devices and key fingerprints. |
 | `secsec revoke <device> [dir]` | Rotate the master key away from a device. |
@@ -66,7 +69,9 @@ A folder is remembered after its first sync — afterwards, just `secsec sync ~/
 | `secsec reset [dir]` | Wipe local secsec state (your files and `~/.ssh` are untouched). |
 
 Every command takes `--help`; all client commands accept `--key <file>` to use a key other than the
-default. Garbage collection runs automatically inside `sync`.
+default, and `--passphrase-stdin` to read the key's passphrase from stdin instead of prompting (for
+headless/GUI launchers — the passphrase travels over a pipe, never the command line). Garbage
+collection runs automatically inside `sync`.
 
 ## Run as a service
 
@@ -75,11 +80,21 @@ hand; then:
 
 ```sh
 systemctl --user enable --now secsec-serve@$(systemd-escape -p /srv/data).service   # server
-systemctl --user enable --now secsec-sync@$(systemd-escape -p ~/Sync).service       # client
+systemctl --user enable --now secsec-sync@$(systemd-escape -p ~/cloud).service       # client
 ```
 
-A service can't prompt, so a headless client needs an empty-passphrase key (pass it with `--key`).
-To run at boot without logging in: `loginctl enable-linger`.
+A service can't prompt, so a headless client either uses an empty-passphrase key (pass it with
+`--key`) or feeds the passphrase over stdin with `--passphrase-stdin` — the launcher writes it to the
+process's stdin, so it never appears on the command line or in `ps`/`top`. To run at boot without
+logging in: `loginctl enable-linger`.
+
+## Desktop menu-bar UIs
+
+Optional native launchers for a passphrase-protected key: a **GNOME Shell extension** and a **macOS
+menu-bar app**. Each prompts for your key passphrase at login, runs `secsec sync` in the background
+(passphrase fed over a pipe, never the command line), lets you set the folder + SSH key, and shows a
+connect-status indicator. Link the folder once by hand, then let the UI drive it. Setup:
+[`ui/README.md`](ui/README.md).
 
 ## How it works
 

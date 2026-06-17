@@ -1,0 +1,12 @@
+# secsec desktop UI config — copy to ~/.config/secsec/ui.conf and edit.
+# The UI can also write this for you (Settings… / Set sync folder… / Select SSH key…).
+# The folder must already be linked by a manual first `secsec sync <folder> --server …`.
+
+# The folder to keep in sync (default: ~/cloud). `~` is expanded.
+folder=~/cloud
+
+# SSH private key to use (optional; blank = ~/.ssh/id_ed25519). `~` is expanded.
+#key=~/.ssh/id_ed25519
+
+# Path to the secsec binary (optional; default: search the usual install dirs and PATH).
+#bin=/usr/local/bin/secsec

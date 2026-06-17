@@ -17,5 +17,5 @@ See the [top-level README](../../README.md) for a quickstart and
 
 Every command operates **over the network** against a pinned, RFP-anchored remote (the host key is
 pinned trust-on-first-use on the first `sync`; the pin, RFP, and ref are persisted in a per-folder
-link under `~/.local/state/secsec/`). There are no local-store admin commands and no `gc` command —
+link under `~/.config/secsec/folders/`). There are no local-store admin commands and no `gc` command —
 GC is automatic inside `sync`. Run `secsec <command> --help` for flags.

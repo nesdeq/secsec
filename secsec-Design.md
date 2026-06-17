@@ -1034,17 +1034,22 @@ The server-side `redb` index holds **only** `{id, size, generation, pack-offset}
 plaintext-derived metadata. One static binary; no external DB.
 
 **Client.** The synced folder holds **nothing but the user's plaintext files** — no control files
-clutter it. All per-folder client state lives out of tree under
-`~/.local/state/secsec/<BLAKE3(abs_folder_path)>/`:
+clutter it. All client state lives under a **single client root** — `$XDG_CONFIG_HOME/secsec` if that
+variable is an absolute path, else `~/.config/secsec` — so nothing scatters across the home dir. Per
+synced folder, state lives at `<root>/folders/<BLAKE3(abs_folder_path)>/`:
 ```
 link            the repo binding (git-remote analogue): server address, pinned host_id, RFP, ref name
 objects.secsec  the encrypted object cache (so a re-sync need not re-fetch/re-encrypt unchanged data)
 frontier        the §8.5 local sealed state (anti-rollback counters), sealed under the SSH key
 base, receipts  the last-synced root and the §15 arrival-receipt log (for auto-GC)
 ```
-The object cache is encrypted (it is the same content-addressed blobs pushed to the server) and is a
-*cache*, not the source of truth — the plaintext folder is. This is why no `redb` file sits in the
-user's working directory.
+The same root also holds the UI config/log (`ui.conf`, `ui/`) and the optional systemd per-instance
+env files (`sync@<dir>.conf`); a pre-consolidation `~/.local/state/secsec/<hash>` dir is migrated to
+`<root>/folders/<hash>` on first use. (The systemd **unit templates** unavoidably live in
+`~/.config/systemd/user/` per systemd; the **server** store is the `secsec serve <dir>` directory,
+not a client dotfile.) The object cache is encrypted (it is the same content-addressed blobs pushed
+to the server) and is a *cache*, not the source of truth — the plaintext folder is. This is why no
+`redb` file sits in the user's working directory.
 
 ---
 ## 14. Durability (single-host)

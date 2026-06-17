@@ -71,6 +71,10 @@ enum Cmd {
         /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
         #[arg(long, value_name = "FILE")]
         key: Option<PathBuf>,
+        /// Read the key passphrase from stdin instead of prompting — for headless/GUI launchers.
+        /// The passphrase travels over a pipe, never argv, so it is not visible to `ps`/`top`.
+        #[arg(long)]
+        passphrase_stdin: bool,
     },
     /// On an enrolled device, print a one-time invite code and pair a new device over the wire.
     Invite {
@@ -79,6 +83,10 @@ enum Cmd {
         /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
         #[arg(long, value_name = "FILE")]
         key: Option<PathBuf>,
+        /// Read the key passphrase from stdin instead of prompting — for headless/GUI launchers.
+        /// The passphrase travels over a pipe, never argv, so it is not visible to `ps`/`top`.
+        #[arg(long)]
+        passphrase_stdin: bool,
     },
     /// List the devices enrolled in a linked folder's repo (with their SSH key fingerprints).
     Devices {
@@ -87,6 +95,10 @@ enum Cmd {
         /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
         #[arg(long, value_name = "FILE")]
         key: Option<PathBuf>,
+        /// Read the key passphrase from stdin instead of prompting — for headless/GUI launchers.
+        /// The passphrase travels over a pipe, never argv, so it is not visible to `ps`/`top`.
+        #[arg(long)]
+        passphrase_stdin: bool,
     },
     /// Show the pinned server host fingerprint for a folder, to compare out-of-band against the
     /// `host pin` the server prints on startup (TOFU first-contact verification).
@@ -101,6 +113,10 @@ enum Cmd {
         /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
         #[arg(long, value_name = "FILE")]
         key: Option<PathBuf>,
+        /// Read the key passphrase from stdin instead of prompting — for headless/GUI launchers.
+        /// The passphrase travels over a pipe, never argv, so it is not visible to `ps`/`top`.
+        #[arg(long)]
+        passphrase_stdin: bool,
     },
     /// Restore a historic version of a file/folder into the working folder; the next sync propagates it
     /// to other devices (like copying the old file over the current one). Run inside the synced folder.
@@ -112,6 +128,10 @@ enum Cmd {
         /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
         #[arg(long, value_name = "FILE")]
         key: Option<PathBuf>,
+        /// Read the key passphrase from stdin instead of prompting — for headless/GUI launchers.
+        /// The passphrase travels over a pipe, never argv, so it is not visible to `ps`/`top`.
+        #[arg(long)]
+        passphrase_stdin: bool,
     },
     /// Revoke a device (e.g. a stolen one): rotate the key away from it so it can't read new data.
     Revoke {
@@ -122,6 +142,10 @@ enum Cmd {
         /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
         #[arg(long, value_name = "FILE")]
         key: Option<PathBuf>,
+        /// Read the key passphrase from stdin instead of prompting — for headless/GUI launchers.
+        /// The passphrase travels over a pipe, never argv, so it is not visible to `ps`/`top`.
+        #[arg(long)]
+        passphrase_stdin: bool,
     },
     /// Wipe secsec's local state at a location (client link/cache and/or server repo + host key) and
     /// start over — your files and your `~/.ssh` key are left untouched. Stop a running sync/serve first.
@@ -177,9 +201,14 @@ fn home() -> Result<PathBuf, Box<dyn Error>> {
 }
 
 /// Load this device's SSH key — the `--key <file>` override if given, else the default
-/// `~/.ssh/id_ed25519` (current behaviour when the flag is absent) — prompting (no echo) to decrypt
-/// a passphrase-protected key in memory; the on-disk key stays encrypted.
-fn load_device(key_path: Option<PathBuf>) -> Result<DeviceKey, Box<dyn Error>> {
+/// `~/.ssh/id_ed25519` (current behaviour when the flag is absent) — decrypting a
+/// passphrase-protected key in memory; the on-disk key stays encrypted. When `passphrase_stdin` is
+/// set the passphrase is read from stdin (for headless/GUI launchers); otherwise we prompt
+/// interactively with no echo.
+fn load_device(
+    key_path: Option<PathBuf>,
+    passphrase_stdin: bool,
+) -> Result<DeviceKey, Box<dyn Error>> {
     let path = match key_path {
         Some(p) => p,
         None => home()?.join(".ssh/id_ed25519"),
@@ -188,6 +217,7 @@ fn load_device(key_path: Option<PathBuf>) -> Result<DeviceKey, Box<dyn Error>> {
         .map_err(|e| format!("cannot read device key {}: {e}", path.display()))?;
     match DeviceKey::from_openssh(&pem) {
         Ok(device) => Ok(device),
+        Err(secsec_sig::SigError::Encrypted) if passphrase_stdin => decrypt_device_stdin(&pem),
         Err(secsec_sig::SigError::Encrypted) => decrypt_device(&pem, &path),
         Err(e) => Err(e.into()),
     }
@@ -216,13 +246,64 @@ fn decrypt_device(pem: &str, path: &Path) -> Result<DeviceKey, Box<dyn Error>> {
     Err("could not decrypt the device key: wrong passphrase".into())
 }
 
-/// The out-of-tree state directory for a synced folder: `~/.local/state/secsec/<hash(abspath)>/`
+/// Decrypt a passphrase-protected key using a passphrase read from **stdin** (the headless / GUI
+/// path). A parent process writes the passphrase to this child's stdin and closes it — so the secret
+/// travels over a pipe and never appears in argv (invisible to `ps`/`top`/`/proc/<pid>/cmdline`),
+/// unlike a `--passphrase <value>` flag would. One attempt only: stdin carries a single passphrase.
+fn decrypt_device_stdin(pem: &str) -> Result<DeviceKey, Box<dyn Error>> {
+    let passphrase = read_passphrase_stdin()?;
+    match DeviceKey::from_openssh_passphrase(pem, &passphrase) {
+        Ok(device) => Ok(device),
+        Err(secsec_sig::SigError::BadPassphrase) => Err("wrong passphrase (read from stdin)".into()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read a passphrase from stdin: take the first line, strip its trailing newline (CRLF tolerated),
+/// and keep it [`Zeroizing`]. Other whitespace is preserved (it may be part of the passphrase); EOF
+/// with no trailing newline is fine — the parent may close the pipe without one.
+fn read_passphrase_stdin() -> Result<Zeroizing<String>, Box<dyn Error>> {
+    use std::io::BufRead;
+    let mut line = Zeroizing::new(String::new());
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(Zeroizing::new(
+        line.trim_end_matches(['\r', '\n']).to_string(),
+    ))
+}
+
+/// The secsec client root: `$XDG_CONFIG_HOME/secsec` if that var is an absolute path, else
+/// `~/.config/secsec`. Everything client-side (per-folder state, the UI's `ui.conf`/log, the systemd
+/// env files) lives under this one root — no scatter across the home dir (§13). Resolves to the same
+/// dir the GNOME/macOS UIs use via the XDG config dir.
+fn config_root() -> Result<PathBuf, Box<dyn Error>> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(v) if Path::new(&v).is_absolute() => PathBuf::from(v),
+        _ => home()?.join(".config"),
+    };
+    Ok(base.join("secsec"))
+}
+
+/// The out-of-tree state directory for a synced folder: `<config_root>/folders/<hash(abspath)>/`
 /// (created if absent). Holds the per-folder link, the sealed cursor, the receipt log, and the object
-/// cache — so the synced folder itself stays nothing but the user's files.
+/// cache — so the synced folder itself stays nothing but the user's files. A pre-consolidation dir
+/// (`~/.local/state/secsec/<hash>`) is migrated on first use, so an existing link keeps its frontier.
 fn state_dir_for(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let abs = std::fs::canonicalize(dir)?;
-    let h = blake3::hash(abs.to_string_lossy().as_bytes());
-    let sdir = home()?.join(".local/state/secsec").join(hex(h.as_bytes()));
+    let name = hex(blake3::hash(abs.to_string_lossy().as_bytes()).as_bytes());
+    let sdir = config_root()?.join("folders").join(&name);
+    // Migrate the legacy ~/.local/state location (best-effort; same filesystem in practice) so an
+    // upgrader doesn't lose its anti-rollback frontier and re-clone.
+    if !sdir.exists() {
+        if let Ok(home) = home() {
+            let legacy = home.join(".local/state/secsec").join(&name);
+            if legacy.is_dir() {
+                if let Some(parent) = sdir.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let _ = std::fs::rename(&legacy, &sdir);
+            }
+        }
+    }
     std::fs::create_dir_all(&sdir)?;
     Ok(sdir)
 }
@@ -461,10 +542,11 @@ async fn run_sync(
     invite_opt: Option<String>,
     once: bool,
     key: Option<PathBuf>,
+    passphrase_stdin: bool,
 ) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&dir)?;
     let sdir = state_dir_for(&dir)?;
-    let device = load_device(key)?;
+    let device = load_device(key, passphrase_stdin)?;
     let link = read_link(&sdir);
 
     let server_str = server_opt
@@ -845,11 +927,15 @@ async fn reconnect_session(
 
 // ---- invite ----
 
-async fn run_invite(dir: PathBuf, key: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+async fn run_invite(
+    dir: PathBuf,
+    key: Option<PathBuf>,
+    passphrase_stdin: bool,
+) -> Result<(), Box<dyn Error>> {
     let sdir = state_dir_for(&dir)?;
     let link = read_link(&sdir)
         .ok_or("this folder isn't linked to a repo yet — run `secsec sync` on it first")?;
-    let device = load_device(key)?;
+    let device = load_device(key, passphrase_stdin)?;
     let addr = resolve_server(&link.server)?;
     let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
@@ -885,10 +971,14 @@ async fn run_invite(dir: PathBuf, key: Option<PathBuf>) -> Result<(), Box<dyn Er
 /// List the repo's enrolled devices: a short device id, the device's SSH key fingerprint (the
 /// `SHA256:…` string `ssh-keygen -lf` prints, so you can match it to a physical device), and a marker
 /// for the current device.
-async fn run_devices(dir: PathBuf, key: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+async fn run_devices(
+    dir: PathBuf,
+    key: Option<PathBuf>,
+    passphrase_stdin: bool,
+) -> Result<(), Box<dyn Error>> {
     let sdir = state_dir_for(&dir)?;
     let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
-    let device = load_device(key)?;
+    let device = load_device(key, passphrase_stdin)?;
     let me = device.device_id()?;
     let addr = resolve_server(&link.server)?;
     let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
@@ -997,7 +1087,11 @@ fn print_path_version(v: &secsec_client::history::PathVersion, now: u64) {
 /// `secsec log [path]` — the repo's change history, or one file/folder's version history. Run inside
 /// the synced folder. Reads history over the wire into a throwaway store (the shared object cache may
 /// be held by a running `sync`), so it works alongside a live sync.
-async fn run_log(path: Option<String>, key: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+async fn run_log(
+    path: Option<String>,
+    key: Option<PathBuf>,
+    passphrase_stdin: bool,
+) -> Result<(), Box<dyn Error>> {
     let dir = std::env::current_dir()?;
     let sdir = state_dir_for(&dir)?;
     let link = read_link(&sdir).ok_or(
@@ -1005,7 +1099,7 @@ async fn run_log(path: Option<String>, key: Option<PathBuf>) -> Result<(), Box<d
     )?;
     let path = path.map(|p| normalize_repo_path(&p)).transpose()?;
 
-    let device = load_device(key)?;
+    let device = load_device(key, passphrase_stdin)?;
     let addr = resolve_server(&link.server)?;
     let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
@@ -1058,6 +1152,7 @@ async fn run_restore(
     path: String,
     version: Option<String>,
     key: Option<PathBuf>,
+    passphrase_stdin: bool,
 ) -> Result<(), Box<dyn Error>> {
     let dir = std::env::current_dir()?;
     let sdir = state_dir_for(&dir)?;
@@ -1069,7 +1164,7 @@ async fn run_restore(
         return Err("specify a file or folder to restore".into());
     }
 
-    let device = load_device(key)?;
+    let device = load_device(key, passphrase_stdin)?;
     let addr = resolve_server(&link.server)?;
     let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
@@ -1138,10 +1233,11 @@ async fn run_revoke(
     device_prefix: String,
     dir: PathBuf,
     key: Option<PathBuf>,
+    passphrase_stdin: bool,
 ) -> Result<(), Box<dyn Error>> {
     let sdir = state_dir_for(&dir)?;
     let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
-    let device = load_device(key)?;
+    let device = load_device(key, passphrase_stdin)?;
     let addr = resolve_server(&link.server)?;
     let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
@@ -1201,16 +1297,22 @@ fn run_reset(dir: PathBuf, yes: bool) -> Result<(), Box<dyn Error>> {
     // (path, what-it-is, is_dir) for each piece of secsec state that actually exists at `dir`.
     let mut targets: Vec<(PathBuf, &str, bool)> = Vec::new();
 
-    // Client state: out-of-tree, keyed by the folder's canonical path (must match `state_dir_for`).
+    // Client state: keyed by the folder's canonical path (must match `state_dir_for`). Check the
+    // current root and the pre-consolidation location, so `reset` fully cleans either.
     if let Ok(abs) = std::fs::canonicalize(&dir) {
-        let h = blake3::hash(abs.to_string_lossy().as_bytes());
-        let cdir = home()?.join(".local/state/secsec").join(hex(h.as_bytes()));
-        if cdir.exists() {
-            targets.push((
-                cdir,
-                "client sync state — link, object cache, rollback cursor",
-                true,
-            ));
+        let name = hex(blake3::hash(abs.to_string_lossy().as_bytes()).as_bytes());
+        let candidates = [
+            config_root()?.join("folders").join(&name),
+            home()?.join(".local/state/secsec").join(&name),
+        ];
+        for cdir in candidates {
+            if cdir.exists() {
+                targets.push((
+                    cdir,
+                    "client sync state — link, object cache, rollback cursor",
+                    true,
+                ));
+            }
         }
     }
     // Server state: lives directly in the serve dir (which holds nothing but these).
@@ -1284,16 +1386,44 @@ fn main() -> Result<(), Box<dyn Error>> {
             invite,
             once,
             key,
-        } => rt()?.block_on(run_sync(dir.unwrap_or_else(cwd), server, invite, once, key)),
-        Cmd::Invite { dir, key } => rt()?.block_on(run_invite(dir.unwrap_or_else(cwd), key)),
-        Cmd::Devices { dir, key } => rt()?.block_on(run_devices(dir.unwrap_or_else(cwd), key)),
+            passphrase_stdin,
+        } => rt()?.block_on(run_sync(
+            dir.unwrap_or_else(cwd),
+            server,
+            invite,
+            once,
+            key,
+            passphrase_stdin,
+        )),
+        Cmd::Invite {
+            dir,
+            key,
+            passphrase_stdin,
+        } => rt()?.block_on(run_invite(dir.unwrap_or_else(cwd), key, passphrase_stdin)),
+        Cmd::Devices {
+            dir,
+            key,
+            passphrase_stdin,
+        } => rt()?.block_on(run_devices(dir.unwrap_or_else(cwd), key, passphrase_stdin)),
         // hostpin is offline (reads the local link), so it needs no tokio runtime.
         Cmd::Hostpin { dir } => run_hostpin(dir.unwrap_or_else(cwd)),
-        Cmd::Log { path, key } => rt()?.block_on(run_log(path, key)),
-        Cmd::Restore { path, version, key } => rt()?.block_on(run_restore(path, version, key)),
-        Cmd::Revoke { device, dir, key } => {
-            rt()?.block_on(run_revoke(device, dir.unwrap_or_else(cwd), key))
-        }
+        Cmd::Log {
+            path,
+            key,
+            passphrase_stdin,
+        } => rt()?.block_on(run_log(path, key, passphrase_stdin)),
+        Cmd::Restore {
+            path,
+            version,
+            key,
+            passphrase_stdin,
+        } => rt()?.block_on(run_restore(path, version, key, passphrase_stdin)),
+        Cmd::Revoke {
+            device,
+            dir,
+            key,
+            passphrase_stdin,
+        } => rt()?.block_on(run_revoke(device, dir.unwrap_or_else(cwd), key, passphrase_stdin)),
         // reset is pure filesystem cleanup (no network), so it needs no tokio runtime.
         Cmd::Reset { dir, yes } => run_reset(dir.unwrap_or_else(cwd), yes),
     }
