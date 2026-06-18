@@ -114,6 +114,51 @@ func health(running: Bool, log: URL) -> Health {
     return .connected
 }
 
+// ---- session passphrase cache ----
+
+// A passphrase kept only in RAM for the session, so the agent can relaunch the wedged sync child
+// after a wake without re-prompting. XOR-masked with a per-store random key, mlock'd out of swap,
+// zeroed on clear. NOT proof against a memory-dump attacker (the mask is in the same RAM) — it
+// defeats casual scraping and swap leakage. Never disk, never argv.
+final class SecretCache {
+    private var data: UnsafeMutableRawPointer?
+    private var mask: UnsafeMutableRawPointer?
+    private var len = 0
+
+    var hasValue: Bool { data != nil && len > 0 }
+
+    func store(_ s: String) {
+        clear()
+        var plain = Array(s.utf8)
+        len = plain.count
+        guard len > 0 else { return }
+        let d = UnsafeMutableRawPointer.allocate(byteCount: len, alignment: 1)
+        let m = UnsafeMutableRawPointer.allocate(byteCount: len, alignment: 1)
+        _ = mlock(d, len); _ = mlock(m, len)
+        arc4random_buf(m, len)
+        let dp = d.assumingMemoryBound(to: UInt8.self)
+        let mp = m.assumingMemoryBound(to: UInt8.self)
+        for i in 0..<len { dp[i] = plain[i] ^ mp[i] }
+        for i in plain.indices { plain[i] = 0 } // scrub the transient plaintext copy
+        data = d; mask = m
+    }
+
+    func reveal() -> Data? {
+        guard let data, let mask, len > 0 else { return nil }
+        let dp = data.assumingMemoryBound(to: UInt8.self)
+        let mp = mask.assumingMemoryBound(to: UInt8.self)
+        var out = [UInt8](repeating: 0, count: len)
+        for i in 0..<len { out[i] = dp[i] ^ mp[i] }
+        return Data(out)
+    }
+
+    func clear() {
+        if let data { _ = memset(data, 0, len); _ = munlock(data, len); data.deallocate() }
+        if let mask { _ = memset(mask, 0, len); _ = munlock(mask, len); mask.deallocate() }
+        data = nil; mask = nil; len = 0
+    }
+}
+
 // ---- app ----
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -123,6 +168,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var task: Process?
     private var pollTimer: Timer?
     private let log = logURL()
+    private let cache = SecretCache()  // session passphrase, for seamless wake-restart
+    private var intendRunning = false  // user wants sync up → relaunch it after a wake
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory) // menu-bar agent, no Dock icon
@@ -136,11 +183,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pollTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+
+        // After a sleep the child's async runtime is permanently wedged — tokio timers run on a
+        // monotonic clock that doesn't advance while macOS sleeps, so it can never reconnect. Can't
+        // be fixed in the child; relaunch it fresh on wake.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(systemDidWake(_:)),
+            name: NSWorkspace.didWakeNotification, object: nil)
     }
 
     func applicationWillTerminate(_ note: Notification) {
         pollTimer?.invalidate()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         stop()
+        cache.clear()
     }
 
     private func buildMenu() {
@@ -216,8 +272,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusLine.title = tail.isEmpty ? head : "\(head) — \(tail)"
     }
 
-    // Prompt for the passphrase (masked) and start the sync child. Config is read fresh, so a
-    // folder/key changed from the menu takes effect on the next start/restart.
+    // Prompt for the passphrase (masked), cache it for the session, and start the sync child. Config
+    // is read fresh, so a folder/key changed from the menu takes effect on the next start/restart.
     private func promptAndStart() {
         if isRunning { return }
         let cfg = readConfig()
@@ -225,7 +281,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             refresh() // cancelled — user can Start from the menu later
             return
         }
-        spawn(cfg, passphrase: pass)
+        cache.store(pass)
+        intendRunning = true
+        spawn(cfg)
+    }
+
+    // Start from the cached passphrase if we have one (wake-restart, toggle, reload), else prompt.
+    private func startFromCacheOrPrompt() {
+        if isRunning { return }
+        if cache.hasValue {
+            intendRunning = true
+            spawn(readConfig())
+        } else {
+            promptAndStart()
+        }
     }
 
     private func promptPassphrase(folder: String) -> String? {
@@ -242,7 +311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return resp == .alertFirstButtonReturn ? field.stringValue : nil
     }
 
-    private func spawn(_ cfg: Config, passphrase: String) {
+    private func spawn(_ cfg: Config) {
         let (exec, prefix) = resolveBinary(cfg.bin)
         let proc = Process()
         proc.executableURL = exec
@@ -276,16 +345,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         task = proc
 
-        // Feed the passphrase over stdin, then close so `secsec` reads EOF. The secret only ever
-        // travels this pipe — it is never an argument.
-        if let data = passphrase.data(using: .utf8) {
-            try? stdinPipe.fileHandleForWriting.write(contentsOf: data)
+        // Feed the cached passphrase over stdin, then close so `secsec` reads EOF. The secret only
+        // ever travels this pipe — it is never an argument.
+        if let pass = cache.reveal() {
+            try? stdinPipe.fileHandleForWriting.write(contentsOf: pass)
         }
         try? stdinPipe.fileHandleForWriting.close()
         refresh()
     }
 
     private func stop() {
+        intendRunning = false // a manual stop must not be auto-restarted on the next wake
         guard let proc = task, proc.isRunning else { task = nil; return }
         proc.terminate() // SIGTERM — let secsec close its connection cleanly
         task = nil
@@ -295,19 +365,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func reloadIfRunning() {
         if isRunning {
             stop()
-            promptAndStart()
+            startFromCacheOrPrompt()
         } else {
             refresh()
         }
     }
 
     @objc private func toggle() {
-        if isRunning { stop(); refresh() } else { promptAndStart() }
+        if isRunning { stop(); refresh() } else { startFromCacheOrPrompt() }
     }
 
     @objc private func restart() {
         stop()
-        promptAndStart()
+        startFromCacheOrPrompt()
+    }
+
+    // Wake from sleep: the child's runtime is wedged, so terminate it and start a fresh process from
+    // the cached passphrase. A short delay lets Wi-Fi reassociate; the fresh child's own reconnect
+    // loop rides out any remaining settling.
+    @objc private func systemDidWake(_ note: Notification) {
+        guard intendRunning else { return } // sync not started, or stopped by the user — leave it
+        if let proc = task, proc.isRunning { proc.terminate() }
+        task = nil
+        refresh()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.intendRunning, !self.isRunning else { return }
+            self.spawn(readConfig())
+        }
     }
 
     @objc private func openLog() {
@@ -345,6 +429,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if panel.runModal() == .OK, let url = panel.url {
             cfg.key = url.path
             writeConfig(cfg)
+            cache.clear() // new key → the cached passphrase no longer applies; prompt again
             reloadIfRunning()
         }
     }
@@ -353,11 +438,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var cfg = readConfig()
         cfg.key = ""
         writeConfig(cfg)
+        cache.clear() // key changed → drop the cached passphrase
         reloadIfRunning()
     }
 
     @objc private func quit() {
         stop()
+        cache.clear()
         NSApp.terminate(nil)
     }
 
