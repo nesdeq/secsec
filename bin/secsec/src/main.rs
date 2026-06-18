@@ -695,19 +695,32 @@ async fn run_sync(
         }
         retry_now = false;
 
-        // Self-heal a dropped connection instead of erroring on every later sync until the user restarts.
-        if conn.close_reason().is_some() {
-            eprintln!("connection lost — reconnecting to {server_str}…");
+        // Self-heal a dropped connection: post-sleep the server has discarded ours, so a reconnect
+        // handshake succeeds but the link is stateless-reset on first use — verify it with a real
+        // round-trip before trusting it, and retry (paced) until it carries data.
+        if let Some(reason) = conn.close_reason() {
+            eprintln!("connection lost ({reason}) — reconnecting to {server_str}…");
             match reconnect_session(addr, host_id, &device).await {
                 Ok((ep, c, t)) => {
+                    // Probe with one round-trip; a reset path fails here despite a "good" handshake.
+                    let probe = QuicRemote::new(&c, t, &device);
+                    if let Err(e) = secsec_client::fetch_head(&probe, &keyring, &ref_name).await {
+                        eprintln!("reconnected but the link is still dead ({e}); retrying in 2s…");
+                        initial = false;
+                        retry_now = true;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
                     endpoint = ep;
                     conn = c;
                     transcript = t;
                     want_refold = true;
                 }
                 Err(err) => {
-                    eprintln!("reconnect failed: {err}");
+                    eprintln!("reconnect failed: {err}; retrying in 2s…");
                     initial = false;
+                    retry_now = true;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
             }
