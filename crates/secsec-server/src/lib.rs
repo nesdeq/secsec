@@ -11,7 +11,7 @@
 pub mod serve;
 
 use secsec_frame::MAX_BLOB_SIZE;
-use secsec_proto::server::{limits, NonceStore, StorageQuota, TokenBucket, WindowCounter};
+use secsec_proto::server::{limits, Limits, NonceStore, StorageQuota, TokenBucket, WindowCounter};
 use secsec_proto::wire::{ErrorCode, Request, Response};
 use secsec_proto::{op, op_and_args, prune, ReadAuth, WriteAuth};
 use secsec_sig::{DeviceId, DevicePublic};
@@ -73,31 +73,20 @@ impl ServerState {
         self.pairing.get(slot).map(|(b, _)| b.clone())
     }
 
-    fn take_write(&mut self, d: DeviceId, n: u64, now: u64) -> bool {
+    fn take_write(&mut self, d: DeviceId, n: u64, now: u64, rate: u64) -> bool {
         self.write_buckets
             .entry(d)
-            .or_insert_with(|| {
-                TokenBucket::new(
-                    limits::WRITE_BURST_BYTES,
-                    limits::WRITE_RATE_BYTES_PER_SEC,
-                    now,
-                )
-            })
+            .or_insert_with(|| TokenBucket::new(limits::WRITE_BURST_BYTES, rate, now))
             .try_take(n, now)
     }
 
-    /// Per-key read byte-rate (§19: 200 MB/s sustained). The burst reuses the §19 write-burst
-    /// constant (1 GiB) so an initial clone is never starved; only sustained egress is bounded.
-    fn take_read(&mut self, d: DeviceId, n: u64, now: u64) -> bool {
+    /// Per-key read byte-rate (configurable; default 200 MB/s sustained). The burst reuses the §19
+    /// write-burst constant (1 GiB ≥ MAX_BLOB_SIZE) so a single object always fits and an initial
+    /// clone is never starved; only sustained egress is bounded.
+    fn take_read(&mut self, d: DeviceId, n: u64, now: u64, rate: u64) -> bool {
         self.read_buckets
             .entry(d)
-            .or_insert_with(|| {
-                TokenBucket::new(
-                    limits::WRITE_BURST_BYTES,
-                    limits::READ_RATE_BYTES_PER_SEC,
-                    now,
-                )
-            })
+            .or_insert_with(|| TokenBucket::new(limits::WRITE_BURST_BYTES, rate, now))
             .try_take(n, now)
     }
 
@@ -122,10 +111,13 @@ impl ServerState {
         }
     }
 
-    fn add_quota(&mut self, d: DeviceId, n: u64) -> bool {
+    fn add_quota(&mut self, d: DeviceId, n: u64, cap: u64) -> bool {
+        if cap == 0 {
+            return true; // unlimited (the default, §6)
+        }
         self.quotas
             .entry(d)
-            .or_insert_with(|| StorageQuota::new(limits::PER_KEY_STORAGE_QUOTA))
+            .or_insert_with(|| StorageQuota::new(cap))
             .try_add(n)
     }
 
@@ -144,6 +136,8 @@ impl ServerState {
 pub struct Server {
     store: Store,
     state: std::sync::Mutex<ServerState>,
+    /// Operator-tunable runtime limits (§7); defaults to the §19 normative values.
+    limits: Limits,
     /// The **mandatory** connection allow-list (the operator's `authorized_keys`), re-read per
     /// connection so adding a key needs no restart. Gates who can talk at all, including pairing
     /// (§7); membership/decryption is the separate crypto roster + keyslots (§8).
@@ -185,8 +179,22 @@ impl Server {
         Self {
             store,
             state: std::sync::Mutex::new(ServerState::default()),
+            limits: Limits::default(),
             authorized: Authorized::Any,
         }
+    }
+
+    /// Apply operator-tuned runtime limits (§7 `secsec.config`); unset values keep their §19 defaults.
+    #[must_use]
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// The configured per-source-IP new-connection rate (the serve accept loop enforces it, §19).
+    #[must_use]
+    pub fn conn_rate_per_sec(&self) -> u64 {
+        self.limits.conn_rate_per_sec
     }
 
     /// Restrict connections to a fixed device-id set (for tests / in-process backends).
@@ -252,11 +260,14 @@ impl Server {
         self.state
             .lock()
             .expect("server state")
-            .take_write(d, n, now)
+            .take_write(d, n, now, self.limits.write_rate)
     }
 
     fn add_quota(&self, d: DeviceId, n: u64) -> bool {
-        self.state.lock().expect("server state").add_quota(d, n)
+        self.state
+            .lock()
+            .expect("server state")
+            .add_quota(d, n, self.limits.storage_cap)
     }
 
     fn release_quota(&self, d: DeviceId, n: u64) {
@@ -270,7 +281,7 @@ impl Server {
         self.state
             .lock()
             .expect("server state")
-            .take_read(d, n, now)
+            .take_read(d, n, now, self.limits.read_rate)
     }
 
     fn sigchain_allow(&self, d: DeviceId, now: u64) -> bool {
@@ -289,9 +300,10 @@ impl Server {
     /// on disconnect, e.g. via [`ConnGuard`]); `false` if the key is already at its cap.
     #[must_use]
     pub fn acquire_conn(&self, d: DeviceId) -> bool {
+        let max = self.limits.max_conns_per_key;
         let mut st = self.state.lock().expect("server state");
         let n = st.conn_counts.entry(d).or_insert(0);
-        if u64::from(*n) >= limits::MAX_CONCURRENT_CONNS_PER_KEY {
+        if u64::from(*n) >= max {
             false
         } else {
             *n += 1;

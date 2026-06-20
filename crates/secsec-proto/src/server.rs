@@ -31,6 +31,36 @@ pub mod limits {
     pub const HOUR_SECS: u64 = 3_600;
 }
 
+/// Operator-tunable server limits (`secsec-Design.md` §7 `secsec.config`), defaulting to the §19
+/// normative values. Only values that are safe to change live here; everything that must be uniform
+/// across peers or that bounds an attacker (decoder bounds, nonce TTL, sigchain caps, the burst that
+/// guarantees a single object always fits) stays compiled-in.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Per-key sustained write rate, bytes/sec.
+    pub write_rate: u64,
+    /// Per-key sustained read rate, bytes/sec.
+    pub read_rate: u64,
+    /// New connections/sec per source IP.
+    pub conn_rate_per_sec: u64,
+    /// Concurrent connections per authenticated key.
+    pub max_conns_per_key: u64,
+    /// Per-key cumulative new-write cap, bytes — `0` means unlimited (the default, §6).
+    pub storage_cap: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            write_rate: limits::WRITE_RATE_BYTES_PER_SEC,
+            read_rate: limits::READ_RATE_BYTES_PER_SEC,
+            conn_rate_per_sec: limits::CONN_RATE_PER_SEC,
+            max_conns_per_key: limits::MAX_CONCURRENT_CONNS_PER_KEY,
+            storage_cap: 0,
+        }
+    }
+}
+
 /// `server_nonce` freshness + single-use store (§11). The server [`issue`](Self::issue)s a fresh
 /// random nonce per challenge; a returned auth signature is only honoured if its nonce
 /// [`consume`](Self::consume)s successfully — issued, unexpired, and not already used.

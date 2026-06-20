@@ -469,16 +469,23 @@ pub fn snapshot_tree<K: MasterKeys>(
     let now_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-    snapshot_dir(
-        root,
+    let ctx = SnapCtx {
         keys,
         store,
-        &chunker,
-        0,
-        prev_tree.as_ref(),
-        root_salt,
+        chunker: &chunker,
         now_nanos,
-    )
+    };
+    snapshot_dir(&ctx, root, 0, prev_tree.as_ref(), root_salt)
+}
+
+/// Walk-constant context for a snapshot: the key ring, object store, chunker, and the snapshot-start
+/// time (nanoseconds) used by the unchanged-file fast path's racy-clean guard. Threaded through the
+/// recursion so per-directory calls stay short.
+struct SnapCtx<'a, K: MasterKeys> {
+    keys: &'a K,
+    store: &'a Store,
+    chunker: &'a secsec_chunk::Chunker,
+    now_nanos: u64,
 }
 
 /// The name field of a tree entry (file or dir).
@@ -533,14 +540,11 @@ pub fn restore_commit_tree<K: MasterKeys>(
 }
 
 fn snapshot_dir<K: MasterKeys>(
+    ctx: &SnapCtx<'_, K>,
     dir: &Path,
-    keys: &K,
-    store: &Store,
-    chunker: &secsec_chunk::Chunker,
     depth: usize,
     prev: Option<&Tree>,
     this_salt: PathSalt,
-    now_nanos: u64,
 ) -> Result<(Id, PathSalt), SnapError> {
     if depth >= MAX_TREE_DEPTH {
         return Err(SnapError::DepthExceeded);
@@ -576,7 +580,10 @@ fn snapshot_dir<K: MasterKeys>(
                 ..
             }) = prev_entry
             {
-                if *prev_size == meta.len() && *prev_mtime == this_mtime && this_mtime < now_nanos {
+                if *prev_size == meta.len()
+                    && *prev_mtime == this_mtime
+                    && this_mtime < ctx.now_nanos
+                {
                     entries.push(Entry::File {
                         name,
                         mode: mode_of(&meta),
@@ -596,11 +603,13 @@ fn snapshot_dir<K: MasterKeys>(
             // Stream the file through the chunker so a file larger than RAM is never read whole.
             let file = std::fs::File::open(&path)?;
             let mut chunks = Vec::new();
-            let size = chunker
+            let size = ctx
+                .chunker
                 .chunk_stream(file, |chunk| -> Result<(), SnapError> {
                     let padded = secsec_object::pad_chunk(chunk, Padding::PowerOfTwo);
-                    let (id, blob) = seal_object(keys.current(), ObjType::Chunk, &path_salt, &padded);
-                    store.put(&id, &blob)?;
+                    let (id, blob) =
+                        seal_object(ctx.keys.current(), ObjType::Chunk, &path_salt, &padded);
+                    ctx.store.put(&id, &blob)?;
                     chunks.push(id);
                     Ok(())
                 })
@@ -624,21 +633,13 @@ fn snapshot_dir<K: MasterKeys>(
                     subtree_salt,
                     ..
                 }) => (
-                    Some(load_tree(subtree, subtree_salt, keys, store)?),
+                    Some(load_tree(subtree, subtree_salt, ctx.keys, ctx.store)?),
                     *subtree_salt,
                 ),
                 _ => (None, random_salt()?),
             };
-            let (subtree, subtree_salt) = snapshot_dir(
-                &path,
-                keys,
-                store,
-                chunker,
-                depth + 1,
-                prev_sub.as_ref(),
-                sub_salt,
-                now_nanos,
-            )?;
+            let (subtree, subtree_salt) =
+                snapshot_dir(ctx, &path, depth + 1, prev_sub.as_ref(), sub_salt)?;
             entries.push(Entry::Dir {
                 name,
                 mode: mode_of(&meta),
@@ -651,8 +652,8 @@ fn snapshot_dir<K: MasterKeys>(
     }
 
     let tree = Tree { entries };
-    let (id, blob) = seal_object(keys.current(), ObjType::Tree, &this_salt, &encode_tree(&tree));
-    store.put(&id, &blob)?;
+    let (id, blob) = seal_object(ctx.keys.current(), ObjType::Tree, &this_salt, &encode_tree(&tree));
+    ctx.store.put(&id, &blob)?;
     Ok((id, this_salt))
 }
 

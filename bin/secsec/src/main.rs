@@ -14,13 +14,13 @@ use secsec_client::repo::{
 };
 use secsec_client::sync::sync_once;
 use secsec_client::{load_frontier, save_frontier, FrontierLoad};
-use secsec_proto::server::{limits, WindowCounter};
+use secsec_proto::server::{Limits, WindowCounter};
 use secsec_server::{serve::serve_connection, Server};
 use secsec_sig::DeviceKey;
 use secsec_store::Store;
 use secsec_sync::rollback::SyncFrontier;
 use secsec_transport::handshake::client_handshake;
-use secsec_transport::quic::{client_config, client_config_tofu, server_config};
+use secsec_transport::quic::{client_config_tofu, client_config_tuned, server_config_tuned, Tuning};
 use secsec_transport::HostPin;
 use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -28,14 +28,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
-/// Default listen port (§19: udp/8899).
+/// Default listen port a client assumes for a bare `host` (§19: udp/8899). The server's actual listen
+/// port, the staging TTL, the reclaim cadence, and history retention are set in `secsec.config` (§7).
 const DEFAULT_PORT: u16 = 8899;
-/// Idle window after which an abandoned in-flight push's staging is reclaimed (§3): 24 hours.
-const STAGING_TTL_SECS: u64 = 24 * 60 * 60;
-/// How often the server sweeps idle staging (§3): every 60 minutes.
-const RECLAIM_TICK_SECS: u64 = 60 * 60;
-/// Default history retention: keep the last N versions of each file (§5).
-const RETENTION_KEEP_VERSIONS: usize = 8;
 /// How long `invite` waits for a device to pair, and `sync --invite` waits for the host, in 500 ms
 /// pairing-poll rounds (§7): the host waits up to the ~10-minute invite lifetime; the joiner ~2 min.
 const PAIR_HOST_ROUNDS: u32 = 1200;
@@ -297,6 +292,170 @@ fn config_root() -> Result<PathBuf, Box<dyn Error>> {
     Ok(base.join("secsec"))
 }
 
+// ---- secsec.config (§7) ----
+
+/// Operator-tunable settings, loaded from `<config_root>/secsec.config` (written with defaults on
+/// first use). Only settings that are safe to change live here; content-addressing, the wire format,
+/// and cryptographic parameters are compiled in. Out-of-range values are clamped on load.
+struct Config {
+    // [client]
+    retention_keep_versions: usize,
+    watch_debounce_ms: u64,
+    poll_interval_secs: u64,
+    quic_idle_secs: u64,
+    quic_keepalive_secs: u64,
+    // [server]
+    listen_port: u16,
+    storage_cap_gib: u64,
+    write_rate_mb_s: u64,
+    read_rate_mb_s: u64,
+    conn_rate_per_ip: u64,
+    max_conns_per_key: u64,
+    staging_ttl_hours: u64,
+    reclaim_tick_minutes: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            retention_keep_versions: 8,
+            watch_debounce_ms: 1000,
+            poll_interval_secs: 15,
+            quic_idle_secs: 30,
+            quic_keepalive_secs: 10,
+            listen_port: DEFAULT_PORT,
+            storage_cap_gib: 0,
+            write_rate_mb_s: 100,
+            read_rate_mb_s: 200,
+            conn_rate_per_ip: 10,
+            max_conns_per_key: 3,
+            staging_ttl_hours: 24,
+            reclaim_tick_minutes: 60,
+        }
+    }
+}
+
+/// The default `secsec.config`, written verbatim on first use. Comments document each setting's range.
+const CONFIG_TEMPLATE: &str = "\
+# secsec.config — operator-tunable settings. Out-of-range values are clamped on load.
+# Only settings that are safe to change are here; content-addressing, the wire format, and
+# cryptographic parameters are compiled in and cannot be set from this file.
+
+[client]
+retention_keep_versions = 8     # versions kept per file (0 = keep every version forever)
+watch_debounce_ms       = 1000  # coalesce a burst of edits into one sync (min 100)
+poll_interval_secs      = 15    # periodic re-sync to pick up newly-enrolled devices (min 5)
+quic_idle_secs          = 30    # connection idle timeout (min 5)
+quic_keepalive_secs     = 10    # keepalive interval (min 1, forced below quic_idle_secs)
+
+[server]
+listen_port          = 8899  # UDP port to listen on (1-65535)
+storage_cap_gib      = 0     # per-key cumulative new-write cap, GiB (0 = unlimited)
+write_rate_mb_s      = 100   # per-key sustained write rate, MB/s (min 1)
+read_rate_mb_s       = 200   # per-key sustained read rate, MB/s (min 1)
+conn_rate_per_ip     = 10    # new connections per second per source IP (min 1)
+max_conns_per_key    = 3     # concurrent connections per device key (min 1)
+staging_ttl_hours    = 24    # idle hours before an abandoned upload's staging is reclaimed (min 1)
+reclaim_tick_minutes = 60    # how often the server sweeps idle staging (min 1)
+";
+
+impl Config {
+    /// Load the config, writing the default template on first use; values are range-clamped (§7).
+    fn load() -> Result<Config, Box<dyn Error>> {
+        let path = config_root()?.join("secsec.config");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, CONFIG_TEMPLATE)?;
+                CONFIG_TEMPLATE.to_string()
+            }
+        };
+        let mut cfg = Config::default();
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() || line.starts_with('[') {
+                continue; // blank, comment, or section header
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                cfg.apply(k.trim(), v.trim());
+            }
+        }
+        cfg.clamp();
+        Ok(cfg)
+    }
+
+    /// Set one field from a `key = value` line; an unknown key or an unparseable value is ignored so
+    /// the compiled-in default stands.
+    fn apply(&mut self, key: &str, val: &str) {
+        match key {
+            "retention_keep_versions" => set(&mut self.retention_keep_versions, val),
+            "watch_debounce_ms" => set(&mut self.watch_debounce_ms, val),
+            "poll_interval_secs" => set(&mut self.poll_interval_secs, val),
+            "quic_idle_secs" => set(&mut self.quic_idle_secs, val),
+            "quic_keepalive_secs" => set(&mut self.quic_keepalive_secs, val),
+            "listen_port" => set(&mut self.listen_port, val),
+            "storage_cap_gib" => set(&mut self.storage_cap_gib, val),
+            "write_rate_mb_s" => set(&mut self.write_rate_mb_s, val),
+            "read_rate_mb_s" => set(&mut self.read_rate_mb_s, val),
+            "conn_rate_per_ip" => set(&mut self.conn_rate_per_ip, val),
+            "max_conns_per_key" => set(&mut self.max_conns_per_key, val),
+            "staging_ttl_hours" => set(&mut self.staging_ttl_hours, val),
+            "reclaim_tick_minutes" => set(&mut self.reclaim_tick_minutes, val),
+            _ => {}
+        }
+    }
+
+    /// Clamp every field to its safe range (§7). `retention_keep_versions == 0` (keep everything) and
+    /// `storage_cap_gib == 0` (unlimited) are valid and left as-is.
+    fn clamp(&mut self) {
+        self.watch_debounce_ms = self.watch_debounce_ms.max(100);
+        self.poll_interval_secs = self.poll_interval_secs.max(5);
+        self.quic_idle_secs = self.quic_idle_secs.max(5);
+        self.quic_keepalive_secs = self
+            .quic_keepalive_secs
+            .clamp(1, self.quic_idle_secs.saturating_sub(1).max(1));
+        if self.listen_port == 0 {
+            self.listen_port = DEFAULT_PORT;
+        }
+        self.write_rate_mb_s = self.write_rate_mb_s.max(1);
+        self.read_rate_mb_s = self.read_rate_mb_s.max(1);
+        self.conn_rate_per_ip = self.conn_rate_per_ip.max(1);
+        self.max_conns_per_key = self.max_conns_per_key.max(1);
+        self.staging_ttl_hours = self.staging_ttl_hours.max(1);
+        self.reclaim_tick_minutes = self.reclaim_tick_minutes.max(1);
+    }
+
+    /// The transport idle/keepalive tuning derived from this config.
+    fn tuning(&self) -> Tuning {
+        Tuning {
+            idle_secs: self.quic_idle_secs,
+            keepalive_secs: self.quic_keepalive_secs,
+        }
+    }
+
+    /// The server runtime limits derived from this config: rates decimal-MB/s → bytes/s, cap GiB →
+    /// bytes (0 = unlimited). Saturating so a huge value cannot overflow.
+    fn limits(&self) -> Limits {
+        Limits {
+            write_rate: self.write_rate_mb_s.saturating_mul(1_000_000),
+            read_rate: self.read_rate_mb_s.saturating_mul(1_000_000),
+            conn_rate_per_sec: self.conn_rate_per_ip,
+            max_conns_per_key: self.max_conns_per_key,
+            storage_cap: self.storage_cap_gib.saturating_mul(1024 * 1024 * 1024),
+        }
+    }
+}
+
+/// Parse `val` into `field` via `FromStr`, leaving the existing value on a parse error.
+fn set<T: std::str::FromStr>(field: &mut T, val: &str) {
+    if let Ok(v) = val.parse() {
+        *field = v;
+    }
+}
+
 /// The out-of-tree state directory for a synced folder: `<config_root>/folders/<hash(abspath)>/`
 /// (created if absent). Holds the per-folder link, the sealed cursor, the receipt log, and the object
 /// cache — so the synced folder itself stays nothing but the user's files. A pre-consolidation dir
@@ -409,11 +568,12 @@ fn write_link(sdir: &Path, l: &Link) -> Result<(), Box<dyn Error>> {
 async fn connect(
     addr: SocketAddr,
     pinned: Option<[u8; 32]>,
+    tuning: Tuning,
 ) -> Result<(quinn::Endpoint, quinn::Connection, [u8; 32]), Box<dyn Error>> {
     let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     let captured = match pinned {
         Some(h) => {
-            ep.set_default_client_config(client_config(HostPin::from_host_id(h))?);
+            ep.set_default_client_config(client_config_tuned(HostPin::from_host_id(h), tuning)?);
             None
         }
         None => {
@@ -451,7 +611,9 @@ fn load_or_generate_hostkey(dir: &Path) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Er
 
 // ---- serve ----
 
-async fn run_serve(dir: PathBuf, port: u16) -> Result<(), Box<dyn Error>> {
+async fn run_serve(dir: PathBuf, port: Option<u16>) -> Result<(), Box<dyn Error>> {
+    let cfg = Config::load()?;
+    let port = port.unwrap_or(cfg.listen_port);
     std::fs::create_dir_all(&dir)?;
     let store_path = dir.join("repo.secsec");
     let hostkey_dir = dir.join("hostkey");
@@ -474,7 +636,9 @@ async fn run_serve(dir: PathBuf, port: u16) -> Result<(), Box<dyn Error>> {
     let host_id = HostPin::from_cert(&cert)?.host_id();
     let store = Store::open(&store_path)?;
     let server = std::sync::Arc::new(
-        Server::new(store).with_authorized_file(auth_path.clone()), // re-read per connection
+        Server::new(store)
+            .with_limits(cfg.limits())
+            .with_authorized_file(auth_path.clone()), // re-read per connection
     );
 
     // Background reclaimer: drop in-flight pushes idle past the staging TTL (§3), so abandoned staging
@@ -482,11 +646,13 @@ async fn run_serve(dir: PathBuf, port: u16) -> Result<(), Box<dyn Error>> {
     // idle, so the sweep needs its own timer).
     {
         let server = server.clone();
+        let staging_ttl_secs = cfg.staging_ttl_hours.saturating_mul(3600);
+        let reclaim_tick_secs = cfg.reclaim_tick_minutes.saturating_mul(60);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(RECLAIM_TICK_SECS));
+            let mut tick = tokio::time::interval(Duration::from_secs(reclaim_tick_secs));
             loop {
                 tick.tick().await;
-                if let Err(e) = server.reclaim_staging(unix_secs(), STAGING_TTL_SECS) {
+                if let Err(e) = server.reclaim_staging(unix_secs(), staging_ttl_secs) {
                     eprintln!("staging reclaim failed: {e}");
                 }
             }
@@ -494,7 +660,7 @@ async fn run_serve(dir: PathBuf, port: u16) -> Result<(), Box<dyn Error>> {
     }
 
     let listen: SocketAddr = (Ipv4Addr::UNSPECIFIED, port).into();
-    let endpoint = quinn::Endpoint::server(server_config(&cert, &key)?, listen)?;
+    let endpoint = quinn::Endpoint::server(server_config_tuned(&cert, &key, cfg.tuning())?, listen)?;
     println!(
         "secsec serve — store {} · host pin {}",
         store_path.display(),
@@ -506,8 +672,10 @@ async fn run_serve(dir: PathBuf, port: u16) -> Result<(), Box<dyn Error>> {
         authorized.len(),
         endpoint.local_addr()?
     );
-    // §19 per-source-IP new-connection rate limit (10/s). The accept loop is a single task, so this
-    // map needs no lock; it is pruned at most once per window so idle source IPs cannot accumulate.
+    // Per-source-IP new-connection rate limit (configurable, §7/§19). The accept loop is a single
+    // task, so this map needs no lock; it is pruned at most once per window so idle source IPs cannot
+    // accumulate.
+    let conn_rate = server.conn_rate_per_sec();
     let mut ip_rate: std::collections::HashMap<std::net::IpAddr, WindowCounter> =
         std::collections::HashMap::new();
     let mut last_prune = 0u64;
@@ -527,7 +695,7 @@ async fn run_serve(dir: PathBuf, port: u16) -> Result<(), Box<dyn Error>> {
         }
         let allowed = ip_rate
             .entry(ip)
-            .or_insert_with(|| WindowCounter::new(1, limits::CONN_RATE_PER_SEC))
+            .or_insert_with(|| WindowCounter::new(1, conn_rate))
             .try_record(now);
         if !allowed {
             incoming.refuse();
@@ -562,6 +730,7 @@ async fn run_sync(
     let sdir = state_dir_for(&dir)?;
     let device = load_device(key, passphrase_stdin)?;
     let link = read_link(&sdir);
+    let cfg = Config::load()?;
 
     let server_str = server_opt
         .clone()
@@ -574,7 +743,7 @@ async fn run_sync(
 
     // Connect: pin the saved host key, or TOFU on first contact.
     let pinned = link.as_ref().map(|l| l.host_id);
-    let (mut endpoint, mut conn, host_id) = connect(addr, pinned).await?;
+    let (mut endpoint, mut conn, host_id) = connect(addr, pinned, cfg.tuning()).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
     let mut transcript = sess.transcript;
     let rem = QuicRemote::new(&conn, transcript, &device);
@@ -690,14 +859,15 @@ async fn run_sync(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     if !once {
         let wdir = dir.clone();
+        let debounce_ms = cfg.watch_debounce_ms;
         std::thread::spawn(move || {
-            let _ = secsec_client::watcher::watch_dir(&wdir, Duration::from_millis(1000), || {
+            let _ = secsec_client::watcher::watch_dir(&wdir, Duration::from_millis(debounce_ms), || {
                 tx.send(()).is_ok()
             });
         });
         println!("watching {} — Ctrl-C to stop", dir.display());
     }
-    let mut poll = tokio::time::interval(Duration::from_secs(15));
+    let mut poll = tokio::time::interval(Duration::from_secs(cfg.poll_interval_secs));
     poll.tick().await;
 
     let mut initial = true;
@@ -717,7 +887,7 @@ async fn run_sync(
         // round-trip before trusting it, and retry (paced) until it carries data.
         if let Some(reason) = conn.close_reason() {
             eprintln!("connection lost ({reason}) — reconnecting to {server_str}…");
-            match reconnect_session(addr, host_id, &device).await {
+            match reconnect_session(addr, host_id, &device, cfg.tuning()).await {
                 Ok((ep, c, t)) => {
                     // Probe with one round-trip; a reset path fails here despite a "good" handshake.
                     let probe = QuicRemote::new(&c, t, &device);
@@ -865,7 +1035,7 @@ async fn run_sync(
                         &store,
                         &keyring,
                         &ref_name,
-                        RETENTION_KEEP_VERSIONS,
+                        cfg.retention_keep_versions,
                         roster_seq,
                     )
                     .await
@@ -915,8 +1085,9 @@ async fn reconnect_session(
     addr: SocketAddr,
     host_id: [u8; 32],
     device: &DeviceKey,
+    tuning: Tuning,
 ) -> Result<(quinn::Endpoint, quinn::Connection, [u8; 32]), Box<dyn Error>> {
-    let (endpoint, conn, _host_id) = connect(addr, Some(host_id)).await?;
+    let (endpoint, conn, _host_id) = connect(addr, Some(host_id), tuning).await?;
     let sess = client_handshake(&conn, device, host_id, rand32()?).await?;
     Ok((endpoint, conn, sess.transcript))
 }
@@ -933,7 +1104,7 @@ async fn run_invite(
         .ok_or("this folder isn't linked to a repo yet — run `secsec sync` on it first")?;
     let device = load_device(key, passphrase_stdin)?;
     let addr = resolve_server(&link.server)?;
-    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
+    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id), Tuning::default()).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
     let (mk, _st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
@@ -977,7 +1148,7 @@ async fn run_devices(
     let device = load_device(key, passphrase_stdin)?;
     let me = device.device_id()?;
     let addr = resolve_server(&link.server)?;
-    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
+    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id), Tuning::default()).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
     let (_mk, st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
@@ -1097,7 +1268,7 @@ async fn run_log(
 
     let device = load_device(key, passphrase_stdin)?;
     let addr = resolve_server(&link.server)?;
-    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
+    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id), Tuning::default()).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
     let (mk, _st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
@@ -1162,7 +1333,7 @@ async fn run_restore(
 
     let device = load_device(key, passphrase_stdin)?;
     let addr = resolve_server(&link.server)?;
-    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
+    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id), Tuning::default()).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
     let (mk, _st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
@@ -1235,7 +1406,7 @@ async fn run_revoke(
     let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
     let device = load_device(key, passphrase_stdin)?;
     let addr = resolve_server(&link.server)?;
-    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id)).await?;
+    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id), Tuning::default()).await?;
     let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
     let (mk, st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
@@ -1372,10 +1543,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let rt = || tokio::runtime::Runtime::new();
     let cwd = || PathBuf::from(".");
     match cli.cmd {
-        Cmd::Serve { dir, port } => rt()?.block_on(run_serve(
-            dir.unwrap_or_else(cwd),
-            port.unwrap_or(DEFAULT_PORT),
-        )),
+        Cmd::Serve { dir, port } => rt()?.block_on(run_serve(dir.unwrap_or_else(cwd), port)),
         Cmd::Sync {
             dir,
             server,

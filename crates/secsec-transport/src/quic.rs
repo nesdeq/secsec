@@ -16,6 +16,25 @@ pub const IDLE_TIMEOUT_SECS: u64 = 30;
 /// QUIC keepalive interval (§19): 10 s.
 pub const KEEPALIVE_SECS: u64 = 10;
 
+/// QUIC idle/keepalive tuning (§7 `secsec.config`); defaults to the §19 values. The keepalive must
+/// stay strictly below the idle timeout so a live connection refreshes before it can idle out.
+#[derive(Debug, Clone, Copy)]
+pub struct Tuning {
+    /// Max idle timeout, seconds.
+    pub idle_secs: u64,
+    /// Keepalive interval, seconds.
+    pub keepalive_secs: u64,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            idle_secs: IDLE_TIMEOUT_SECS,
+            keepalive_secs: KEEPALIVE_SECS,
+        }
+    }
+}
+
 /// Failure to build a QUIC endpoint configuration.
 #[derive(Debug)]
 pub struct ConfigError(String);
@@ -27,15 +46,15 @@ impl core::fmt::Display for ConfigError {
 }
 impl std::error::Error for ConfigError {}
 
-/// The shared §19 transport tuning (idle / keepalive).
-fn transport_config() -> TransportConfig {
+/// The shared transport tuning (idle / keepalive) for `t`.
+fn transport_config(t: Tuning) -> TransportConfig {
     let mut tc = TransportConfig::default();
     tc.max_idle_timeout(Some(
-        Duration::from_secs(IDLE_TIMEOUT_SECS)
+        Duration::from_secs(t.idle_secs)
             .try_into()
             .expect("idle timeout fits"),
     ));
-    tc.keep_alive_interval(Some(Duration::from_secs(KEEPALIVE_SECS)));
+    tc.keep_alive_interval(Some(Duration::from_secs(t.keepalive_secs)));
     tc
 }
 
@@ -67,10 +86,15 @@ fn rustls_server_config(
 
 /// Build a `quinn::ClientConfig` that only completes a handshake against the pinned host key (§11).
 pub fn client_config(pin: HostPin) -> Result<ClientConfig, ConfigError> {
+    client_config_tuned(pin, Tuning::default())
+}
+
+/// Like [`client_config`] but with explicit idle/keepalive tuning (§7 `secsec.config`).
+pub fn client_config_tuned(pin: HostPin, tuning: Tuning) -> Result<ClientConfig, ConfigError> {
     let qcc = QuicClientConfig::try_from(rustls_client_config(pin))
         .map_err(|e| ConfigError(e.to_string()))?;
     let mut cfg = ClientConfig::new(Arc::new(qcc));
-    cfg.transport_config(Arc::new(transport_config()));
+    cfg.transport_config(Arc::new(transport_config(tuning)));
     Ok(cfg)
 }
 
@@ -89,16 +113,25 @@ pub fn client_config_tofu() -> Result<(ClientConfig, CapturedHostPin), ConfigErr
         .with_no_client_auth();
     let qcc = QuicClientConfig::try_from(rcc).map_err(|e| ConfigError(e.to_string()))?;
     let mut cfg = ClientConfig::new(Arc::new(qcc));
-    cfg.transport_config(Arc::new(transport_config()));
+    cfg.transport_config(Arc::new(transport_config(Tuning::default())));
     Ok((cfg, captured))
 }
 
 /// Build a `quinn::ServerConfig` presenting the self-signed host key `cert_der` / `key_der`.
 pub fn server_config(cert_der: &[u8], key_der: &[u8]) -> Result<ServerConfig, ConfigError> {
+    server_config_tuned(cert_der, key_der, Tuning::default())
+}
+
+/// Like [`server_config`] but with explicit idle/keepalive tuning (§7 `secsec.config`).
+pub fn server_config_tuned(
+    cert_der: &[u8],
+    key_der: &[u8],
+    tuning: Tuning,
+) -> Result<ServerConfig, ConfigError> {
     let qsc = QuicServerConfig::try_from(rustls_server_config(cert_der, key_der)?)
         .map_err(|e| ConfigError(e.to_string()))?;
     let mut cfg = ServerConfig::with_crypto(Arc::new(qsc));
-    cfg.transport_config(Arc::new(transport_config()));
+    cfg.transport_config(Arc::new(transport_config(tuning)));
     Ok(cfg)
 }
 
