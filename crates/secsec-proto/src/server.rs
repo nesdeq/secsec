@@ -15,8 +15,6 @@ pub mod limits {
     pub const MAX_SIGCHAIN_ENTRIES_PER_CONN_PER_HOUR: u64 = 60;
     /// Max total sigchain length (§19, configurable default).
     pub const MAX_TOTAL_SIGCHAIN: u64 = 10_000;
-    /// Per-key storage quota, bytes — 10 GiB default (§19).
-    pub const PER_KEY_STORAGE_QUOTA: u64 = 10 * 1024 * 1024 * 1024;
     /// Per-key sustained write rate, bytes/sec — 100 MB/s (§19, decimal MB).
     pub const WRITE_RATE_BYTES_PER_SEC: u64 = 100_000_000;
     /// Per-key write burst, bytes — 1 GiB (§19).
@@ -235,9 +233,10 @@ impl WindowCounter {
     }
 }
 
-/// Per-key **new-write** quota for one server session (§11/§19): an anti-flood cap on bytes a key
-/// introduces, reset on restart. A dedup store has no durable per-key byte ownership — durable disk
-/// limits are the operator's filesystem quota (§11). Idempotent re-puts are not charged.
+/// Per-key **new-write** quota for one server session (§15): an anti-flood cap on the bytes a key
+/// makes durable at promote, reset on restart. A dedup store has no durable per-key byte ownership —
+/// durable disk limits are the operator's filesystem quota. Idempotent re-puts and abandoned staging
+/// are never charged. Constructed only with a finite limit; the unlimited default is handled upstream.
 #[derive(Debug, Clone)]
 pub struct StorageQuota {
     limit: u64,
@@ -245,7 +244,7 @@ pub struct StorageQuota {
 }
 
 impl StorageQuota {
-    /// A quota of `limit` bytes (use [`limits::PER_KEY_STORAGE_QUOTA`] for the §19 default).
+    /// A finite per-key new-write cap of `limit` bytes (§15); the unlimited default is handled upstream.
     #[must_use]
     pub fn new(limit: u64) -> Self {
         Self { limit, used: 0 }
@@ -262,7 +261,7 @@ impl StorageQuota {
         }
     }
 
-    /// Release `amount` bytes (e.g. after GC).
+    /// Release `amount` bytes (e.g. after a `cas-head` lost its CAS and promoted nothing).
     pub fn release(&mut self, amount: u64) {
         self.used = self.used.saturating_sub(amount);
     }
@@ -346,7 +345,7 @@ mod tests {
 
     #[test]
     fn window_counter_caps_per_window() {
-        // gc: 4 per hour.
+        // a generic per-hour window cap (here 4 events/hour).
         let mut w = WindowCounter::new(limits::HOUR_SECS, 4);
         for t in [0, 10, 20, 30] {
             assert!(w.try_record(t), "first 4 allowed");
@@ -390,6 +389,5 @@ mod tests {
         assert_eq!(limits::SERVER_NONCE_TTL_SECS, 60);
         assert_eq!(limits::MAX_HAS_IDS, 1024);
         assert_eq!(limits::MAX_SIGCHAIN_ENTRIES_PER_CONN_PER_HOUR, 60);
-        assert_eq!(limits::PER_KEY_STORAGE_QUOTA, 10 * 1024 * 1024 * 1024);
     }
 }

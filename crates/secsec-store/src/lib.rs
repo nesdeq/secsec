@@ -37,7 +37,7 @@ pub const ABSENT_HEAD: [u8; 32] = [0u8; 32];
 pub type RefBlobHash = ([u8; 32], [u8; 32]);
 
 /// The result of [`Store::cas_ref`]: whether the swap happened and, if so, how many bytes of staged
-/// content became durable (the new bytes charged against the per-key cap, §11).
+/// content became durable (the new bytes charged against the per-key cap, §15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CasOutcome {
     /// Whether the compare-and-swap succeeded (the ref token matched).

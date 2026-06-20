@@ -491,7 +491,7 @@ pub enum ErrorCode {
     BadAuth,
     /// A rate limit or quota was exceeded (§19).
     RateLimit,
-    /// A `has`/`gc` batch exceeded its cap (§12).
+    /// A `has`/`prune` batch exceeded its cap (§12).
     TooManyIds,
     /// `cas-head` lost the compare-and-swap race.
     CasConflict,
