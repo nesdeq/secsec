@@ -365,7 +365,13 @@ pub fn merge_heads<K: MasterKeys>(
             let base_map = match lcas.iter().next() {
                 Some(base_id) => {
                     let (bc, _) = secsec_snapshot::open_signed_commit(base_id, keys, store)?;
-                    load_nodes(&bc.root_tree, &bc.root_salt, keys, store)?
+                    // The LCA commit is kept (I4), but its tree content may be pruned beyond retention;
+                    // an empty ancestor still merges correctly (keep-both on divergence, no data loss).
+                    match load_nodes(&bc.root_tree, &bc.root_salt, keys, store) {
+                        Ok(nodes) => nodes,
+                        Err(EngineError::Snap(SnapError::Missing(_))) => BTreeMap::new(),
+                        Err(e) => return Err(e.into()),
+                    }
                 }
                 None => BTreeMap::new(),
             };

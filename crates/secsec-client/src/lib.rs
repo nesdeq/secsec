@@ -291,8 +291,11 @@ pub async fn push_objects<R: Remote, K: MasterKeys>(
         let present = remote.has_for_push(push_id, chunk).await?;
         for (id, p) in chunk.iter().zip(present) {
             if !p {
-                let blob = store.get(id)?.ok_or(ClientError::MissingLocal(*id))?;
-                remote.put_blob(id, &blob, push_id).await?;
+                // Upload what we hold; an object absent locally is pruned old content the server either
+                // keeps or has dropped too — never re-uploaded (§5/I5).
+                if let Some(blob) = store.get(id)? {
+                    remote.put_blob(id, &blob, push_id).await?;
+                }
             }
         }
     }
@@ -354,11 +357,12 @@ pub async fn fetch_head<R: Remote, K: MasterKeys>(
 }
 
 /// One item of the typed fetch traversal (we know each id's role from its parent, so we can open and
-/// verify it correctly without trusting a server-supplied type).
+/// verify it correctly without trusting a server-supplied type). The bool is `strict`: the head
+/// commit's own content must be present; ancestor content is skip-missing (pruned history, §5/I5).
 enum Work {
-    Commit(Id),
-    Tree(Id, PathSalt),
-    Chunk(Id, PathSalt),
+    Commit(Id, bool),
+    Tree(Id, PathSalt, bool),
+    Chunk(Id, PathSalt, bool),
 }
 
 /// Fetch the full reachable closure of `commit_id` from `remote` into `store`, **verifying every
@@ -371,35 +375,41 @@ pub async fn fetch_closure<R: Remote, K: MasterKeys>(
     commit_id: &Id,
 ) -> Result<usize, ClientError> {
     let mut seen: BTreeSet<Id> = BTreeSet::new();
-    let mut work = vec![Work::Commit(*commit_id)];
+    let mut work = vec![Work::Commit(*commit_id, true)];
     let mut fetched = 0;
 
     while let Some(item) = work.pop() {
-        let id = match &item {
-            Work::Commit(id) | Work::Tree(id, _) | Work::Chunk(id, _) => *id,
+        let (id, strict) = match &item {
+            Work::Commit(id, s) | Work::Tree(id, _, s) | Work::Chunk(id, _, s) => (*id, *s),
         };
         if !seen.insert(id) {
             continue;
         }
-        // Fetch + store (skip the network if we already hold it locally).
+        // Fetch + store unless already local. The head's own content is strict (a missing current
+        // object is a real error); ancestor content is skip-missing — history pruned beyond retention
+        // is simply gone (§5/I5).
         if store.get(&id)?.is_none() {
-            let blob = remote
-                .get_blob(&id)
-                .await?
-                .ok_or(ClientError::MissingRemote(id))?;
-            store.put(&id, &blob)?;
-            fetched += 1;
+            match remote.get_blob(&id).await? {
+                Some(blob) => {
+                    store.put(&id, &blob)?;
+                    fetched += 1;
+                }
+                None if strict => return Err(ClientError::MissingRemote(id)),
+                None => continue,
+            }
         }
         match item {
-            Work::Commit(_) => {
+            Work::Commit(_, _) => {
                 // open_signed_commit re-verifies the content address and decodes (§9.2).
                 let (commit, _sig) = secsec_snapshot::open_signed_commit(&id, keys, store)?;
+                // Parents are ancestors: their content is fetched leniently (kept history is brought
+                // local for merge; pruned history is skipped).
                 for p in &commit.parents {
-                    work.push(Work::Commit(*p));
+                    work.push(Work::Commit(*p, false));
                 }
-                work.push(Work::Tree(commit.root_tree, commit.root_salt));
+                work.push(Work::Tree(commit.root_tree, commit.root_salt, strict));
             }
-            Work::Tree(_, salt) => {
+            Work::Tree(_, salt, _) => {
                 let tree = secsec_snapshot::load_tree(&id, &salt, keys, store)?;
                 for e in tree.entries {
                     match e {
@@ -407,18 +417,18 @@ pub async fn fetch_closure<R: Remote, K: MasterKeys>(
                             path_salt, chunks, ..
                         } => {
                             for c in chunks {
-                                work.push(Work::Chunk(c, path_salt));
+                                work.push(Work::Chunk(c, path_salt, strict));
                             }
                         }
                         Entry::Dir {
                             subtree,
                             subtree_salt,
                             ..
-                        } => work.push(Work::Tree(subtree, subtree_salt)),
+                        } => work.push(Work::Tree(subtree, subtree_salt, strict)),
                     }
                 }
             }
-            Work::Chunk(_, salt) => {
+            Work::Chunk(_, salt, _) => {
                 // Leaf: verify the chunk's content address (§9.2); `open_object` resolves its
                 // generation from `keys` (§8.2).
                 let blob = store.get(&id)?.ok_or(ClientError::MissingLocal(id))?;

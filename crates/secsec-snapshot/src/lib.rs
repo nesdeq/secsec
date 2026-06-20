@@ -109,6 +109,8 @@ pub enum SnapError {
     BadSignature,
     /// A requested path did not exist in the tree being resolved (`secsec log`/`restore`).
     PathNotFound(String),
+    /// The requested version's content has been pruned beyond retention (§5) — it cannot be restored.
+    PrunedBeyondRetention(String),
     /// Signing/key error.
     Sig(secsec_sig::SigError),
 }
@@ -127,6 +129,9 @@ impl core::fmt::Display for SnapError {
             SnapError::Rng => f.write_str("OS RNG failure"),
             SnapError::BadSignature => f.write_str("commit signature invalid or wrong author"),
             SnapError::PathNotFound(p) => write!(f, "path not found in that version: {p}"),
+            SnapError::PrunedBeyondRetention(p) => {
+                write!(f, "the requested version of {p} has been pruned beyond retention")
+            }
             SnapError::Sig(e) => write!(f, "sig: {e}"),
         }
     }
@@ -827,17 +832,19 @@ pub fn restore_tree_into<K: MasterKeys>(
     restore_tree(tree_id, tree_salt, keys, store, dest, 0)
 }
 
-// ---- reachable closure (GC keep-set, §15) ----
+// ---- reachable closure (push set / retention, §5) ----
 
-/// All object ids reachable from `heads` (commits + parents + trees + chunks) — the §15 keep-set.
-/// Every object is opened (§9.2 re-verified); a missing object returns [`SnapError::Missing`] so GC
-/// **fails safe** on an incomplete closure.
+/// All object ids reachable from `heads` (commits + parents + trees + chunks). Each commit in `heads`
+/// and its own tree are **strict** — a missing object errors, because current content must be complete
+/// — while an ancestor commit's content is **skip-missing**: history pruned beyond retention is simply
+/// absent (§5/I5). Every present object is opened (§9.2-verified).
 pub fn reachable_objects<K: MasterKeys>(
     keys: &K,
     store: &Store,
     heads: &[Id],
 ) -> Result<std::collections::BTreeSet<Id>, SnapError> {
     use std::collections::BTreeSet;
+    let head_set: BTreeSet<Id> = heads.iter().copied().collect();
     let mut reachable: BTreeSet<Id> = BTreeSet::new();
     let mut commits_done: BTreeSet<Id> = BTreeSet::new();
     let mut work: Vec<Id> = heads.to_vec();
@@ -846,9 +853,17 @@ pub fn reachable_objects<K: MasterKeys>(
         if !commits_done.insert(cid) {
             continue;
         }
+        let is_head = head_set.contains(&cid);
+        // A head commit must be present; a pruned ancestor commit is skipped (commits are kept, I4,
+        // so this only fires on a genuinely truncated history).
+        let blob = match store.get(&cid)? {
+            Some(b) => b,
+            None if is_head => return Err(SnapError::Missing(cid)),
+            None => continue,
+        };
         reachable.insert(cid);
         let (commit, _sig) =
-            decode_signed_commit(&fetch_open(keys, ObjType::Commit, &ZERO_SALT, &cid, store)?)?;
+            decode_signed_commit(&open_object(keys, ObjType::Commit, &ZERO_SALT, &cid, &blob)?)?;
         collect_tree(
             keys,
             store,
@@ -856,6 +871,7 @@ pub fn reachable_objects<K: MasterKeys>(
             &commit.root_salt,
             0,
             &mut reachable,
+            is_head,
         )?;
         for parent in commit.parents {
             work.push(parent);
@@ -871,14 +887,23 @@ fn collect_tree<K: MasterKeys>(
     tree_salt: &PathSalt,
     depth: usize,
     reachable: &mut std::collections::BTreeSet<Id>,
+    strict: bool,
 ) -> Result<(), SnapError> {
     if depth >= MAX_TREE_DEPTH {
         return Err(SnapError::DepthExceeded);
     }
-    if !reachable.insert(*tree_id) {
+    if reachable.contains(tree_id) {
         return Ok(()); // shared subtree already walked
     }
-    let tree = decode_tree(&fetch_open(keys, ObjType::Tree, tree_salt, tree_id, store)?)?;
+    // A pruned tree is absent: under the head's own tree that is an error (current content must be
+    // complete); under an ancestor it is skipped — its old content fell out of retention (§5/I5).
+    let blob = match store.get(tree_id)? {
+        Some(b) => b,
+        None if strict => return Err(SnapError::Missing(*tree_id)),
+        None => return Ok(()),
+    };
+    reachable.insert(*tree_id);
+    let tree = decode_tree(&open_object(keys, ObjType::Tree, tree_salt, tree_id, &blob)?)?;
     for entry in &tree.entries {
         match entry {
             Entry::File { chunks, .. } => {
@@ -890,7 +915,7 @@ fn collect_tree<K: MasterKeys>(
                 subtree,
                 subtree_salt,
                 ..
-            } => collect_tree(keys, store, subtree, subtree_salt, depth + 1, reachable)?,
+            } => collect_tree(keys, store, subtree, subtree_salt, depth + 1, reachable, strict)?,
         }
     }
     Ok(())
@@ -990,6 +1015,62 @@ pub fn resolve_path<K: MasterKeys>(
     Ok(None)
 }
 
+/// The object ids needed to materialize `path` from `(root_tree, root_salt)`: the tree ids on the
+/// spine from the root to `path`, plus — for a file — its chunk ids, or — for a directory — the full
+/// closure under it. `None` if `path` does not resolve (or its spine has already been pruned). Used by
+/// retention to keep one specific version's content (§5); skip-missing, so an already-pruned part is
+/// simply not added.
+pub fn path_content<K: MasterKeys>(
+    keys: &K,
+    store: &Store,
+    root_tree: &Id,
+    root_salt: &PathSalt,
+    path: &str,
+) -> Result<Option<std::collections::BTreeSet<Id>>, SnapError> {
+    let mut content: std::collections::BTreeSet<Id> = std::collections::BTreeSet::new();
+    content.insert(*root_tree);
+    let comps = path_components(path);
+    if comps.is_empty() {
+        collect_tree(keys, store, root_tree, root_salt, 0, &mut content, false)?;
+        return Ok(Some(content));
+    }
+    let (mut cur_tree, mut cur_salt) = (*root_tree, *root_salt);
+    for (i, comp) in comps.iter().enumerate() {
+        let tree = match load_tree(&cur_tree, &cur_salt, keys, store) {
+            Ok(t) => t,
+            Err(SnapError::Missing(_)) => return Ok(None), // this version's spine is already pruned
+            Err(e) => return Err(e),
+        };
+        let Some(entry) = tree.entries.iter().find(|e| entry_name(e) == *comp) else {
+            return Ok(None);
+        };
+        let last = i + 1 == comps.len();
+        match entry {
+            Entry::File { chunks, .. } => {
+                if last {
+                    content.extend(chunks.iter().copied());
+                    return Ok(Some(content));
+                }
+                return Ok(None); // a non-final component is a file
+            }
+            Entry::Dir {
+                subtree,
+                subtree_salt,
+                ..
+            } => {
+                content.insert(*subtree);
+                if last {
+                    collect_tree(keys, store, subtree, subtree_salt, 0, &mut content, false)?;
+                    return Ok(Some(content));
+                }
+                cur_tree = *subtree;
+                cur_salt = *subtree_salt;
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Restore the file or directory at `path` from `commit` into `dest_root` at the same relative
 /// `path` — the read side of `secsec restore`. A file is materialized (parent dirs created, §9.2
 /// verified, padding stripped); a directory is restored recursively. `PathNotFound` if the path did
@@ -1001,8 +1082,14 @@ pub fn restore_path<K: MasterKeys>(
     path: &str,
     dest_root: &Path,
 ) -> Result<(), SnapError> {
-    let node = resolve_path(keys, store, &commit.root_tree, &commit.root_salt, path)?
-        .ok_or_else(|| SnapError::PathNotFound(path.to_string()))?;
+    let node = match resolve_path(keys, store, &commit.root_tree, &commit.root_salt, path) {
+        Ok(Some(n)) => n,
+        Ok(None) => return Err(SnapError::PathNotFound(path.to_string())),
+        Err(SnapError::Missing(_)) => {
+            return Err(SnapError::PrunedBeyondRetention(path.to_string()))
+        }
+        Err(e) => return Err(e),
+    };
     let target = dest_root.join(path);
     match node {
         PathNode::File {
@@ -1018,7 +1105,13 @@ pub fn restore_path<K: MasterKeys>(
             let mut file = std::fs::File::create(&target)?;
             let mut written: u64 = 0;
             for cid in &chunks {
-                let padded = fetch_open(keys, ObjType::Chunk, &path_salt, cid, store)?;
+                let padded = match fetch_open(keys, ObjType::Chunk, &path_salt, cid, store) {
+                    Ok(b) => b,
+                    Err(SnapError::Missing(_)) => {
+                        return Err(SnapError::PrunedBeyondRetention(path.to_string()))
+                    }
+                    Err(e) => return Err(e),
+                };
                 let plain = unpad_chunk(&padded, Padding::PowerOfTwo)?;
                 file.write_all(plain)?;
                 written += plain.len() as u64;
@@ -1069,7 +1162,13 @@ fn diff_trees<K: MasterKeys>(
     }
     let load = |t: Option<(&Id, &PathSalt)>| -> Result<Vec<Entry>, SnapError> {
         match t {
-            Some((id, salt)) => Ok(load_tree(id, salt, keys, store)?.entries),
+            Some((id, salt)) => match load_tree(id, salt, keys, store) {
+                Ok(tree) => Ok(tree.entries),
+                // A tree pruned beyond retention is treated as an empty side, so `log` lists the commit
+                // without a diff rather than erroring (§5).
+                Err(SnapError::Missing(_)) => Ok(Vec::new()),
+                Err(e) => Err(e),
+            },
             None => Ok(Vec::new()),
         }
     };

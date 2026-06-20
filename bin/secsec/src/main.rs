@@ -34,6 +34,8 @@ const DEFAULT_PORT: u16 = 8899;
 const STAGING_TTL_SECS: u64 = 24 * 60 * 60;
 /// How often the server sweeps idle staging (§3): every 60 minutes.
 const RECLAIM_TICK_SECS: u64 = 60 * 60;
+/// Default history retention: keep the last N versions of each file (§5).
+const RETENTION_KEEP_VERSIONS: usize = 8;
 /// How long `invite` waits for a device to pair, and `sync --invite` waits for the host, in 500 ms
 /// pairing-poll rounds (§7): the host waits up to the ~10-minute invite lifetime; the joiner ~2 min.
 const PAIR_HOST_ROUNDS: u32 = 1200;
@@ -854,6 +856,23 @@ async fn run_sync(
                 }
                 frontier = outcome.frontier;
                 base = outcome.base;
+
+                // Bound history once per session (best-effort, §5): keep the last N versions per file,
+                // deleting superseded content under the head-binding CAS. Never blocks syncing.
+                if initial {
+                    if let Err(e) = secsec_client::prune::prune_history(
+                        &rem,
+                        &store,
+                        &keyring,
+                        &ref_name,
+                        RETENTION_KEEP_VERSIONS,
+                        roster_seq,
+                    )
+                    .await
+                    {
+                        eprintln!("history prune skipped: {e}");
+                    }
+                }
             }
             // A cas-head conflict is a normal concurrent-write race (another device advanced the ref
             // while we were pushing), not an error — re-sync immediately to fetch its head and merge.
