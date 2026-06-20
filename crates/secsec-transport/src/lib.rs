@@ -31,7 +31,7 @@ pub struct HostPin {
 impl HostPin {
     /// Pin to a SubjectPublicKeyInfo DER directly (e.g. recovered from a stored pin).
     #[must_use]
-    pub fn from_spki(spki: Vec<u8>) -> Self {
+    pub(crate) fn from_spki(spki: Vec<u8>) -> Self {
         Self {
             host_id: *blake3::hash(&spki).as_bytes(),
             spki: Some(spki),
@@ -55,6 +55,7 @@ impl HostPin {
     }
 
     /// The pinned SPKI DER bytes, if this pin carries them (cert/SPKI pins; `None` for `--host-fp`).
+    #[cfg(test)]
     #[must_use]
     pub fn spki(&self) -> Option<&[u8]> {
         self.spki.as_deref()
@@ -92,7 +93,7 @@ fn spki_of(cert_der: &[u8]) -> Result<Vec<u8>, PinError> {
 /// (§11). It performs no CA-chain or hostname validation — identity rests entirely on the SPKI pin —
 /// and delegates handshake-signature verification to the crypto provider.
 #[derive(Debug)]
-pub struct PinnedServerVerifier {
+pub(crate) struct PinnedServerVerifier {
     pin: HostPin,
     supported: WebPkiSupportedAlgorithms,
 }
@@ -100,7 +101,7 @@ pub struct PinnedServerVerifier {
 impl PinnedServerVerifier {
     /// Build a verifier for the given host pin.
     #[must_use]
-    pub fn new(pin: HostPin) -> Self {
+    pub(crate) fn new(pin: HostPin) -> Self {
         Self {
             pin,
             supported: default_provider().signature_verification_algorithms,
@@ -161,7 +162,7 @@ impl ServerCertVerifier for PinnedServerVerifier {
 /// cell; the caller confirms the fingerprint out-of-band and pins it for every later connection.
 /// The ssh `known_hosts` first-contact model, with the same one-time risk.
 #[derive(Debug)]
-pub struct TofuVerifier {
+pub(crate) struct TofuVerifier {
     captured: std::sync::Arc<std::sync::Mutex<Option<[u8; 32]>>>,
     supported: WebPkiSupportedAlgorithms,
 }
@@ -169,7 +170,7 @@ pub struct TofuVerifier {
 impl TofuVerifier {
     /// Build a TOFU verifier that writes the presented server's `host_id` into `captured`.
     #[must_use]
-    pub fn new(captured: std::sync::Arc<std::sync::Mutex<Option<[u8; 32]>>>) -> Self {
+    pub(crate) fn new(captured: std::sync::Arc<std::sync::Mutex<Option<[u8; 32]>>>) -> Self {
         Self {
             captured,
             supported: default_provider().signature_verification_algorithms,

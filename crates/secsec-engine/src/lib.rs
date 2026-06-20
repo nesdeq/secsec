@@ -50,7 +50,7 @@ impl From<SnapError> for EngineError {
 
 /// Materialize the stored tree into an in-memory [`Node`] map, recursing into subtrees (each level
 /// §9.2-verified). A missing object surfaces as [`SnapError::Missing`].
-pub fn load_nodes<K: MasterKeys>(
+pub(crate) fn load_nodes<K: MasterKeys>(
     tree_id: &Id,
     tree_salt: &PathSalt,
     keys: &K,
@@ -116,7 +116,7 @@ fn load_nodes_inner<K: MasterKeys>(
 
 /// Seal a [`Node`] map back into the store (children first). Files reuse their `chunks` and
 /// `path_salt` — nothing is re-chunked, so the tree restores byte-identically. Returns `(id, salt)`.
-pub fn seal_nodes(
+pub(crate) fn seal_nodes(
     nodes: &BTreeMap<String, Node>,
     mk: &MasterKey,
     store: &Store,
@@ -158,8 +158,8 @@ pub fn seal_nodes(
     Ok(secsec_snapshot::seal_tree(&Tree { entries }, mk, store)?)
 }
 
-/// The outcome of [`reconcile`]: the merged tree's address in the store, and the conflicts that were
-/// resolved keep-both (empty for a clean merge).
+/// The outcome of a three-way merge: the merged tree's address in the store, and the conflicts that
+/// were resolved keep-both (empty for a clean merge).
 #[derive(Debug, Clone)]
 pub struct Reconciled {
     /// Merged root tree content id.
@@ -168,24 +168,6 @@ pub struct Reconciled {
     pub root_salt: PathSalt,
     /// Keep-both conflicts, in path order.
     pub conflicts: Vec<Conflict>,
-}
-
-/// Three-way reconcile of two divergent commit trees against their common ancestor (each a
-/// `(root_tree_id, root_salt)`), materializing the merged tree into `store`. `their_label` is the
-/// §10 keep-both suffix. Both sides' chunks must already be in `store`.
-pub fn reconcile<K: MasterKeys>(
-    base: (&Id, &PathSalt),
-    ours: (&Id, &PathSalt),
-    theirs: (&Id, &PathSalt),
-    their_label: &str,
-    keys: &K,
-    store: &Store,
-) -> Result<Reconciled, EngineError> {
-    // Reads resolve each tree's own generation (§8.2); the result seals under the current one.
-    let b = load_nodes(base.0, base.1, keys, store)?;
-    let o = load_nodes(ours.0, ours.1, keys, store)?;
-    let t = load_nodes(theirs.0, theirs.1, keys, store)?;
-    merge_node_maps(&b, &o, &t, their_label, keys, store)
 }
 
 /// The merge core over already-materialized node maps: three-way merge then re-seal under the current
@@ -468,65 +450,6 @@ mod tests {
         secsec_snapshot::restore_tree_into(&id2, &salt2, &m, &store, dst.path()).unwrap();
 
         assert_eq!(read_tree(src.path()), read_tree(dst.path()));
-    }
-
-    #[test]
-    fn reconcile_merges_divergent_trees_to_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("s.redb")).unwrap();
-        let m = mk();
-
-        // base: {keep, shared}; ours adds "ours-only" + edits "shared"; theirs edits "shared"
-        // differently (a real conflict) and edits "keep" (one-sided, taken).
-        let base = tempfile::tempdir().unwrap();
-        std::fs::write(base.path().join("keep"), b"k0").unwrap();
-        std::fs::write(base.path().join("shared"), b"s0").unwrap();
-
-        let ours = tempfile::tempdir().unwrap();
-        std::fs::write(ours.path().join("keep"), b"k0").unwrap();
-        std::fs::write(ours.path().join("shared"), b"sOURS").unwrap();
-        std::fs::write(ours.path().join("ours-only"), b"new").unwrap();
-
-        let theirs = tempfile::tempdir().unwrap();
-        std::fs::write(theirs.path().join("keep"), b"kEDIT").unwrap();
-        std::fs::write(theirs.path().join("shared"), b"sTHEIRS").unwrap();
-
-        // base is the common ancestor; ours and theirs each descend from it, so unchanged paths reuse
-        // base's salts (§9.7) and the merge can recognize them as unchanged (real sync topology).
-        let b = secsec_snapshot::snapshot_tree(base.path(), &m, &store, None).unwrap();
-        let o =
-            secsec_snapshot::snapshot_tree(ours.path(), &m, &store, Some((&b.0, &b.1))).unwrap();
-        let t =
-            secsec_snapshot::snapshot_tree(theirs.path(), &m, &store, Some((&b.0, &b.1))).unwrap();
-
-        let r = reconcile(
-            (&b.0, &b.1),
-            (&o.0, &o.1),
-            (&t.0, &t.1),
-            "devB-abc123",
-            &m,
-            &store,
-        )
-        .unwrap();
-
-        // exactly one conflict: "shared".
-        assert_eq!(r.conflicts.len(), 1);
-        assert_eq!(r.conflicts[0].path, "shared");
-
-        // materialize and check the on-disk reconciled tree.
-        let out = tempfile::tempdir().unwrap();
-        secsec_snapshot::restore_tree_into(&r.root_tree, &r.root_salt, &m, &store, out.path())
-            .unwrap();
-        let files: BTreeMap<String, Vec<u8>> = read_tree(out.path()).into_iter().collect();
-
-        assert_eq!(files.get("keep").unwrap(), b"kEDIT"); // one-sided edit taken
-        assert_eq!(files.get("ours-only").unwrap(), b"new"); // one-sided add taken
-        assert_eq!(files.get("shared").unwrap(), b"sOURS"); // ours keeps the name
-        assert_eq!(
-            files.get("shared.conflict-devB-abc123").unwrap(),
-            b"sTHEIRS"
-        ); // theirs kept-both
-        assert_eq!(files.len(), 4, "no data lost, nothing extra");
     }
 
     use secsec_sig::DeviceKey;

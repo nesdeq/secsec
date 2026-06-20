@@ -276,7 +276,7 @@ pub fn decode_entry(bytes: &[u8]) -> Result<Entry, RosterError> {
 
 /// BLAKE3 of the full entry — the chain link `prev` and the genesis RFP.
 #[must_use]
-pub fn entry_hash(e: &Entry) -> [u8; 32] {
+pub(crate) fn entry_hash(e: &Entry) -> [u8; 32] {
     *blake3::hash(&encode_entry(e)).as_bytes()
 }
 
@@ -322,7 +322,7 @@ pub fn open_entry(
 const ROSTER_KEY_LEN: usize = 32;
 /// Stored size of one `roster_keyhist_g` wrap: `ctx_tag(32) ‖ ct(32)` (§8.2). No FRAME prefix —
 /// `g` comes from the storage path and the AD is reconstructed by the reader.
-pub const ROSTER_KEYHIST_LEN: usize = CTX_TAG_LEN + ROSTER_KEY_LEN;
+pub(crate) const ROSTER_KEYHIST_LEN: usize = CTX_TAG_LEN + ROSTER_KEY_LEN;
 
 /// Wrap `roster_key_g` so it can be recovered by a holder of `roster_key_{g+1}` (the next
 /// generation). Keyed by `k_rkh_g = derive_key("secsec-roster-keyhist-v1", roster_key_{g+1} ‖
@@ -345,7 +345,7 @@ pub fn seal_roster_keyhist(
 
 /// Recover `roster_key_g` from a `roster_keyhist_g` wrap using `roster_key_{g+1}`. Verifies the
 /// CMT-4 commitment before releasing the key. Returns the zeroizing-wrapped recovered key.
-pub fn open_roster_keyhist(
+pub(crate) fn open_roster_keyhist(
     roster_key_next: &[u8; 32],
     g: u32,
     stored: &[u8],
@@ -373,7 +373,7 @@ pub fn open_roster_keyhist(
 /// Peel the roster-key history downward from `roster_key_current`: returns `g → roster_key_g` for
 /// all `1..=current_gen`. `history` MUST hold a wrap for every `g` in `1..current_gen`; a missing
 /// or unopenable wrap aborts (a current member can always produce the never-trimmed chain).
-pub fn peel_roster_keys(
+pub(crate) fn peel_roster_keys(
     roster_key_current: &[u8; 32],
     current_gen: u32,
     history: &BTreeMap<u32, Vec<u8>>,
@@ -397,7 +397,7 @@ pub fn peel_roster_keys(
 
 /// Stored size of one DATA `keyhist_g` wrap: `ctx_tag(32) ‖ ct(32)` (§8.2). Same layout as the
 /// roster-key history; no FRAME prefix (`g` comes from the storage path).
-pub const DATA_KEYHIST_LEN: usize = CTX_TAG_LEN + 32;
+pub(crate) const DATA_KEYHIST_LEN: usize = CTX_TAG_LEN + 32;
 
 /// Wrap `master_key_g` under `master_key_{g+1}` (§8.2): the CTX/CMT-4 seal with
 /// AD = `FRAME(type=keyhist, gen=g)`; returns the bare `ctx_tag ‖ ct`.
@@ -418,7 +418,7 @@ pub fn seal_data_keyhist(
 
 /// Recover `master_key_g` from a DATA `keyhist_g` wrap using `master_key_{g+1}` (§8.2). Verifies the
 /// CMT-4 commitment before releasing the key. Returns the generation-`g` [`MasterKey`].
-pub fn open_data_keyhist(
+pub(crate) fn open_data_keyhist(
     master_key_next: &[u8; 32],
     g: u32,
     stored: &[u8],
@@ -579,7 +579,7 @@ fn verify_entry_sig(pubkey: &DevicePublic, e: &Entry) -> Result<(), RosterError>
 /// Fold and fully validate a sigchain against the pinned `rfp`. Enforces genesis = RFP,
 /// sequential seqs, the `prev` hash chain, per-entry signatures, and **succession** (each signer
 /// must be a current member of the prefix). Returns the resulting [`State`].
-pub fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterError> {
+pub(crate) fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterError> {
     let g = entries.first().ok_or(RosterError::Empty)?;
     if g.seq != 0 || g.prev != [0u8; 32] {
         return Err(RosterError::BadGenesis);
@@ -729,7 +729,7 @@ pub fn cold_start_fold(
 /// granted at/after `after_seq` (the revoker's last-authored-or-witnessed seq). Sorted, so the
 /// follow-on `RevokeDevice` entries are deterministic.
 #[must_use]
-pub fn devices_added_by(state: &State, revoked: &DeviceId, after_seq: u64) -> Vec<DeviceId> {
+pub(crate) fn devices_added_by(state: &State, revoked: &DeviceId, after_seq: u64) -> Vec<DeviceId> {
     state
         .added_by
         .iter()

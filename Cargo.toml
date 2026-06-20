@@ -11,6 +11,7 @@ license = "GPL-2.0-only"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+unreachable_pub = "warn"          # flag over-exposed `pub`; `dead_code` then guards pub(crate) items
 rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]

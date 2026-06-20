@@ -151,7 +151,7 @@ pub fn commit_ids<K: MasterKeys>(
 /// Fetch only the chunk blobs needed to materialize `path` from `commit` (the trees are assumed
 /// already local via [`fetch_history`]). For a file: its chunks; for a directory: every chunk under
 /// it. So restoring one file from a large repo does not download the whole snapshot.
-pub async fn fetch_path_content<R: Remote, K: MasterKeys>(
+pub(crate) async fn fetch_path_content<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
     keys: &K,

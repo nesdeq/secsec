@@ -11,9 +11,9 @@ use secsec_sig::DeviceId;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Local sealed-state nonce length (§9.8): 96-bit.
-pub const FRONTIER_NONCE_LEN: usize = 12;
+pub(crate) const FRONTIER_NONCE_LEN: usize = 12;
 /// Poly1305 tag length in the sealed frontier blob (§9.8).
-pub const FRONTIER_TAG_LEN: usize = 16;
+pub(crate) const FRONTIER_TAG_LEN: usize = 16;
 
 /// The persisted, monotonic client frontier (§8.5) the merge gates check against. Sealed locally
 /// under the device key (§8.5/§9.8); this is just the in-memory state.
@@ -250,7 +250,7 @@ fn decode_hwm(r: &mut Reader<'_>) -> Result<BTreeMap<DeviceId, u64>, CanonError>
 impl SyncFrontier {
     /// Canonical plaintext encoding of the frontier (the inner of the §8.5 sealed blob).
     #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.u64(self.roster_seq);
         encode_hwm(&mut w, &self.commit_version_hwm);
@@ -259,7 +259,7 @@ impl SyncFrontier {
     }
 
     /// Strictly decode a frontier plaintext (inverse of [`Self::encode`]).
-    pub fn decode(bytes: &[u8]) -> Result<Self, FrontierError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, FrontierError> {
         let mut r = Reader::new(bytes);
         let roster_seq = r.u64()?;
         let commit_version_hwm = decode_hwm(&mut r)?;

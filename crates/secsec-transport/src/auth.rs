@@ -8,9 +8,9 @@ use secsec_sig::{DeviceKey, DevicePublic, NS_AUTH};
 
 /// The wire `secsec_version` carried in the handshake hellos (§11). A peer at a different version
 /// fails the hello — there is no negotiation or backward compatibility.
-pub const SECSEC_VERSION: u16 = 2;
+pub(crate) const SECSEC_VERSION: u16 = 2;
 /// Handshake nonce length (client/server), in bytes (§11).
-pub const NONCE_LEN: usize = 32;
+pub(crate) const NONCE_LEN: usize = 32;
 
 /// The §11 session transcript: a running BLAKE3 over exactly the two ordered, length-prefixed
 /// hellos. Both ends MUST feed identical bytes in this fixed order.
@@ -84,7 +84,7 @@ impl From<secsec_sig::SigError> for AuthError {
 /// The connection-auth context (§9.6 `secsec-auth-v1`): the fields the client signs to prove it
 /// completed *this* session against *this* server over *this* channel.
 #[derive(Clone, Copy)]
-pub struct ConnectionAuth<'a> {
+pub(crate) struct ConnectionAuth<'a> {
     /// The TLS 1.3 keying-material exporter — the channel binding (§11).
     pub channel_binding: &'a [u8],
     /// `BLAKE3(SPKI)` of the pinned server key (§11).
@@ -100,7 +100,7 @@ impl ConnectionAuth<'_> {
     /// (§9.6 field order). `channel_binding` is length-prefixed so the encoding is unambiguous; the
     /// rest are fixed-width.
     #[must_use]
-    pub fn message(&self) -> Vec<u8> {
+    pub(crate) fn message(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.bytes(self.channel_binding)
             .raw(&self.host_id)
@@ -110,13 +110,13 @@ impl ConnectionAuth<'_> {
     }
 
     /// Sign the connection-auth payload under `NS_AUTH` (§9.6).
-    pub fn sign(&self, device: &DeviceKey) -> Result<Vec<u8>, AuthError> {
+    pub(crate) fn sign(&self, device: &DeviceKey) -> Result<Vec<u8>, AuthError> {
         Ok(device.sign(NS_AUTH, &self.message())?)
     }
 
     /// Verify a connection-auth signature against `pubkey`. The server resolves `pubkey` from the
     /// roster and MUST also confirm it owns a keyslot and that `server_nonce` is fresh (§11/§12).
-    pub fn verify(&self, pubkey: &DevicePublic, sig: &[u8]) -> Result<(), AuthError> {
+    pub(crate) fn verify(&self, pubkey: &DevicePublic, sig: &[u8]) -> Result<(), AuthError> {
         pubkey
             .verify(NS_AUTH, &self.message(), sig)
             .map_err(|_| AuthError::BadSignature)

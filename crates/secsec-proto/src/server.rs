@@ -80,7 +80,7 @@ impl Default for NonceStore {
 impl NonceStore {
     /// A store with an explicit TTL (use [`Default`] for the §19 60-second TTL).
     #[must_use]
-    pub fn new(ttl_secs: u64) -> Self {
+    pub(crate) fn new(ttl_secs: u64) -> Self {
         Self {
             ttl: ttl_secs,
             live: HashMap::new(),
@@ -117,11 +117,12 @@ impl NonceStore {
     }
 
     /// Drop all expired nonces (periodic housekeeping; bounds memory).
-    pub fn evict_expired(&mut self, now: u64) {
+    pub(crate) fn evict_expired(&mut self, now: u64) {
         self.live.retain(|_, &mut expiry| now < expiry);
     }
 
     /// Number of live (issued, unconsumed, unexpired-at-last-eviction) nonces.
+    #[cfg(test)]
     #[must_use]
     pub fn live_count(&self) -> usize {
         self.live.len()
@@ -171,6 +172,7 @@ impl TokenBucket {
     }
 
     /// Current token count (after refilling to `now`).
+    #[cfg(test)]
     pub fn available(&mut self, now: u64) -> u64 {
         self.refill(now);
         self.tokens
@@ -267,6 +269,7 @@ impl StorageQuota {
     }
 
     /// Bytes currently in use.
+    #[cfg(test)]
     #[must_use]
     pub fn used(&self) -> u64 {
         self.used

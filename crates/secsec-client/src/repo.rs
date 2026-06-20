@@ -20,13 +20,15 @@ use secsec_roster::{
     seal_roster_keyhist, Op, RosterError, State,
 };
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
-use secsec_store::{Store, StoreError, ABSENT_HEAD};
+#[cfg(test)]
+use secsec_store::Store;
+use secsec_store::{StoreError, ABSENT_HEAD};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
 /// X-Wing keyslot KEM algorithm id (§9.1/§8.3): a stored keyslot is `algo_id(1B) ‖ body`. The tag
 /// plus the §16 `min_algo` floor give the protocol crypto agility.
-pub const ALGO_XWING: u8 = 1;
+pub(crate) const ALGO_XWING: u8 = 1;
 
 /// A device's X-Wing keypair, derived from its SSH private **seed** (§8.3) — no extra stored PQ key
 /// material, and not reconstructible from the public Ed25519 key (see `DeviceKey::xwing_seed`).
@@ -38,7 +40,7 @@ fn xwing_keypair(device: &DeviceKey) -> Result<(XWingSecret, XWingPublic), RepoE
 
 /// A device's published X-Wing public key (§8.3/§17) — recorded in the roster so a granter or
 /// rotation can wrap `master_key_g` to it; the CLI prints it during enrollment (§7).
-pub fn device_xwing_pub(device: &DeviceKey) -> Result<Vec<u8>, RepoError> {
+pub(crate) fn device_xwing_pub(device: &DeviceKey) -> Result<Vec<u8>, RepoError> {
     Ok(xwing_keypair(device)?.1.to_bytes())
 }
 
@@ -208,6 +210,7 @@ impl From<secsec_sig::SigError> for RepoError {
 /// under `roster_key_1`) and device-1's keyslot wrapping the master key, into `store`. Returns the
 /// **RFP** — the out-of-band anchor the user records (§5/§7). The master key never leaves this
 /// function; it is recovered later by [`open_repo`] unwrapping the keyslot.
+#[cfg(test)]
 pub fn init_repo(store: &Store, device: &DeviceKey, ts: u64) -> Result<[u8; 32], RepoError> {
     let mut key = Zeroizing::new([0u8; 32]);
     getrandom::fill(key.as_mut_slice()).map_err(|_| RepoError::Rng)?;
@@ -282,6 +285,7 @@ fn frame_gen(blob: &[u8]) -> Result<u32, RepoError> {
 /// §8.1 cold-start open: recover the live `MasterKey` and folded roster [`State`] for `device` from
 /// `store`. Reads genesis..tip + this device's keyslot, X-Wing-unwraps the candidate, then
 /// `cold_start_fold` peels keys, folds the chain, and verifies `rfp` + `mk_commit` (§7 step 3).
+#[cfg(test)]
 pub fn open_repo(
     store: &Store,
     device: &DeviceKey,
@@ -340,6 +344,7 @@ fn enforce_min_algo(keyslot: &[u8], state: &State) -> Result<(), RepoError> {
 /// Build the §8.2 DATA keyring from the **local** store: peel `master_key_g` for every generation
 /// `1..=mk.generation()` so objects sealed under any past generation stay readable. Returns
 /// `g → master_key_g`; at generation 1 the map is just `{1: mk}`.
+#[cfg(test)]
 pub fn data_keyring(store: &Store, mk: &MasterKey) -> Result<BTreeMap<u32, MasterKey>, RepoError> {
     let g_cur = mk.generation();
     let mut hist: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
@@ -375,6 +380,7 @@ pub async fn data_keyring_remote<R: Remote>(
 /// every remaining member's keyslot to the new generation. When `revoke` is `Some(b)`, `b` and its
 /// transitive add-by closure are revoked first and their keyslots deleted — the `revoke ⇒ rotate`
 /// forward-secrecy flow (P6/P11). Returns the new live `(MasterKey, State)`.
+#[cfg(test)]
 pub fn rotate_repo(
     store: &Store,
     device: &DeviceKey,
@@ -557,7 +563,7 @@ pub async fn rotate_repo_remote<R: Remote>(
 /// invite pairing ([`crate::pair`]): append an `AddDevice` entry (publishing D's X-Wing public) and
 /// wrap `master_key_g` to D's keyslot. D's keys are authenticated by the invite-code MAC (§7); on a
 /// CAS race the caller re-folds and retries.
-pub async fn grant_device_remote<R: Remote>(
+pub(crate) async fn grant_device_remote<R: Remote>(
     remote: &R,
     device: &DeviceKey,
     mk: &MasterKey,
@@ -607,7 +613,7 @@ pub async fn grant_device_remote<R: Remote>(
 /// Fetch a remote's full sigchain (`get-roster` `seq = 0, 1, …` until absent), bounded by the §19
 /// total-sigchain cap so a misbehaving server cannot stream entries forever. Entries are the stored
 /// (encrypted) blobs; the caller folds/verifies them against the RFP (§8.1).
-pub async fn fetch_roster_entries<R: Remote>(remote: &R) -> Result<Vec<Vec<u8>>, RepoError> {
+pub(crate) async fn fetch_roster_entries<R: Remote>(remote: &R) -> Result<Vec<Vec<u8>>, RepoError> {
     let mut entries: Vec<Vec<u8>> = Vec::new();
     let mut seq = 0u64;
     while seq < MAX_TOTAL_SIGCHAIN {

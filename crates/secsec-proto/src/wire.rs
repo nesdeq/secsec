@@ -15,11 +15,11 @@ use secsec_frame::{MAX_BLOB_SIZE, MAX_ROSTER_ENTRY_SIZE};
 pub type Id = [u8; 32];
 
 /// Maximum canonical device-pubkey length (Ed25519 SSH encoding is ~51 bytes; bounded generously).
-pub const MAX_PUBKEY: usize = 1024;
+pub(crate) const MAX_PUBKEY: usize = 1024;
 /// Maximum SSHSIG length (a PEM SSHSIG is well under this).
-pub const MAX_SIG: usize = MAX_ROSTER_ENTRY_SIZE;
+pub(crate) const MAX_SIG: usize = MAX_ROSTER_ENTRY_SIZE;
 /// Maximum encoded `Request` length: a 16 MiB `put` blob plus envelope overhead.
-pub const MAX_REQUEST_LEN: usize = MAX_BLOB_SIZE + 4096;
+pub(crate) const MAX_REQUEST_LEN: usize = MAX_BLOB_SIZE + 4096;
 
 /// Errors decoding a wire message.
 #[derive(Debug, Clone, PartialEq, Eq)]

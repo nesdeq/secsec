@@ -8,7 +8,6 @@
 #![forbid(unsafe_code)]
 
 use ssh_key::private::KeypairData;
-use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
 use zeroize::Zeroizing;
 
@@ -145,7 +144,7 @@ impl DeviceKey {
     /// The X25519 secret scalar (Ed25519→X25519 map, §8.3): raw clamped `SHA-512(seed)[..32]` —
     /// the §8.5 `device_ed25519_scalar_clamped`. NOT `SigningKey::to_scalar()` (that reduces mod
     /// the group order, which clamping would then corrupt). Zeroized on drop.
-    pub fn x25519_secret(&self) -> Result<Zeroizing<[u8; 32]>, SigError> {
+    pub(crate) fn x25519_secret(&self) -> Result<Zeroizing<[u8; 32]>, SigError> {
         use sha2::{Digest, Sha512};
         let seed = self.ed25519_seed()?;
         let h = Sha512::digest(seed.as_slice());
@@ -156,11 +155,6 @@ impl DeviceKey {
         k[31] &= 127;
         k[31] |= 64;
         Ok(k)
-    }
-
-    /// This device's X25519 public key (Montgomery-u of the Ed25519 public point).
-    pub fn x25519_public(&self) -> Result<[u8; 32], SigError> {
-        self.public().x25519_public()
     }
 
     /// The §8.5 local-seal key, derived from the **private** clamped scalar (never the public key —
@@ -232,21 +226,6 @@ impl DevicePublic {
     /// for identifying a device to a human (e.g. in `secsec devices`).
     pub fn ssh_fingerprint(&self) -> Result<String, SigError> {
         Ok(self.key.fingerprint(HashAlg::Sha256).to_string())
-    }
-
-    fn ed25519_public_bytes(&self) -> Result<[u8; 32], SigError> {
-        match self.key.key_data() {
-            KeyData::Ed25519(pk) => Ok(pk.0),
-            _ => Err(SigError::NotEd25519),
-        }
-    }
-
-    /// This key's X25519 public key (Montgomery-u of the Ed25519 public point), for keyslot ECDH.
-    pub fn x25519_public(&self) -> Result<[u8; 32], SigError> {
-        let ed = self.ed25519_public_bytes()?;
-        let vk =
-            ed25519_dalek::VerifyingKey::from_bytes(&ed).map_err(|_| SigError::KeyConversion)?;
-        Ok(vk.to_montgomery().to_bytes())
     }
 
     /// Verify an SSHSIG (PEM bytes) over `msg` under `namespace`.
@@ -324,25 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn x25519_conversion_consistent_and_dh_agrees() {
-        use x25519_dalek::{PublicKey as XPub, StaticSecret};
-        let a = DeviceKey::generate().unwrap();
-        let b = DeviceKey::generate().unwrap();
-        let a_sec = StaticSecret::from(*a.x25519_secret().unwrap());
-        let b_sec = StaticSecret::from(*b.x25519_secret().unwrap());
-        let a_pub = a.x25519_public().unwrap();
-        let b_pub = b.x25519_public().unwrap();
-        // The X25519 public derived from our converted secret must equal our converted public —
-        // this is the correctness condition the age/ssh-to-age conversion relies on.
-        assert_eq!(XPub::from(&a_sec).as_bytes(), &a_pub);
-        assert_eq!(XPub::from(&b_sec).as_bytes(), &b_pub);
-        // ECDH agrees in both directions.
-        let ab = a_sec.diffie_hellman(&XPub::from(b_pub));
-        let ba = b_sec.diffie_hellman(&XPub::from(a_pub));
-        assert_eq!(ab.as_bytes(), ba.as_bytes());
-    }
-
-    #[test]
     fn local_seal_key_is_private_derived_and_per_device() {
         let a = DeviceKey::generate().unwrap();
         let b = DeviceKey::generate().unwrap();
@@ -351,10 +311,8 @@ mod tests {
         assert_eq!(*ka, *a.local_seal_key().unwrap());
         // distinct per device.
         assert_ne!(*ka, *b.local_seal_key().unwrap());
-        // §8.5: derived from the PRIVATE scalar, and not equal to that scalar nor to any
-        // public-recoverable material (it passes through derive_key, so it differs from x25519_secret).
+        // §8.5: derived from the PRIVATE scalar via derive_key, so it differs from that scalar.
         assert_ne!(ka.as_slice(), a.x25519_secret().unwrap().as_slice());
-        assert_ne!(ka.as_slice(), &a.x25519_public().unwrap());
     }
 
     #[test]
@@ -369,7 +327,6 @@ mod tests {
         // §8.3: from the PRIVATE scalar, and domain-separated from the local-seal key and the scalar.
         assert_ne!(sa.as_slice(), a.x25519_secret().unwrap().as_slice());
         assert_ne!(sa.as_slice(), a.local_seal_key().unwrap().as_slice());
-        assert_ne!(sa.as_slice(), &a.x25519_public().unwrap());
     }
 
     #[test]

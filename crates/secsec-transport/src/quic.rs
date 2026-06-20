@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// QUIC idle timeout (§19): 30 s.
-pub const IDLE_TIMEOUT_SECS: u64 = 30;
+pub(crate) const IDLE_TIMEOUT_SECS: u64 = 30;
 /// QUIC keepalive interval (§19): 10 s.
-pub const KEEPALIVE_SECS: u64 = 10;
+pub(crate) const KEEPALIVE_SECS: u64 = 10;
 
 /// QUIC idle/keepalive tuning (§19 `secsec.config`); defaults to the §19 values. The keepalive must
 /// stay strictly below the idle timeout so a live connection refreshes before it can idle out.

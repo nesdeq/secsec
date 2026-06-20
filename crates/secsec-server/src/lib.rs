@@ -145,11 +145,9 @@ pub struct Server {
 }
 
 /// The server's connection allow-list source (§11/§12).
-pub enum Authorized {
+pub(crate) enum Authorized {
     /// Allow any authenticated key to connect (tests / in-process backends only).
     Any,
-    /// A fixed set of permitted device ids.
-    Static(BTreeSet<DeviceId>),
     /// Re-read `~/.ssh/authorized_keys` (the OpenSSH `authorized_keys` file) on every check, so the
     /// operator can add/remove devices live. Unreadable ⇒ deny (fail closed).
     File(std::path::PathBuf),
@@ -198,13 +196,6 @@ impl Server {
         self.limits.conn_rate_per_sec
     }
 
-    /// Restrict connections to a fixed device-id set (for tests / in-process backends).
-    #[must_use]
-    pub fn with_authorized(mut self, authorized: BTreeSet<DeviceId>) -> Self {
-        self.authorized = Authorized::Static(authorized);
-        self
-    }
-
     /// Gate connections on the operator's `authorized_keys` **file**, re-read per connection so adding
     /// a device takes effect with no restart. This is the mandatory `secsec serve` configuration.
     #[must_use]
@@ -215,10 +206,9 @@ impl Server {
 
     /// Whether `device_id` is permitted to connect. `File` is re-read on each call (unreadable ⇒ deny).
     #[must_use]
-    pub fn is_authorized(&self, device_id: &DeviceId) -> bool {
+    pub(crate) fn is_authorized(&self, device_id: &DeviceId) -> bool {
         match &self.authorized {
             Authorized::Any => true,
-            Authorized::Static(set) => set.contains(device_id),
             Authorized::File(path) => std::fs::read_to_string(path)
                 .map(|body| parse_authorized_keys(&body).contains(device_id))
                 .unwrap_or(false),
@@ -227,6 +217,7 @@ impl Server {
 
     /// Borrow the underlying object + keyslot store (e.g. for enrollment writes by the orchestration
     /// layer, or `keyslot_exists` queries).
+    #[cfg(test)]
     #[must_use]
     pub fn store(&self) -> &Store {
         &self.store
@@ -241,7 +232,7 @@ impl Server {
 
     /// Issue a fresh `server_nonce` challenge (the caller draws it from the OS CSPRNG and sends it to
     /// the client). It is honoured once, within the §19 TTL.
-    pub fn issue_nonce(&self, nonce: [u8; 32], now: u64) {
+    pub(crate) fn issue_nonce(&self, nonce: [u8; 32], now: u64) {
         self.state
             .lock()
             .expect("server state")
@@ -300,7 +291,7 @@ impl Server {
     /// authenticated key). Returns `true` if reserved (the caller MUST [`release_conn`](Self::release_conn)
     /// on disconnect, e.g. via [`ConnGuard`]); `false` if the key is already at its cap.
     #[must_use]
-    pub fn acquire_conn(&self, d: DeviceId) -> bool {
+    pub(crate) fn acquire_conn(&self, d: DeviceId) -> bool {
         let max = self.limits.max_conns_per_key;
         let mut st = self.state.lock().expect("server state");
         let n = st.conn_counts.entry(d).or_insert(0);
@@ -313,7 +304,7 @@ impl Server {
     }
 
     /// Release a slot reserved by [`acquire_conn`](Self::acquire_conn).
-    pub fn release_conn(&self, d: DeviceId) {
+    pub(crate) fn release_conn(&self, d: DeviceId) {
         let mut st = self.state.lock().expect("server state");
         if let Some(n) = st.conn_counts.get_mut(&d) {
             *n = n.saturating_sub(1);
@@ -389,7 +380,7 @@ impl Server {
     }
 
     /// Run the §12 pipeline for one request and return the response.
-    pub fn handle(&self, inc: Incoming<'_>, now: u64) -> Response {
+    pub(crate) fn handle(&self, inc: Incoming<'_>, now: u64) -> Response {
         // (0) Pairing mailbox (§7 invite onboarding): allowed PRE-enrollment (a joining device owns no
         // keyslot yet), so dispatch it before the keyslot-existence check.
         if matches!(

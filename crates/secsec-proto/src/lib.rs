@@ -65,7 +65,7 @@ fn blake3_of(bytes: &[u8]) -> [u8; 32] {
 /// `args_hash` for `put` (§12): `BLAKE3(canonical("put" ‖ id ‖ le32(declared_size) ‖ push_id))`. The
 /// `push_id` is bound so the signature authorizes staging this object under that exact push (§15).
 #[must_use]
-pub fn args_put(id: &Id, declared_size: u32, push_id: &[u8; PUSH_ID_LEN]) -> [u8; 32] {
+pub(crate) fn args_put(id: &Id, declared_size: u32, push_id: &[u8; PUSH_ID_LEN]) -> [u8; 32] {
     let mut w = Writer::new();
     w.raw(op::PUT.as_bytes())
         .raw(id)
@@ -78,7 +78,7 @@ pub fn args_put(id: &Id, declared_size: u32, push_id: &[u8; PUSH_ID_LEN]) -> [u8
 /// ‖ promote))`. The `promote` push id is bound so the swap authorizes promoting that push's staged
 /// objects atomically with the ref change (§15).
 #[must_use]
-pub fn args_cas_head(
+pub(crate) fn args_cas_head(
     ref_h: &Id,
     old_head_id: &Id,
     new_head_id: &Id,
@@ -96,7 +96,7 @@ pub fn args_cas_head(
 /// `args_hash` for `roster-append` (§12): `BLAKE3(canonical("roster-append" ‖ BLAKE3(canonical(entry))))`,
 /// where `entry_bytes` is the canonical encoding of the sigchain entry.
 #[must_use]
-pub fn args_roster_append(entry_bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn args_roster_append(entry_bytes: &[u8]) -> [u8; 32] {
     let entry_hash = blake3_of(entry_bytes);
     let mut w = Writer::new();
     w.raw(op::ROSTER_APPEND.as_bytes()).raw(&entry_hash);
@@ -106,7 +106,7 @@ pub fn args_roster_append(entry_bytes: &[u8]) -> [u8; 32] {
 /// `args_hash` for a read op (§9.6): `BLAKE3(canonical(op ‖ ids))`, binding the exact requested ids
 /// in request order. `op` is [`op::GET`] or [`op::HAS`].
 #[must_use]
-pub fn args_read(op: &str, ids: &[Id]) -> [u8; 32] {
+pub(crate) fn args_read(op: &str, ids: &[Id]) -> [u8; 32] {
     let mut w = Writer::new();
     w.bytes(op.as_bytes()).u64(ids.len() as u64);
     for id in ids {
@@ -118,7 +118,7 @@ pub fn args_read(op: &str, ids: &[Id]) -> [u8; 32] {
 /// `args_hash` for `get-roster` (§9.6/§12): `BLAKE3(canonical("get-roster" ‖ le64(seq)))`, binding
 /// the exact sigchain sequence requested.
 #[must_use]
-pub fn args_get_roster(seq: u64) -> [u8; 32] {
+pub(crate) fn args_get_roster(seq: u64) -> [u8; 32] {
     let mut w = Writer::new();
     w.raw(op::GET_ROSTER.as_bytes()).u64(seq);
     blake3_of(&w.finish())
@@ -127,7 +127,7 @@ pub fn args_get_roster(seq: u64) -> [u8; 32] {
 /// `args_hash` for `get-keyslot` (§9.6/§12): `BLAKE3(canonical("get-keyslot" ‖ device_id ‖ le32(gen)))`,
 /// binding the exact keyslot (device, generation) requested.
 #[must_use]
-pub fn args_get_keyslot(device_id: &Id, gen: u32) -> [u8; 32] {
+pub(crate) fn args_get_keyslot(device_id: &Id, gen: u32) -> [u8; 32] {
     let mut w = Writer::new();
     w.raw(op::GET_KEYSLOT.as_bytes()).raw(device_id).u32(gen);
     blake3_of(&w.finish())
@@ -136,7 +136,7 @@ pub fn args_get_keyslot(device_id: &Id, gen: u32) -> [u8; 32] {
 /// `args_hash` for `put-keyslot` (§9.6/§12): `BLAKE3(canonical("put-keyslot" ‖ device_id ‖ le32(gen)
 /// ‖ BLAKE3(blob)))`, binding the exact keyslot (device, generation, content) being written.
 #[must_use]
-pub fn args_put_keyslot(device_id: &Id, gen: u32, blob: &[u8]) -> [u8; 32] {
+pub(crate) fn args_put_keyslot(device_id: &Id, gen: u32, blob: &[u8]) -> [u8; 32] {
     let mut w = Writer::new();
     w.raw(op::PUT_KEYSLOT.as_bytes())
         .raw(device_id)
@@ -149,7 +149,7 @@ pub fn args_put_keyslot(device_id: &Id, gen: u32, blob: &[u8]) -> [u8; 32] {
 /// MAC'd under the invite code end-to-end, so the per-op signature only proves the connecting key
 /// holds its private SSH key (pre-enrollment), not authorization.
 #[must_use]
-pub fn args_pair(op_label: &str, slot: &Id) -> [u8; 32] {
+pub(crate) fn args_pair(op_label: &str, slot: &Id) -> [u8; 32] {
     let mut w = Writer::new();
     w.raw(op_label.as_bytes()).raw(slot);
     blake3_of(&w.finish())
@@ -250,7 +250,7 @@ pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
 
 /// `args_hash` for a key-history write (§8.2): `BLAKE3(canonical(op ‖ le32(gen) ‖ BLAKE3(blob)))`.
 #[must_use]
-pub fn args_keyhist(op_label: &str, gen: u32, blob: &[u8]) -> [u8; 32] {
+pub(crate) fn args_keyhist(op_label: &str, gen: u32, blob: &[u8]) -> [u8; 32] {
     let mut w = Writer::new();
     w.raw(op_label.as_bytes()).u32(gen).raw(&blake3_of(blob));
     blake3_of(&w.finish())
@@ -298,7 +298,7 @@ impl WriteAuth<'_> {
     /// The signed payload `op ‖ args_hash ‖ session_transcript ‖ server_nonce` (§9.6), canonically
     /// encoded (length-prefixed op label, fixed-width remainder).
     #[must_use]
-    pub fn message(&self) -> Vec<u8> {
+    pub(crate) fn message(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.bytes(self.op.as_bytes())
             .raw(&self.args_hash)
@@ -336,7 +336,7 @@ pub struct ReadAuth<'a> {
 impl ReadAuth<'_> {
     /// The signed payload `op ‖ args_hash ‖ session_transcript` (§9.6).
     #[must_use]
-    pub fn message(&self) -> Vec<u8> {
+    pub(crate) fn message(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.bytes(self.op.as_bytes())
             .raw(&self.args_hash)

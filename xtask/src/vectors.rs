@@ -131,7 +131,7 @@ fn vectors_path() -> PathBuf {
 
 /// Compute all vectors from live code and compare to the committed file. `check` only reports; without
 /// it, also print the computed values (for a human updating the file after a deliberate change).
-pub fn run(check: bool) -> Result<(), String> {
+pub(crate) fn run(check: bool) -> Result<(), String> {
     let computed = computed();
     let path = vectors_path();
     let text =

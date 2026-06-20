@@ -277,7 +277,7 @@ impl From<HeadError> for ClientError {
 /// only what the server does not already hold (durably, or already staged under this push), so a
 /// resumed push re-sends just the gap. The objects become durable when [`push_head`] promotes this
 /// push (§15). The closure is `commit + ancestors + trees + chunks`.
-pub async fn push_objects<R: Remote, K: MasterKeys>(
+pub(crate) async fn push_objects<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
     keys: &K,
@@ -307,7 +307,7 @@ pub async fn push_objects<R: Remote, K: MasterKeys>(
 /// (`None` for the first head); the old CAS token is `BLAKE3(prev_blob)` (or [`ABSENT_HEAD`]). Returns
 /// the new `(head, stored_blob)` to carry as `prev` next time. The caller pushes objects first.
 #[allow(clippy::too_many_arguments)]
-pub async fn push_head<R: Remote, K: MasterKeys>(
+pub(crate) async fn push_head<R: Remote, K: MasterKeys>(
     remote: &R,
     keys: &K,
     device: &secsec_sig::DeviceKey,
@@ -368,7 +368,7 @@ enum Work {
 /// Fetch the full reachable closure of `commit_id` from `remote` into `store`, **verifying every
 /// object on arrival** (§9.2): commits/trees are opened to discover their children, chunks under
 /// their file's `path_salt`. Idempotent (present objects skipped); returns the count fetched.
-pub async fn fetch_closure<R: Remote, K: MasterKeys>(
+pub(crate) async fn fetch_closure<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
     keys: &K,
@@ -445,7 +445,7 @@ pub async fn fetch_closure<R: Remote, K: MasterKeys>(
 /// `device_id` (§9.6), so the signer is the one member key that verifies. `None` if no current
 /// member signed it (forged / stale-roster head).
 #[must_use]
-pub fn resolve_head_signer(
+pub(crate) fn resolve_head_signer(
     members: &BTreeMap<DeviceId, DevicePublic>,
     head: &Head,
     sig: &[u8],
@@ -476,7 +476,7 @@ pub struct SyncReport {
 // All distinct caller-supplied inputs with no cohesive subgroup; a parameter object would only
 // exist to satisfy the lint.
 #[allow(clippy::too_many_arguments)]
-pub async fn sync_ref<R: Remote, K: MasterKeys>(
+pub(crate) async fn sync_ref<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
     keys: &K,

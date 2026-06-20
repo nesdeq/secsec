@@ -25,11 +25,11 @@ pub type RefHash = [u8; 32];
 /// Head-blob AEAD nonce length (§9.8): 96-bit.
 pub const HEAD_NONCE_LEN: usize = 12;
 /// Poly1305 tag length stored in the head blob (§9.8).
-pub const HEAD_TAG_LEN: usize = 16;
+pub(crate) const HEAD_TAG_LEN: usize = 16;
 /// Maximum ref-name length, in bytes (decoder bound).
-pub const MAX_REF_NAME: usize = 4096;
+pub(crate) const MAX_REF_NAME: usize = 4096;
 /// Maximum stored head-signature length, in bytes (decoder bound; an SSHSIG PEM is far smaller).
-pub const MAX_HEAD_SIG: usize = 4096;
+pub(crate) const MAX_HEAD_SIG: usize = 4096;
 
 /// The sentinel `prev_head` for a ref's first head (no predecessor).
 pub const NO_PREV_HEAD: Id = [0u8; 32];
@@ -127,7 +127,7 @@ impl Head {
     /// The §9.6 signed message: `ref ‖ commit_id ‖ head_version ‖ roster_seq ‖ prev_head`,
     /// canonically encoded (length-prefixed ref name, fixed-width remainder).
     #[must_use]
-    pub fn signed_message(&self) -> Vec<u8> {
+    pub(crate) fn signed_message(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.bytes(self.ref_name.as_bytes())
             .raw(&self.commit_id)
@@ -173,20 +173,6 @@ pub fn build_head(
         head_version: prev.map_or(1, |p| p.head_version + 1),
         roster_seq,
         prev_head: prev.map_or(NO_PREV_HEAD, head_id),
-    }
-}
-
-/// Whether `new` is a well-formed successor of `prev` on the same ref: version +1 and
-/// `prev_head == head_id(prev)` (first head: version 1, no predecessor). Complements §8.5.
-#[must_use]
-pub fn is_head_successor(prev: Option<&Head>, new: &Head) -> bool {
-    match prev {
-        None => new.head_version == 1 && new.prev_head == NO_PREV_HEAD,
-        Some(p) => {
-            new.ref_name == p.ref_name
-                && new.head_version == p.head_version + 1
-                && new.prev_head == head_id(p)
-        }
     }
 }
 
@@ -505,29 +491,16 @@ mod tests {
     }
 
     #[test]
-    fn build_head_chains_and_is_successor() {
+    fn build_head_chains_and_addresses() {
         // first head: version 1, no predecessor.
         let h1 = build_head("main", [0xC1; 32], 4, None);
         assert_eq!(h1.head_version, 1);
         assert_eq!(h1.prev_head, NO_PREV_HEAD);
-        assert!(is_head_successor(None, &h1));
-        assert!(!is_head_successor(Some(&h1), &h1)); // h1 is not its own successor
 
-        // next head: version 2, prev_head = id(h1), same ref.
+        // next head: version 2, prev_head = id(h1).
         let h2 = build_head("main", [0xC2; 32], 5, Some(&h1));
         assert_eq!(h2.head_version, 2);
         assert_eq!(h2.prev_head, head_id(&h1));
-        assert!(is_head_successor(Some(&h1), &h2));
-
-        // a non-successor: skipped version / wrong prev / wrong ref are all rejected.
-        let mut bad_ver = h2.clone();
-        bad_ver.head_version = 3;
-        assert!(!is_head_successor(Some(&h1), &bad_ver));
-        let mut bad_prev = h2.clone();
-        bad_prev.prev_head = [0xFF; 32];
-        assert!(!is_head_successor(Some(&h1), &bad_prev));
-        let wrong_ref = build_head("other", [0xC2; 32], 5, Some(&h1));
-        assert!(!is_head_successor(Some(&h1), &wrong_ref));
 
         // head_id is content-deterministic and distinguishes versions.
         assert_eq!(

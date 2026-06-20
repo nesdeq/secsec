@@ -96,7 +96,7 @@ pub fn new_invite() -> Result<([u8; CODE_LEN], String), PairError> {
 
 /// Display the code as dash-grouped lowercase hex.
 #[must_use]
-pub fn encode_code(code: &[u8; CODE_LEN]) -> String {
+pub(crate) fn encode_code(code: &[u8; CODE_LEN]) -> String {
     let hex: String = code.iter().map(|b| format!("{b:02x}")).collect();
     hex.as_bytes()
         .chunks(4)
@@ -162,7 +162,7 @@ async fn poll_slot<R: Remote>(
 /// host's response and verify its MAC. Returns the genuine `(rfp, host_id)` — the caller MUST confirm
 /// `host_id` equals the pin of the server it actually connected to before trusting the repo. `rounds`
 /// bounds the wait (× [`POLL_INTERVAL`]).
-pub async fn join<R: Remote>(
+pub(crate) async fn join<R: Remote>(
     remote: &R,
     code: &[u8; CODE_LEN],
     d_pubkey: &DevicePublic,
@@ -192,7 +192,7 @@ pub async fn join<R: Remote>(
 /// Host E: wait for the joiner's submission on slot `d` and verify its code-MAC. Returns the joiner's
 /// `(DevicePublic, xwing_pub)` for the caller to [`grant_device_remote`](crate::repo::grant_device_remote);
 /// the caller then calls [`respond`] to hand the joiner the RFP + host pin.
-pub async fn await_join<R: Remote>(
+pub(crate) async fn await_join<R: Remote>(
     remote: &R,
     code: &[u8; CODE_LEN],
     rounds: u32,
@@ -212,7 +212,7 @@ pub async fn await_join<R: Remote>(
 
 /// Host E: post the code-MAC'd `{rfp, host_id}` response to slot `e` so the joiner learns the genuine
 /// repo anchor + server pin. Call this **after** granting the joiner a keyslot.
-pub async fn respond<R: Remote>(
+pub(crate) async fn respond<R: Remote>(
     remote: &R,
     code: &[u8; CODE_LEN],
     rfp: &[u8; 32],

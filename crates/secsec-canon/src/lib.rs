@@ -122,12 +122,6 @@ impl Writer {
         self
     }
 
-    /// Borrow the encoded bytes without consuming the encoder.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.buf
-    }
-
     /// Consume the encoder and return the encoded bytes.
     #[must_use]
     pub fn finish(self) -> Vec<u8> {

@@ -12,7 +12,7 @@ pub type ParentMap = BTreeMap<Id, Vec<Id>>;
 
 /// Every ancestor of `start`, **including `start` itself** (reflexive closure up the parent edges).
 #[must_use]
-pub fn ancestors(parents: &ParentMap, start: &Id) -> BTreeSet<Id> {
+pub(crate) fn ancestors(parents: &ParentMap, start: &Id) -> BTreeSet<Id> {
     let mut seen: BTreeSet<Id> = BTreeSet::new();
     let mut work = vec![*start];
     while let Some(c) = work.pop() {
@@ -33,7 +33,7 @@ pub fn ancestors(parents: &ParentMap, start: &Id) -> BTreeSet<Id> {
 /// Is `ancestor` an ancestor of — **or equal to** — `descendant`? Reflexive: every commit is its
 /// own ancestor. Bounded walk up from `descendant`.
 #[must_use]
-pub fn is_ancestor(parents: &ParentMap, ancestor: &Id, descendant: &Id) -> bool {
+pub(crate) fn is_ancestor(parents: &ParentMap, ancestor: &Id, descendant: &Id) -> bool {
     if ancestor == descendant {
         return true;
     }
@@ -59,6 +59,7 @@ pub fn is_ancestor(parents: &ParentMap, ancestor: &Id, descendant: &Id) -> bool 
 
 /// Are `a` and `b` **DAG-incomparable** — neither an ancestor of the other (§10 fork condition)?
 /// Equal commits are comparable (not a fork).
+#[cfg(test)]
 #[must_use]
 pub fn incomparable(parents: &ParentMap, a: &Id, b: &Id) -> bool {
     !is_ancestor(parents, a, b) && !is_ancestor(parents, b, a)
@@ -66,7 +67,7 @@ pub fn incomparable(parents: &ParentMap, a: &Id, b: &Id) -> bool {
 
 /// All commits that are ancestors of **both** `a` and `b` (the candidate merge bases).
 #[must_use]
-pub fn common_ancestors(parents: &ParentMap, a: &Id, b: &Id) -> BTreeSet<Id> {
+pub(crate) fn common_ancestors(parents: &ParentMap, a: &Id, b: &Id) -> BTreeSet<Id> {
     let anc_a = ancestors(parents, a);
     let anc_b = ancestors(parents, b);
     anc_a.intersection(&anc_b).copied().collect()

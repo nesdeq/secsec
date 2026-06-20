@@ -27,17 +27,17 @@ const XWING_LABEL: [u8; 6] = [0x5c, 0x2e, 0x2f, 0x2f, 0x5e, 0x5c];
 /// X-Wing decapsulation-key seed length: a single 32-byte secret (draft-10 §6).
 pub const XWING_SEED_LEN: usize = 32;
 /// ML-KEM-768 ciphertext length (§17).
-pub const ML_KEM_CT_LEN: usize = 1088;
+pub(crate) const ML_KEM_CT_LEN: usize = 1088;
 /// ML-KEM-768 public-key length.
-pub const ML_KEM_PK_LEN: usize = 1184;
+pub(crate) const ML_KEM_PK_LEN: usize = 1184;
 /// ML-KEM-768 keygen seed (`d ‖ z`) length (FIPS 203 §7.1).
-pub const ML_KEM_SEED_LEN: usize = 64;
+pub(crate) const ML_KEM_SEED_LEN: usize = 64;
 /// X25519 key length.
-pub const X_LEN: usize = 32;
+pub(crate) const X_LEN: usize = 32;
 /// X-Wing encapsulation seed length: `m(32) ‖ ek_X(32)` (draft-10 §6 EncapsulateDerand).
-pub const XWING_ESEED_LEN: usize = 64;
+pub(crate) const XWING_ESEED_LEN: usize = 64;
 /// X-Wing keyslot ciphertext length: `ct_MLKEM ‖ ct_X`.
-pub const XWING_CT_LEN: usize = ML_KEM_CT_LEN + X_LEN;
+pub(crate) const XWING_CT_LEN: usize = ML_KEM_CT_LEN + X_LEN;
 
 /// Errors from the X-Wing keyslot.
 #[derive(Debug, PartialEq, Eq)]

@@ -11,17 +11,17 @@ use core::fmt;
 use secsec_canon::{Reader, Writer};
 
 /// 4-byte object magic.
-pub const MAGIC: [u8; 4] = *b"ssec";
+pub(crate) const MAGIC: [u8; 4] = *b"ssec";
 
 /// Current on-disk format version.
-pub const FORMAT_VERSION_V1: u8 = 1;
+pub(crate) const FORMAT_VERSION_V1: u8 = 1;
 /// Compile-time format-version floor (§16): anything below this is rejected outright.
-pub const MIN_FORMAT_VERSION: u8 = 1;
+pub(crate) const MIN_FORMAT_VERSION: u8 = 1;
 
 /// `algo_id` for the object AEAD suite (ChaCha20-Poly1305 CTX, §9.4). This is the FRAME's
 /// symmetric-suite tag, a **separate namespace** from the keyslot KEM `algo_id` (X-Wing = 1, §8.3),
 /// which is carried in the keyslot blob rather than the FRAME.
-pub const ALGO_V1: u8 = 1;
+pub(crate) const ALGO_V1: u8 = 1;
 /// Compile-time algorithm floor (§16): `algo_id` below this is rejected as a downgrade.
 pub const MIN_ALGO_ID: u8 = 1;
 
@@ -75,7 +75,7 @@ impl ObjType {
 
     /// Parse a `type` byte; `None` for an unknown value.
     #[must_use]
-    pub fn from_u8(v: u8) -> Option<Self> {
+    pub(crate) fn from_u8(v: u8) -> Option<Self> {
         Some(match v {
             0 => Self::Chunk,
             1 => Self::Tree,

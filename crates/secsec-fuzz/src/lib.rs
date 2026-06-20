@@ -67,9 +67,11 @@ pub fn fuzz_commit(data: &[u8]) {
 }
 
 /// A named decoder fuzz entry (its `cargo-fuzz` target name and harness function).
+#[cfg(test)]
 pub type Decoder = (&'static str, fn(&[u8]));
 
 /// Every harness entry, by name, for the stable robustness test and to enumerate the cargo-fuzz set.
+#[cfg(test)]
 pub const DECODERS: &[Decoder] = &[
     ("frame", fuzz_frame),
     ("wire", fuzz_wire),

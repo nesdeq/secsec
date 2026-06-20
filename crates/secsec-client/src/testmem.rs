@@ -16,7 +16,7 @@ pub(crate) struct MemRemote {
 
 impl MemRemote {
     /// A truthful in-process remote over `store`.
-    pub fn new(store: Store) -> Self {
+    pub(crate) fn new(store: Store) -> Self {
         Self { store }
     }
 }

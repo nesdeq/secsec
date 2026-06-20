@@ -9,11 +9,11 @@
 use std::io::Read;
 
 /// Default FastCDC sizes (§19): 16 / 64 / 256 KiB.
-pub const DEFAULT_MIN: usize = 16 * 1024;
+pub(crate) const DEFAULT_MIN: usize = 16 * 1024;
 /// Default average chunk size.
-pub const DEFAULT_AVG: usize = 64 * 1024;
+pub(crate) const DEFAULT_AVG: usize = 64 * 1024;
 /// Default maximum chunk size.
-pub const DEFAULT_MAX: usize = 256 * 1024;
+pub(crate) const DEFAULT_MAX: usize = 256 * 1024;
 
 /// Normalization level (FastCDC NC): how many bits the pre-/post-average masks differ from
 /// `log2(avg)`. Level 2 is the common choice; it tightens the chunk-size distribution toward `avg`.
@@ -88,7 +88,7 @@ impl Chunker {
     /// # Panics
     /// Panics unless `0 < min <= avg <= max`.
     #[must_use]
-    pub fn new(cdc_seed: &[u8; 32], min: usize, avg: usize, max: usize) -> Self {
+    pub(crate) fn new(cdc_seed: &[u8; 32], min: usize, avg: usize, max: usize) -> Self {
         assert!(
             0 < min && min <= avg && avg <= max,
             "require 0 < min <= avg <= max"
@@ -109,7 +109,7 @@ impl Chunker {
     /// Length of the first chunk in `data` (the FastCDC cut point), in `[min, max]` unless `data`
     /// is shorter than `min` (then the whole of `data`).
     #[must_use]
-    pub fn next_cut(&self, data: &[u8]) -> usize {
+    pub(crate) fn next_cut(&self, data: &[u8]) -> usize {
         let n = data.len();
         if n <= self.min {
             return n;
@@ -138,6 +138,7 @@ impl Chunker {
     }
 
     /// Cut `data` into chunk end-offsets. The final offset always equals `data.len()`.
+    #[cfg(test)]
     #[must_use]
     pub fn cut_points(&self, data: &[u8]) -> Vec<usize> {
         let mut cuts = Vec::new();

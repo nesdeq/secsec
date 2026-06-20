@@ -20,7 +20,7 @@ use std::io::Write;
 use std::path::Path;
 
 /// Maximum length of a single path-component name (bytes).
-pub const MAX_NAME: usize = 4096;
+pub(crate) const MAX_NAME: usize = 4096;
 
 /// A directory listing (§6). Entries are kept sorted by name for a canonical encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,14 +392,14 @@ impl Commit {
     /// The canonical signed message — all commit fields, binding author, replay counter, roster
     /// state, and last-seen head (§9.3/§9.6).
     #[must_use]
-    pub fn signed_message(&self) -> Vec<u8> {
+    pub(crate) fn signed_message(&self) -> Vec<u8> {
         encode_commit(self)
     }
 }
 
 /// Sign a commit under [`secsec_sig::NS_COMMIT`] (§9.6). The signer should be the device named by
 /// `commit.device_id`; [`verify_commit`] enforces that.
-pub fn sign_commit(device: &secsec_sig::DeviceKey, commit: &Commit) -> Result<Vec<u8>, SnapError> {
+pub(crate) fn sign_commit(device: &secsec_sig::DeviceKey, commit: &Commit) -> Result<Vec<u8>, SnapError> {
     Ok(device.sign(secsec_sig::NS_COMMIT, &commit.signed_message())?)
 }
 
