@@ -46,16 +46,20 @@ pub async fn prune_history<R: Remote, K: MasterKeys>(
     // KEEP = the head's full current closure ∪ each file's last `keep` changing-versions' content.
     // ALL  = every tree/chunk reachable from any commit's tree. DEAD = ALL − KEEP (no commits, I4).
     let (head_commit, _) = open_signed_commit(&head.commit_id, keys, store)?;
-    let mut keep_set: BTreeSet<Id> =
-        path_content(keys, store, &head_commit.root_tree, &head_commit.root_salt, "")?
-            .unwrap_or_default();
+    let mut keep_set: BTreeSet<Id> = path_content(
+        keys,
+        store,
+        &head_commit.root_tree,
+        &head_commit.root_salt,
+        "",
+    )?
+    .unwrap_or_default();
     let mut all: BTreeSet<Id> = keep_set.clone();
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
 
     for cid in crate::history::commit_ids(keys, store, &head.commit_id)? {
         let (commit, _) = open_signed_commit(&cid, keys, store)?;
-        if let Some(content) =
-            path_content(keys, store, &commit.root_tree, &commit.root_salt, "")?
+        if let Some(content) = path_content(keys, store, &commit.root_tree, &commit.root_salt, "")?
         {
             all.extend(content);
         }
@@ -167,9 +171,13 @@ mod tests {
             let mut data = vec![0u8; 200 * 1024];
             getrandom::fill(&mut data).unwrap();
             std::fs::write(work.path().join("f.bin"), &data).unwrap();
-            let (rt, rs) =
-                snapshot_tree(work.path(), &m, &store, prev_tree.as_ref().map(|(t, s)| (t, s)))
-                    .unwrap();
+            let (rt, rs) = snapshot_tree(
+                work.path(),
+                &m,
+                &store,
+                prev_tree.as_ref().map(|(t, s)| (t, s)),
+            )
+            .unwrap();
             let parents = commits.last().copied().map(|c| vec![c]).unwrap_or_default();
             let last_seen = prev_head
                 .as_ref()
@@ -187,7 +195,9 @@ mod tests {
             };
             let cid = seal_signed_commit(&m, &store, &dev, &commit).unwrap();
             let push = [v; 16];
-            push_objects(&remote, &store, &m, &cid, &push).await.unwrap();
+            push_objects(&remote, &store, &m, &cid, &push)
+                .await
+                .unwrap();
             let (h, b) = push_head(
                 &remote,
                 &m,

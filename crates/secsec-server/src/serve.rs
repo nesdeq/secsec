@@ -210,9 +210,7 @@ mod tests {
                 blob: blob.clone(),
             };
             assert_eq!(
-                request(&conn, sess.transcript, &device, put)
-                    .await
-                    .unwrap(),
+                request(&conn, sess.transcript, &device, put).await.unwrap(),
                 Response::Ok
             );
             // a get does not see a staged object until it is promoted.
@@ -233,9 +231,7 @@ mod tests {
                 new_blob: head,
             };
             assert_eq!(
-                request(&conn, sess.transcript, &device, cas)
-                    .await
-                    .unwrap(),
+                request(&conn, sess.transcript, &device, cas).await.unwrap(),
                 Response::Ok
             );
 

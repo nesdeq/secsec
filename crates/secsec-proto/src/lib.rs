@@ -369,10 +369,16 @@ mod tests {
         assert_eq!(args_put(&id, 100, &p), args_put(&id, 100, &p));
         assert_ne!(args_put(&id, 100, &p), args_put(&id, 101, &p)); // declared_size bound
         assert_ne!(args_put(&id, 100, &p), args_put(&[0x12; 32], 100, &p)); // id bound
-        assert_ne!(args_put(&id, 100, &p), args_put(&id, 100, &[1u8; PUSH_ID_LEN])); // push_id bound
+        assert_ne!(
+            args_put(&id, 100, &p),
+            args_put(&id, 100, &[1u8; PUSH_ID_LEN])
+        ); // push_id bound
 
         // distinct ops never collide even on similar inputs.
-        assert_ne!(args_cas_head(&id, &[1; 32], &[2; 32], &p), args_put(&id, 0, &p));
+        assert_ne!(
+            args_cas_head(&id, &[1; 32], &[2; 32], &p),
+            args_put(&id, 0, &p)
+        );
         assert_ne!(
             args_cas_head(&id, &[1; 32], &[2; 32], &p),
             args_cas_head(&id, &[2; 32], &[1; 32], &p) // old/new order bound

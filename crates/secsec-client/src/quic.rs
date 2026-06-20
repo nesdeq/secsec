@@ -79,7 +79,12 @@ impl Remote for QuicRemote<'_> {
     async fn has(&self, ids: &[Id]) -> Result<Vec<bool>, RemoteError> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(MAX_HAS_IDS) {
-            match self.call(Request::Has { ids: chunk.to_vec() }).await? {
+            match self
+                .call(Request::Has {
+                    ids: chunk.to_vec(),
+                })
+                .await?
+            {
                 Response::Exists(bits) => out.extend(bits),
                 Response::Err(c) => return Err(RemoteError(format!("has: {c:?}"))),
                 other => return Err(RemoteError(format!("has: unexpected {other:?}"))),
@@ -384,9 +389,18 @@ mod tests {
             push_objects(&remote, &a_store, &m, &commit_id, &[0x70; 16])
                 .await
                 .unwrap();
-            let (head, _) = push_head(&remote, &m, &device, "main", commit_id, 0, None, &[0x70; 16])
-                .await
-                .unwrap();
+            let (head, _) = push_head(
+                &remote,
+                &m,
+                &device,
+                "main",
+                commit_id,
+                0,
+                None,
+                &[0x70; 16],
+            )
+            .await
+            .unwrap();
 
             // a fresh reader pulls the head (get-ref) + closure (get), verifies, and restores it.
             let b_store = Store::open(srv_dir.path().join("b.redb")).unwrap();

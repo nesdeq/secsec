@@ -602,7 +602,11 @@ mod tests {
         let ref_h = id(0xCB);
         s.stage(&push, &id(1), b"x", 0).unwrap();
         // Establish the ref at v1 via a separate (empty) push, so expect-absent now conflicts.
-        assert!(s.cas_ref(&ref_h, &ABSENT_HEAD, b"v1", &[0u8; 16]).unwrap().swapped);
+        assert!(
+            s.cas_ref(&ref_h, &ABSENT_HEAD, b"v1", &[0u8; 16])
+                .unwrap()
+                .swapped
+        );
         let out = s.cas_ref(&ref_h, &ABSENT_HEAD, b"v2", &push).unwrap();
         assert!(!out.swapped);
         assert_eq!(out.promoted_bytes, 0);

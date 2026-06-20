@@ -44,7 +44,11 @@ pub fn dead_set_hash(ids: &[Id]) -> [u8; 32] {
 /// recomputed message and the prune is rejected, rather than deleting an object a reverted head now
 /// references.
 #[must_use]
-pub fn args_prune(dead_set_hash: &[u8; 32], all_heads_hash: &[u8; 32], roster_seq: u64) -> [u8; 32] {
+pub fn args_prune(
+    dead_set_hash: &[u8; 32],
+    all_heads_hash: &[u8; 32],
+    roster_seq: u64,
+) -> [u8; 32] {
     let mut w = Writer::new();
     w.raw(op::PRUNE.as_bytes())
         .raw(dead_set_hash)

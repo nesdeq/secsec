@@ -76,7 +76,12 @@ impl From<FrameError> for ObjError {
 
 /// The §9.2 content address over `FRAME ‖ path_salt ‖ plaintext`, keyed by `id_key[gen][type]`.
 #[must_use]
-pub(crate) fn content_id(id_key: &[u8; 32], frame: &Frame, path_salt: &PathSalt, plaintext: &[u8]) -> Id {
+pub(crate) fn content_id(
+    id_key: &[u8; 32],
+    frame: &Frame,
+    path_salt: &PathSalt,
+    plaintext: &[u8],
+) -> Id {
     let mut h = blake3::Hasher::new_keyed(id_key);
     h.update(&frame.encode());
     h.update(path_salt);

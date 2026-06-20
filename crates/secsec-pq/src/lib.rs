@@ -369,7 +369,10 @@ mod tests {
         // tampered ciphertext → AEAD fails.
         let mut bad = blob.clone();
         *bad.last_mut().unwrap() ^= 1;
-        assert_eq!(unwrap_pq_raw(&bad, GEN, &DID, &sk).err(), Some(PqError::Aead));
+        assert_eq!(
+            unwrap_pq_raw(&bad, GEN, &DID, &sk).err(),
+            Some(PqError::Aead)
+        );
         // A keyslot for a DIFFERENT master key still opens (the wrap commits to the shared secret, not
         // the master key); its anti-forgery rejection is the `mk_commit` check at the cold-start fold
         // (`secsec-roster`), not here.

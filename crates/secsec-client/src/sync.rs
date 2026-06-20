@@ -269,14 +269,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
             seal(&f)?;
             push_objects(remote, store, keys, &our_commit, push_id).await?;
             push_head(
-                remote,
-                keys,
-                device,
-                ref_name,
-                our_commit,
-                roster_seq,
-                None,
-                push_id,
+                remote, keys, device, ref_name, our_commit, roster_seq, None, push_id,
             )
             .await?;
             Ok(SyncOutcome {
@@ -379,8 +372,19 @@ mod tests {
         let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
         let sync = |store, wdir, frontier, base| {
             sync_once(
-                &remote, store, wdir, &m, &dev_a, &members, frontier, "main", 0, base, 0,
-                &[0x44; 16], &seal,
+                &remote,
+                store,
+                wdir,
+                &m,
+                &dev_a,
+                &members,
+                frontier,
+                "main",
+                0,
+                base,
+                0,
+                &[0x44; 16],
+                &seal,
             )
         };
 
@@ -469,8 +473,19 @@ mod tests {
         let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
         let sync = |store, wdir, frontier, base| {
             sync_once(
-                &remote, store, wdir, &m, &dev_a, &members, frontier, "main", 0, base, 0,
-                &[0x44; 16], &seal,
+                &remote,
+                store,
+                wdir,
+                &m,
+                &dev_a,
+                &members,
+                frontier,
+                "main",
+                0,
+                base,
+                0,
+                &[0x44; 16],
+                &seal,
             )
         };
 
@@ -748,5 +763,4 @@ mod tests {
             "a pulled head below the persisted head_version high-water must be a rollback alarm"
         );
     }
-
 }

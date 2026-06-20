@@ -779,7 +779,11 @@ mod tests {
     fn put_blob_over_max_is_rejected() {
         // claim a blob length far over MAX_BLOB_SIZE; canon rejects on the length prefix.
         let mut w = Writer::new();
-        w.u8(T_PUT).raw(&[0u8; 32]).u32(0).raw(&[0u8; 16]).u32(u32::MAX); // bytes() prefix = u32::MAX
+        w.u8(T_PUT)
+            .raw(&[0u8; 32])
+            .u32(0)
+            .raw(&[0u8; 16])
+            .u32(u32::MAX); // bytes() prefix = u32::MAX
         assert!(matches!(
             Request::decode(&w.finish()),
             Err(WireError::Canon(CanonError::LengthExceedsMax { .. }))

@@ -130,7 +130,10 @@ impl core::fmt::Display for SnapError {
             SnapError::BadSignature => f.write_str("commit signature invalid or wrong author"),
             SnapError::PathNotFound(p) => write!(f, "path not found in that version: {p}"),
             SnapError::PrunedBeyondRetention(p) => {
-                write!(f, "the requested version of {p} has been pruned beyond retention")
+                write!(
+                    f,
+                    "the requested version of {p} has been pruned beyond retention"
+                )
             }
             SnapError::Sig(e) => write!(f, "sig: {e}"),
         }
@@ -399,7 +402,10 @@ impl Commit {
 
 /// Sign a commit under [`secsec_sig::NS_COMMIT`] (§9.6). The signer should be the device named by
 /// `commit.device_id`; [`verify_commit`] enforces that.
-pub(crate) fn sign_commit(device: &secsec_sig::DeviceKey, commit: &Commit) -> Result<Vec<u8>, SnapError> {
+pub(crate) fn sign_commit(
+    device: &secsec_sig::DeviceKey,
+    commit: &Commit,
+) -> Result<Vec<u8>, SnapError> {
     Ok(device.sign(secsec_sig::NS_COMMIT, &commit.signed_message())?)
 }
 
@@ -652,7 +658,12 @@ fn snapshot_dir<K: MasterKeys>(
     }
 
     let tree = Tree { entries };
-    let (id, blob) = seal_object(ctx.keys.current(), ObjType::Tree, &this_salt, &encode_tree(&tree));
+    let (id, blob) = seal_object(
+        ctx.keys.current(),
+        ObjType::Tree,
+        &this_salt,
+        &encode_tree(&tree),
+    );
     ctx.store.put(&id, &blob)?;
     Ok((id, this_salt))
 }
@@ -863,8 +874,13 @@ pub fn reachable_objects<K: MasterKeys>(
             None => continue,
         };
         reachable.insert(cid);
-        let (commit, _sig) =
-            decode_signed_commit(&open_object(keys, ObjType::Commit, &ZERO_SALT, &cid, &blob)?)?;
+        let (commit, _sig) = decode_signed_commit(&open_object(
+            keys,
+            ObjType::Commit,
+            &ZERO_SALT,
+            &cid,
+            &blob,
+        )?)?;
         collect_tree(
             keys,
             store,
@@ -904,7 +920,13 @@ fn collect_tree<K: MasterKeys>(
         None => return Ok(()),
     };
     reachable.insert(*tree_id);
-    let tree = decode_tree(&open_object(keys, ObjType::Tree, tree_salt, tree_id, &blob)?)?;
+    let tree = decode_tree(&open_object(
+        keys,
+        ObjType::Tree,
+        tree_salt,
+        tree_id,
+        &blob,
+    )?)?;
     for entry in &tree.entries {
         match entry {
             Entry::File { chunks, .. } => {
@@ -916,7 +938,15 @@ fn collect_tree<K: MasterKeys>(
                 subtree,
                 subtree_salt,
                 ..
-            } => collect_tree(keys, store, subtree, subtree_salt, depth + 1, reachable, strict)?,
+            } => collect_tree(
+                keys,
+                store,
+                subtree,
+                subtree_salt,
+                depth + 1,
+                reachable,
+                strict,
+            )?,
         }
     }
     Ok(())

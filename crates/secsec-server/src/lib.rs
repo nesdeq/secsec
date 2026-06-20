@@ -226,7 +226,11 @@ impl Server {
     /// Reclaim in-flight pushes idle past `ttl_secs` (§15). The serve loop drives this on a background
     /// interval so abandoned staging cannot accumulate on a server that no client is actively pushing
     /// to. Returns the number of pushes reclaimed.
-    pub fn reclaim_staging(&self, now: u64, ttl_secs: u64) -> Result<u64, secsec_store::StoreError> {
+    pub fn reclaim_staging(
+        &self,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<u64, secsec_store::StoreError> {
         self.store.reclaim_staging(now, ttl_secs)
     }
 
@@ -263,10 +267,7 @@ impl Server {
     }
 
     fn release_quota(&self, d: DeviceId, n: u64) {
-        self.state
-            .lock()
-            .expect("server state")
-            .release_quota(d, n);
+        self.state.lock().expect("server state").release_quota(d, n);
     }
 
     fn take_read(&self, d: DeviceId, n: u64, now: u64) -> bool {
@@ -823,7 +824,10 @@ mod tests {
             blob: vec![0u8],
         };
         // first use ok.
-        assert_eq!(s.handle(write_req(&dev, put.clone(), T, nonce), 0), Response::Ok);
+        assert_eq!(
+            s.handle(write_req(&dev, put.clone(), T, nonce), 0),
+            Response::Ok
+        );
         // replay with the same nonce -> rejected (single-use).
         assert_eq!(
             s.handle(write_req(&dev, put, T, nonce), 0),

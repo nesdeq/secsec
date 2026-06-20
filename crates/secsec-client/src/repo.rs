@@ -951,9 +951,18 @@ mod tests {
         push_objects(&remote, &remote.store, &mk1, &commit_id, &[0x60; 16])
             .await
             .unwrap();
-        push_head(&remote, &mk1, &device, "main", commit_id, 0, None, &[0x60; 16])
-            .await
-            .unwrap();
+        push_head(
+            &remote,
+            &mk1,
+            &device,
+            "main",
+            commit_id,
+            0,
+            None,
+            &[0x60; 16],
+        )
+        .await
+        .unwrap();
 
         // Rotate to generation 2 and build the peeled key ring a cold-started member would hold.
         let (mk2, _st2) = rotate_repo(&remote.store, &device, &mk1, &st1, &rfp, None, 0).unwrap();

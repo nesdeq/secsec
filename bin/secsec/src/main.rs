@@ -20,7 +20,9 @@ use secsec_sig::DeviceKey;
 use secsec_store::Store;
 use secsec_sync::rollback::SyncFrontier;
 use secsec_transport::handshake::client_handshake;
-use secsec_transport::quic::{client_config_tofu, client_config_tuned, server_config_tuned, Tuning};
+use secsec_transport::quic::{
+    client_config_tofu, client_config_tuned, server_config_tuned, Tuning,
+};
 use secsec_transport::HostPin;
 use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -646,7 +648,8 @@ async fn run_serve(dir: PathBuf, port: Option<u16>) -> Result<(), Box<dyn Error>
     }
 
     let listen: SocketAddr = (Ipv4Addr::UNSPECIFIED, port).into();
-    let endpoint = quinn::Endpoint::server(server_config_tuned(&cert, &key, cfg.tuning())?, listen)?;
+    let endpoint =
+        quinn::Endpoint::server(server_config_tuned(&cert, &key, cfg.tuning())?, listen)?;
     println!(
         "secsec serve — store {} · host pin {}",
         store_path.display(),
@@ -852,9 +855,11 @@ async fn run_sync(
         let wdir = dir.clone();
         let debounce_ms = cfg.watch_debounce_ms;
         std::thread::spawn(move || {
-            let _ = secsec_client::watcher::watch_dir(&wdir, Duration::from_millis(debounce_ms), || {
-                tx.send(()).is_ok()
-            });
+            let _ = secsec_client::watcher::watch_dir(
+                &wdir,
+                Duration::from_millis(debounce_ms),
+                || tx.send(()).is_ok(),
+            );
         });
         println!("watching {} — Ctrl-C to stop", dir.display());
     }
