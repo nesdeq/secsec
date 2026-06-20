@@ -31,7 +31,7 @@ pub mod limits {
     pub const HOUR_SECS: u64 = 3_600;
 }
 
-/// Operator-tunable server limits (`secsec-Design.md` §7 `secsec.config`), defaulting to the §19
+/// Operator-tunable server limits (`secsec-Design.md` §19 `secsec.config`), defaulting to the §19
 /// normative values. Only values that are safe to change live here; everything that must be uniform
 /// across peers or that bounds an attacker (decoder bounds, nonce TTL, sigchain caps, the burst that
 /// guarantees a single object always fits) stays compiled-in.
@@ -45,7 +45,7 @@ pub struct Limits {
     pub conn_rate_per_sec: u64,
     /// Concurrent connections per authenticated key.
     pub max_conns_per_key: u64,
-    /// Per-key cumulative new-write cap, bytes — `0` means unlimited (the default, §6).
+    /// Per-key cumulative new-write cap, bytes — `0` means unlimited (the default, §15).
     pub storage_cap: u64,
 }
 

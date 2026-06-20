@@ -22,7 +22,9 @@ the incremental-upload and three-way-merge model, not an optimization.
 - `snapshot_tree(dir, mk, store, prev)` — incrementally snapshot a directory into the store.
 - `seal_signed_commit` / `open_signed_commit` / `sign_commit` / `verify_commit` — the signed `Commit`.
 - `restore_commit_tree` / `restore_tree_into` / `load_tree` / `seal_tree` — materialize trees.
-- `reachable_objects` — the reachable object closure (the GC keep-set / push closure).
+- `reachable_objects` — the reachable object closure a push uploads and retention keeps (§15); strict
+  on the head's own tree, skip-missing on pruned ancestor content.
+- `path_content` — the spine + content of one path at a commit (the per-version unit retention keeps, §15).
 - `Commit`, `Tree`, `Entry`, `MAX_NAME`, `SnapError`.
 
 All tree-reading functions are generic over `MasterKeys` (cross-generation reads, §8.2).

@@ -1,4 +1,4 @@
-//! Retention-prune serialization (`secsec-Design.md` §5): the canonical hashes binding a `prune` call
+//! Retention-prune serialization (`secsec-Design.md` §15): the canonical hashes binding a `prune` call
 //! to the client's view of the server's mutable head/roster state. Verifying the client's signature
 //! over `args_prune` IS a compare-and-swap — a concurrent `cas-head`/`roster-append` moves the value
 //! the server recomputes, so the prune is rejected rather than deleting against stale state. Inputs
@@ -38,7 +38,7 @@ pub fn dead_set_hash(ids: &[Id]) -> [u8; 32] {
     *blake3::hash(&w.finish()).as_bytes()
 }
 
-/// `args_hash` for `prune` (§5/§12): `BLAKE3(canonical("prune" ‖ dead_set_hash ‖ all_heads_hash ‖
+/// `args_hash` for `prune` (§15/§12): `BLAKE3(canonical("prune" ‖ dead_set_hash ‖ all_heads_hash ‖
 /// roster_seq))`. Binding `all_heads_hash`/`roster_seq` makes `prune` a compare-and-swap against the
 /// server's current head/roster state — a concurrent `cas-head`/`roster-append` changes the
 /// recomputed message and the prune is rejected, rather than deleting an object a reverted head now

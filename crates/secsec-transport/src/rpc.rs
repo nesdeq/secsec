@@ -87,8 +87,8 @@ pub async fn request(
     .await
 }
 
-/// Issue a §5 retention `prune` request: its `args_hash` binds the client's view of the server's
-/// mutable head/roster state (`all_heads_hash`/`roster_seq` — the §5 head-binding CAS), so it signs
+/// Issue a §15 retention `prune` request: its `args_hash` binds the client's view of the server's
+/// mutable head/roster state (`all_heads_hash`/`roster_seq` — the §15 head-binding CAS), so it signs
 /// the full `args_prune` rather than the generic `op_and_args` binding.
 pub async fn request_prune(
     conn: &Connection,

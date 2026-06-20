@@ -22,11 +22,11 @@ the QUIC adapter (`quic.rs`, over `secsec-transport`) is a thin layer on top.
 - **`sync`** — `sync_once` (clone / publish / pull / merge in one call), `SyncKind`, `SyncOutcome`.
 - Push/pull primitives: `push_objects` / `push_head`, `fetch_head` / `fetch_closure`,
   `sync_ref` (+ `resolve_head_signer`).
-- **`gc`** (§15) — `gc_collect`, the arrival-receipt log (`parse_receipt_log` / `serialize_receipt_log`
-  / `merge_receipts`), `gc_gen_from_log` / `gc_gen_from_receipts`, `put_epoch_from_log`,
-  `GC_GRACE_WINDOW_SECS`, `GcOutcome`. (Driven automatically from the `sync` loop — no `gc` command.)
+- **`prune`** (§15) — `local_sweep` (drops cache orphans unreachable from the head) and
+  `prune_history` (count-based retention: keep the last N versions per file, delete the rest under the
+  head-CAS). (Driven automatically from the `sync` loop — no `prune` command.)
 - **`watcher`** — `notify`-driven debounced change ticks for live sync.
-- Frontier persistence: `load_frontier` / `save_frontier` (§8.5), `Receipt`, `Remote`, `ClientError`.
+- Frontier persistence: `load_frontier` / `save_frontier` (§8.5), `Remote`, `ClientError`.
 
 Fork detection is the **same-server DAG-incomparable check** in the merge path (a divergence is kept
 both-sides as a `name.conflict-*` copy and surfaced to the user); there is no multi-remote or gossip

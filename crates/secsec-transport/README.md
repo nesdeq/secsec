@@ -26,6 +26,6 @@ The mandatory negative tests (wrong pin fails; tampered/garbage handshake fails)
 - `auth` — `SessionTranscript` (the §11 BLAKE3-over-hellos channel binding), `ConnectionAuth`
   (`secsec-auth-v1` sign/verify), `SECSEC_VERSION`, `NONCE_LEN`.
 - `frame` — length-prefixed framing (`read_frame` / `write_frame`, `MAX_FRAME_LEN`).
-- `rpc` — per-op `request` / `request_gc`.
+- `rpc` — per-op `request` / `request_prune` (the §15 head-binding retention prune).
 - `IDLE_TIMEOUT_SECS`, `KEEPALIVE_SECS` (§19); `AuthError`, `HandshakeError`, `FrameError`,
   `RpcError`, `PinError`, `ConfigError`.

@@ -358,7 +358,7 @@ impl Store {
         Ok(newly)
     }
 
-    /// Stage `blob` under an in-flight `push_id` (§3): a no-op if `id` is already durable (dedup),
+    /// Stage `blob` under an in-flight `push_id` (§15): a no-op if `id` is already durable (dedup),
     /// otherwise recorded in `STAGING` with the push's `STAGING_META` activity clock refreshed to
     /// `now`. Staged objects stay invisible to [`Self::has`]/[`Self::get`] until a winning `cas-head`
     /// promotes them.
@@ -440,7 +440,7 @@ impl Store {
         Ok(total)
     }
 
-    /// Reclaim abandoned pushes (§3), one write transaction: for every push whose `STAGING_META`
+    /// Reclaim abandoned pushes (§15), one write transaction: for every push whose `STAGING_META`
     /// activity is idle past `ttl_secs`, drop all its staged objects and its activity row. Never
     /// touches `OBJECTS`. Returns the number of pushes reclaimed. The clock slides on every
     /// [`Self::stage`], so a live upload — however many objects it is mid-staging — is never reaped.

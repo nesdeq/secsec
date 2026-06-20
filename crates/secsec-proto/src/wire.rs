@@ -149,14 +149,14 @@ pub enum Request {
         id: Id,
         /// Declared size (server rejects `> 16 MiB` before reading the body).
         declared_size: u32,
-        /// The per-attempt push id this object is staged under (§3).
+        /// The per-attempt push id this object is staged under (§15).
         push_id: [u8; PUSH_ID_LEN],
         /// The object blob.
         blob: Vec<u8>,
     },
     /// Atomic ref CAS with staged-object promotion: swap `/refs/<ref_h>` from `old_head` to `new_head`
     /// (the new head blob attached) and, in the same transaction, promote every object staged under
-    /// `promote` to durable storage (§3) — so a durable head never references a non-durable object.
+    /// `promote` to durable storage (§15) — so a durable head never references a non-durable object.
     CasHead {
         /// Keyed-hash ref name.
         ref_h: Id,
@@ -196,8 +196,8 @@ pub enum Request {
         /// Master-key generation.
         gen: u32,
     },
-    /// Client-driven retention prune (§5): delete the durable objects in `dead` (now superseded — no
-    /// kept version references them). The `secsec-write-v1` `args_hash` binds `dead`, the server's
+    /// Client-driven retention prune (§15): delete the durable objects in `dead` that retention has
+    /// dropped — no kept version references them. The `secsec-write-v1` `args_hash` binds `dead`, the server's
     /// current `all_heads_hash`, and `roster_seq` (a head-binding compare-and-swap; see
     /// [`crate::prune`]), so a concurrent `cas-head`/`roster-append` rejects the prune rather than
     /// deleting an object a reverted head now references. `dead` is capped at [`MAX_HAS_IDS`] per call;
@@ -205,7 +205,7 @@ pub enum Request {
     Prune {
         /// The durable object ids to delete.
         dead: Vec<Id>,
-        /// The client's view of the server's `all_heads_hash` — the CAS token (§5).
+        /// The client's view of the server's `all_heads_hash` — the CAS token (§15).
         all_heads_hash: [u8; 32],
         /// The client's view of the current sigchain tip sequence.
         roster_seq: u64,

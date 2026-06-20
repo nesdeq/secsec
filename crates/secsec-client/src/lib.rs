@@ -56,7 +56,7 @@ pub trait Remote {
     /// Fetch a blob by id (`None` if absent).
     async fn get_blob(&self, id: &Id) -> Result<Option<Vec<u8>>, RemoteError>;
     /// Stage a blob under an in-flight `push_id` (idempotent by id). It becomes durable only when this
-    /// push's [`Self::cas_head`] promotes it (§3).
+    /// push's [`Self::cas_head`] promotes it (§15).
     async fn put_blob(
         &self,
         id: &Id,
@@ -67,7 +67,7 @@ pub trait Remote {
     /// reported absent). Batched at `<= MAX_HAS_IDS` by the caller.
     async fn has(&self, ids: &[Id]) -> Result<Vec<bool>, RemoteError>;
     /// Existence check that also counts objects already staged under `push_id` — lets a resumed push
-    /// skip re-uploading what it staged before a crash (§3).
+    /// skip re-uploading what it staged before a crash (§15).
     async fn has_for_push(
         &self,
         push_id: &[u8; PUSH_ID_LEN],
@@ -90,7 +90,7 @@ pub trait Remote {
     async fn get_keyhist(&self, _gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
         Ok(None)
     }
-    /// Blind compare-and-swap with staged-object promotion (§3/§12): replace `/refs/<ref_h>` with
+    /// Blind compare-and-swap with staged-object promotion (§15/§12): replace `/refs/<ref_h>` with
     /// `new_blob` iff `BLAKE3(current stored blob)` (or [`ABSENT_HEAD`]) equals `expected_old`, and in
     /// the same transaction promote every object staged under `promote` to durable storage. Returns
     /// `true` on swap, `false` on conflict.
@@ -101,7 +101,7 @@ pub trait Remote {
         new_blob: &[u8],
         promote: &[u8; PUSH_ID_LEN],
     ) -> Result<bool, RemoteError>;
-    /// Request a §5 retention prune: delete the durable objects in `dead` that no longer belong to any
+    /// Request a §15 retention prune: delete the durable objects in `dead` that no longer belong to any
     /// kept version. The `all_heads_hash`/`roster_seq` are the client's view; the server recomputes
     /// them and the prune is a head-binding compare-and-swap. Returns `true` on success, `false` on a
     /// CAS conflict (a concurrent head/roster mutation — re-pull and retry).
@@ -276,7 +276,7 @@ impl From<HeadError> for ClientError {
 /// Stage the reachable object closure of `commit_id` from `store` to `remote` under `push_id`: upload
 /// only what the server does not already hold (durably, or already staged under this push), so a
 /// resumed push re-sends just the gap. The objects become durable when [`push_head`] promotes this
-/// push (§3). The closure is `commit + ancestors + trees + chunks`.
+/// push (§15). The closure is `commit + ancestors + trees + chunks`.
 pub async fn push_objects<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
@@ -292,7 +292,7 @@ pub async fn push_objects<R: Remote, K: MasterKeys>(
         for (id, p) in chunk.iter().zip(present) {
             if !p {
                 // Upload what we hold; an object absent locally is pruned old content the server either
-                // keeps or has dropped too — never re-uploaded (§5/I5).
+                // keeps or has dropped too — never re-uploaded (§15/I5).
                 if let Some(blob) = store.get(id)? {
                     remote.put_blob(id, &blob, push_id).await?;
                 }
@@ -327,7 +327,7 @@ pub async fn push_head<R: Remote, K: MasterKeys>(
 
     let ref_h = ref_hash(&rnk, ref_name);
     let old = prev.map_or(ABSENT_HEAD, |(_, b)| *blake3::hash(b).as_bytes());
-    // The cas-head promotes the objects staged under `push_id` atomically with the ref swap (§3).
+    // The cas-head promotes the objects staged under `push_id` atomically with the ref swap (§15).
     if remote.cas_head(&ref_h, &old, &blob, push_id).await? {
         Ok((head, blob))
     } else {
@@ -358,7 +358,7 @@ pub async fn fetch_head<R: Remote, K: MasterKeys>(
 
 /// One item of the typed fetch traversal (we know each id's role from its parent, so we can open and
 /// verify it correctly without trusting a server-supplied type). The bool is `strict`: the head
-/// commit's own content must be present; ancestor content is skip-missing (pruned history, §5/I5).
+/// commit's own content must be present; ancestor content is skip-missing (pruned history, §15/I5).
 enum Work {
     Commit(Id, bool),
     Tree(Id, PathSalt, bool),
@@ -387,7 +387,7 @@ pub async fn fetch_closure<R: Remote, K: MasterKeys>(
         }
         // Fetch + store unless already local. The head's own content is strict (a missing current
         // object is a real error); ancestor content is skip-missing — history pruned beyond retention
-        // is simply gone (§5/I5).
+        // is simply gone (§15/I5).
         if store.get(&id)?.is_none() {
             match remote.get_blob(&id).await? {
                 Some(blob) => {

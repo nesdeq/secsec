@@ -43,9 +43,9 @@ secsec/
 │   ├── secsec-sync/      §10   refs, cas-head, rollback-aware merge (storage-free Node model), fork detection
 │   ├── secsec-engine/    §10   snapshot-tree ↔ merge-node bridge, three-way reconcile to the store
 │   ├── secsec-transport/ §11   QUIC+TLS pinned verifier, auth, channel binding
-│   ├── secsec-proto/     §12   wire protocol, RPC framing, write/read-auth, rate limits, gc serialization (§15)
-│   ├── secsec-client/    §7,§10,§15  orchestration: cold-start, watcher, sync loop, auto-GC, invite-pairing
-│   └── secsec-server/          serve loop, quota/rate-limit + gc CAS enforcement, GC executor
+│   ├── secsec-proto/     §12   wire protocol, RPC framing, write/read-auth, rate limits, transactional-push + prune serialization (§15)
+│   ├── secsec-client/    §7,§10,§15  orchestration: cold-start, watcher, sync loop, history retention, invite-pairing
+│   └── secsec-server/          serve loop, transactional promote + prune head-CAS, idle-staging reclaim
 ├── bin/secsec            thin CLI over the crates
 ├── vectors/              committed KAT / cross-impl test vectors
 ├── fuzz/                 cargo-fuzz targets, one per decoder
@@ -57,9 +57,9 @@ snapshot/store/pq/roster → sync → engine → transport/proto → client/serv
 crate depends on a higher layer. `secsec-sync` keeps §10's merge/dag/rollback logic **storage-free
 and purely testable**; `secsec-engine` is the only §10 code that touches `store`+`snapshot` (it
 materializes stored trees into the merge model, re-seals the result, and authors the signed merge
-commit). The §15 GC driver builds on the `Remote` trait, which lives in `secsec-client`; the §15
-serialization hashes are in `secsec-proto`, and the GC executor + CAS enforcement in
-`secsec-store`/`secsec-server`.
+commit). The §15 transactional-push + retention driver builds on the `Remote` trait, which lives in
+`secsec-client`; the `prune`/`all_heads_hash` serialization hashes are in `secsec-proto`, and the
+staged promote + prune head-CAS in `secsec-store`/`secsec-server`.
 
 ---
 
@@ -122,7 +122,7 @@ committed vectors, and `cargo-audit`. Reproducible static `musl` build via `xtas
 | R3 | X-Wing keyslot seal (§8.3/§17) | non-conformant combiner/seed handling; low-order X25519 point | draft-10 KAT (byte-identity); FIPS 203 §7.1 PCT; X-Wing seed from the Ed25519 seed (not the scalar); CTX-committing AEAD over the wrap |
 | R4 | Rollback-aware merge (§10) | replayed old commit steers merge; lost write | frontier/version/HWM gates; adversarial replay tests; keep-both default (no data loss) |
 | R5 | Sigchain fold + cold-start + roster-key peel (§8) | mis-fold → wrong membership; bootstrap deadlock | model-based tests; explicit cold-start order; RFP-anchor + `mk_commit` checks; persisted anti-rollback anchor (P7) |
-| R6 | Hardened GC (§15) | deletes live data under concurrency / ref-hiding | fail-safe-on-missing; serialization CAS (`all_heads_hash`/`roster_seq`/`put_epoch`); keep-everything default; grace window keyed to local time |
+| R6 | Transactional push + retention (§15) | a promoted head references a non-durable object, or retention deletes live data | promote+ref-swap in one redb txn (I1); count-based prune under a head-binding `all_heads_hash`/`roster_seq` CAS; keep-everything when `retention_keep_versions=0` |
 | R7 | Canonical serialization (§9.3) | malleability → signature bypass | verify over received bytes (re-encode guard); reject non-canonical; fuzz |
 | R8 | Keyed FastCDC (§9.7) | unkeyed boundaries → cross-repo size fingerprinting | gear table seeded from `cdc_seed[gen]`; default-on padding is the load-bearing privacy mechanism (§21) |
 
@@ -197,13 +197,12 @@ committed vectors, and `cargo-audit`. Reproducible static `musl` build via `xtas
   symlinks/special files are left alone. The cold-start carries a persisted anti-rollback anchor
   (highest seq + tip-blob hash) that refuses a server-truncated or re-forked sigchain (P7).
 
-- **Automatic GC (`secsec-client::gc`, §15).** There is no `gc` command. `sync` records signed
-  arrival receipts to a local log and runs one best-effort pass per session: it picks a grace-aged
-  `gc_gen` from **local** receipt times, fetches the reachable keep-set over the repo's single ref
-  (`main`), and issues the compare-and-swap sweep — **fail-safe**: any missing object aborts the sweep
-  rather than deleting. Completeness is also guaranteed by the CAS: the server recomputes
-  `all_heads_hash` over every stored ref, so a sweep that doesn't account for them all is rejected.
-  The server serializes it against concurrent writes via the `args_hash`.
+- **History retention (`secsec-client::prune`, §15).** There is no `gc`/`prune` command. `sync` runs
+  `local_sweep` over the local cache (dropping orphans unreachable from the head) and one best-effort
+  `prune_history` pass per session: it keeps the last N versions per file and deletes the superseded
+  content under the head-binding CAS — the server recomputes `all_heads_hash` over every stored ref
+  (with `roster_seq`), so a prune that doesn't account for them all is rejected. Commit objects are
+  kept forever so `log` stays whole. A failure is logged and never fatal.
 
 - **Devices / revoke (CLI + `rotate_repo_remote`).** `secsec devices` lists the folded roster with
   each device's `SHA256:…` SSH fingerprint and a self-marker; `secsec revoke <prefix>` resolves the

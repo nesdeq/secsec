@@ -3,7 +3,7 @@
 //! `args_hash` + session transcript (+ single-use `server_nonce` for writes) → §19 limits → execute.
 //! The server is **blind**: blobs are opaque (clients re-check content addresses on fetch, §9.2),
 //! a push stages objects and the winning `cas-head` atomically promotes them, and `prune` is a
-//! compare-and-swap against the server's head/roster state (§5). The handler is pure and
+//! compare-and-swap against the server's head/roster state (§15). The handler is pure and
 //! clock-injected (`now`) — [`Server::handle`] unit-tests, no sockets.
 
 #![forbid(unsafe_code)]
@@ -113,7 +113,7 @@ impl ServerState {
 
     fn add_quota(&mut self, d: DeviceId, n: u64, cap: u64) -> bool {
         if cap == 0 {
-            return true; // unlimited (the default, §6)
+            return true; // unlimited (the default, §15)
         }
         self.quotas
             .entry(d)
@@ -136,7 +136,7 @@ impl ServerState {
 pub struct Server {
     store: Store,
     state: std::sync::Mutex<ServerState>,
-    /// Operator-tunable runtime limits (§7); defaults to the §19 normative values.
+    /// Operator-tunable runtime limits (§19 `secsec.config`); default to the §19 normative values.
     limits: Limits,
     /// The **mandatory** connection allow-list (the operator's `authorized_keys`), re-read per
     /// connection so adding a key needs no restart. Gates who can talk at all, including pairing
@@ -173,7 +173,8 @@ pub fn parse_authorized_keys(body: &str) -> BTreeSet<DeviceId> {
 }
 
 impl Server {
-    /// Build a handler over `store` (receipts unsigned).
+    /// Build a handler over `store` with default limits and an open allow-list (tighten with
+    /// [`with_limits`](Self::with_limits) / [`with_authorized_file`](Self::with_authorized_file)).
     #[must_use]
     pub fn new(store: Store) -> Self {
         Self {
@@ -184,7 +185,7 @@ impl Server {
         }
     }
 
-    /// Apply operator-tuned runtime limits (§7 `secsec.config`); unset values keep their §19 defaults.
+    /// Apply operator-tuned runtime limits (§19 `secsec.config`); unset values keep their §19 defaults.
     #[must_use]
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
@@ -231,7 +232,7 @@ impl Server {
         &self.store
     }
 
-    /// Reclaim in-flight pushes idle past `ttl_secs` (§3). The serve loop drives this on a background
+    /// Reclaim in-flight pushes idle past `ttl_secs` (§15). The serve loop drives this on a background
     /// interval so abandoned staging cannot accumulate on a server that no client is actively pushing
     /// to. Returns the number of pushes reclaimed.
     pub fn reclaim_staging(&self, now: u64, ttl_secs: u64) -> Result<u64, secsec_store::StoreError> {
@@ -422,7 +423,7 @@ impl Server {
             }
         }
 
-        // prune has a state-dependent args_hash (§5 compare-and-swap), so it is authorized separately
+        // prune has a state-dependent args_hash (§15 compare-and-swap), so it is authorized separately
         // from the generic op_and_args path below.
         if matches!(inc.request, Request::Prune { .. }) {
             return self.handle_prune(inc, now);
@@ -509,7 +510,7 @@ impl Server {
                 if !self.take_write(device_id, blob.len() as u64, now) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
-                // Stage the object under this push; a winning cas-head promotes it durably (§3).
+                // Stage the object under this push; a winning cas-head promotes it durably (§15).
                 match self.store.stage(&push_id, &id, &blob, now) {
                     Ok(()) => Response::Ok,
                     Err(_) => Response::Err(ErrorCode::Internal),
@@ -529,7 +530,7 @@ impl Server {
                 if !self.take_write(device_id, new_blob.len() as u64, now) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
-                // Charge the per-key cap (§11) on the bytes this push would make durable, BEFORE
+                // Charge the per-key cap (§15) on the bytes this push would make durable, BEFORE
                 // promoting, so an over-cap promote is rejected rather than committed. A lost CAS
                 // promotes nothing, so its reservation is refunded.
                 let promote_bytes = self.store.staged_bytes(&promote).unwrap_or(0);
@@ -537,7 +538,7 @@ impl Server {
                     return Response::Err(ErrorCode::RateLimit);
                 }
                 // Atomic compare-and-swap on the server-visible blob hash, promoting this push's staged
-                // objects in the same transaction (blind server, §3/§12).
+                // objects in the same transaction (blind server, §15/§12).
                 match self.store.cas_ref(&ref_h, &old_head, &new_blob, &promote) {
                     Ok(outcome) if outcome.swapped => Response::Ok,
                     Ok(_) => {
@@ -619,14 +620,14 @@ impl Server {
                 Ok(_) => Response::Ok,
                 Err(_) => Response::Err(ErrorCode::Internal),
             },
-            // prune is dispatched before this match (state-dependent auth, §5); never reached here.
+            // prune is dispatched before this match (state-dependent auth, §15); never reached here.
             Request::Prune { .. } => Response::Err(ErrorCode::Internal),
             // Pairing ops are dispatched at the top of `handle` (pre-enrollment); never reached here.
             Request::PairPut { .. } | Request::PairGet { .. } => Response::Err(ErrorCode::Internal),
         }
     }
 
-    /// §5 `prune`: `args_hash` is recomputed from the **server's** current head/roster state
+    /// §15 `prune`: `args_hash` is recomputed from the **server's** current head/roster state
     /// (`all_heads_hash` / `roster_seq`), so verifying the client's signature over it **is** the
     /// head-binding compare-and-swap — a concurrent `cas-head`/`roster-append` changes the recomputed
     /// message and the prune aborts (`BadAuth`) instead of deleting an object a reverted head now
@@ -661,7 +662,7 @@ impl Server {
             server_nonce: nonce,
         };
         if wa.verify(inc.pubkey, &inc.op_sig).is_err() {
-            // Bad signature OR a stale client view of the bound state — the §5 CAS failed.
+            // Bad signature OR a stale client view of the bound state — the §15 CAS failed.
             return Response::Err(ErrorCode::BadAuth);
         }
         if !self.consume_nonce(&nonce, now) {

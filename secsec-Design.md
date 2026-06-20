@@ -882,7 +882,7 @@ The §8.5 local sealed-state blob uses this same construction with `key = local_
 - **put() declared size:** The `put()` request frame MUST include a `declared_size: u32` field
   immediately preceding the blob bytes. The server MUST reject any `put()` with
   `declared_size > 16 MiB` before reading the body. `declared_size` is included in the
-  `secsec-write-v1` args hash: `args_hash = BLAKE3(canonical("put" ‖ id ‖ le32(declared_size)))`.
+  `secsec-write-v1` args hash: `args_hash = BLAKE3(canonical("put" ‖ id ‖ le32(declared_size) ‖ push_id))`.
 - **DoS hardening:** the server issues a stateless **QUIC Retry** to any un-validated source address
   before allocating connection state (anti-amplification, and so the per-source-IP connection-rate
   limit cannot be evaded by address spoofing); request bodies accepted only **after** the write-auth
@@ -898,14 +898,14 @@ The §8.5 local sealed-state blob uses this same construction with `key = local_
 | `get(id)` | **`secsec-read-v1` sig** per op | fetch an object blob (ciphertext) from `/objects/<id>` |
 | `get-ref(ref_H)` | **`secsec-read-v1` sig** per op | fetch the current head blob at `/refs/<H>` (§13); the server returns the opaque §9.8 head ciphertext (or absent) and never learns the ref name behind `H`. Required to read heads for sync (§10) |
 | `has(ids)` | **`secsec-read-v1` sig** per op | existence check (dedup); max 1,024 IDs per call |
-| `put(blob)` | **`secsec-write-v1` sig** | store an object, idempotent by id |
-| `cas-head(old,new,sig)` | **`secsec-write-v1` sig** + valid `secsec-head` | atomic ref CAS |
+| `put(blob,push_id)` | **`secsec-write-v1` sig** | stage an object under an in-flight push (§15), idempotent by id |
+| `cas-head(old,new,promote)` | **`secsec-write-v1` sig** + valid `secsec-head` | atomic ref CAS; promotes the named push's staged objects durably (§15) |
 | `roster-append(entry)` | **`secsec-write-v1` sig** + valid `secsec-roster` | grant/revoke/rotate/min-algo |
 | `put-keyslot(device_id,gen,blob)` | **`secsec-write-v1` sig** | write a device's keyslot at enrollment/rotation (§8.3); permitted from a not-yet-enrolled key **only** under the genesis-bootstrap exception (`roster_len == 0`) |
 | `delete-keyslot(device_id,gen)` | **`secsec-write-v1` sig** | remove a revoked device's keyslot on rotation (§8.4) |
 | `put-keyhist(gen,blob)` / `put-roster-keyhist(gen,blob)` | **`secsec-write-v1` sig** | store the §8.2 data- and roster-key-history forward-wraps minted by a rotation |
 | `pair-put(slot,blob)` / `pair-get(slot)` | **`secsec-read-v1` sig** | §7 invite-pairing mailbox: a TTL'd relay of code-MAC'd blobs at `slot = BLAKE3::derive_key(label, code)`. Dispatched **pre-enrollment** (a joining device owns no keyslot yet); the server learns neither the code nor the contents |
-| `gc(keep-set,gen)` | **`secsec-write-v1` sig** | client-driven sweep (§15); max 100,000 IDs per keep-set |
+| `prune(dead,all_heads_hash,roster_seq)` | **`secsec-write-v1` sig** | client-driven retention deletion under a head-binding CAS (§15); `dead` batched ≤ 1,024 IDs |
 
 **Every repo operation — including reads — requires a per-op signature from a key that owns a
 keyslot** (i.e., a rostered device). `get`, `get-ref`, and `has` each require a fresh
@@ -913,13 +913,13 @@ keyslot** (i.e., a rostered device). `get`, `get-ref`, and `has` each require a 
 bound as a single-id read: `args_hash = BLAKE3(canonical("get-ref" ‖ H))`); connection-level auth
 alone is not sufficient.
 `has(ids)` MUST reject requests with more than 1,024 IDs; the client batches larger check sets
-into sequential calls. The server returns a `too-many-ids` error before performing any lookups.
-`gc(keep-set, gen)` MUST reject requests with keep-sets exceeding 100,000 IDs; for repos with
-more live objects the client performs GC in generation-bounded batches.
+into sequential calls. The server returns a `too-many-ids` error before performing any lookups. A
+`prune` delete-set is bounded the same way — a `dead` list longer than 1,024 IDs is rejected, and the
+client batches across calls.
 
 **Keyslot-existence enforcement (normative).** The server MUST verify, on every per-op request
 (including `get`, `get-ref`, `has`, `put`, `cas-head`, `roster-append`, `put-keyslot`,
-`delete-keyslot`, `put-keyhist`, `put-roster-keyhist`, `gc`), that a keyslot blob exists at
+`delete-keyslot`, `put-keyhist`, `put-roster-keyhist`, `prune`), that a keyslot blob exists at
 `/keyslots/<device_id>/<any_g>` where `device_id = BLAKE3(canonical(authenticated_pubkey))` from
 the connection auth step. A request from a key with no stored keyslot MUST be rejected with a
 distinct `not-enrolled` error code before any read or write is performed. This check uses
@@ -951,16 +951,17 @@ field (`u32`) preceding the blob bytes. The server MUST reject any `put()` with
 `secsec-write-v1` args hash:
 
 ```
-args_hash = BLAKE3(canonical("put" ‖ id ‖ le32(declared_size)))
+args_hash = BLAKE3(canonical("put" ‖ id ‖ le32(declared_size) ‖ push_id))
 ```
 
 **Write-op `args_hash` (normative).** Every mutating RPC carries a `secsec-write-v1` signature over
 `op ‖ args_hash ‖ session_transcript ‖ server_nonce` (§9.6); the client constructs `op`/`args` and
 the server supplies only `server_nonce`. The `args_hash` per op is:
-- `put`: `BLAKE3(canonical("put" ‖ id ‖ le32(declared_size)))`
-- `cas-head`: `BLAKE3(canonical("cas-head" ‖ ref_H ‖ old_head_id ‖ new_head_id))`
+- `put`: `BLAKE3(canonical("put" ‖ id ‖ le32(declared_size) ‖ push_id))`
+- `cas-head`: `BLAKE3(canonical("cas-head" ‖ ref_H ‖ old_head_id ‖ new_head_id ‖ promote))`
 - `roster-append`: `BLAKE3(canonical("roster-append" ‖ BLAKE3(canonical(entry))))`
-- `gc`: the GC serialization hash defined in §15.
+- `prune`: `BLAKE3(canonical("prune" ‖ dead_set_hash ‖ all_heads_hash ‖ roster_seq))` (§15) — the server
+  recomputes `all_heads_hash`/`roster_seq` from its own state and rejects on mismatch (the head-binding CAS).
 
 **`cas-head` head-id semantics (normative).** Because the server is **blind** it cannot read the
 encrypted head blob, so the compare-and-swap operates on a *server-computable* token: `old_head_id`
@@ -974,29 +975,31 @@ too; this is purely a concurrency guard — the head's *authenticity* still rest
 signature inside the blob (§9.8), verified by readers against the roster.
 
 **Per-key storage quota and rate limits** (normative — server MUST enforce):
-- Per-key storage quota: 10 GiB default (configurable). **Scope:** the store is content-addressed and
-  deduplicated, so an object is not owned by the key that wrote it (another key's tree may reference
-  it) and a precise *durable* per-key byte attribution is undefined. This quota therefore bounds the
-  volume of **new** objects a single key introduces **per server session** (an anti-flood cap, reset
-  on restart; idempotent re-puts are not charged). Durable protection against disk exhaustion is the
-  operator's filesystem quota on the store directory — the standard control for a self-hosted,
-  single-user server (§14).
-- Per-key write rate: 100 MB/s sustained, burst 1 GiB.
+- Per-key storage quota: **unlimited by default** (configurable, §15.3). **Scope:** the store is
+  content-addressed and deduplicated, so an object is not owned by the key that wrote it (another key's
+  tree may reference it) and a precise *durable* per-key byte attribution is undefined. A finite cap
+  bounds the volume of **new** objects a single key introduces **per server session** (an anti-flood
+  cap, reset on restart), charged on the `promoted_bytes` at `cas-head` (§15) so idempotent re-puts and
+  abandoned staging are never counted. Durable protection against disk exhaustion is the operator's
+  filesystem quota on the store directory — the standard control for a self-hosted, single-user server
+  (§14).
+- Per-key write rate: 100 MB/s sustained, burst 1 GiB (the burst stays ≥ the 16 MiB object cap so a
+  single object always fits regardless of the configured rate).
 - Per-key read rate: 200 MB/s sustained.
 - Connection rate: 10 new connections/s per source IP; 3 concurrent connections per authenticated key.
   Enforced after the **QUIC Retry** address validation (§11), so a spoofed source cannot exhaust the
   per-IP budget.
-- `gc()` rate: 4 calls per key per hour; the server MUST reject excess calls with a `rate-limit` error before performing any object scan.
 
-These limits are checked after auth and before object storage. See §19.
+The storage cap, the byte rates, and the connection limits are operator-tunable (§19 `secsec.config`);
+the burst is compiled-in. These limits are checked after auth and before object storage. See §19.
 
 ---
 ## 13. Storage layout
 
 **Server.** All state lives in one file, `repo.secsec` (a `redb` database, not a directory tree — the
 paths below are logical key namespaces inside it), in the directory passed to `secsec serve` (default
-the current dir). Alongside it the server keeps its self-signed host identity (`hostkey/`) and receipt
-key. All repo state is opaque:
+the current dir). Alongside it the server keeps its self-signed host identity (`hostkey/`). All repo
+state is opaque:
 ```
 /objects/<id>            packed encrypted blobs (chunk/tree/commit)
 /keyslots/<device_id>/<g> versioned authenticated keyslots per device per generation
@@ -1041,7 +1044,7 @@ synced folder, state lives at `<root>/folders/<BLAKE3(abs_folder_path)>/`:
 link            the repo binding (git-remote analogue): server address, pinned host_id, RFP, ref name
 objects.secsec  the encrypted object cache (so a re-sync need not re-fetch/re-encrypt unchanged data)
 frontier        the §8.5 local sealed state (anti-rollback counters), sealed under the SSH key
-base, receipts  the last-synced root and the §15 arrival-receipt log (for auto-GC)
+base, push_id   the last-synced root, plus the in-flight push id persisted for crash-resume (§15)
 ```
 The same root also holds the UI config/log (`ui.conf`, `ui/`) and the optional systemd per-instance
 env files (`sync@<dir>.conf`); a pre-consolidation `~/.local/state/secsec/<hash>` dir is migrated to
@@ -1067,103 +1070,109 @@ two facts:
   its `~/.ssh/id_ed25519` plus the folder — survives. Losing *every* device **and** the key is the
   information-theoretic total-loss residual (§21).
 
-Against a *deleting* server, the client's keep-everything retention (§15) and the grace window bound
-silent loss; there is no cross-remote recovery. This is the deliberate single-host tradeoff (§2): the
-operator runs their own server, and the device replicas are the redundancy.
+Against a *deleting* server, the device replicas bound silent loss: every enrolled device holds the
+working set plus the last `keep` versions per file (§15), re-pushable to a replacement; there is no
+cross-remote recovery. This is the deliberate single-host tradeoff (§2): the operator runs their own
+server, and the device replicas are the redundancy.
 
 ---
-## 15. Garbage collection (hardened)
+## 15. Storage lifecycle: transactional push, retention, reclaim
 
-**GC is automatic and client-driven — there is no `gc` command.** The blind server cannot compute
-reachability (every head/commit/tree is ciphertext to it), so a client must initiate; but *which*
-client and *when* is not a decision to push onto the user. `secsec sync` therefore runs one
-best-effort GC pass per session (after the first sync): it fetches the reachable closure over the
-repo's ref (the keep-set, below), derives `gc_gen` from its own §15 arrival-receipt log (only
-generations whose every object has aged past the `GC_GRACE_WINDOW`), and issues the compare-and-swap
-`gc` op below. A failure is
-logged and skipped — never fatal to the sync. Retention is keep-everything until an object both
-falls out of the keep-set and ages past the grace window; nothing is deleted silently. There is no
-`gc` command — the sync loop is the trigger.
+The blind server cannot compute reachability — every head/commit/tree is ciphertext to it — so storage
+is kept tidy by two client-driven mechanisms that never ask the server to traverse the object graph: a
+**transactional staged push** that leaves no orphans, and **count-based retention** that bounds history.
+There is no reachability sweep and no `gc` command.
 
-The **same keep-everything policy also runs against the client's own local object cache**
-(`objects.secsec`) once per session, so both ends prune identically: it drops objects unreachable
-from the client's head — orphans left by cas-conflict retries and aborted pushes — while keeping the
-full reachable history (no grace window is needed, since that cache serves only the local device).
-This trims the *logical* object set; it does not by itself shrink the on-disk `redb` file, which
-`redb` re-grows to its working size on the next write — reclaiming the file footprint needs the
-delta-scoped transfer that would let the local cache hold only the current snapshot.
+### 15.1 Transactional staged push
 
-- **Keep-set** = reachable closure over the repo's **single ref `main`** (the shared per-name head at
-  `/refs/<H>`, §13). A repo holds exactly one synced tree (§2), so the keep-set covers the whole
-  repo. **Completeness is also enforced by the `gc` compare-and-swap, not by trust:** the
-  `all_heads_hash` bound into `args_gc` (below) is computed by the **server over every stored ref**;
-  a client whose keep-set omits a ref signs a different `all_heads_hash`, so the recomputed `args_gc`
-  fails signature verification and the sweep is **rejected** (`CasConflict`) rather than executed —
-  GC can never delete an out-of-keep-set ref's objects, it can only decline to run. If any object
-  (commit, tree, or subtree node) required during keep-set traversal is unavailable in the local
-  store, the client additionally **MUST abort GC** (fail-safe) and **MUST NOT** proceed to a `gc()`
-  call; server ref-hiding likewise cannot trick GC into deleting (a hidden ref still changes the
-  server's `all_heads_hash`). GC keep-set per call is capped at 100,000 IDs (§12, §19); larger repos
-  use generation-bounded batches.
+A push is atomic at the granularity of a head advance. Each push **attempt** mints a fresh random
+`push_id` (`PUSH_ID_LEN` = 16 bytes), and every object it uploads is written to a per-push **staging**
+area keyed `push_id ‖ id`, never directly to durable storage. The winning `cas-head` names that
+`push_id` as its `promote` argument, and the server **promotes the whole staged set into durable storage
+and swaps the ref in one redb write transaction**:
 
-- **`keep_set_hash` canonical encoding:** `keep_set_hash = BLAKE3(canonical_id_list(keep_set))`
-  where `canonical_id_list` encodes the keep-set as `le64(count) ‖ id[0] ‖ id[1] ‖ … ‖ id[count-1]`
-  with IDs in **ascending byte-lexicographic order**. Both client and server MUST use this exact
-  encoding when computing or verifying `args_hash` for a `gc` call. A test vector appears in §19.
+> **I1 (atomic promote).** A durable head never references a non-durable object: promote + ref-swap are
+> one `begin_write()`/`commit()`, so a crash never leaves a durable head pointing at a staged or absent
+> object — and no separate sweep is ever needed to collect a half-finished push.
 
-- **Generation + grace:** the server tags objects with an arrival generation; `gc(keep-set, gc_gen)`
-  sweeps only `generation ≤ gc_gen ∧ ∉ keep-set`; in-flight/newer puts get a higher generation; a
-  **grace window** (`GC_GRACE_WINDOW = 48 h`) shields recent arrivals. The client derives `gc_gen`
-  from its own stored arrival receipts (see below) — not from a server-asserted generation counter.
+Consequences:
+- `has(ids)` reports **durable** existence only (**I3**); a push checks its own not-yet-promoted objects
+  with `has_for_push(push_id, ids)`, so a crash-resumed attempt re-uploads only what is still missing.
+- A `push_id` is **per attempt**, not per repo. A `cas-head` conflict (another device advanced the ref)
+  makes the merge retry mint a fresh `push_id`; the losing attempt's staged objects are never promoted —
+  its `cas-head` never ran — so a winning promote carries exactly that attempt's head closure, no
+  orphans. The client persists the `push_id` to its folder state before the first staged `put` and
+  deletes it on the committing `cas-head`, so a crash mid-push resumes the same attempt.
 
-- **Arrival receipts:** on each successful `put(id, blob)`, the server returns a signed receipt:
-  `SIG_hostkey(id ‖ host_id ‖ arrival_generation ‖ put_epoch ‖ timestamp)` where `host_id` is the SPKI hash
-  of the remote's pinned host key. The client verifies the receipt signature against the remote's
-  pinned key and checks that the `host_id` field matches that remote. The client records
-  `(id, arrival_generation, local_receipt_time)` at the moment the receipt is stored, where
-  `local_receipt_time` is the client's own wall-clock time. The client **MUST segregate arrival
-  receipts by the remote that issued them** (keyed by `host_id`); a receipt from remote-R **MUST
-  NOT** influence the `gc_gen` computation for any other remote.
+**Idle-TTL reclaim.** Each push carries one sliding clock (`STAGING_META[push_id] = last_activity`),
+refreshed on every staged `put` — per push, not per object, so a live upload of however many objects is
+never reaped. A server background task (`reclaim_staging`, run on a timer rather than the connection
+accept loop, which never fires on an idle server) drops the **whole** staging range of any push idle
+past `staging_ttl` and **never touches durable storage**. An abandoned push (objects staged, head never
+advanced) thus reclaims itself; no committed data is ever at risk, because a promoted set is no longer
+staging.
 
-  `gc_gen` is the largest `arrival_generation` such that **all** objects with that generation
-  have `local_receipt_time < now − GC_GRACE_WINDOW`. The grace window eligibility check MUST use
-  `local_receipt_time`, regardless of the server-embedded `timestamp` field. The server-provided
-  `timestamp` is informational only and MUST NOT be used to determine GC eligibility.
+### 15.2 Count-based retention
 
-- **Client-verifiable GC serialization:** the `secsec-write-v1` args_hash for a `gc` call MUST
-  bind the client's view of all mutable state at gc-request time:
-  `args_hash = BLAKE3(canonical("gc" ‖ keep_set_hash ‖ gc_gen ‖ all_heads_hash ‖ roster_seq ‖ put_epoch))`,
-  where
-  `all_heads_hash = BLAKE3(le64(n) ‖ (ref_H[0] ‖ head_blob_hash[0]) ‖ … ‖ (ref_H[n-1] ‖ head_blob_hash[n-1]))`
-  is computed over all `n` active refs, the pairs sorted by `ref_H` in ascending byte-lexicographic
-  order, where `head_blob_hash = BLAKE3(stored §9.8 head blob)` — the **server-visible** per-ref token
-  (the same value `cas-head` compares on, §12). It MUST be the blob hash, **not** `head_version`: the
-  blind server cannot read the encrypted `head_version`, so it could not recompute the hash to verify
-  the compare-and-swap; the blob hash is computable by both sides from the stored bytes, and any
-  concurrent `cas-head` changes it (a single scalar cannot serialize a multi-ref repo; the aggregate
-  does). `put_epoch` is a single **global (per-repository) monotonic counter**
-  maintained by the server and incremented on **every** successful `put` regardless of which device
-  issued it — a per-device counter could not catch a concurrent in-flight `put` from another device.
-  The client learns the current `put_epoch` from the **highest value carried in any signed arrival
-  receipt** it has received from that remote (receipts include `put_epoch`, above); it binds that
-  value, making `gc` a compare-and-swap. The server MUST reject a `gc` call if the `all_heads_hash`
-  or `roster_seq` in the args_hash differs
-  from the server's current values, or if the `put_epoch` in the args_hash is lower than the
-  server's current `put_epoch` — serializing `gc` against concurrent `cas-head`, `roster-append`,
-  and any `put` from any device. Concurrent execution fails rather than proceeding silently. **Note:**
-  a malicious server can still elect to execute a stale-`put_epoch` GC request; against a *deleting*
-  server the backstop is the grace window plus the device replicas (every enrolled device still holds
-  the reachable objects locally, §14), not server-side redundancy.
+History is bounded by keeping, **per file, the last `keep` versions** (`retention_keep_versions`, default
+8; `0` = keep everything). A "version" of a file is a commit in which that file's content changed — one
+row of `secsec log <path>`. The policy is per file, not per repo-snapshot (eight whole-repo snapshots
+would be seconds of history under commit-on-change), and purely topological — it never trusts a
+timestamp.
 
-- **Destructive-op containment:** `gc` is a signed `secsec-write` op; deletions are bounded by the
-  grace window and by the device-side replicas (a wipe on the server is re-pushable from any device's
-  local store, §14). The delete log is an advisory record on a cooperative server; against a malicious
-  one it can be omitted or fabricated, so deletion integrity rests on content-addressing and the GC
-  signed-receipt mechanism (above), which gives client-verifiable evidence of what was swept.
-  Retention default is **keep-everything**; pruning is explicit and opt-in. No silent
-  deletion. The `gc()` call is rate-limited to **4 calls per key per hour** (normative limit
-  defined in §12; test parameters in §19); the server MUST reject excess calls before performing
-  any object scan.
+What is kept and what is pruned rests on two invariants:
+
+> **I4 (commits are kept).** Every **commit object** reachable from the head is kept forever (they are
+> tiny), so the parent-graph walk and `secsec log` always resolve. Only tree/chunk **content** is pruned.
+
+> **I5 (horizon implicit in presence).** Pruned content is simply **absent** — there is no horizon
+> predicate threaded through the code. Content walks are therefore **strict on the head commit's own
+> tree** (a missing *current* object is a real error) and **skip-missing on ancestor content** (a pruned
+> old version). A fresh clone fetches current content plus the commit skeleton; historic versions are
+> fetched on demand by `log`/`restore`.
+
+The kept set is the head's full current content plus, per file, the content (chunk-lists + the tree
+spines that resolve them) of its last `keep` changing-versions. Everything reachable only from older
+versions is pruned. A pruned LCA tree degrades a merge to an empty-ancestor keep-both (no data loss,
+§10); restoring a pruned version is a clean `PrunedBeyondRetention` error; `log` lists every commit
+(kept) and shows a beyond-window commit without a diff.
+
+**The prune** is the only client-driven server deletion. The client computes the **dead set** locally
+and asks the server to delete it:
+
+```
+Request::Prune { dead: Vec<Id>, all_heads_hash: [u8;32], roster_seq: u64 }            // batchable
+args_hash = BLAKE3(canonical("prune" ‖ dead_set_hash ‖ all_heads_hash ‖ roster_seq))  // secsec-write-v1
+```
+
+The server **recomputes `all_heads_hash`** (over every stored ref — the same per-ref blob-hash token
+`cas-head` compares on, §12) and **`roster_seq`**, and rejects on any mismatch: a **head-binding
+compare-and-swap**. This defeats the resurrection-via-dedup race — a device that reverts a file
+re-derives an old chunk id, `has`-skips its upload, then `cas-head`s a new head referencing it; the
+moved `all_heads_hash` makes a concurrent `Prune` a `CasConflict`, so the client re-pulls, recomputes
+(the now-reachable id drops out of `dead`), and retries. Because it is a **delete-set, not a keep-set**,
+an omitted id only means *delete fewer*, never *destroy live data* — there is no completeness
+requirement and no keep-set size cap; the client batches freely and the head-CAS handles the temporal
+race. The client drops the dead set from its **own** object cache symmetrically, then issues the batched
+`prune`.
+
+### 15.3 Per-key write cap
+
+`StorageQuota` is a per-key cumulative **new-write** cap for one serve-session, charged on the
+`promoted_bytes` at promote time (§12) so idempotent re-puts and abandoned staging are never counted. It
+is **unlimited by default** — secsec is single-user self-hosted; the filesystem quota is the durable
+bound and retention bounds version growth — while a finite `storage_cap_gib` limits a **compromised
+device's** blast radius. A commit whose newly-promoted bytes exceed the remaining budget has its atomic
+promote rejected with a clear `RateLimit`, never silently; a finite cap below a single commit's footprint
+hard-blocks that file until raised, but the default never hits this. The write `TokenBucket` and the
+per-IP / per-key connection limits are unchanged.
+
+### 15.4 Local cache hygiene
+
+The content-addressed cache the client pushes from (`objects.secsec`) is swept once per session by
+`local_sweep`: it drops objects unreachable from the last-synced head — orphans from cas-conflict
+retries — and keeps the head's full reachable closure (no grace window; the cache serves only this
+device). This trims the *logical* object set; `redb` re-grows its file to working size on the next write.
 
 ---
 ## 16. Downgrade protection & crypto agility
@@ -1262,33 +1271,41 @@ X-Wing keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today
 
 ## 19. Constants _(normative — required for conformance)_
 
+Values marked **operator-tunable** are read from `secsec.config` (`$XDG_CONFIG_HOME/secsec/secsec.config`,
+else `~/.config/secsec/secsec.config`), written with these defaults on first `serve`/`sync` and
+**range-clamped on load** — a config can never produce a breaking value. Everything else is compiled-in:
+a constant that must be identical across peers (changing it would alter a `content_id` or the wire
+contract) or that bounds an attacker is **not** configurable. `[client]` keys apply to `sync`/etc.,
+`[server]` keys to `serve`.
+
 | Knob | Value | Note |
 |---|---|---|
 | FastCDC min/avg/max | 16 / 64 / 256 KiB | sync responsiveness vs object count |
 | Pack target | 8 MiB | bundle small chunks |
-| Listen port | udp/8899 | overridable |
-| QUIC idle / keepalive | 30 s / 10 s | reconnect vs wakeups |
+| Listen port | udp/8899 default | operator-tunable (`secsec.config`) |
+| QUIC idle / keepalive | 30 s / 10 s default | operator-tunable (`secsec.config`); keepalive forced below idle |
 | `server_nonce` size / TTL | 32 B / 60 s | single-use; replay bound; server SHOULD re-verify keyslot existence on each per-op request and MUST do so at least once per this TTL window (§9.6, §12) |
-| GC grace window | 48 h | `GC_GRACE_WINDOW`; shields recent arrivals during multi-day offline periods; normative definition in §15 — this value MUST match §15 exactly |
+| Push id length | 16 B | `PUSH_ID_LEN`; the per-attempt staging key (§15) |
+| Staging idle TTL | 24 h default | an abandoned push's staging is reclaimed past this idle window (§15); operator-tunable (`secsec.config`) |
+| Reclaim sweep cadence | 60 min default | how often the server sweeps idle staging (§15); operator-tunable (`secsec.config`) |
 | Metadata padding buckets | powers of two | default-on (small objects) |
 | Chunk padding policy | power-of-two (default) / uniform (opt-in) / off (opt-out) | default pads to next power-of-two ≥ size (≤2× overhead) — *reduces* the boundary signal; uniform pads all chunks to one fixed size — *eliminates* it at higher cost; off saves space |
-| Per-key storage quota | 10 GiB default | configurable; per-session new-write anti-flood cap (dedup store has no durable per-key byte ownership, §11); durable disk limits are the operator's filesystem quota |
-| Per-key write rate | 100 MB/s sustained, burst 1 GiB | server MUST enforce after auth |
-| Per-key read rate | 200 MB/s sustained | server MUST enforce after auth; matches 2× write rate to allow sync catch-up without unbounded egress |
-| Connection rate limit | 10 new/s per source IP; 3 concurrent per authenticated key | server MUST enforce |
+| Per-key storage quota | unlimited default | operator-tunable (`secsec.config`); a finite cap is a per-session new-write anti-flood charge at promote (dedup store has no durable per-key byte ownership, §11/§15); durable disk limits are the operator's filesystem quota |
+| Per-key write / read rate | 100 / 200 MB/s sustained default | operator-tunable (`secsec.config`); server MUST enforce after auth; 2× read allows sync catch-up without unbounded egress |
+| Write burst | 1 GiB | compiled-in; ≥ the 16 MiB object cap so a single object always fits regardless of the configured rate |
+| Connection rate limit | 10 new/s per source IP; 3 concurrent per authenticated key (defaults) | operator-tunable (`secsec.config`); server MUST enforce |
 | Device key algorithm | **Ed25519 only** | RSA/ECDSA/`sk-*` keys are rejected at parse (scope) |
 | Connection gate | `~/.ssh/authorized_keys`, re-read per connection, fail-closed | mandatory — `secsec serve` refuses to start without a usable key (§11, §12) |
 | Keyslot KEM | **X-Wing** (ML-KEM-768 ⊕ X25519, draft-connolly-cfrg-xwing-kem-10), `algo_id = 1`; CTX AEAD AD = "secsec-keyslot-v1" ‖ canonical(device_id) ‖ le32(gen); device X-Wing seed = `derive_key("secsec-xwing-seed-v1", ed25519_seed)` | post-quantum; the keyslot KEM (§8.3). `min_algo` floor enforced at cold-start (§16) |
-| Retention | keep-all; prune opt-in | no silent deletion |
+| Retention | last 8 versions per file default | `retention_keep_versions` (0 = keep everything); count-based, client-driven prune under a head-CAS (§15); operator-tunable (`secsec.config`) |
 | Invite code length | 96 bits (12 bytes, OS CSPRNG), single-use; displayed as dash-grouped lowercase hex | the §7 out-of-band pairing secret; single-use + the mailbox TTL + the `authorized_keys` gate bound online guessing |
 | Pairing mailbox TTL (`PAIR_TTL`) | 600 s | server-side lifetime of an invite-pairing slot; an expired or consumed slot ends the exchange (§7, §12) |
 | Pairing mailbox slot cap / poll | 256 slots / 500 ms poll | bounds mailbox memory; pairing blobs are also charged against the connecting key's write-rate bucket (anti-flood) |
 | Max has() IDs per call | 1,024 | server rejects with too-many-ids before any lookup |
-| Max gc() keep-set IDs per call | 100,000 | server rejects before processing |
-| Max gc() calls per key per hour | 4 | server MUST enforce; prevents disk-scan amplification; 4 calls/hour supports normal operation (daily GC in batches of up to 100,000 IDs each) while blocking sustained scan abuse |
-| keep_set_hash canonical encoding | BLAKE3(le64(count) ‖ id[0] ‖ … ‖ id[count-1]), IDs in ascending byte-lexicographic order | normative for gc() args_hash (§15); both client and server MUST use this exact encoding; test vector required |
+| Max prune() dead-set IDs per call | 1,024 | server rejects with too-many-ids; the client batches larger sets (§15) |
+| dead_set_hash canonical encoding | BLAKE3(le64(count) ‖ id[0] ‖ … ‖ id[count-1]), IDs ascending byte-lexicographic and deduplicated | normative for prune() args_hash (§15); both sides MUST use this exact encoding |
 | Max sigchain entries per authenticated connection identity per hour | 60 | server enforces by counting roster-append calls per BLAKE3(authenticated_pubkey); server does not decrypt the entry to read the inner signer field; server MUST enforce at roster-append |
-| Max total sigchain length | 10,000 entries (configurable) | server MUST enforce |
+| Max total sigchain length | 10,000 entries | compiled-in anti-abuse floor (not in `secsec.config`); server MUST enforce |
 | Key-history depth (generations) | unbounded (never trimmed) | both the data and roster key-histories keep one 64-byte wrap per generation; total is bounded by the sigchain-length cap (§8.2) |
 | Max blob size (any object type) | 16 MiB | decoders reject before allocating |
 | Max tree depth | 64 levels | decoders reject before allocating |
@@ -1309,8 +1326,11 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
 
 - **Availability/durability.** A hostile or dead server can refuse or delete. secsec is single-host
   (§14), so there is no server-side replica to fail over to; the mitigation is that every enrolled
-  device is a full plaintext replica (re-push to a replacement server) plus client keep-everything
-  retention and the grace window. Residual only if the server is lost *and* no device retains the data.
+  device is a full plaintext replica (re-push to a replacement server) holding the working set plus the
+  last `keep` versions per file (§15). Residual only if the server is lost *and* no device retains the
+  data. History beyond `keep` versions per file is intentionally pruned — `restore`/deep `log` are
+  bounded to the retained window; a staged-but-uncommitted push reclaimed by the idle-TTL costs no
+  committed data (the head never advanced) and is re-pushable from any replica.
 
 - **Reinstall freshness.** A device that loses *all* local frontier state can still verify
   **authenticity** (RFP + `mk_commit`, §7) but cannot alone prove it was served the *latest* head.
@@ -1399,17 +1419,11 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
   compile-time floor — which no withholding can lower — is the bound; once a client *has* received a
   `SetMinAlgo` entry, anti-rollback (the persisted anchor) keeps it from being dropped later.
 
-- **Delete log advisory only.** The append-only delete log is advisory on a cooperative server;
-  a malicious server can omit or fabricate entries. Actual deletion integrity relies on
-  content-addressing, the device-side replicas (§14), and the signed GC receipt mechanism (§15).
-
-- **GC put-epoch integrity (defence-in-depth).** The signed GC receipt (§15) binds the set of
-  surviving object IDs at the time of collection, but the server controls the arrival timestamps
-  it associates with object writes. A malicious server can claim an object was written in the
-  current epoch to prevent its collection, or claim an object is old to accelerate its deletion.
-  Clients MUST therefore treat GC eligibility as a client-computed decision based on the signed
-  sigchain frontier, not on server-supplied timestamps. This is a defence-in-depth residual:
-  a cooperative server's timestamps are not load-bearing for correctness.
+- **Retention prune is best-effort against a malicious server.** The `prune` (§15) deletes under a
+  head-binding CAS, so a *concurrent* head/roster change makes it a no-op rather than a live-data
+  delete — but a malicious server can simply ignore a `prune` (keeping old ciphertext it should have
+  dropped) or delete beyond it (the deleting-server case above). Neither reads plaintext; the bound is
+  the device-side replicas (§14), and the resurrection-via-dedup race is closed by the head-CAS.
 
 - **Key-rotation count and timing leakage.** The storage layout uses plaintext generation indices
   in `/keyslots/<device_id>/<g>` and `/keyhist/<g>`. A malicious server enumerating these paths

@@ -406,7 +406,7 @@ mod tests {
             .to_openssh(LineEnding::LF)
             .unwrap();
 
-        // Plain loader refuses an encrypted key up front (was: load-then-fail-at-sign → `Auth`).
+        // The plain loader refuses an encrypted key up front rather than failing later at sign time.
         assert!(matches!(
             DeviceKey::from_openssh(&encrypted_pem),
             Err(SigError::Encrypted)
@@ -416,7 +416,7 @@ mod tests {
             DeviceKey::from_openssh_passphrase(&encrypted_pem, "wrong"),
             Err(SigError::BadPassphrase)
         ));
-        // Right passphrase → the genuine key: same id, and the previously-failing sign path works.
+        // Right passphrase → the genuine key: same id, and the genuine key signs.
         let dk = DeviceKey::from_openssh_passphrase(&encrypted_pem, "correct horse").unwrap();
         assert_eq!(dk.device_id().unwrap(), id);
         let sig = dk.sign(NS_AUTH, b"connection-auth payload").unwrap();

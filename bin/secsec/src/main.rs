@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
 /// Default listen port a client assumes for a bare `host` (§19: udp/8899). The server's actual listen
-/// port, the staging TTL, the reclaim cadence, and history retention are set in `secsec.config` (§7).
+/// port, the staging TTL, the reclaim cadence, and history retention are set in `secsec.config` (§19).
 const DEFAULT_PORT: u16 = 8899;
 /// How long `invite` waits for a device to pair, and `sync --invite` waits for the host, in 500 ms
 /// pairing-poll rounds (§7): the host waits up to the ~10-minute invite lifetime; the joiner ~2 min.
@@ -194,7 +194,7 @@ fn rand32() -> Result<[u8; 32], Box<dyn Error>> {
     Ok(n)
 }
 
-/// A fresh 16-byte per-attempt push id (§3).
+/// A fresh 16-byte per-attempt push id (§15).
 fn rand16() -> Result<[u8; 16], Box<dyn Error>> {
     let mut n = [0u8; 16];
     getrandom::fill(&mut n)?;
@@ -292,7 +292,7 @@ fn config_root() -> Result<PathBuf, Box<dyn Error>> {
     Ok(base.join("secsec"))
 }
 
-// ---- secsec.config (§7) ----
+// ---- secsec.config (§19) ----
 
 /// Operator-tunable settings, loaded from `<config_root>/secsec.config` (written with defaults on
 /// first use). Only settings that are safe to change live here; content-addressing, the wire format,
@@ -360,7 +360,7 @@ reclaim_tick_minutes = 60    # how often the server sweeps idle staging (min 1)
 ";
 
 impl Config {
-    /// Load the config, writing the default template on first use; values are range-clamped (§7).
+    /// Load the config, writing the default template on first use; values are range-clamped (§19).
     fn load() -> Result<Config, Box<dyn Error>> {
         let path = config_root()?.join("secsec.config");
         let text = match std::fs::read_to_string(&path) {
@@ -408,7 +408,7 @@ impl Config {
         }
     }
 
-    /// Clamp every field to its safe range (§7). `retention_keep_versions == 0` (keep everything) and
+    /// Clamp every field to its safe range (§19). `retention_keep_versions == 0` (keep everything) and
     /// `storage_cap_gib == 0` (unlimited) are valid and left as-is.
     fn clamp(&mut self) {
         self.watch_debounce_ms = self.watch_debounce_ms.max(100);
@@ -457,7 +457,7 @@ fn set<T: std::str::FromStr>(field: &mut T, val: &str) {
 }
 
 /// The out-of-tree state directory for a synced folder: `<config_root>/folders/<hash(abspath)>/`
-/// (created if absent). Holds the per-folder link, the sealed cursor, the receipt log, and the object
+/// (created if absent). Holds the per-folder link, the sealed cursor, the in-flight push id, and the object
 /// cache — so the synced folder itself stays nothing but the user's files. A pre-consolidation dir
 /// (`~/.local/state/secsec/<hash>`) is migrated on first use, so an existing link keeps its frontier.
 fn state_dir_for(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
@@ -641,7 +641,7 @@ async fn run_serve(dir: PathBuf, port: Option<u16>) -> Result<(), Box<dyn Error>
             .with_authorized_file(auth_path.clone()), // re-read per connection
     );
 
-    // Background reclaimer: drop in-flight pushes idle past the staging TTL (§3), so abandoned staging
+    // Background reclaimer: drop in-flight pushes idle past the staging TTL (§15), so abandoned staging
     // cannot accumulate on a server no client is actively pushing to (the accept loop never fires when
     // idle, so the sweep needs its own timer).
     {
@@ -672,7 +672,7 @@ async fn run_serve(dir: PathBuf, port: Option<u16>) -> Result<(), Box<dyn Error>
         authorized.len(),
         endpoint.local_addr()?
     );
-    // Per-source-IP new-connection rate limit (configurable, §7/§19). The accept loop is a single
+    // Per-source-IP new-connection rate limit (configurable, §19). The accept loop is a single
     // task, so this map needs no lock; it is pruned at most once per window so idle source IPs cannot
     // accumulate.
     let conn_rate = server.conn_rate_per_sec();
@@ -812,7 +812,7 @@ async fn run_sync(
     let store = Store::open(sdir.join("objects.secsec"))?;
     let frontier_path = sdir.join("frontier");
     let base_path = sdir.join("base");
-    // The per-attempt push id (§3): persisted before each push, removed after; a file left behind by a
+    // The per-attempt push id (§15): persisted before each push, removed after; a file left behind by a
     // crash mid-push is reused on the next run so the resumed push re-sends only what is still missing.
     let push_id_path = sdir.join("push_id");
     let mut resume_push_id: Option<[u8; 16]> = std::fs::read(&push_id_path)
@@ -1027,7 +1027,7 @@ async fn run_sync(
                 frontier = outcome.frontier;
                 base = outcome.base;
 
-                // Bound history once per session (best-effort, §5): keep the last N versions per file,
+                // Bound history once per session (best-effort, §15): keep the last N versions per file,
                 // deleting superseded content under the head-binding CAS. Never blocks syncing.
                 if initial {
                     if let Err(e) = secsec_client::prune::prune_history(

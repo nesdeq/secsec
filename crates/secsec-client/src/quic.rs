@@ -264,7 +264,7 @@ impl Remote for QuicRemote<'_> {
         all_heads_hash: &[u8; 32],
         roster_seq: u64,
     ) -> Result<bool, RemoteError> {
-        // prune signs over the full args_prune (the §5 head-binding CAS), so it uses the dedicated
+        // prune signs over the full args_prune (the §15 head-binding CAS), so it uses the dedicated
         // request_prune path rather than self.call (which would sign the op_and_args placeholder).
         let resp = secsec_transport::rpc::request_prune(
             self.conn,
@@ -279,7 +279,7 @@ impl Remote for QuicRemote<'_> {
         match resp {
             Response::Ok => Ok(true),
             // BadAuth ⇒ the recomputed args_prune differs from the client's signed one — the server's
-            // head/roster state moved since the client read it (the §5 CAS failed).
+            // head/roster state moved since the client read it (the §15 CAS failed).
             Response::Err(ErrorCode::BadAuth) => Ok(false),
             Response::Err(c) => Err(RemoteError(format!("prune: {c:?}"))),
             other => Err(RemoteError(format!("prune: unexpected {other:?}"))),
@@ -555,9 +555,9 @@ mod tests {
         });
     }
 
-    /// §5 retention prune over **live QUIC**: stage the snapshot closure plus two extra durable
+    /// §15 retention prune over **live QUIC**: stage the snapshot closure plus two extra durable
     /// "garbage" blobs and promote them under one head, then prune one — it is deleted while the other
-    /// and the reachable closure survive. A prune bound to a STALE `all_heads_hash` fails the §5
+    /// and the reachable closure survive. A prune bound to a STALE `all_heads_hash` fails the §15
     /// head-binding compare-and-swap.
     #[test]
     fn prune_deletes_garbage_and_rejects_stale_cas_over_live_quic() {
@@ -656,7 +656,7 @@ mod tests {
                 "reachable closure kept"
             );
 
-            // a prune bound to a STALE all_heads_hash fails the §5 compare-and-swap (returns false).
+            // a prune bound to a STALE all_heads_hash fails the §15 compare-and-swap (returns false).
             assert!(
                 !remote.prune(&[g2], &[0u8; 32], 0).await.unwrap(),
                 "stale CAS rejected"

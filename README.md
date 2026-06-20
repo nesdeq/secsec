@@ -70,8 +70,8 @@ A folder is remembered after its first sync — afterwards, just `secsec sync ~/
 
 Every command takes `--help`; all client commands accept `--key <file>` to use a key other than the
 default, and `--passphrase-stdin` to read the key's passphrase from stdin instead of prompting (for
-headless/GUI launchers — the passphrase travels over a pipe, never the command line). Garbage
-collection runs automatically inside `sync`.
+headless/GUI launchers — the passphrase travels over a pipe, never the command line). History
+retention (keeping the last few versions of each file) runs automatically inside `sync`.
 
 ## Run as a service
 

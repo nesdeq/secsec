@@ -1,4 +1,4 @@
-//! Client cache hygiene (`secsec-Design.md` §5). [`local_sweep`] drops objects in the client's own
+//! Client cache hygiene (`secsec-Design.md` §15). [`local_sweep`] drops objects in the client's own
 //! object cache that are no longer reachable from the synced head — orphans left by cas-conflict
 //! retries or aborted pushes. (Bounded server-side history retention — `prune_history` — is added
 //! here in the retention layer.)
@@ -20,7 +20,7 @@ pub fn local_sweep<K: MasterKeys>(keys: &K, store: &Store, head: &Id) -> Result<
     Ok(store.retain(&keep)?)
 }
 
-/// Bound history to the last `keep` versions per file (§5): keep the head's full current content plus,
+/// Bound history to the last `keep` versions per file (§15): keep the head's full current content plus,
 /// for each file, the content of its last `keep` changing-versions; delete everything else. The dead
 /// set is dropped from the local cache, then deleted on the server under a head-binding compare-and-swap
 /// (a concurrent `cas-head`/`roster-append` rejects the prune, so a reverted head's content is never

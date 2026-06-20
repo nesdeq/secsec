@@ -16,7 +16,7 @@ pub const IDLE_TIMEOUT_SECS: u64 = 30;
 /// QUIC keepalive interval (§19): 10 s.
 pub const KEEPALIVE_SECS: u64 = 10;
 
-/// QUIC idle/keepalive tuning (§7 `secsec.config`); defaults to the §19 values. The keepalive must
+/// QUIC idle/keepalive tuning (§19 `secsec.config`); defaults to the §19 values. The keepalive must
 /// stay strictly below the idle timeout so a live connection refreshes before it can idle out.
 #[derive(Debug, Clone, Copy)]
 pub struct Tuning {
@@ -89,7 +89,7 @@ pub fn client_config(pin: HostPin) -> Result<ClientConfig, ConfigError> {
     client_config_tuned(pin, Tuning::default())
 }
 
-/// Like [`client_config`] but with explicit idle/keepalive tuning (§7 `secsec.config`).
+/// Like [`client_config`] but with explicit idle/keepalive tuning (§19 `secsec.config`).
 pub fn client_config_tuned(pin: HostPin, tuning: Tuning) -> Result<ClientConfig, ConfigError> {
     let qcc = QuicClientConfig::try_from(rustls_client_config(pin))
         .map_err(|e| ConfigError(e.to_string()))?;
@@ -122,7 +122,7 @@ pub fn server_config(cert_der: &[u8], key_der: &[u8]) -> Result<ServerConfig, Co
     server_config_tuned(cert_der, key_der, Tuning::default())
 }
 
-/// Like [`server_config`] but with explicit idle/keepalive tuning (§7 `secsec.config`).
+/// Like [`server_config`] but with explicit idle/keepalive tuning (§19 `secsec.config`).
 pub fn server_config_tuned(
     cert_der: &[u8],
     key_der: &[u8],

@@ -109,7 +109,7 @@ pub enum SnapError {
     BadSignature,
     /// A requested path did not exist in the tree being resolved (`secsec log`/`restore`).
     PathNotFound(String),
-    /// The requested version's content has been pruned beyond retention (§5) — it cannot be restored.
+    /// The requested version's content has been pruned beyond retention (§15) — it cannot be restored.
     PrunedBeyondRetention(String),
     /// Signing/key error.
     Sig(secsec_sig::SigError),
@@ -833,12 +833,12 @@ pub fn restore_tree_into<K: MasterKeys>(
     restore_tree(tree_id, tree_salt, keys, store, dest, 0)
 }
 
-// ---- reachable closure (push set / retention, §5) ----
+// ---- reachable closure (push set / retention, §15) ----
 
 /// All object ids reachable from `heads` (commits + parents + trees + chunks). Each commit in `heads`
 /// and its own tree are **strict** — a missing object errors, because current content must be complete
 /// — while an ancestor commit's content is **skip-missing**: history pruned beyond retention is simply
-/// absent (§5/I5). Every present object is opened (§9.2-verified).
+/// absent (§15/I5). Every present object is opened (§9.2-verified).
 pub fn reachable_objects<K: MasterKeys>(
     keys: &K,
     store: &Store,
@@ -897,7 +897,7 @@ fn collect_tree<K: MasterKeys>(
         return Ok(()); // shared subtree already walked
     }
     // A pruned tree is absent: under the head's own tree that is an error (current content must be
-    // complete); under an ancestor it is skipped — its old content fell out of retention (§5/I5).
+    // complete); under an ancestor it is skipped — its old content fell out of retention (§15/I5).
     let blob = match store.get(tree_id)? {
         Some(b) => b,
         None if strict => return Err(SnapError::Missing(*tree_id)),
@@ -1019,7 +1019,7 @@ pub fn resolve_path<K: MasterKeys>(
 /// The object ids needed to materialize `path` from `(root_tree, root_salt)`: the tree ids on the
 /// spine from the root to `path`, plus — for a file — its chunk ids, or — for a directory — the full
 /// closure under it. `None` if `path` does not resolve (or its spine has already been pruned). Used by
-/// retention to keep one specific version's content (§5); skip-missing, so an already-pruned part is
+/// retention to keep one specific version's content (§15); skip-missing, so an already-pruned part is
 /// simply not added.
 pub fn path_content<K: MasterKeys>(
     keys: &K,
@@ -1166,7 +1166,7 @@ fn diff_trees<K: MasterKeys>(
             Some((id, salt)) => match load_tree(id, salt, keys, store) {
                 Ok(tree) => Ok(tree.entries),
                 // A tree pruned beyond retention is treated as an empty side, so `log` lists the commit
-                // without a diff rather than erroring (§5).
+                // without a diff rather than erroring (§15).
                 Err(SnapError::Missing(_)) => Ok(Vec::new()),
                 Err(e) => Err(e),
             },

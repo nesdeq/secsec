@@ -28,7 +28,7 @@ pub mod op {
     pub const CAS_HEAD: &str = "cas-head";
     /// Append a roster sigchain entry.
     pub const ROSTER_APPEND: &str = "roster-append";
-    /// Client-driven retention prune: delete a set of now-superseded objects (§5).
+    /// Client-driven retention prune: delete a set of objects retention has dropped (§15).
     pub const PRUNE: &str = "prune";
     /// Fetch a blob.
     pub const GET: &str = "get";
@@ -63,7 +63,7 @@ fn blake3_of(bytes: &[u8]) -> [u8; 32] {
 }
 
 /// `args_hash` for `put` (§12): `BLAKE3(canonical("put" ‖ id ‖ le32(declared_size) ‖ push_id))`. The
-/// `push_id` is bound so the signature authorizes staging this object under that exact push (§3).
+/// `push_id` is bound so the signature authorizes staging this object under that exact push (§15).
 #[must_use]
 pub fn args_put(id: &Id, declared_size: u32, push_id: &[u8; PUSH_ID_LEN]) -> [u8; 32] {
     let mut w = Writer::new();
@@ -76,7 +76,7 @@ pub fn args_put(id: &Id, declared_size: u32, push_id: &[u8; PUSH_ID_LEN]) -> [u8
 
 /// `args_hash` for `cas-head` (§12): `BLAKE3(canonical("cas-head" ‖ ref_H ‖ old_head_id ‖ new_head_id
 /// ‖ promote))`. The `promote` push id is bound so the swap authorizes promoting that push's staged
-/// objects atomically with the ref change (§3).
+/// objects atomically with the ref change (§15).
 #[must_use]
 pub fn args_cas_head(
     ref_h: &Id,
@@ -182,7 +182,7 @@ pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
             w.raw(op::GET_KEYHIST.as_bytes()).u32(*gen);
             (op::GET_KEYHIST, blake3_of(&w.finish()), false)
         }
-        // prune's REAL binding is the state-bound args_prune (§5), computed in the server's prune
+        // prune's REAL binding is the state-bound args_prune (§15), computed in the server's prune
         // handler and the client's prune driver — never this placeholder (handle dispatches Prune
         // before here).
         Request::Prune {
