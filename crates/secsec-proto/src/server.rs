@@ -9,12 +9,8 @@ use std::collections::{HashMap, VecDeque};
 pub mod limits {
     /// `server_nonce` time-to-live, seconds (§19): single-use within this window.
     pub const SERVER_NONCE_TTL_SECS: u64 = 60;
-    /// Max `has()` ids per call (§12/§19); the client batches larger sets.
+    /// Max ids in a single `has()` or `prune` batch (§12/§19); the client batches larger sets.
     pub const MAX_HAS_IDS: usize = 1_024;
-    /// Max `gc()` keep-set ids per call (§12/§19).
-    pub const MAX_GC_KEEP_SET_IDS: usize = 100_000;
-    /// Max `gc()` calls per key per hour (§19).
-    pub const MAX_GC_CALLS_PER_HOUR: u64 = 4;
     /// Max sigchain entries per authenticated connection identity per hour (§19).
     pub const MAX_SIGCHAIN_ENTRIES_PER_CONN_PER_HOUR: u64 = 60;
     /// Max total sigchain length (§19, configurable default).
@@ -363,7 +359,6 @@ mod tests {
         // spot-check the normative §19 values.
         assert_eq!(limits::SERVER_NONCE_TTL_SECS, 60);
         assert_eq!(limits::MAX_HAS_IDS, 1024);
-        assert_eq!(limits::MAX_GC_CALLS_PER_HOUR, 4);
         assert_eq!(limits::MAX_SIGCHAIN_ENTRIES_PER_CONN_PER_HOUR, 60);
         assert_eq!(limits::PER_KEY_STORAGE_QUOTA, 10 * 1024 * 1024 * 1024);
     }

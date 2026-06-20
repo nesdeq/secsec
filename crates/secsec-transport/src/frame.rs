@@ -123,6 +123,7 @@ mod tests {
             let request = Request::Put {
                 id: [0x11; 32],
                 declared_size: 5,
+                push_id: [0x22; 16],
                 blob: b"hello".to_vec(),
             };
             write_frame(&mut send, &request.encode()).await.unwrap();

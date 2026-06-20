@@ -14,6 +14,7 @@ use crate::{
 use secsec_engine::MergeError;
 use secsec_kdf::MasterKeys;
 use secsec_object::Id;
+use secsec_proto::PUSH_ID_LEN;
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
 use secsec_snapshot::{
     open_signed_commit, restore_commit_tree, seal_signed_commit, snapshot_tree, verify_commit,
@@ -52,9 +53,6 @@ pub struct SyncOutcome {
     pub base: Option<Id>,
     /// The frontier advanced by this sync (§8.5: persist before the next sync).
     pub frontier: SyncFrontier,
-    /// The §15 arrival receipts for objects pushed this sync (empty on a pure pull/clone/no-op). The
-    /// caller merges these into its persisted receipt log to drive a later [`crate::gc::gc_collect`].
-    pub receipts: Vec<(Id, crate::Receipt)>,
     /// Keep-both conflict paths produced by a three-way merge this sync (§10), so the caller can
     /// surface them to the user. Empty unless `kind == Merged` with genuine conflicts; the conflicting
     /// content is preserved on disk as `name.conflict-<device>-<id>.ext` (no data is lost).
@@ -162,6 +160,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
     roster_seq: u64,
     base: Option<Id>,
     ts: u64,
+    push_id: &[u8; PUSH_ID_LEN],
     seal: &dyn Fn(&SyncFrontier) -> Result<(), ClientError>,
 ) -> Result<SyncOutcome, ClientError> {
     // Writes (snapshot, commit, head) use the current generation; reads (closures, old commits) route
@@ -182,7 +181,6 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                     kind: SyncKind::Cloned,
                     base: Some(h.commit_id),
                     frontier,
-                    receipts: Vec::new(),
                     conflicts: Vec::new(),
                 });
             }
@@ -211,7 +209,6 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                     kind: SyncKind::Pulled,
                     base: Some(h.commit_id),
                     frontier,
-                    receipts: Vec::new(),
                     conflicts: Vec::new(),
                 })
             }
@@ -219,7 +216,6 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                 kind: SyncKind::UpToDate,
                 base,
                 frontier: frontier.clone(),
-                receipts: Vec::new(),
                 conflicts: Vec::new(),
             }),
         };
@@ -271,13 +267,22 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
         None => {
             // §8.5: seal the frontier (carrying our commit's version) before the ref-advancing push.
             seal(&f)?;
-            let receipts = push_objects(remote, store, keys, &our_commit).await?;
-            push_head(remote, keys, device, ref_name, our_commit, roster_seq, None).await?;
+            push_objects(remote, store, keys, &our_commit, push_id).await?;
+            push_head(
+                remote,
+                keys,
+                device,
+                ref_name,
+                our_commit,
+                roster_seq,
+                None,
+                push_id,
+            )
+            .await?;
             Ok(SyncOutcome {
                 kind: SyncKind::Published,
                 base: Some(our_commit),
                 frontier: f,
-                receipts,
                 conflicts: Vec::new(),
             })
         }
@@ -299,10 +304,10 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                 ref_name,
                 &our_commit,
                 author,
+                push_id,
                 seal,
             )
             .await?;
-            let receipts = report.receipts;
             let mut frontier = report.frontier;
             let (kind, base, conflicts) = match report.action {
                 SyncAction::AlreadyHave => {
@@ -329,7 +334,6 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                 kind,
                 base: Some(base),
                 frontier,
-                receipts,
                 conflicts,
             })
         }
@@ -375,7 +379,8 @@ mod tests {
         let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
         let sync = |store, wdir, frontier, base| {
             sync_once(
-                &remote, store, wdir, &m, &dev_a, &members, frontier, "main", 0, base, 0, &seal,
+                &remote, store, wdir, &m, &dev_a, &members, frontier, "main", 0, base, 0,
+                &[0x44; 16], &seal,
             )
         };
 
@@ -464,7 +469,8 @@ mod tests {
         let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
         let sync = |store, wdir, frontier, base| {
             sync_once(
-                &remote, store, wdir, &m, &dev_a, &members, frontier, "main", 0, base, 0, &seal,
+                &remote, store, wdir, &m, &dev_a, &members, frontier, "main", 0, base, 0,
+                &[0x44; 16], &seal,
             )
         };
 
@@ -541,13 +547,12 @@ mod tests {
             0,
             None,
             0,
+            &[0x44; 16],
             &seal,
         )
         .await
         .unwrap();
         assert_eq!(r1.kind, SyncKind::Published);
-        // §15: a publish surfaces arrival receipts (commit + tree + chunk) for the receipt log.
-        assert!(!r1.receipts.is_empty(), "publish surfaces arrival receipts");
         let a_base = r1.base;
 
         // B clones into an empty dir → gets A's file (B does NOT publish its empty dir).
@@ -564,12 +569,12 @@ mod tests {
             0,
             None,
             0,
+            &[0x44; 16],
             &seal,
         )
         .await
         .unwrap();
         assert_eq!(r2.kind, SyncKind::Cloned);
-        assert!(r2.receipts.is_empty(), "a clone pushes nothing");
         assert_eq!(read_tree(b_dir.path()), read_tree(a_dir.path()));
         let b_base = r2.base;
 
@@ -587,12 +592,12 @@ mod tests {
             0,
             a_base,
             0,
+            &[0x44; 16],
             &seal,
         )
         .await
         .unwrap();
         assert_eq!(r3.kind, SyncKind::Pushed);
-        assert!(!r3.receipts.is_empty(), "a push surfaces arrival receipts");
 
         // B syncs (no local change) → fast-forwards, restoring A's edit.
         let r4 = sync_once(
@@ -607,12 +612,12 @@ mod tests {
             0,
             b_base,
             0,
+            &[0x44; 16],
             &seal,
         )
         .await
         .unwrap();
         assert_eq!(r4.kind, SyncKind::Pulled);
-        assert!(r4.receipts.is_empty(), "a fast-forward pull pushes nothing");
         assert_eq!(
             std::fs::read(b_dir.path().join("hello.txt")).unwrap(),
             b"v2-edited"
@@ -631,6 +636,7 @@ mod tests {
             0,
             r4.base,
             0,
+            &[0x44; 16],
             &seal,
         )
         .await
@@ -673,6 +679,7 @@ mod tests {
             0,
             None,
             0,
+            &[0x44; 16],
             &seal,
         )
         .await;
@@ -742,50 +749,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn local_sweep_keeps_reachable_and_drops_orphans() {
-        let dir = tempfile::tempdir().unwrap();
-        let m = MasterKey::new(1, [0x55; 32]);
-        let dev_a = DeviceKey::generate().unwrap();
-        let members: BTreeMap<DeviceId, DevicePublic> =
-            [(dev_a.device_id().unwrap(), dev_a.public())]
-                .into_iter()
-                .collect();
-        let remote = MemRemote::new(Store::open(dir.path().join("remote.redb")).unwrap());
-        let a_store = Store::open(dir.path().join("a.redb")).unwrap();
-        let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
-
-        // A publishes a folder → a_store holds exactly the head's reachable closure.
-        let a_dir = tempfile::tempdir().unwrap();
-        std::fs::write(a_dir.path().join("hello.txt"), b"v1").unwrap();
-        let r = sync_once(
-            &remote,
-            &a_store,
-            a_dir.path(),
-            &m,
-            &dev_a,
-            &members,
-            &SyncFrontier::default(),
-            "main",
-            0,
-            None,
-            0,
-            &seal,
-        )
-        .await
-        .unwrap();
-        let head = r.base.unwrap();
-        let reachable = a_store.object_count().unwrap();
-
-        // Inject an object unreachable from the head (an orphan, as a cas-conflict retry would leave).
-        a_store.put(&[0xee; 32], b"orphan").unwrap();
-        assert_eq!(a_store.object_count().unwrap(), reachable + 1);
-
-        // The sweep drops exactly the orphan; the head's full closure survives and still opens.
-        let dropped = crate::gc::local_sweep(&m, &a_store, &head).unwrap();
-        assert_eq!(dropped, 1, "only the unreachable orphan is dropped");
-        assert_eq!(a_store.get(&[0xee; 32]).unwrap(), None);
-        assert_eq!(a_store.object_count().unwrap(), reachable);
-        assert!(open_signed_commit(&head, &m, &a_store).is_ok());
-    }
 }

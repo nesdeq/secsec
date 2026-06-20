@@ -7,6 +7,7 @@
 //! the transport/handshake layer.
 
 use crate::server::limits::MAX_HAS_IDS;
+use crate::PUSH_ID_LEN;
 use secsec_canon::{CanonError, Reader, Writer};
 use secsec_frame::{MAX_BLOB_SIZE, MAX_ROSTER_ENTRY_SIZE};
 
@@ -50,6 +51,12 @@ impl From<CanonError> for WireError {
 fn read32(r: &mut Reader<'_>) -> Result<Id, WireError> {
     let mut out = [0u8; 32];
     out.copy_from_slice(r.raw(32)?);
+    Ok(out)
+}
+
+fn read_push_id(r: &mut Reader<'_>) -> Result<[u8; PUSH_ID_LEN], WireError> {
+    let mut out = [0u8; PUSH_ID_LEN];
+    out.copy_from_slice(r.raw(PUSH_ID_LEN)?);
     Ok(out)
 }
 
@@ -135,16 +142,21 @@ pub enum Request {
         /// The ids to check, in request order.
         ids: Vec<Id>,
     },
-    /// Store an object (idempotent by id).
+    /// Stage an object under an in-flight push (idempotent by id). The object is held in `STAGING`
+    /// until this push's `cas-head` promotes it; it is not durably stored on its own.
     Put {
         /// Content address.
         id: Id,
         /// Declared size (server rejects `> 16 MiB` before reading the body).
         declared_size: u32,
+        /// The per-attempt push id this object is staged under (§3).
+        push_id: [u8; PUSH_ID_LEN],
         /// The object blob.
         blob: Vec<u8>,
     },
-    /// Atomic ref CAS: swap `/refs/<ref_h>` from `old_head` to `new_head` (the new head blob attached).
+    /// Atomic ref CAS with staged-object promotion: swap `/refs/<ref_h>` from `old_head` to `new_head`
+    /// (the new head blob attached) and, in the same transaction, promote every object staged under
+    /// `promote` to durable storage (§3) — so a durable head never references a non-durable object.
     CasHead {
         /// Keyed-hash ref name.
         ref_h: Id,
@@ -152,6 +164,8 @@ pub enum Request {
         old_head: Id,
         /// New head id.
         new_head: Id,
+        /// The push whose staged objects this swap promotes.
+        promote: [u8; PUSH_ID_LEN],
         /// The new head blob to store.
         new_blob: Vec<u8>,
     },
@@ -182,15 +196,19 @@ pub enum Request {
         /// Master-key generation.
         gen: u32,
     },
-    /// Client-driven garbage-collection sweep (§15): delete every object with arrival `put_epoch ≤
-    /// gc_gen` that is **not** in `keep_set`. The `secsec-write-v1` `args_hash` binds `keep_set`,
-    /// `gc_gen`, and the server's current `all_heads_hash`/`roster_seq`/`put_epoch` (a compare-and-swap;
-    /// see [`crate::gc`]). `keep_set` is capped at [`MAX_GC_KEEP_SET_IDS`].
-    Gc {
-        /// The reachable-object closure to keep (sorted/deduped by the hash; the server folds again).
-        keep_set: Vec<Id>,
-        /// Sweep objects whose arrival `put_epoch ≤ gc_gen`.
-        gc_gen: u64,
+    /// Client-driven retention prune (§5): delete the durable objects in `dead` (now superseded — no
+    /// kept version references them). The `secsec-write-v1` `args_hash` binds `dead`, the server's
+    /// current `all_heads_hash`, and `roster_seq` (a head-binding compare-and-swap; see
+    /// [`crate::prune`]), so a concurrent `cas-head`/`roster-append` rejects the prune rather than
+    /// deleting an object a reverted head now references. `dead` is capped at [`MAX_HAS_IDS`] per call;
+    /// the client batches a larger delete-set (each batch is independently CAS-guarded).
+    Prune {
+        /// The durable object ids to delete.
+        dead: Vec<Id>,
+        /// The client's view of the server's `all_heads_hash` — the CAS token (§5).
+        all_heads_hash: [u8; 32],
+        /// The client's view of the current sigchain tip sequence.
+        roster_seq: u64,
     },
     /// Fetch the roster-key-history wrap at `/roster-keyhist/<gen>` (§8.2) — for rotation-era cold-start
     /// (peeling `roster_key_g` across generations). A read op; the server returns the opaque wrap.
@@ -263,7 +281,7 @@ const T_ROSTER: u8 = 4;
 const T_GETREF: u8 = 5;
 const T_GETROSTER: u8 = 6;
 const T_GETKEYSLOT: u8 = 7;
-const T_GC: u8 = 8;
+const T_PRUNE: u8 = 8;
 const T_GETRKH: u8 = 9;
 const T_GETKH: u8 = 10;
 const T_PUTKEYSLOT: u8 = 11;
@@ -291,20 +309,27 @@ impl Request {
             Request::Put {
                 id,
                 declared_size,
+                push_id,
                 blob,
             } => {
-                w.u8(T_PUT).raw(id).u32(*declared_size).bytes(blob);
+                w.u8(T_PUT)
+                    .raw(id)
+                    .u32(*declared_size)
+                    .raw(push_id)
+                    .bytes(blob);
             }
             Request::CasHead {
                 ref_h,
                 old_head,
                 new_head,
+                promote,
                 new_blob,
             } => {
                 w.u8(T_CAS)
                     .raw(ref_h)
                     .raw(old_head)
                     .raw(new_head)
+                    .raw(promote)
                     .bytes(new_blob);
             }
             Request::RosterAppend { old_tip, entry } => {
@@ -319,12 +344,16 @@ impl Request {
             Request::GetKeyslot { device_id, gen } => {
                 w.u8(T_GETKEYSLOT).raw(device_id).u32(*gen);
             }
-            Request::Gc { keep_set, gc_gen } => {
-                w.u8(T_GC).u32(keep_set.len() as u32);
-                for id in keep_set {
+            Request::Prune {
+                dead,
+                all_heads_hash,
+                roster_seq,
+            } => {
+                w.u8(T_PRUNE).u32(dead.len() as u32);
+                for id in dead {
                     w.raw(id);
                 }
-                w.u64(*gc_gen);
+                w.raw(all_heads_hash).u64(*roster_seq);
             }
             Request::GetRosterKeyhist { gen } => {
                 w.u8(T_GETRKH).u32(*gen);
@@ -381,12 +410,14 @@ impl Request {
             T_PUT => Request::Put {
                 id: read32(&mut r)?,
                 declared_size: r.u32()?,
+                push_id: read_push_id(&mut r)?,
                 blob: r.bytes(MAX_BLOB_SIZE)?.to_vec(),
             },
             T_CAS => Request::CasHead {
                 ref_h: read32(&mut r)?,
                 old_head: read32(&mut r)?,
                 new_head: read32(&mut r)?,
+                promote: read_push_id(&mut r)?,
                 new_blob: r.bytes(MAX_BLOB_SIZE)?.to_vec(),
             },
             T_ROSTER => Request::RosterAppend {
@@ -401,20 +432,21 @@ impl Request {
                 device_id: read32(&mut r)?,
                 gen: r.u32()?,
             },
-            T_GC => {
+            T_PRUNE => {
                 let n = r.u32()? as usize;
-                if n > crate::server::limits::MAX_GC_KEEP_SET_IDS {
+                if n > MAX_HAS_IDS {
                     return Err(WireError::TooLarge);
                 }
-                // Cap the pre-allocation to what the remaining input can actually hold (32 bytes per
-                // id), so a lying count (claims 100k, sends a short body) can't force a ~3 MiB alloc.
-                let mut keep_set = Vec::with_capacity(n.min(r.remaining() / 32));
+                // Cap the pre-allocation to what the remaining input can hold (32 bytes per id), so a
+                // lying count cannot force a large allocation ahead of a truncated body.
+                let mut dead = Vec::with_capacity(n.min(r.remaining() / 32));
                 for _ in 0..n {
-                    keep_set.push(read32(&mut r)?);
+                    dead.push(read32(&mut r)?);
                 }
-                Request::Gc {
-                    keep_set,
-                    gc_gen: r.u64()?,
+                Request::Prune {
+                    dead,
+                    all_heads_hash: read32(&mut r)?,
+                    roster_seq: r.u64()?,
                 }
             }
             T_GETRKH => Request::GetRosterKeyhist { gen: r.u32()? },
@@ -476,22 +508,8 @@ pub enum Response {
     Blob(Option<Vec<u8>>),
     /// `has` result: one bool per requested id, in order.
     Exists(Vec<bool>),
-    /// The write op (`cas-head`/`roster-append`/`gc`) was accepted.
+    /// A write op (`put`/`cas-head`/`roster-append`/`prune`) was accepted.
     Ok,
-    /// A `put` was accepted, with its signed §15 arrival receipt ([`crate::receipt`]) — the client
-    /// records it to derive `gc_gen` and bind the gc CAS.
-    Stored {
-        /// The object's arrival generation (its first-`put` epoch; idempotent puts keep the original).
-        arrival_gen: u64,
-        /// The server's current global `put_epoch` after this put.
-        put_epoch: u64,
-        /// The server's asserted timestamp (advisory; never used for GC eligibility, §15/§21).
-        ts: u64,
-        /// The host's Ed25519 receipt public key (all-zero if receipts are unsigned).
-        receipt_pubkey: [u8; 32],
-        /// The receipt signature over the §15 message (all-zero if unsigned).
-        signature: [u8; 64],
-    },
     /// The op was rejected with this code.
     Err(ErrorCode),
 }
@@ -500,7 +518,6 @@ const R_BLOB: u8 = 0;
 const R_EXISTS: u8 = 1;
 const R_OK: u8 = 2;
 const R_ERR: u8 = 3;
-const R_STORED: u8 = 4;
 
 fn code_to_u8(c: ErrorCode) -> u8 {
     match c {
@@ -547,20 +564,6 @@ impl Response {
             Response::Ok => {
                 w.u8(R_OK);
             }
-            Response::Stored {
-                arrival_gen,
-                put_epoch,
-                ts,
-                receipt_pubkey,
-                signature,
-            } => {
-                w.u8(R_STORED)
-                    .u64(*arrival_gen)
-                    .u64(*put_epoch)
-                    .u64(*ts)
-                    .raw(receipt_pubkey)
-                    .raw(signature);
-            }
             Response::Err(c) => {
                 w.u8(R_ERR).u8(code_to_u8(*c));
             }
@@ -589,17 +592,6 @@ impl Response {
                 Response::Exists(bits)
             }
             R_OK => Response::Ok,
-            R_STORED => Response::Stored {
-                arrival_gen: r.u64()?,
-                put_epoch: r.u64()?,
-                ts: r.u64()?,
-                receipt_pubkey: read32(&mut r)?,
-                signature: {
-                    let mut s = [0u8; 64];
-                    s.copy_from_slice(r.raw(64)?);
-                    s
-                },
-            },
             R_ERR => Response::Err(code_from_u8(r.u8()?)?),
             other => return Err(WireError::BadTag(other)),
         };
@@ -696,12 +688,14 @@ mod tests {
             Request::Put {
                 id: [4; 32],
                 declared_size: 11,
+                push_id: [0xab; 16],
                 blob: b"hello world".to_vec(),
             },
             Request::CasHead {
                 ref_h: [5; 32],
                 old_head: [6; 32],
                 new_head: [7; 32],
+                promote: [0xcd; 16],
                 new_blob: b"head".to_vec(),
             },
             Request::RosterAppend {
@@ -714,9 +708,10 @@ mod tests {
                 device_id: [10; 32],
                 gen: 3,
             },
-            Request::Gc {
-                keep_set: vec![[11; 32], [12; 32]],
-                gc_gen: 9,
+            Request::Prune {
+                dead: vec![[11; 32], [12; 32]],
+                all_heads_hash: [0x44; 32],
+                roster_seq: 9,
             },
             Request::GetRosterKeyhist { gen: 2 },
             Request::GetKeyhist { gen: 5 },
@@ -733,13 +728,6 @@ mod tests {
             Response::Blob(Some(b"blob".to_vec())),
             Response::Exists(vec![true, false, true]),
             Response::Ok,
-            Response::Stored {
-                arrival_gen: 7,
-                put_epoch: 42,
-                ts: 1234,
-                receipt_pubkey: [0x55; 32],
-                signature: [0x66; 64],
-            },
             Response::Err(ErrorCode::CasConflict),
             Response::Err(ErrorCode::NotEnrolled),
         ];
@@ -761,6 +749,7 @@ mod tests {
             request: Request::Put {
                 id: [9; 32],
                 declared_size: 3,
+                push_id: [0; 16],
                 blob: b"abc".to_vec(),
             },
         };
@@ -790,7 +779,7 @@ mod tests {
     fn put_blob_over_max_is_rejected() {
         // claim a blob length far over MAX_BLOB_SIZE; canon rejects on the length prefix.
         let mut w = Writer::new();
-        w.u8(T_PUT).raw(&[0u8; 32]).u32(0).u32(u32::MAX); // bytes() length prefix = u32::MAX
+        w.u8(T_PUT).raw(&[0u8; 32]).u32(0).raw(&[0u8; 16]).u32(u32::MAX); // bytes() prefix = u32::MAX
         assert!(matches!(
             Request::decode(&w.finish()),
             Err(WireError::Canon(CanonError::LengthExceedsMax { .. }))

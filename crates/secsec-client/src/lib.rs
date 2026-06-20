@@ -7,9 +7,9 @@
 
 #![forbid(unsafe_code)]
 
-pub mod gc;
 pub mod history;
 pub mod pair;
+pub mod prune;
 pub mod quic;
 pub mod repo;
 pub mod sync;
@@ -23,6 +23,8 @@ use secsec_engine::{merge_heads, CommitAuthor, MergeError, SyncAction};
 use secsec_frame::ObjType;
 use secsec_kdf::MasterKeys;
 use secsec_object::{open_object, Id, ObjError, PathSalt};
+use secsec_proto::server::limits::MAX_HAS_IDS;
+use secsec_proto::PUSH_ID_LEN;
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
 use secsec_snapshot::{Entry, SnapError};
 use secsec_store::{Store, StoreError, ABSENT_HEAD};
@@ -47,61 +49,30 @@ impl core::fmt::Display for RemoteError {
 }
 impl std::error::Error for RemoteError {}
 
-/// A §15 arrival receipt returned on a successful `put`. The client records it to choose a safe
-/// `gc_gen` and to bind the `gc` CAS to `put_epoch`. Signed by the host receipt key (§15
-/// defence-in-depth); all-zero pubkey/signature when unsigned (e.g. the in-process backend).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Receipt {
-    /// The object's arrival generation (the `put_epoch` it first landed at).
-    pub arrival_gen: u64,
-    /// The server's current global `put_epoch` after this put.
-    pub put_epoch: u64,
-    /// The server's asserted timestamp (advisory; never used for GC eligibility, §15/§21).
-    pub ts: u64,
-    /// The host's Ed25519 receipt public key (all-zero if unsigned).
-    pub receipt_pubkey: [u8; 32],
-    /// The receipt signature over the §15 message (all-zero if unsigned).
-    pub signature: [u8; 64],
-}
-
-impl Receipt {
-    /// An unsigned receipt (all-zero pubkey/signature) — for an in-process backend with no host key.
-    #[must_use]
-    pub fn unsigned(arrival_gen: u64, put_epoch: u64) -> Self {
-        Self {
-            arrival_gen,
-            put_epoch,
-            ts: 0,
-            receipt_pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        }
-    }
-
-    /// Verify this receipt's signature against `host_id` (§15). Returns `false` for an unsigned
-    /// receipt (all-zero pubkey). The caller TOFU-binds `receipt_pubkey` to the pinned `host_id` over
-    /// the host-authenticated connection.
-    #[must_use]
-    pub fn verify(&self, id: &Id, host_id: &[u8; 32]) -> bool {
-        secsec_proto::receipt::verify_receipt(
-            &self.receipt_pubkey,
-            &self.signature,
-            id,
-            host_id,
-            self.arrival_gen,
-            self.put_epoch,
-            self.ts,
-        )
-    }
-}
-
 /// A content-addressed object + mutable-ref store on the far side of a connection (§12, §13). The
 /// blind server exposes exactly this surface; an in-process backing store implements it identically.
 #[allow(async_fn_in_trait)]
 pub trait Remote {
     /// Fetch a blob by id (`None` if absent).
     async fn get_blob(&self, id: &Id) -> Result<Option<Vec<u8>>, RemoteError>;
-    /// Store a blob (idempotent by id); returns the §15 arrival [`Receipt`].
-    async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<Receipt, RemoteError>;
+    /// Stage a blob under an in-flight `push_id` (idempotent by id). It becomes durable only when this
+    /// push's [`Self::cas_head`] promotes it (§3).
+    async fn put_blob(
+        &self,
+        id: &Id,
+        blob: &[u8],
+        push_id: &[u8; PUSH_ID_LEN],
+    ) -> Result<(), RemoteError>;
+    /// Existence check against **durable** storage (drives dedup; a staged-but-unpromoted object is
+    /// reported absent). Batched at `<= MAX_HAS_IDS` by the caller.
+    async fn has(&self, ids: &[Id]) -> Result<Vec<bool>, RemoteError>;
+    /// Existence check that also counts objects already staged under `push_id` — lets a resumed push
+    /// skip re-uploading what it staged before a crash (§3).
+    async fn has_for_push(
+        &self,
+        push_id: &[u8; PUSH_ID_LEN],
+        ids: &[Id],
+    ) -> Result<Vec<bool>, RemoteError>;
     /// Fetch the stored head blob for `/refs/<ref_h>` (`None` if absent).
     async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, RemoteError>;
     /// Fetch the sigchain entry blob at `seq` (`None` past the tip) — cold-start fold (§8.1).
@@ -119,26 +90,27 @@ pub trait Remote {
     async fn get_keyhist(&self, _gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
         Ok(None)
     }
-    /// Blind compare-and-swap (§12): replace `/refs/<ref_h>` with `new_blob` iff `BLAKE3(current
-    /// stored blob)` (or [`ABSENT_HEAD`]) equals `expected_old`. Returns `true` on swap, `false` on
-    /// conflict.
+    /// Blind compare-and-swap with staged-object promotion (§3/§12): replace `/refs/<ref_h>` with
+    /// `new_blob` iff `BLAKE3(current stored blob)` (or [`ABSENT_HEAD`]) equals `expected_old`, and in
+    /// the same transaction promote every object staged under `promote` to durable storage. Returns
+    /// `true` on swap, `false` on conflict.
     async fn cas_head(
         &self,
         ref_h: &Id,
         expected_old: &Id,
         new_blob: &[u8],
+        promote: &[u8; PUSH_ID_LEN],
     ) -> Result<bool, RemoteError>;
-    /// Request a §15 GC sweep: delete objects with arrival `put_epoch ≤ gc_gen` not in `keep_set`. The
-    /// `all_heads_hash`/`roster_seq`/`put_epoch` are the client's view; the server recomputes them and
-    /// the sweep is a compare-and-swap (a concurrent mutation aborts it). Returns the outcome.
-    async fn gc(
+    /// Request a §5 retention prune: delete the durable objects in `dead` that no longer belong to any
+    /// kept version. The `all_heads_hash`/`roster_seq` are the client's view; the server recomputes
+    /// them and the prune is a head-binding compare-and-swap. Returns `true` on success, `false` on a
+    /// CAS conflict (a concurrent head/roster mutation — re-pull and retry).
+    async fn prune(
         &self,
-        keep_set: Vec<Id>,
-        gc_gen: u64,
+        dead: &[Id],
         all_heads_hash: &[u8; 32],
         roster_seq: u64,
-        put_epoch: u64,
-    ) -> Result<GcOutcome, RemoteError>;
+    ) -> Result<bool, RemoteError>;
     /// Store a device's keyslot blob (§13) — the network half of enrollment (§7/§8.4). Defaults to an
     /// error so read-only / in-process backends need not implement it.
     async fn put_keyslot(
@@ -188,17 +160,6 @@ pub trait Remote {
             "delete_keyslot unsupported by this remote".to_string(),
         ))
     }
-}
-
-/// The result of a [`Remote::gc`] request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GcOutcome {
-    /// The sweep ran (objects below `gc_gen` and outside the keep-set were deleted).
-    Swept,
-    /// The §15 compare-and-swap failed — the server's mutable state moved since the client computed
-    /// `all_heads_hash`/`roster_seq`/`put_epoch` (a concurrent `cas-head`/`roster-append`/`put`). The
-    /// client should re-read state and retry.
-    CasConflict,
 }
 
 /// Errors from client orchestration.
@@ -312,30 +273,37 @@ impl From<HeadError> for ClientError {
 
 // ---- push ----
 
-/// Push the full reachable object closure of `commit_id` from `store` to `remote` (idempotent puts).
-/// The id set is the §15 keep-set closure (commit + ancestors + trees + chunks); each blob is read
-/// from the local store and `put`. Returns the per-object arrival [`Receipt`]s (for the caller to
-/// record toward `gc_gen`).
+/// Stage the reachable object closure of `commit_id` from `store` to `remote` under `push_id`: upload
+/// only what the server does not already hold (durably, or already staged under this push), so a
+/// resumed push re-sends just the gap. The objects become durable when [`push_head`] promotes this
+/// push (§3). The closure is `commit + ancestors + trees + chunks`.
 pub async fn push_objects<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
     keys: &K,
     commit_id: &Id,
-) -> Result<Vec<(Id, Receipt)>, ClientError> {
-    let ids = secsec_snapshot::reachable_objects(keys, store, &[*commit_id])?;
-    let mut receipts = Vec::with_capacity(ids.len());
-    for id in &ids {
-        let blob = store.get(id)?.ok_or(ClientError::MissingLocal(*id))?;
-        let receipt = remote.put_blob(id, &blob).await?;
-        receipts.push((*id, receipt));
+    push_id: &[u8; PUSH_ID_LEN],
+) -> Result<(), ClientError> {
+    let ids: Vec<Id> = secsec_snapshot::reachable_objects(keys, store, &[*commit_id])?
+        .into_iter()
+        .collect();
+    for chunk in ids.chunks(MAX_HAS_IDS) {
+        let present = remote.has_for_push(push_id, chunk).await?;
+        for (id, p) in chunk.iter().zip(present) {
+            if !p {
+                let blob = store.get(id)?.ok_or(ClientError::MissingLocal(*id))?;
+                remote.put_blob(id, &blob, push_id).await?;
+            }
+        }
     }
-    Ok(receipts)
+    Ok(())
 }
 
 /// Advance `/refs/<ref_name>` to `commit_id`: seal a signed head (chained on `prev`), then blind-CAS
 /// it onto the remote. `prev` is the `(head, stored_blob)` the client last observed for this ref
 /// (`None` for the first head); the old CAS token is `BLAKE3(prev_blob)` (or [`ABSENT_HEAD`]). Returns
 /// the new `(head, stored_blob)` to carry as `prev` next time. The caller pushes objects first.
+#[allow(clippy::too_many_arguments)]
 pub async fn push_head<R: Remote, K: MasterKeys>(
     remote: &R,
     keys: &K,
@@ -344,6 +312,7 @@ pub async fn push_head<R: Remote, K: MasterKeys>(
     commit_id: Id,
     roster_seq: u64,
     prev: Option<(&Head, &[u8])>,
+    push_id: &[u8; PUSH_ID_LEN],
 ) -> Result<(Head, Vec<u8>), ClientError> {
     let head = build_head(ref_name, commit_id, roster_seq, prev.map(|(h, _)| h));
     let sig = sign_head(device, &head)?;
@@ -355,7 +324,8 @@ pub async fn push_head<R: Remote, K: MasterKeys>(
 
     let ref_h = ref_hash(&rnk, ref_name);
     let old = prev.map_or(ABSENT_HEAD, |(_, b)| *blake3::hash(b).as_bytes());
-    if remote.cas_head(&ref_h, &old, &blob).await? {
+    // The cas-head promotes the objects staged under `push_id` atomically with the ref swap (§3).
+    if remote.cas_head(&ref_h, &old, &blob, push_id).await? {
         Ok((head, blob))
     } else {
         Err(ClientError::CasConflict)
@@ -484,9 +454,6 @@ pub struct SyncReport {
     pub frontier: SyncFrontier,
     /// The head we wrote, if we advanced the ref (merge or fast-forward-the-remote-to-us).
     pub wrote: Option<(Head, Vec<u8>)>,
-    /// The §15 arrival receipts for any objects we pushed this call (empty if we only adopted a
-    /// remote head). The caller records these toward a future `gc_gen` (§15).
-    pub receipts: Vec<(Id, Receipt)>,
 }
 
 /// Reconcile our local `our_commit` for `ref_name` against the remote (§10): fetch the remote head
@@ -508,6 +475,7 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
     ref_name: &str,
     our_commit: &Id,
     author: CommitAuthor<'_>,
+    push_id: &[u8; PUSH_ID_LEN],
     seal: &dyn Fn(&SyncFrontier) -> Result<(), ClientError>,
 ) -> Result<SyncReport, ClientError> {
     let device: &DeviceKey = author.device;
@@ -519,7 +487,7 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
         // §8.5: seal the frontier (carrying our commit's version, set by the caller) before the
         // ref-advancing push.
         seal(frontier)?;
-        let receipts = push_objects(remote, store, keys, our_commit).await?;
+        push_objects(remote, store, keys, our_commit, push_id).await?;
         let (head, blob) = push_head(
             remote,
             keys,
@@ -528,6 +496,7 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
             *our_commit,
             roster_seq,
             None,
+            push_id,
         )
         .await?;
         return Ok(SyncReport {
@@ -536,7 +505,6 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
             },
             frontier: frontier.clone(),
             wrote: Some((head, blob)),
-            receipts,
         });
     };
 
@@ -563,11 +531,11 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
         SyncAction::FastForward { .. } => None,       // remote is ahead → adopt, nothing to push
     };
 
-    let (wrote, receipts) = if let Some(commit_id) = new_commit {
+    let wrote = if let Some(commit_id) = new_commit {
         // §8.5: seal the observed frontier BEFORE publishing a head that descends from those
         // observations — a crash post-push must not leave the head uncovered by the frontier.
         seal(&plan.frontier)?;
-        let receipts = push_objects(remote, store, keys, &commit_id).await?;
+        push_objects(remote, store, keys, &commit_id, push_id).await?;
         let (head, blob) = push_head(
             remote,
             keys,
@@ -576,18 +544,18 @@ pub async fn sync_ref<R: Remote, K: MasterKeys>(
             commit_id,
             roster_seq,
             Some((&remote_head, &remote_blob)),
+            push_id,
         )
         .await?;
-        (Some((head, blob)), receipts)
+        Some((head, blob))
     } else {
-        (None, Vec::new())
+        None
     };
 
     Ok(SyncReport {
         action: plan.action,
         frontier: plan.frontier,
         wrote,
-        receipts,
     })
 }
 
@@ -704,8 +672,10 @@ mod tests {
             ts: 0,
         };
         let id1 = secsec_snapshot::seal_signed_commit(&m, &a_store, &device, &c1).unwrap();
-        push_objects(&remote, &a_store, &m, &id1).await.unwrap();
-        let (h1, b1) = push_head(&remote, &m, &device, "main", id1, 0, None)
+        push_objects(&remote, &a_store, &m, &id1, &[0x01; 16])
+            .await
+            .unwrap();
+        let (h1, b1) = push_head(&remote, &m, &device, "main", id1, 0, None, &[0x01; 16])
             .await
             .unwrap();
 
@@ -724,10 +694,21 @@ mod tests {
             ts: 0,
         };
         let id2 = secsec_snapshot::seal_signed_commit(&m, &a_store, &device, &c2).unwrap();
-        push_objects(&remote, &a_store, &m, &id2).await.unwrap();
-        let (h2, _b2) = push_head(&remote, &m, &device, "main", id2, 0, Some((&h1, &b1)))
+        push_objects(&remote, &a_store, &m, &id2, &[0x02; 16])
             .await
             .unwrap();
+        let (h2, _b2) = push_head(
+            &remote,
+            &m,
+            &device,
+            "main",
+            id2,
+            0,
+            Some((&h1, &b1)),
+            &[0x02; 16],
+        )
+        .await
+        .unwrap();
         assert_eq!(h2.head_version, 2);
         assert_eq!(h2.prev_head, secsec_sync::head_id(&h1));
 
@@ -746,8 +727,20 @@ mod tests {
             ts: 0,
         };
         let id3 = secsec_snapshot::seal_signed_commit(&m, &a_store, &device, &c3).unwrap();
-        push_objects(&remote, &a_store, &m, &id3).await.unwrap();
-        let stale = push_head(&remote, &m, &device, "main", id3, 0, Some((&h1, &b1))).await;
+        push_objects(&remote, &a_store, &m, &id3, &[0x03; 16])
+            .await
+            .unwrap();
+        let stale = push_head(
+            &remote,
+            &m,
+            &device,
+            "main",
+            id3,
+            0,
+            Some((&h1, &b1)),
+            &[0x03; 16],
+        )
+        .await;
         assert!(matches!(stale, Err(ClientError::CasConflict)));
     }
 
@@ -803,8 +796,10 @@ mod tests {
         write_dir(base.path(), &[("keep", b"k0"), ("shared", b"s0")]);
         let (bt, bs) = secsec_snapshot::snapshot_tree(base.path(), &m, &a_store, None).unwrap();
         let c_base = seal_commit(&a_store, &m, &dev_a, bt, bs, vec![], 1, [0u8; 32]);
-        push_objects(&remote, &a_store, &m, &c_base).await.unwrap();
-        let (h_base, b_base) = push_head(&remote, &m, &dev_a, "main", c_base, 0, None)
+        push_objects(&remote, &a_store, &m, &c_base, &[0x10; 16])
+            .await
+            .unwrap();
+        let (h_base, b_base) = push_head(&remote, &m, &dev_a, "main", c_base, 0, None, &[0x10; 16])
             .await
             .unwrap();
 
@@ -817,7 +812,9 @@ mod tests {
         let (at, asalt) =
             secsec_snapshot::snapshot_tree(a_wt.path(), &m, &a_store, Some((&bt, &bs))).unwrap();
         let c_a = seal_commit(&a_store, &m, &dev_a, at, asalt, vec![c_base], 2, c_base);
-        push_objects(&remote, &a_store, &m, &c_a).await.unwrap();
+        push_objects(&remote, &a_store, &m, &c_a, &[0x11; 16])
+            .await
+            .unwrap();
         push_head(
             &remote,
             &m,
@@ -826,6 +823,7 @@ mod tests {
             c_a,
             0,
             Some((&h_base, &b_base)),
+            &[0x11; 16],
         )
         .await
         .unwrap();
@@ -853,6 +851,7 @@ mod tests {
                 roster_seq: 0,
                 ts: 0,
             },
+            &[0x12; 16],
             &seal,
         )
         .await
@@ -910,6 +909,7 @@ mod tests {
                 roster_seq: 0,
                 ts: 0,
             },
+            &[0x13; 16],
             &seal,
         )
         .await

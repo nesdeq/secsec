@@ -2,13 +2,12 @@
 //!
 //! Every repo op — reads included — requires a per-op signature from a keyslot-owning key. Writes
 //! sign `op ‖ args_hash ‖ session_transcript ‖ server_nonce` (`NS_WRITE`); reads drop the nonce
-//! (`NS_READ`). The per-op `args_hash` bindings are the normative §12 set; gc's §15 state-bound
-//! serialization is in [`gc`]; the GC executor lives in `secsec-store`/`secsec-server`.
+//! (`NS_READ`). The per-op `args_hash` bindings are the normative §12 set; the retention `prune`
+//! op's state-bound serialization (a head-binding compare-and-swap) is in [`prune`].
 
 #![forbid(unsafe_code)]
 
-pub mod gc;
-pub mod receipt;
+pub mod prune;
 pub mod server;
 pub mod wire;
 
@@ -18,6 +17,9 @@ use secsec_sig::{DeviceKey, DevicePublic, NS_READ, NS_WRITE};
 /// A 256-bit id / hash.
 pub type Id = [u8; 32];
 
+/// A per-attempt `push_id` length, in bytes — the staging key prefix bound into `put`/`cas-head`.
+pub const PUSH_ID_LEN: usize = 16;
+
 /// Op labels (§12). These appear both inside the relevant `args_hash` and in the signed payload.
 pub mod op {
     /// Store an object.
@@ -26,8 +28,8 @@ pub mod op {
     pub const CAS_HEAD: &str = "cas-head";
     /// Append a roster sigchain entry.
     pub const ROSTER_APPEND: &str = "roster-append";
-    /// Client-driven GC sweep.
-    pub const GC: &str = "gc";
+    /// Client-driven retention prune: delete a set of now-superseded objects (§5).
+    pub const PRUNE: &str = "prune";
     /// Fetch a blob.
     pub const GET: &str = "get";
     /// Existence check.
@@ -60,22 +62,34 @@ fn blake3_of(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
 }
 
-/// `args_hash` for `put` (§12): `BLAKE3(canonical("put" ‖ id ‖ le32(declared_size)))`.
+/// `args_hash` for `put` (§12): `BLAKE3(canonical("put" ‖ id ‖ le32(declared_size) ‖ push_id))`. The
+/// `push_id` is bound so the signature authorizes staging this object under that exact push (§3).
 #[must_use]
-pub fn args_put(id: &Id, declared_size: u32) -> [u8; 32] {
+pub fn args_put(id: &Id, declared_size: u32, push_id: &[u8; PUSH_ID_LEN]) -> [u8; 32] {
     let mut w = Writer::new();
-    w.raw(op::PUT.as_bytes()).raw(id).u32(declared_size);
+    w.raw(op::PUT.as_bytes())
+        .raw(id)
+        .u32(declared_size)
+        .raw(push_id);
     blake3_of(&w.finish())
 }
 
-/// `args_hash` for `cas-head` (§12): `BLAKE3(canonical("cas-head" ‖ ref_H ‖ old_head_id ‖ new_head_id))`.
+/// `args_hash` for `cas-head` (§12): `BLAKE3(canonical("cas-head" ‖ ref_H ‖ old_head_id ‖ new_head_id
+/// ‖ promote))`. The `promote` push id is bound so the swap authorizes promoting that push's staged
+/// objects atomically with the ref change (§3).
 #[must_use]
-pub fn args_cas_head(ref_h: &Id, old_head_id: &Id, new_head_id: &Id) -> [u8; 32] {
+pub fn args_cas_head(
+    ref_h: &Id,
+    old_head_id: &Id,
+    new_head_id: &Id,
+    promote: &[u8; PUSH_ID_LEN],
+) -> [u8; 32] {
     let mut w = Writer::new();
     w.raw(op::CAS_HEAD.as_bytes())
         .raw(ref_h)
         .raw(old_head_id)
-        .raw(new_head_id);
+        .raw(new_head_id)
+        .raw(promote);
     blake3_of(&w.finish())
 }
 
@@ -168,24 +182,38 @@ pub fn op_and_args(req: &wire::Request) -> (&'static str, [u8; 32], bool) {
             w.raw(op::GET_KEYHIST.as_bytes()).u32(*gen);
             (op::GET_KEYHIST, blake3_of(&w.finish()), false)
         }
-        // gc's REAL binding is the state-bound args_gc (§15), computed in the server's gc handler
-        // and the client's gc driver — never this placeholder (handle dispatches Gc before here).
-        Request::Gc { keep_set, gc_gen } => {
+        // prune's REAL binding is the state-bound args_prune (§5), computed in the server's prune
+        // handler and the client's prune driver — never this placeholder (handle dispatches Prune
+        // before here).
+        Request::Prune {
+            dead,
+            all_heads_hash,
+            roster_seq,
+        } => {
             let mut w = Writer::new();
-            w.raw(op::GC.as_bytes())
-                .raw(&gc::keep_set_hash(keep_set))
-                .u64(*gc_gen);
-            (op::GC, blake3_of(&w.finish()), true)
+            w.raw(op::PRUNE.as_bytes())
+                .raw(&prune::dead_set_hash(dead))
+                .raw(all_heads_hash)
+                .u64(*roster_seq);
+            (op::PRUNE, blake3_of(&w.finish()), true)
         }
         Request::Put {
-            id, declared_size, ..
-        } => (op::PUT, args_put(id, *declared_size), true),
+            id,
+            declared_size,
+            push_id,
+            ..
+        } => (op::PUT, args_put(id, *declared_size, push_id), true),
         Request::CasHead {
             ref_h,
             old_head,
             new_head,
+            promote,
             ..
-        } => (op::CAS_HEAD, args_cas_head(ref_h, old_head, new_head), true),
+        } => (
+            op::CAS_HEAD,
+            args_cas_head(ref_h, old_head, new_head, promote),
+            true,
+        ),
         Request::RosterAppend { entry, .. } => (op::ROSTER_APPEND, args_roster_append(entry), true),
         Request::PutKeyslot {
             device_id,
@@ -256,7 +284,7 @@ impl From<secsec_sig::SigError> for ProtoError {
 /// constructs `op`/`args_hash`.
 #[derive(Clone, Copy)]
 pub struct WriteAuth<'a> {
-    /// The op label ([`op::PUT`] / [`op::CAS_HEAD`] / [`op::ROSTER_APPEND`] / [`op::GC`]).
+    /// The op label ([`op::PUT`] / [`op::CAS_HEAD`] / [`op::ROSTER_APPEND`] / [`op::PRUNE`]).
     pub op: &'a str,
     /// The per-op `args_hash`.
     pub args_hash: [u8; 32],
@@ -337,15 +365,21 @@ mod tests {
     #[test]
     fn args_hashes_are_deterministic_and_sensitive() {
         let id = [0x11; 32];
-        assert_eq!(args_put(&id, 100), args_put(&id, 100));
-        assert_ne!(args_put(&id, 100), args_put(&id, 101)); // declared_size bound
-        assert_ne!(args_put(&id, 100), args_put(&[0x12; 32], 100)); // id bound
+        let p = [0u8; PUSH_ID_LEN];
+        assert_eq!(args_put(&id, 100, &p), args_put(&id, 100, &p));
+        assert_ne!(args_put(&id, 100, &p), args_put(&id, 101, &p)); // declared_size bound
+        assert_ne!(args_put(&id, 100, &p), args_put(&[0x12; 32], 100, &p)); // id bound
+        assert_ne!(args_put(&id, 100, &p), args_put(&id, 100, &[1u8; PUSH_ID_LEN])); // push_id bound
 
         // distinct ops never collide even on similar inputs.
-        assert_ne!(args_cas_head(&id, &[1; 32], &[2; 32]), args_put(&id, 0));
+        assert_ne!(args_cas_head(&id, &[1; 32], &[2; 32], &p), args_put(&id, 0, &p));
         assert_ne!(
-            args_cas_head(&id, &[1; 32], &[2; 32]),
-            args_cas_head(&id, &[2; 32], &[1; 32]) // old/new order bound
+            args_cas_head(&id, &[1; 32], &[2; 32], &p),
+            args_cas_head(&id, &[2; 32], &[1; 32], &p) // old/new order bound
+        );
+        assert_ne!(
+            args_cas_head(&id, &[1; 32], &[2; 32], &p),
+            args_cas_head(&id, &[1; 32], &[2; 32], &[9u8; PUSH_ID_LEN]) // promote bound
         );
         assert_ne!(
             args_roster_append(b"entry-a"),
@@ -382,7 +416,7 @@ mod tests {
         let dev = DeviceKey::generate().unwrap();
         let base = WriteAuth {
             op: op::PUT,
-            args_hash: args_put(&[0xAB; 32], 42),
+            args_hash: args_put(&[0xAB; 32], 42, &[0u8; PUSH_ID_LEN]),
             session_transcript: [0x7a; 32],
             server_nonce: [0x5e; 32],
         };
@@ -391,7 +425,10 @@ mod tests {
 
         // every field is bound.
         for altered in [
-            WriteAuth { op: op::GC, ..base },
+            WriteAuth {
+                op: op::PRUNE,
+                ..base
+            },
             WriteAuth {
                 args_hash: [0; 32],
                 ..base

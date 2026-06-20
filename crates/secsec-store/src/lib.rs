@@ -1,20 +1,23 @@
-//! `secsec-store` — the server's content-addressed blob store (`secsec-Design.md` §13): one
-//! embedded `redb` database holding only opaque ciphertext (objects, keyslots, refs, sigchain,
-//! key-history wraps). These are the read/write primitives behind the §11/§12 server API; the
-//! monotonic `put_epoch` counter underpins the §15 GC serialization.
+//! `secsec-store` — the content-addressed blob store (`secsec-Design.md` §13): one embedded `redb`
+//! database holding only opaque ciphertext (durable objects, in-flight push staging, keyslots, refs,
+//! sigchain, key-history wraps). These are the read/write primitives behind the §11/§12 server API. A
+//! push stages its objects and the winning `cas-head` atomically promotes them while swapping the ref,
+//! so a durable head never references a non-durable object.
 
 #![forbid(unsafe_code)]
 
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
-use std::collections::BTreeSet;
 use std::path::Path;
 
-/// id (32 bytes) → object blob.
+/// id (32 bytes) → durable object blob.
 const OBJECTS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("objects");
-/// id (32 bytes) → the `put_epoch` at which it arrived (§15 GC).
-const ARRIVAL: TableDefinition<'static, &[u8], u64> = TableDefinition::new("arrival");
-/// named counters; currently just `"put_epoch"`.
-const COUNTERS: TableDefinition<'static, &str, u64> = TableDefinition::new("counters");
+/// `push_id(16) ‖ id(32)` → a blob staged by an in-flight push. Staged objects are promoted into
+/// `OBJECTS` when that push's `cas-head` wins, and dropped if the push is abandoned. Never durably
+/// visible: a staged object does not exist until promotion.
+const STAGING: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("staging");
+/// `push_id(16)` → the push's last-activity time (unix seconds). One sliding-TTL clock per push,
+/// refreshed on every `stage`, that the idle reclaimer ages out.
+const STAGING_META: TableDefinition<'static, &[u8], u64> = TableDefinition::new("staging_meta");
 /// `device_id(32) ‖ le32(gen)` → keyslot blob (§13 `/keyslots/<device_id>/<g>`).
 const KEYSLOTS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("keyslots");
 /// `ref_H(32)` → current head blob (§13 `/refs/<H>`); CAS-guarded by `BLAKE3(blob)`.
@@ -26,13 +29,34 @@ const ROSTER_KEYHIST: TableDefinition<'static, u32, &[u8]> = TableDefinition::ne
 /// `gen(u32)` → DATA key-history wrap (§8.2 `/keyhist/<g>`).
 const KEYHIST: TableDefinition<'static, u32, &[u8]> = TableDefinition::new("keyhist");
 
-const PUT_EPOCH: &str = "put_epoch";
-
 /// `old_head_id` sentinel meaning "expect the ref to be absent" — a first `cas-head` (§12).
 pub const ABSENT_HEAD: [u8; 32] = [0u8; 32];
 
-/// A ref hash paired with the `BLAKE3` of its stored head blob (§15 `all_heads_hash` input).
+/// A ref hash paired with the `BLAKE3` of its stored head blob — the per-ref token a `cas-head`
+/// compares on, and the input the retention `Prune` head-binding check recomputes.
 pub type RefBlobHash = ([u8; 32], [u8; 32]);
+
+/// The result of [`Store::cas_ref`]: whether the swap happened and, if so, how many bytes of staged
+/// content became durable (the new bytes charged against the per-key cap, §11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CasOutcome {
+    /// Whether the compare-and-swap succeeded (the ref token matched).
+    pub swapped: bool,
+    /// Bytes of staged objects promoted to durable storage by this swap (0 on conflict).
+    pub promoted_bytes: u64,
+}
+
+/// `push_id` length, in bytes — the per-attempt staging-key prefix.
+const PUSH_ID_LEN: usize = 16;
+/// The fixed length of a staging key: `push_id(16) ‖ id(32)`.
+const STAGING_KEY_LEN: usize = PUSH_ID_LEN + 32;
+
+fn staging_key(push_id: &[u8; PUSH_ID_LEN], id: &[u8; 32]) -> [u8; STAGING_KEY_LEN] {
+    let mut k = [0u8; STAGING_KEY_LEN];
+    k[..PUSH_ID_LEN].copy_from_slice(push_id);
+    k[PUSH_ID_LEN..].copy_from_slice(id);
+    k
+}
 
 /// The fixed length of a keyslot key: `device_id(32) ‖ le32(gen)`.
 const KEYSLOT_KEY_LEN: usize = 36;
@@ -90,8 +114,8 @@ impl Store {
         let wtx = db.begin_write()?;
         {
             wtx.open_table(OBJECTS)?;
-            wtx.open_table(ARRIVAL)?;
-            wtx.open_table(COUNTERS)?;
+            wtx.open_table(STAGING)?;
+            wtx.open_table(STAGING_META)?;
             wtx.open_table(KEYSLOTS)?;
             wtx.open_table(REFS)?;
             wtx.open_table(ROSTER)?;
@@ -206,32 +230,60 @@ impl Store {
         Ok(out)
     }
 
-    /// Atomic `cas-head` (§12), one write transaction: swap iff `BLAKE3(current blob)` (or
-    /// [`ABSENT_HEAD`]) equals `expected_old`; `Ok(false)` = CAS conflict. Authenticity is the
-    /// head's signature (§9.8); the store guards concurrency only.
+    /// Atomic `cas-head` with staged-object promotion (§12), one write transaction: if `BLAKE3(current
+    /// blob)` (or [`ABSENT_HEAD`]) equals `expected_old`, promote every object staged under `promote`
+    /// into `OBJECTS` and swap the ref to `new_blob`; otherwise nothing changes (a CAS conflict). The
+    /// promote and swap commit together, so a durable head never references a non-durable object.
+    /// Authenticity is the head's signature (§9.8); the store guards concurrency only.
     pub fn cas_ref(
         &self,
         ref_h: &[u8; 32],
         expected_old: &[u8; 32],
         new_blob: &[u8],
-    ) -> Result<bool, StoreError> {
+        promote: &[u8; PUSH_ID_LEN],
+    ) -> Result<CasOutcome, StoreError> {
         let wtx = self.db.begin_write()?;
-        let swapped;
+        let outcome;
         {
             let mut refs = wtx.open_table(REFS)?;
             let current = match refs.get(&ref_h[..])? {
                 Some(g) => *blake3::hash(g.value()).as_bytes(),
                 None => ABSENT_HEAD,
             };
-            if current == *expected_old {
-                refs.insert(&ref_h[..], new_blob)?;
-                swapped = true;
+            if current != *expected_old {
+                outcome = CasOutcome::default();
             } else {
-                swapped = false;
+                // Promote this push's staged objects, then swap the ref — one commit. An object that
+                // is already durable (a concurrent push promoted it) is neither re-stored nor charged.
+                let mut objs = wtx.open_table(OBJECTS)?;
+                let mut staging = wtx.open_table(STAGING)?;
+                let mut meta = wtx.open_table(STAGING_META)?;
+                let lo = staging_key(promote, &[0u8; 32]);
+                let hi = staging_key(promote, &[0xffu8; 32]);
+                let mut promoted_bytes = 0u64;
+                let mut staged_keys: Vec<Vec<u8>> = Vec::new();
+                for item in staging.range(&lo[..]..=&hi[..])? {
+                    let (k, v) = item?;
+                    let id = &k.value()[PUSH_ID_LEN..];
+                    if objs.get(id)?.is_none() {
+                        objs.insert(id, v.value())?;
+                        promoted_bytes += v.value().len() as u64;
+                    }
+                    staged_keys.push(k.value().to_vec());
+                }
+                for k in &staged_keys {
+                    staging.remove(k.as_slice())?;
+                }
+                meta.remove(&promote[..])?;
+                refs.insert(&ref_h[..], new_blob)?;
+                outcome = CasOutcome {
+                    swapped: true,
+                    promoted_bytes,
+                };
             }
         }
         wtx.commit()?;
-        Ok(swapped)
+        Ok(outcome)
     }
 
     /// Store (or overwrite) the keyslot blob for `device_id` at generation `gen`
@@ -287,8 +339,9 @@ impl Store {
         Ok(ks.range(&lo[..]..=&hi[..])?.next().is_some())
     }
 
-    /// Store an object idempotently by `id`: `Ok(true)` if newly stored, `Ok(false)` if already
-    /// present (a duplicate `put` is a no-op).
+    /// Store an object durably and idempotently by `id`: `Ok(true)` if newly stored, `Ok(false)` if
+    /// already present. The client's local cache and a server-side promotion both land objects here; a
+    /// push to the blind server stages instead (see [`Self::stage`]).
     pub fn put(&self, id: &[u8; 32], blob: &[u8]) -> Result<bool, StoreError> {
         let wtx = self.db.begin_write()?;
         let newly;
@@ -298,16 +351,36 @@ impl Store {
                 newly = false;
             } else {
                 objs.insert(&id[..], blob)?;
-                let mut counters = wtx.open_table(COUNTERS)?;
-                let epoch = counters.get(PUT_EPOCH)?.map_or(0, |v| v.value()) + 1;
-                counters.insert(PUT_EPOCH, epoch)?;
-                let mut arrival = wtx.open_table(ARRIVAL)?;
-                arrival.insert(&id[..], epoch)?;
                 newly = true;
             }
         }
         wtx.commit()?;
         Ok(newly)
+    }
+
+    /// Stage `blob` under an in-flight `push_id` (§3): a no-op if `id` is already durable (dedup),
+    /// otherwise recorded in `STAGING` with the push's `STAGING_META` activity clock refreshed to
+    /// `now`. Staged objects stay invisible to [`Self::has`]/[`Self::get`] until a winning `cas-head`
+    /// promotes them.
+    pub fn stage(
+        &self,
+        push_id: &[u8; PUSH_ID_LEN],
+        id: &[u8; 32],
+        blob: &[u8],
+        now: u64,
+    ) -> Result<(), StoreError> {
+        let wtx = self.db.begin_write()?;
+        {
+            let objs = wtx.open_table(OBJECTS)?;
+            if objs.get(&id[..])?.is_none() {
+                let mut staging = wtx.open_table(STAGING)?;
+                staging.insert(&staging_key(push_id, id)[..], blob)?;
+                let mut meta = wtx.open_table(STAGING_META)?;
+                meta.insert(&push_id[..], now)?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
     }
 
     /// Fetch an object blob by id, or `None` if absent.
@@ -317,7 +390,8 @@ impl Store {
         Ok(objs.get(&id[..])?.map(|g| g.value().to_vec()))
     }
 
-    /// Existence check for a batch of ids (drives dedup, §11 `has`).
+    /// Existence check for a batch of ids against **durable** storage only (drives dedup, §11 `has`).
+    /// Staged-but-unpromoted objects do not count as present.
     pub fn has(&self, ids: &[[u8; 32]]) -> Result<Vec<bool>, StoreError> {
         let rtx = self.db.begin_read()?;
         let objs = rtx.open_table(OBJECTS)?;
@@ -328,46 +402,120 @@ impl Store {
         Ok(out)
     }
 
-    /// The current global `put_epoch` (0 if nothing stored yet).
-    pub fn put_epoch(&self) -> Result<u64, StoreError> {
+    /// Like [`Self::has`] but also counts an id as present if it is already staged under `push_id` — so
+    /// a resumed push skips re-uploading what it staged before a crash. Durable objects always count.
+    pub fn has_for_push(
+        &self,
+        push_id: &[u8; PUSH_ID_LEN],
+        ids: &[[u8; 32]],
+    ) -> Result<Vec<bool>, StoreError> {
         let rtx = self.db.begin_read()?;
-        let counters = rtx.open_table(COUNTERS)?;
-        Ok(counters.get(PUT_EPOCH)?.map_or(0, |v| v.value()))
+        let objs = rtx.open_table(OBJECTS)?;
+        let staging = rtx.open_table(STAGING)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let present = objs.get(&id[..])?.is_some()
+                || staging.get(&staging_key(push_id, id)[..])?.is_some();
+            out.push(present);
+        }
+        Ok(out)
     }
 
-    /// The `put_epoch` at which `id` arrived, or `None` if absent (§15 GC).
-    pub fn arrival_epoch(&self, id: &[u8; 32]) -> Result<Option<u64>, StoreError> {
+    /// Total bytes of objects staged under `push_id` that are not yet durable — the upper bound on
+    /// what a promote would add to durable storage, charged against the per-key cap before the swap.
+    pub fn staged_bytes(&self, push_id: &[u8; PUSH_ID_LEN]) -> Result<u64, StoreError> {
         let rtx = self.db.begin_read()?;
-        let arrival = rtx.open_table(ARRIVAL)?;
-        Ok(arrival.get(&id[..])?.map(|v| v.value()))
+        let objs = rtx.open_table(OBJECTS)?;
+        let staging = rtx.open_table(STAGING)?;
+        let lo = staging_key(push_id, &[0u8; 32]);
+        let hi = staging_key(push_id, &[0xffu8; 32]);
+        let mut total = 0u64;
+        for item in staging.range(&lo[..]..=&hi[..])? {
+            let (k, v) = item?;
+            let id = &k.value()[PUSH_ID_LEN..];
+            if objs.get(id)?.is_none() {
+                total += v.value().len() as u64;
+            }
+        }
+        Ok(total)
     }
 
-    /// §15 GC sweep, one write transaction: delete every object with arrival `put_epoch` ≤ `gc_gen`
-    /// and not in `keep_set`; newer arrivals are always shielded. Returns the number deleted.
-    /// Choosing a grace-aged `gc_gen` and a complete keep-set is the client's job (§15).
-    pub fn gc(&self, keep_set: &BTreeSet<[u8; 32]>, gc_gen: u64) -> Result<u64, StoreError> {
+    /// Reclaim abandoned pushes (§3), one write transaction: for every push whose `STAGING_META`
+    /// activity is idle past `ttl_secs`, drop all its staged objects and its activity row. Never
+    /// touches `OBJECTS`. Returns the number of pushes reclaimed. The clock slides on every
+    /// [`Self::stage`], so a live upload — however many objects it is mid-staging — is never reaped.
+    pub fn reclaim_staging(&self, now: u64, ttl_secs: u64) -> Result<u64, StoreError> {
+        let cutoff = now.saturating_sub(ttl_secs);
         let wtx = self.db.begin_write()?;
-        // Collect deletable ids first (can't mutate the table mid-iteration).
+        let mut reclaimed = 0u64;
+        {
+            let mut staging = wtx.open_table(STAGING)?;
+            let mut meta = wtx.open_table(STAGING_META)?;
+            // Collect the idle push ids first (can't mutate a table mid-iteration).
+            let mut idle: Vec<[u8; PUSH_ID_LEN]> = Vec::new();
+            for item in meta.iter()? {
+                let (k, v) = item?;
+                if v.value() <= cutoff {
+                    if let Ok(pid) = <[u8; PUSH_ID_LEN]>::try_from(k.value()) {
+                        idle.push(pid);
+                    }
+                }
+            }
+            for pid in &idle {
+                let lo = staging_key(pid, &[0u8; 32]);
+                let hi = staging_key(pid, &[0xffu8; 32]);
+                let mut keys: Vec<Vec<u8>> = Vec::new();
+                for item in staging.range(&lo[..]..=&hi[..])? {
+                    keys.push(item?.0.value().to_vec());
+                }
+                for k in &keys {
+                    staging.remove(k.as_slice())?;
+                }
+                meta.remove(&pid[..])?;
+                reclaimed += 1;
+            }
+        }
+        wtx.commit()?;
+        Ok(reclaimed)
+    }
+
+    /// Delete `ids` from durable storage — the retention `Prune` and the local orphan sweep. Returns
+    /// the count removed; absent ids are skipped.
+    pub fn delete_objects(&self, ids: &[[u8; 32]]) -> Result<u64, StoreError> {
+        let wtx = self.db.begin_write()?;
+        let mut removed = 0u64;
+        {
+            let mut objs = wtx.open_table(OBJECTS)?;
+            for id in ids {
+                if objs.remove(&id[..])?.is_some() {
+                    removed += 1;
+                }
+            }
+        }
+        wtx.commit()?;
+        Ok(removed)
+    }
+
+    /// Delete every durable object **not** in `keep` — the local cache's orphan sweep, dropping objects
+    /// no longer reachable from the synced head. Returns the count removed. One write transaction.
+    pub fn retain(&self, keep: &std::collections::BTreeSet<[u8; 32]>) -> Result<u64, StoreError> {
+        let wtx = self.db.begin_write()?;
         let mut to_delete: Vec<[u8; 32]> = Vec::new();
         {
-            let arrival = wtx.open_table(ARRIVAL)?;
-            for item in arrival.iter()? {
-                let (k, v) = item?;
-                if v.value() <= gc_gen {
-                    if let Ok(id) = <[u8; 32]>::try_from(k.value()) {
-                        if !keep_set.contains(&id) {
-                            to_delete.push(id);
-                        }
+            let objs = wtx.open_table(OBJECTS)?;
+            for item in objs.iter()? {
+                let (k, _v) = item?;
+                if let Ok(id) = <[u8; 32]>::try_from(k.value()) {
+                    if !keep.contains(&id) {
+                        to_delete.push(id);
                     }
                 }
             }
         }
         {
             let mut objs = wtx.open_table(OBJECTS)?;
-            let mut arr = wtx.open_table(ARRIVAL)?;
             for id in &to_delete {
                 objs.remove(&id[..])?;
-                arr.remove(&id[..])?;
             }
         }
         wtx.commit()?;
@@ -411,21 +559,62 @@ mod tests {
     }
 
     #[test]
-    fn put_is_idempotent_and_epoch_only_advances_on_new() {
+    fn put_is_idempotent_durable() {
         let (_d, s) = temp_store();
-        assert_eq!(s.put_epoch().unwrap(), 0);
-        assert!(s.put(&id(1), b"a").unwrap()); // new
-        assert!(s.put(&id(2), b"b").unwrap()); // new
-        assert_eq!(s.put_epoch().unwrap(), 2);
+        assert!(s.put(&id(1), b"a").unwrap()); // newly stored
+        assert!(s.put(&id(2), b"b").unwrap());
         assert!(!s.put(&id(1), b"a").unwrap()); // duplicate -> no-op
-        assert_eq!(
-            s.put_epoch().unwrap(),
-            2,
-            "duplicate put must not advance the epoch"
-        );
-        assert_eq!(s.arrival_epoch(&id(1)).unwrap(), Some(1));
-        assert_eq!(s.arrival_epoch(&id(2)).unwrap(), Some(2));
         assert_eq!(s.object_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn stage_is_invisible_until_a_winning_cas_head_promotes_it() {
+        let (_d, s) = temp_store();
+        let push = [0x07u8; 16];
+        let ref_h = id(0xCA);
+
+        // Staged objects: durable `has`/`get` still report absent; `has_for_push` sees them.
+        s.stage(&push, &id(1), b"alpha", 100).unwrap();
+        s.stage(&push, &id(2), b"beta", 100).unwrap();
+        assert_eq!(s.has(&[id(1), id(2)]).unwrap(), vec![false, false]);
+        assert_eq!(s.get(&id(1)).unwrap(), None);
+        assert_eq!(
+            s.has_for_push(&push, &[id(1), id(2), id(3)]).unwrap(),
+            vec![true, true, false]
+        );
+        assert_eq!(s.object_count().unwrap(), 0);
+
+        // A winning cas-head (expect-absent ref) promotes the push's objects and swaps the ref.
+        let out = s.cas_ref(&ref_h, &ABSENT_HEAD, b"head-v1", &push).unwrap();
+        assert!(out.swapped);
+        assert_eq!(out.promoted_bytes, (b"alpha".len() + b"beta".len()) as u64);
+        assert_eq!(s.has(&[id(1), id(2)]).unwrap(), vec![true, true]);
+        assert_eq!(s.get(&id(1)).unwrap().as_deref(), Some(&b"alpha"[..]));
+        assert_eq!(s.get_ref(&ref_h).unwrap().as_deref(), Some(&b"head-v1"[..]));
+        assert_eq!(s.object_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn lost_cas_head_promotes_nothing_and_leaves_staging_for_retry() {
+        let (_d, s) = temp_store();
+        let push = [0x09u8; 16];
+        let ref_h = id(0xCB);
+        s.stage(&push, &id(1), b"x", 0).unwrap();
+        // Establish the ref at v1 via a separate (empty) push, so expect-absent now conflicts.
+        assert!(s.cas_ref(&ref_h, &ABSENT_HEAD, b"v1", &[0u8; 16]).unwrap().swapped);
+        let out = s.cas_ref(&ref_h, &ABSENT_HEAD, b"v2", &push).unwrap();
+        assert!(!out.swapped);
+        assert_eq!(out.promoted_bytes, 0);
+        assert_eq!(
+            s.has(&[id(1)]).unwrap(),
+            vec![false],
+            "a lost cas-head must not promote"
+        );
+        assert_eq!(
+            s.has_for_push(&push, &[id(1)]).unwrap(),
+            vec![true],
+            "staging survives for the retry"
+        );
     }
 
     #[test]
@@ -450,7 +639,6 @@ mod tests {
         } // drop closes the db
         let s2 = Store::open(&path).unwrap();
         assert_eq!(s2.get(&id(7)).unwrap().as_deref(), Some(&b"durable"[..]));
-        assert_eq!(s2.put_epoch().unwrap(), 1);
     }
 
     #[test]
@@ -501,23 +689,24 @@ mod tests {
     fn cas_ref_first_write_then_swap_then_conflict() {
         let (_d, s) = temp_store();
         let r = id(0x11);
+        let p = [0u8; 16]; // empty push: no staged objects to promote
         assert_eq!(s.get_ref(&r).unwrap(), None);
 
         // first write: expect-absent (ABSENT_HEAD) succeeds.
-        assert!(s.cas_ref(&r, &ABSENT_HEAD, b"head-v1").unwrap());
+        assert!(s.cas_ref(&r, &ABSENT_HEAD, b"head-v1", &p).unwrap().swapped);
         assert_eq!(s.get_ref(&r).unwrap().as_deref(), Some(&b"head-v1"[..]));
 
         // a second first-write (still expecting absent) now conflicts.
-        assert!(!s.cas_ref(&r, &ABSENT_HEAD, b"head-vX").unwrap());
+        assert!(!s.cas_ref(&r, &ABSENT_HEAD, b"head-vX", &p).unwrap().swapped);
         assert_eq!(s.get_ref(&r).unwrap().as_deref(), Some(&b"head-v1"[..])); // unchanged
 
         // swap with the correct expected-old (= BLAKE3 of the current blob) succeeds.
         let cur_hash = *blake3::hash(b"head-v1").as_bytes();
-        assert!(s.cas_ref(&r, &cur_hash, b"head-v2").unwrap());
+        assert!(s.cas_ref(&r, &cur_hash, b"head-v2", &p).unwrap().swapped);
         assert_eq!(s.get_ref(&r).unwrap().as_deref(), Some(&b"head-v2"[..]));
 
         // a stale expected-old conflicts.
-        assert!(!s.cas_ref(&r, &cur_hash, b"head-v3").unwrap());
+        assert!(!s.cas_ref(&r, &cur_hash, b"head-v3", &p).unwrap().swapped);
         assert_eq!(s.get_ref(&r).unwrap().as_deref(), Some(&b"head-v2"[..]));
     }
 
@@ -549,48 +738,66 @@ mod tests {
     }
 
     #[test]
-    fn gc_respects_keep_set_and_generation() {
+    fn reclaim_drops_idle_pushes_keeps_fresh_ones_and_never_touches_objects() {
         let (_d, s) = temp_store();
-        s.put(&id(1), b"a").unwrap(); // put_epoch 1
-        s.put(&id(2), b"b").unwrap(); // put_epoch 2
-        s.put(&id(3), b"c").unwrap(); // put_epoch 3
-        s.put(&id(4), b"d").unwrap(); // put_epoch 4
+        s.put(&id(1), b"durable").unwrap(); // a durable object reclaim must never touch
+        let idle = [0x01u8; 16];
+        let live = [0x02u8; 16];
+        s.stage(&idle, &id(2), b"old", 100).unwrap();
+        s.stage(&live, &id(3), b"new", 1000).unwrap();
 
-        // sweep gen ≤ 3, keeping id(2). id(1),id(3) collectible; id(2) kept; id(4) too new.
-        let keep = std::collections::BTreeSet::from([id(2)]);
-        assert_eq!(s.gc(&keep, 3).unwrap(), 2);
-
-        assert_eq!(s.get(&id(1)).unwrap(), None); // swept
-        assert_eq!(s.get(&id(2)).unwrap().as_deref(), Some(&b"b"[..])); // kept
-        assert_eq!(s.get(&id(3)).unwrap(), None); // swept
-        assert_eq!(s.get(&id(4)).unwrap().as_deref(), Some(&b"d"[..])); // too new (epoch > gc_gen)
-        assert_eq!(s.object_count().unwrap(), 2);
-
-        // a second identical sweep deletes nothing.
-        assert_eq!(s.gc(&keep, 3).unwrap(), 0);
+        // ttl 600 at now=1000: the idle push (last activity 100) is past its window; the live one isn't.
+        assert_eq!(s.reclaim_staging(1000, 600).unwrap(), 1);
+        assert_eq!(
+            s.has_for_push(&idle, &[id(2)]).unwrap(),
+            vec![false],
+            "idle push reaped"
+        );
+        assert_eq!(
+            s.has_for_push(&live, &[id(3)]).unwrap(),
+            vec![true],
+            "live push survives"
+        );
+        assert_eq!(
+            s.get(&id(1)).unwrap().as_deref(),
+            Some(&b"durable"[..]),
+            "reclaim never touches OBJECTS"
+        );
     }
 
     #[test]
-    fn compact_reclaims_space_after_a_sweep() {
+    fn delete_objects_removes_durable_ids() {
+        let (_d, s) = temp_store();
+        s.put(&id(1), b"a").unwrap();
+        s.put(&id(2), b"b").unwrap();
+        s.put(&id(3), b"c").unwrap();
+        assert_eq!(s.delete_objects(&[id(1), id(3), id(9)]).unwrap(), 2); // id(9) absent → skipped
+        assert_eq!(s.get(&id(1)).unwrap(), None);
+        assert_eq!(s.get(&id(2)).unwrap().as_deref(), Some(&b"b"[..]));
+        assert_eq!(s.object_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn compact_reclaims_space_after_deletes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("objects.redb");
         let mut s = Store::open(&path).unwrap();
-        // Fill with sizable objects so the live file is clearly non-trivial.
+        let mut ids = Vec::new();
         for i in 0..256u32 {
             let mut k = [0u8; 32];
             k[..4].copy_from_slice(&i.to_le_bytes());
             s.put(&k, &vec![0xab; 4096]).unwrap();
+            ids.push(k);
         }
         let grown = std::fs::metadata(&path).unwrap().len();
-        // Sweep everything (keep nothing; every epoch ≤ u64::MAX).
-        assert_eq!(s.gc(&BTreeSet::new(), u64::MAX).unwrap(), 256);
+        assert_eq!(s.delete_objects(&ids).unwrap(), 256);
         assert_eq!(s.object_count().unwrap(), 0);
-        // The sweep frees pages but does not shrink the file; compaction returns them to the OS.
+        // Deletes free pages but do not shrink the file; compaction returns them to the OS.
         s.compact().unwrap();
         let compacted = std::fs::metadata(&path).unwrap().len();
         assert!(
             compacted < grown,
-            "compaction reclaims swept space ({grown} → {compacted})"
+            "compaction reclaims deleted space ({grown} → {compacted})"
         );
     }
 }

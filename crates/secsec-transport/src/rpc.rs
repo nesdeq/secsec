@@ -62,7 +62,7 @@ pub async fn request(
     request: Request,
 ) -> Result<Response, RpcError> {
     // `op_sig` is built from the recomputed `args_hash` (so the client can't lie about what it
-    // signed). gc has a state-bound args_hash and uses `request_gc` instead.
+    // signed). prune has a state-bound args_hash and uses `request_prune` instead.
     send_authed(conn, &request, |nonce| {
         let (op_label, args_hash, is_write) = op_and_args(&request);
         if is_write {
@@ -87,31 +87,30 @@ pub async fn request(
     .await
 }
 
-/// Issue a §15 `gc` request: its `args_hash` binds the client's view of the server's mutable state
-/// (`all_heads_hash`/`roster_seq`/`put_epoch` — the §15 CAS), so it signs the full `args_gc` rather
-/// than the generic `op_and_args` binding.
-#[allow(clippy::too_many_arguments)]
-pub async fn request_gc(
+/// Issue a §5 retention `prune` request: its `args_hash` binds the client's view of the server's
+/// mutable head/roster state (`all_heads_hash`/`roster_seq` — the §5 head-binding CAS), so it signs
+/// the full `args_prune` rather than the generic `op_and_args` binding.
+pub async fn request_prune(
     conn: &Connection,
     transcript: [u8; 32],
     device: &DeviceKey,
-    keep_set: Vec<[u8; 32]>,
-    gc_gen: u64,
+    dead: Vec<[u8; 32]>,
     all_heads_hash: &[u8; 32],
     roster_seq: u64,
-    put_epoch: u64,
 ) -> Result<Response, RpcError> {
-    let args_hash = secsec_proto::gc::args_gc(
-        &secsec_proto::gc::keep_set_hash(&keep_set),
-        gc_gen,
+    let args_hash = secsec_proto::prune::args_prune(
+        &secsec_proto::prune::dead_set_hash(&dead),
         all_heads_hash,
         roster_seq,
-        put_epoch,
     );
-    let req = Request::Gc { keep_set, gc_gen };
+    let req = Request::Prune {
+        dead,
+        all_heads_hash: *all_heads_hash,
+        roster_seq,
+    };
     send_authed(conn, &req, |nonce| {
         WriteAuth {
-            op: secsec_proto::op::GC,
+            op: secsec_proto::op::PRUNE,
             args_hash,
             session_transcript: transcript,
             server_nonce: nonce,

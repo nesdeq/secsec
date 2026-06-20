@@ -7,7 +7,9 @@
 use crate::{Remote, RemoteError};
 use quinn::Connection;
 use secsec_object::Id;
+use secsec_proto::server::limits::MAX_HAS_IDS;
 use secsec_proto::wire::{ErrorCode, Request, Response};
+use secsec_proto::PUSH_ID_LEN;
 use secsec_sig::DeviceKey;
 use secsec_transport::rpc::request as rpc_request;
 
@@ -51,33 +53,50 @@ impl Remote for QuicRemote<'_> {
         expect_blob("get", self.call(Request::Get { id: *id }).await?)
     }
 
-    async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<crate::Receipt, RemoteError> {
+    async fn put_blob(
+        &self,
+        id: &Id,
+        blob: &[u8],
+        push_id: &[u8; PUSH_ID_LEN],
+    ) -> Result<(), RemoteError> {
         // Blobs are bounded by the §19 16 MiB object cap, so the length fits a u32 declared_size.
         let declared_size = blob.len() as u32;
         match self
             .call(Request::Put {
                 id: *id,
                 declared_size,
+                push_id: *push_id,
                 blob: blob.to_vec(),
             })
             .await?
         {
-            Response::Stored {
-                arrival_gen,
-                put_epoch,
-                ts,
-                receipt_pubkey,
-                signature,
-            } => Ok(crate::Receipt {
-                arrival_gen,
-                put_epoch,
-                ts,
-                receipt_pubkey,
-                signature,
-            }),
+            Response::Ok => Ok(()),
             Response::Err(c) => Err(RemoteError(format!("put: {c:?}"))),
             other => Err(RemoteError(format!("put: unexpected {other:?}"))),
         }
+    }
+
+    async fn has(&self, ids: &[Id]) -> Result<Vec<bool>, RemoteError> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(MAX_HAS_IDS) {
+            match self.call(Request::Has { ids: chunk.to_vec() }).await? {
+                Response::Exists(bits) => out.extend(bits),
+                Response::Err(c) => return Err(RemoteError(format!("has: {c:?}"))),
+                other => return Err(RemoteError(format!("has: unexpected {other:?}"))),
+            }
+        }
+        Ok(out)
+    }
+
+    async fn has_for_push(
+        &self,
+        _push_id: &[u8; PUSH_ID_LEN],
+        ids: &[Id],
+    ) -> Result<Vec<bool>, RemoteError> {
+        // The blind server reports durable existence only (I3); a push's own staging is not queryable
+        // over the wire, so a resumed push re-stages its still-unpromoted objects (idempotently) and
+        // relies on durable dedup for everything an earlier push already promoted.
+        self.has(ids).await
     }
 
     async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
@@ -121,15 +140,17 @@ impl Remote for QuicRemote<'_> {
         ref_h: &Id,
         expected_old: &Id,
         new_blob: &[u8],
+        promote: &[u8; PUSH_ID_LEN],
     ) -> Result<bool, RemoteError> {
         // The wire carries the new head-id token (§12: BLAKE3 of the stored blob); the server
-        // re-derives the old token from its current ref blob and CASes.
+        // re-derives the old token from its current ref blob, CASes, and promotes `promote`'s staging.
         let new_head = *blake3::hash(new_blob).as_bytes();
         match self
             .call(Request::CasHead {
                 ref_h: *ref_h,
                 old_head: *expected_old,
                 new_head,
+                promote: *promote,
                 new_blob: new_blob.to_vec(),
             })
             .await?
@@ -237,35 +258,31 @@ impl Remote for QuicRemote<'_> {
         }
     }
 
-    async fn gc(
+    async fn prune(
         &self,
-        keep_set: Vec<Id>,
-        gc_gen: u64,
+        dead: &[Id],
         all_heads_hash: &[u8; 32],
         roster_seq: u64,
-        put_epoch: u64,
-    ) -> Result<crate::GcOutcome, RemoteError> {
-        // gc signs over the full args_gc (the §15 compare-and-swap binding), so it uses the dedicated
-        // request_gc path rather than self.call (which would sign the op_and_args placeholder).
-        let resp = secsec_transport::rpc::request_gc(
+    ) -> Result<bool, RemoteError> {
+        // prune signs over the full args_prune (the §5 head-binding CAS), so it uses the dedicated
+        // request_prune path rather than self.call (which would sign the op_and_args placeholder).
+        let resp = secsec_transport::rpc::request_prune(
             self.conn,
             self.transcript,
             self.device,
-            keep_set,
-            gc_gen,
+            dead.to_vec(),
             all_heads_hash,
             roster_seq,
-            put_epoch,
         )
         .await
         .map_err(|e| RemoteError(e.to_string()))?;
         match resp {
-            Response::Ok => Ok(crate::GcOutcome::Swept),
-            // The server returns BadAuth when the recomputed args_gc differs from the client's signed
-            // one — i.e. its state moved since the client read it (the §15 CAS failed).
-            Response::Err(ErrorCode::BadAuth) => Ok(crate::GcOutcome::CasConflict),
-            Response::Err(c) => Err(RemoteError(format!("gc: {c:?}"))),
-            other => Err(RemoteError(format!("gc: unexpected {other:?}"))),
+            Response::Ok => Ok(true),
+            // BadAuth ⇒ the recomputed args_prune differs from the client's signed one — the server's
+            // head/roster state moved since the client read it (the §5 CAS failed).
+            Response::Err(ErrorCode::BadAuth) => Ok(false),
+            Response::Err(c) => Err(RemoteError(format!("prune: {c:?}"))),
+            other => Err(RemoteError(format!("prune: unexpected {other:?}"))),
         }
     }
 }
@@ -364,10 +381,10 @@ mod tests {
             };
             let commit_id =
                 secsec_snapshot::seal_signed_commit(&m, &a_store, &device, &commit).unwrap();
-            push_objects(&remote, &a_store, &m, &commit_id)
+            push_objects(&remote, &a_store, &m, &commit_id, &[0x70; 16])
                 .await
                 .unwrap();
-            let (head, _) = push_head(&remote, &m, &device, "main", commit_id, 0, None)
+            let (head, _) = push_head(&remote, &m, &device, "main", commit_id, 0, None, &[0x70; 16])
                 .await
                 .unwrap();
 
@@ -538,14 +555,13 @@ mod tests {
         });
     }
 
-    /// §15 GC over **live QUIC**: push a snapshot (the keep-set), add two unreachable "garbage" blobs,
-    /// then gc — the old garbage (arrival ≤ gc_gen) is swept, the new garbage (arrival > gc_gen) and
-    /// the reachable closure are kept. Then a gc with a stale `all_heads_hash` fails the §15
-    /// compare-and-swap.
+    /// §5 retention prune over **live QUIC**: stage the snapshot closure plus two extra durable
+    /// "garbage" blobs and promote them under one head, then prune one — it is deleted while the other
+    /// and the reachable closure survive. A prune bound to a STALE `all_heads_hash` fails the §5
+    /// head-binding compare-and-swap.
     #[test]
-    fn gc_sweeps_garbage_keeps_reachable_over_live_quic() {
-        use crate::gc::gc_collect;
-        use crate::{push_head, push_objects, GcOutcome};
+    fn prune_deletes_garbage_and_rejects_stale_cas_over_live_quic() {
+        use crate::{push_head, push_objects};
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -585,7 +601,8 @@ mod tests {
                 .unwrap();
             let remote = QuicRemote::new(&conn, sess.transcript, &device);
 
-            // push a snapshot (the keep-set) and advance the head.
+            // Stage the snapshot closure AND two extra garbage blobs under one push; a single cas-head
+            // promotes them all durably under one ref ("main").
             let src = tempfile::tempdir().unwrap();
             std::fs::write(src.path().join("keep.txt"), b"reachable-data").unwrap();
             let a_store = Store::open(srv_dir.path().join("a.redb")).unwrap();
@@ -603,65 +620,50 @@ mod tests {
             };
             let commit_id =
                 secsec_snapshot::seal_signed_commit(&m, &a_store, &device, &commit).unwrap();
-            push_objects(&remote, &a_store, &m, &commit_id)
-                .await
-                .unwrap();
-            push_head(&remote, &m, &device, "main", commit_id, 0, None)
-                .await
-                .unwrap();
-
-            // two unreachable garbage blobs (the server is blind — any bytes are accepted).
+            let push = [0x99; 16];
             let g1 = [0xAA; 32];
             let g2 = [0xBB; 32];
-            let r1 = remote.put_blob(&g1, b"garbage-one").await.unwrap();
-            let r2 = remote.put_blob(&g2, b"garbage-two").await.unwrap();
-            assert!(r2.put_epoch > r1.put_epoch);
+            push_objects(&remote, &a_store, &m, &commit_id, &push)
+                .await
+                .unwrap();
+            remote.put_blob(&g1, b"garbage-one", &push).await.unwrap();
+            remote.put_blob(&g2, b"garbage-two", &push).await.unwrap();
+            let (_head, head_blob) =
+                push_head(&remote, &m, &device, "main", commit_id, 0, None, &push)
+                    .await
+                    .unwrap();
             assert!(remote.get_blob(&g1).await.unwrap().is_some());
             assert!(remote.get_blob(&g2).await.unwrap().is_some());
+            assert!(remote.get_blob(&commit_id).await.unwrap().is_some());
 
-            // gc: sweep arrival ≤ r1.arrival_gen, bound to the current put_epoch (r2's). The keep-set
-            // (reachable from main) is read from a_store; all_heads_hash is computed from the head blob.
-            let outcome = gc_collect(
-                &remote,
-                &a_store,
-                &m,
-                &["main"],
-                r1.arrival_gen,
-                0,
-                r2.put_epoch,
-            )
-            .await
-            .unwrap();
-            assert_eq!(outcome, GcOutcome::Swept);
+            // The head-binding CAS token over the single "main" ref; no sigchain → roster_seq 0.
+            let rnk = *m.ref_name_key();
+            let ref_h = secsec_sync::ref_hash(&rnk, "main");
+            let ahh = secsec_proto::prune::all_heads_hash(&[(
+                ref_h,
+                *blake3::hash(&head_blob).as_bytes(),
+            )]);
 
-            // g1 (old, unreachable) swept; g2 (newer than gc_gen) kept; reachable closure kept.
-            assert!(
-                remote.get_blob(&g1).await.unwrap().is_none(),
-                "old garbage swept"
-            );
+            // prune g1 with the correct CAS token: deleted; g2 + the reachable closure survive.
+            assert!(remote.prune(&[g1], &ahh, 0).await.unwrap());
+            assert!(remote.get_blob(&g1).await.unwrap().is_none(), "g1 pruned");
             assert!(
                 remote.get_blob(&g2).await.unwrap().is_some(),
-                "new garbage kept"
+                "g2 not in the delete-set"
             );
             assert!(
                 remote.get_blob(&commit_id).await.unwrap().is_some(),
-                "reachable commit kept"
+                "reachable closure kept"
             );
 
-            // a gc bound to a STALE all_heads_hash fails the §15 compare-and-swap.
-            let keep: Vec<[u8; 32]> =
-                secsec_snapshot::reachable_objects(&m, &a_store, &[commit_id])
-                    .unwrap()
-                    .into_iter()
-                    .collect();
-            let stale = remote
-                .gc(keep, r1.arrival_gen, &[0u8; 32], 0, r2.put_epoch)
-                .await
-                .unwrap();
-            assert_eq!(
-                stale,
-                GcOutcome::CasConflict,
-                "stale all_heads_hash must fail the CAS"
+            // a prune bound to a STALE all_heads_hash fails the §5 compare-and-swap (returns false).
+            assert!(
+                !remote.prune(&[g2], &[0u8; 32], 0).await.unwrap(),
+                "stale CAS rejected"
+            );
+            assert!(
+                remote.get_blob(&g2).await.unwrap().is_some(),
+                "stale CAS must not delete"
             );
 
             conn.close(0u32.into(), b"done");

@@ -3,8 +3,9 @@
 //! the QUIC server uses (`cas_ref` = `BLAKE3`-of-blob compare), minus the network. The module is
 //! `#[cfg(test)]` (gated by its declaration in `lib.rs`), so it only exists in test builds.
 
-use crate::{GcOutcome, Receipt, Remote, RemoteError};
+use crate::{Remote, RemoteError};
 use secsec_object::Id;
+use secsec_proto::PUSH_ID_LEN;
 use secsec_store::Store;
 
 /// An in-process [`Remote`] backed by a real [`Store`].
@@ -24,20 +25,27 @@ impl Remote for MemRemote {
     async fn get_blob(&self, id: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
         self.store.get(id).map_err(|e| RemoteError(e.to_string()))
     }
-    async fn put_blob(&self, id: &Id, blob: &[u8]) -> Result<Receipt, RemoteError> {
+    async fn put_blob(
+        &self,
+        id: &Id,
+        blob: &[u8],
+        push_id: &[u8; PUSH_ID_LEN],
+    ) -> Result<(), RemoteError> {
         self.store
-            .put(id, blob)
-            .map_err(|e| RemoteError(e.to_string()))?;
-        let arrival_gen = self
-            .store
-            .arrival_epoch(id)
-            .map_err(|e| RemoteError(e.to_string()))?
-            .unwrap_or(0);
-        let put_epoch = self
-            .store
-            .put_epoch()
-            .map_err(|e| RemoteError(e.to_string()))?;
-        Ok(Receipt::unsigned(arrival_gen, put_epoch))
+            .stage(push_id, id, blob, 0)
+            .map_err(|e| RemoteError(e.to_string()))
+    }
+    async fn has(&self, ids: &[Id]) -> Result<Vec<bool>, RemoteError> {
+        self.store.has(ids).map_err(|e| RemoteError(e.to_string()))
+    }
+    async fn has_for_push(
+        &self,
+        push_id: &[u8; PUSH_ID_LEN],
+        ids: &[Id],
+    ) -> Result<Vec<bool>, RemoteError> {
+        self.store
+            .has_for_push(push_id, ids)
+            .map_err(|e| RemoteError(e.to_string()))
     }
     async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
         self.store
@@ -69,23 +77,22 @@ impl Remote for MemRemote {
         ref_h: &Id,
         expected_old: &Id,
         new_blob: &[u8],
+        promote: &[u8; PUSH_ID_LEN],
     ) -> Result<bool, RemoteError> {
         self.store
-            .cas_ref(ref_h, expected_old, new_blob)
+            .cas_ref(ref_h, expected_old, new_blob, promote)
+            .map(|o| o.swapped)
             .map_err(|e| RemoteError(e.to_string()))
     }
-    async fn gc(
+    async fn prune(
         &self,
-        keep_set: Vec<Id>,
-        gc_gen: u64,
+        dead: &[Id],
         _all_heads_hash: &[u8; 32],
         _roster_seq: u64,
-        _put_epoch: u64,
-    ) -> Result<GcOutcome, RemoteError> {
-        let keep: std::collections::BTreeSet<[u8; 32]> = keep_set.into_iter().collect();
+    ) -> Result<bool, RemoteError> {
         self.store
-            .gc(&keep, gc_gen)
-            .map(|_| GcOutcome::Swept)
+            .delete_objects(dead)
+            .map(|_| true)
             .map_err(|e| RemoteError(e.to_string()))
     }
     // Enrollment ops (delegating to the store), so the in-process remote can drive the genesis /

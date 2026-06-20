@@ -4,7 +4,6 @@
 
 use secsec_frame::{Frame, ObjType};
 use secsec_kdf::{obj_key, roster_entry_key, roster_keyhist_key, MasterKey};
-use secsec_proto::gc;
 use secsec_roster::{seal_entry, seal_roster_keyhist};
 use secsec_sync::{ref_hash, seal_head, Head};
 use secsec_transport::auth::SessionTranscript;
@@ -80,13 +79,6 @@ fn computed() -> BTreeMap<String, String> {
         "head_blob",
         hx(&seal_head(&mk, &rnk, &head, b"dummy-sig", &[0x07; 12])),
     );
-
-    // [gc]
-    let ksh = gc::keep_set_hash(&[[1; 32], [2; 32]]);
-    let ahh = gc::all_heads_hash(&[([3; 32], [4; 32])]);
-    put("keep_set_hash", hx(&ksh));
-    put("all_heads_hash", hx(&ahh));
-    put("args_gc", hx(&gc::args_gc(&ksh, 2, &ahh, 4, 10)));
 
     // [auth] — session transcript.
     let mut t = SessionTranscript::new();

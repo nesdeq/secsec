@@ -6,8 +6,9 @@
 use secsec_canon::Writer;
 use secsec_sig::{DeviceKey, DevicePublic, NS_AUTH};
 
-/// The wire `secsec_version` carried in the handshake hellos (§11).
-pub const SECSEC_VERSION: u16 = 1;
+/// The wire `secsec_version` carried in the handshake hellos (§11). A peer at a different version
+/// fails the hello — there is no negotiation or backward compatibility.
+pub const SECSEC_VERSION: u16 = 2;
 /// Handshake nonce length (client/server), in bytes (§11).
 pub const NONCE_LEN: usize = 32;
 
@@ -231,12 +232,16 @@ mod tests {
         assert!(dev.public().verify(NS_WRITE, &ctx.message(), &sig).is_err());
     }
 
-    /// Frozen transcript KAT, mirrored in `vectors/secsec-kat-v1.txt [auth]`. version=1,
-    /// client_nonce=0x01*32, server_nonce=0x02*32, host_id=0x03*32.
+    /// Frozen transcript KAT, mirrored in `vectors/secsec-kat-v1.txt [auth]`: it pins the transcript
+    /// hashing for fixed inputs (protocol version 1, client_nonce=0x01*32, server_nonce=0x02*32,
+    /// host_id=0x03*32), independent of the live `SECSEC_VERSION`.
     #[test]
     fn transcript_kat() {
+        let mut t = SessionTranscript::new();
+        t.client_hello(1, &[1; 32])
+            .server_hello(1, &[2; 32], &[3; 32]);
         assert_eq!(
-            hx(&transcript(&[1; 32], &[2; 32], &[3; 32])),
+            hx(&t.finalize()),
             "d7da869b22932e7f1e55fe87d1bec0245d9c41273dc4b39e38c3c4e0328ebbde"
         );
     }

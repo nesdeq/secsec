@@ -2,7 +2,7 @@
 //! operator's `authorized_keys`), `sync` (link a folder and keep it in continuous two-way sync; one
 //! repo = one tree under the ref `main`), `invite` / `devices` / `revoke` (enrollment lifecycle,
 //! §7/§8.4), `hostpin` (§11 TOFU verification), `log` / `restore` (history), and `reset` (wipe local
-//! secsec state). Garbage collection (§15) runs automatically inside `sync`. Usage: README.md.
+//! secsec state). Usage: README.md.
 
 #![allow(missing_docs)] // a binary crate exports no public API
 
@@ -10,8 +10,7 @@ use clap::{Parser, Subcommand};
 use secsec_client::pair;
 use secsec_client::quic::QuicRemote;
 use secsec_client::repo::{
-    data_keyring_remote, fetch_roster_entries, init_repo_remote, open_repo_remote, RepoError,
-    RosterAnchor,
+    data_keyring_remote, init_repo_remote, open_repo_remote, RepoError, RosterAnchor,
 };
 use secsec_client::sync::sync_once;
 use secsec_client::{load_frontier, save_frontier, FrontierLoad};
@@ -31,6 +30,10 @@ use zeroize::Zeroizing;
 
 /// Default listen port (§19: udp/8899).
 const DEFAULT_PORT: u16 = 8899;
+/// Idle window after which an abandoned in-flight push's staging is reclaimed (§3): 24 hours.
+const STAGING_TTL_SECS: u64 = 24 * 60 * 60;
+/// How often the server sweeps idle staging (§3): every 60 minutes.
+const RECLAIM_TICK_SECS: u64 = 60 * 60;
 /// How long `invite` waits for a device to pair, and `sync --invite` waits for the host, in 500 ms
 /// pairing-poll rounds (§7): the host waits up to the ~10-minute invite lifetime; the joiner ~2 min.
 const PAIR_HOST_ROUNDS: u32 = 1200;
@@ -190,6 +193,13 @@ fn unix_secs() -> u64 {
 
 fn rand32() -> Result<[u8; 32], Box<dyn Error>> {
     let mut n = [0u8; 32];
+    getrandom::fill(&mut n)?;
+    Ok(n)
+}
+
+/// A fresh 16-byte per-attempt push id (§3).
+fn rand16() -> Result<[u8; 16], Box<dyn Error>> {
+    let mut n = [0u8; 16];
     getrandom::fill(&mut n)?;
     Ok(n)
 }
@@ -437,19 +447,6 @@ fn load_or_generate_hostkey(dir: &Path) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Er
     Ok((cert, key))
 }
 
-fn load_or_generate_receipt_key(dir: &Path) -> Result<[u8; 32], Box<dyn Error>> {
-    let path = dir.join("hostkey.receipt");
-    if let Ok(bytes) = std::fs::read(&path) {
-        if bytes.len() == 32 {
-            return Ok(bytes.try_into().expect("checked len"));
-        }
-    }
-    let seed = rand32()?;
-    std::fs::create_dir_all(dir)?;
-    std::fs::write(&path, seed)?;
-    Ok(seed)
-}
-
 // ---- serve ----
 
 async fn run_serve(dir: PathBuf, port: u16) -> Result<(), Box<dyn Error>> {
@@ -473,13 +470,26 @@ async fn run_serve(dir: PathBuf, port: u16) -> Result<(), Box<dyn Error>> {
 
     let (cert, key) = load_or_generate_hostkey(&hostkey_dir)?;
     let host_id = HostPin::from_cert(&cert)?.host_id();
-    let receipt_seed = load_or_generate_receipt_key(&hostkey_dir)?;
     let store = Store::open(&store_path)?;
     let server = std::sync::Arc::new(
-        Server::new(store)
-            .with_receipts(&receipt_seed, host_id)
-            .with_authorized_file(auth_path.clone()), // re-read per connection (live add/remove)
+        Server::new(store).with_authorized_file(auth_path.clone()), // re-read per connection
     );
+
+    // Background reclaimer: drop in-flight pushes idle past the staging TTL (§3), so abandoned staging
+    // cannot accumulate on a server no client is actively pushing to (the accept loop never fires when
+    // idle, so the sweep needs its own timer).
+    {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(RECLAIM_TICK_SECS));
+            loop {
+                tick.tick().await;
+                if let Err(e) = server.reclaim_staging(unix_secs(), STAGING_TTL_SECS) {
+                    eprintln!("staging reclaim failed: {e}");
+                }
+            }
+        });
+    }
 
     let listen: SocketAddr = (Ipv4Addr::UNSPECIFIED, port).into();
     let endpoint = quinn::Endpoint::server(server_config(&cert, &key)?, listen)?;
@@ -631,7 +641,12 @@ async fn run_sync(
     let store = Store::open(sdir.join("objects.secsec"))?;
     let frontier_path = sdir.join("frontier");
     let base_path = sdir.join("base");
-    let receipts_path = sdir.join("receipts");
+    // The per-attempt push id (§3): persisted before each push, removed after; a file left behind by a
+    // crash mid-push is reused on the next run so the resumed push re-sends only what is still missing.
+    let push_id_path = sdir.join("push_id");
+    let mut resume_push_id: Option<[u8; 16]> = std::fs::read(&push_id_path)
+        .ok()
+        .and_then(|b| <[u8; 16]>::try_from(b).ok());
     let mut frontier = match load_frontier(&frontier_path, &device)? {
         FrontierLoad::Loaded(f) => f,
         FrontierLoad::Absent => {
@@ -656,8 +671,8 @@ async fn run_sync(
     // head (orphans from cas-conflict retries / aborted pushes). Best-effort, never blocks syncing.
     // (Trims the logical set; redb re-grows its file to working size on the next write.)
     if let Some(b) = base {
-        match secsec_client::gc::local_sweep(&keyring, &store, &b) {
-            Ok(n) if n > 0 => eprintln!("local GC: dropped {n} unreachable object(s)"),
+        match secsec_client::prune::local_sweep(&keyring, &store, &b) {
+            Ok(n) if n > 0 => eprintln!("local sweep: dropped {n} unreachable object(s)"),
             _ => {}
         }
     }
@@ -786,8 +801,19 @@ async fn run_sync(
 
         // §8.5: seal the advanced frontier to disk BEFORE any ref-advancing head push — a crash
         // post-push must not leave a published head uncovered by the persisted frontier.
+        // Mint (or resume) the per-attempt push id and persist it before the push (temp+rename), so a
+        // crash mid-push can resume it next run; it is removed once the attempt returns.
+        let push_id = match resume_push_id.take() {
+            Some(p) => p,
+            None => rand16()?,
+        };
+        {
+            let tmp = push_id_path.with_extension("tmp");
+            std::fs::write(&tmp, push_id)?;
+            std::fs::rename(&tmp, &push_id_path)?;
+        }
         let seal = |fr: &SyncFrontier| save_frontier(&frontier_path, fr, &device);
-        match sync_once(
+        let outcome = sync_once(
             &rem,
             &store,
             &dir,
@@ -799,42 +825,18 @@ async fn run_sync(
             roster_seq,
             base,
             unix_secs(),
+            &push_id,
             &seal,
         )
-        .await
-        {
+        .await;
+        let _ = std::fs::remove_file(&push_id_path);
+        match outcome {
             Ok(outcome) => {
                 // Persist the final frontier too — it additionally carries our own commit's high-water,
                 // which the pre-push seal (observations only) need not have included.
                 save_frontier(&frontier_path, &outcome.frontier, &device)?;
                 if let Some(b) = outcome.base {
                     std::fs::write(&base_path, hex(&b))?;
-                }
-                if !outcome.receipts.is_empty() {
-                    // §15 defence-in-depth: verify each receipt's signature against the pinned host
-                    // before recording — a forged arrival must not enter the GC log.
-                    let verified: Vec<_> = outcome
-                        .receipts
-                        .iter()
-                        .copied()
-                        .filter(|(id, r)| r.verify(id, &host_id))
-                        .collect();
-                    let dropped = outcome.receipts.len() - verified.len();
-                    if dropped > 0 {
-                        eprintln!(
-                            "warning: dropped {dropped} unverifiable arrival receipt(s) from {server_str}"
-                        );
-                    }
-                    if !verified.is_empty() {
-                        let mut log = secsec_client::gc::parse_receipt_log(
-                            &std::fs::read_to_string(&receipts_path).unwrap_or_default(),
-                        );
-                        secsec_client::gc::merge_receipts(&mut log, &verified, unix_secs());
-                        std::fs::write(
-                            &receipts_path,
-                            secsec_client::gc::serialize_receipt_log(&log),
-                        )?;
-                    }
                 }
                 if initial || !matches!(outcome.kind, secsec_client::sync::SyncKind::UpToDate) {
                     println!("sync: {:?}", outcome.kind);
@@ -852,46 +854,6 @@ async fn run_sync(
                 }
                 frontier = outcome.frontier;
                 base = outcome.base;
-
-                // Auto-GC once per session (best-effort, §15): prune server objects aged past the 48h
-                // grace window so the store stays lean — the user never runs a gc command.
-                if initial {
-                    let gc = async {
-                        if let Some((head, _, _)) =
-                            secsec_client::fetch_head(&rem, &keyring, &ref_name).await?
-                        {
-                            secsec_client::fetch_closure(&rem, &store, &keyring, &head.commit_id)
-                                .await?;
-                            let log = secsec_client::gc::parse_receipt_log(
-                                &std::fs::read_to_string(&receipts_path).unwrap_or_default(),
-                            );
-                            let gc_gen = secsec_client::gc::gc_gen_from_log(&log, unix_secs());
-                            if gc_gen != 0 {
-                                let put_epoch = secsec_client::gc::put_epoch_from_log(&log);
-                                let roster_seq =
-                                    fetch_roster_entries(&rem).await?.len().saturating_sub(1)
-                                        as u64;
-                                // One repo = one ref, so the keep-set over `main` is complete (§15)
-                                // and the gc CAS's all_heads_hash matches the server's single ref.
-                                secsec_client::gc::gc_collect(
-                                    &rem,
-                                    &store,
-                                    &keyring,
-                                    &[ref_name.as_str()],
-                                    gc_gen,
-                                    roster_seq,
-                                    put_epoch,
-                                )
-                                .await?;
-                            }
-                        }
-                        Ok::<(), Box<dyn Error>>(())
-                    }
-                    .await;
-                    if let Err(e) = gc {
-                        eprintln!("auto-gc skipped: {e}");
-                    }
-                }
             }
             // A cas-head conflict is a normal concurrent-write race (another device advanced the ref
             // while we were pushing), not an error — re-sync immediately to fetch its head and merge.
@@ -1343,7 +1305,7 @@ fn run_reset(dir: PathBuf, yes: bool) -> Result<(), Box<dyn Error>> {
     if hostkey.is_dir() {
         targets.push((
             hostkey,
-            "server host key + receipt seed — clients will have to re-verify the pin",
+            "server host key — clients will have to re-verify the pin",
             true,
         ));
     }

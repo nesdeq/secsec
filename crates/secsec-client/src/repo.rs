@@ -942,10 +942,10 @@ mod tests {
         };
         let commit_id =
             secsec_snapshot::seal_signed_commit(&mk1, &remote.store, &device, &commit).unwrap();
-        push_objects(&remote, &remote.store, &mk1, &commit_id)
+        push_objects(&remote, &remote.store, &mk1, &commit_id, &[0x60; 16])
             .await
             .unwrap();
-        push_head(&remote, &mk1, &device, "main", commit_id, 0, None)
+        push_head(&remote, &mk1, &device, "main", commit_id, 0, None, &[0x60; 16])
             .await
             .unwrap();
 

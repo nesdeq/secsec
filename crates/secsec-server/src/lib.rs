@@ -2,8 +2,9 @@
 //! (`secsec-Design.md` §12, §19). Pipeline: keyslot existence → per-op signature over the recomputed
 //! `args_hash` + session transcript (+ single-use `server_nonce` for writes) → §19 limits → execute.
 //! The server is **blind**: blobs are opaque (clients re-check content addresses on fetch, §9.2),
-//! mutable ops CAS on the `BLAKE3` of the stored tip blob, and `gc` is a CAS against server state
-//! (§15). The handler is pure and clock-injected (`now`) — [`Server::handle`] unit-tests, no sockets.
+//! a push stages objects and the winning `cas-head` atomically promotes them, and `prune` is a
+//! compare-and-swap against the server's head/roster state (§5). The handler is pure and
+//! clock-injected (`now`) — [`Server::handle`] unit-tests, no sockets.
 
 #![forbid(unsafe_code)]
 
@@ -12,13 +13,11 @@ pub mod serve;
 use secsec_frame::MAX_BLOB_SIZE;
 use secsec_proto::server::{limits, NonceStore, StorageQuota, TokenBucket, WindowCounter};
 use secsec_proto::wire::{ErrorCode, Request, Response};
-use secsec_proto::{gc, op, op_and_args, ReadAuth, WriteAuth};
+use secsec_proto::{op, op_and_args, prune, ReadAuth, WriteAuth};
 use secsec_sig::{DeviceId, DevicePublic};
 use secsec_store::Store;
 use std::collections::{BTreeSet, HashMap};
 
-/// One hour, in seconds — the `gc` rate-limit window (§19: 4 gc calls / key / hour).
-const GC_WINDOW_SECS: u64 = 3600;
 /// Pairing-mailbox entry TTL (§7 invite onboarding): the agreed invite lifetime (~10 minutes). An
 /// unclaimed pairing slot is evicted after this; an invite is single-use and short-lived.
 const PAIR_TTL_SECS: u64 = 600;
@@ -49,7 +48,6 @@ struct ServerState {
     write_buckets: HashMap<DeviceId, TokenBucket>,
     read_buckets: HashMap<DeviceId, TokenBucket>,
     quotas: HashMap<DeviceId, StorageQuota>,
-    gc_calls: HashMap<DeviceId, WindowCounter>,
     /// Per-connection-identity sigchain-append counter (§8.1: ≤ 60 roster-appends per key per hour).
     sigchain_calls: HashMap<DeviceId, WindowCounter>,
     /// §7 invite-onboarding mailbox: `slot → (blob, expiry)`. Transient, never persisted, TTL-evicted.
@@ -73,13 +71,6 @@ impl ServerState {
     fn pair_get(&mut self, slot: &[u8; 32], now: u64) -> Option<Vec<u8>> {
         self.pairing.retain(|_, (_, exp)| *exp > now);
         self.pairing.get(slot).map(|(b, _)| b.clone())
-    }
-
-    fn gc_record(&mut self, d: DeviceId, now: u64) -> bool {
-        self.gc_calls
-            .entry(d)
-            .or_insert_with(|| WindowCounter::new(GC_WINDOW_SECS, limits::MAX_GC_CALLS_PER_HOUR))
-            .try_record(now)
     }
 
     fn take_write(&mut self, d: DeviceId, n: u64, now: u64) -> bool {
@@ -116,7 +107,7 @@ impl ServerState {
             .entry(d)
             .or_insert_with(|| {
                 WindowCounter::new(
-                    GC_WINDOW_SECS,
+                    limits::HOUR_SECS,
                     limits::MAX_SIGCHAIN_ENTRIES_PER_CONN_PER_HOUR,
                 )
             })
@@ -137,6 +128,14 @@ impl ServerState {
             .or_insert_with(|| StorageQuota::new(limits::PER_KEY_STORAGE_QUOTA))
             .try_add(n)
     }
+
+    /// Return `n` reserved bytes to a key's cap — used when a charged `cas-head` then lost its CAS, so
+    /// a benign racer is not permanently charged for objects it never promoted.
+    fn release_quota(&mut self, d: DeviceId, n: u64) {
+        if let Some(q) = self.quotas.get_mut(&d) {
+            q.release(n);
+        }
+    }
 }
 
 /// The server's per-op handler. Object ops hit the redb store lock-free (redb is transactional);
@@ -145,9 +144,6 @@ impl ServerState {
 pub struct Server {
     store: Store,
     state: std::sync::Mutex<ServerState>,
-    /// Optional host receipt key + this server's `host_id` (§15 signed receipts). `None` ⇒ receipts
-    /// are returned unsigned (all-zero pubkey/signature).
-    receipts: Option<(ed25519_dalek::SigningKey, [u8; 32])>,
     /// The **mandatory** connection allow-list (the operator's `authorized_keys`), re-read per
     /// connection so adding a key needs no restart. Gates who can talk at all, including pairing
     /// (§7); membership/decryption is the separate crypto roster + keyslots (§8).
@@ -189,7 +185,6 @@ impl Server {
         Self {
             store,
             state: std::sync::Mutex::new(ServerState::default()),
-            receipts: None,
             authorized: Authorized::Any,
         }
     }
@@ -221,20 +216,18 @@ impl Server {
         }
     }
 
-    /// Enable §15 **signed arrival receipts**: `receipt_seed` is the host's 32-byte Ed25519 receipt
-    /// key seed, `host_id` is this server's `host_id` (`BLAKE3` of its pinned SPKI). Each `put` then
-    /// returns a receipt signed over `id ‖ host_id ‖ arrival_gen ‖ put_epoch ‖ ts`.
-    #[must_use]
-    pub fn with_receipts(mut self, receipt_seed: &[u8; 32], host_id: [u8; 32]) -> Self {
-        self.receipts = Some((ed25519_dalek::SigningKey::from_bytes(receipt_seed), host_id));
-        self
-    }
-
     /// Borrow the underlying object + keyslot store (e.g. for enrollment writes by the orchestration
     /// layer, or `keyslot_exists` queries).
     #[must_use]
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Reclaim in-flight pushes idle past `ttl_secs` (§3). The serve loop drives this on a background
+    /// interval so abandoned staging cannot accumulate on a server that no client is actively pushing
+    /// to. Returns the number of pushes reclaimed.
+    pub fn reclaim_staging(&self, now: u64, ttl_secs: u64) -> Result<u64, secsec_store::StoreError> {
+        self.store.reclaim_staging(now, ttl_secs)
     }
 
     /// Issue a fresh `server_nonce` challenge (the caller draws it from the OS CSPRNG and sends it to
@@ -266,8 +259,11 @@ impl Server {
         self.state.lock().expect("server state").add_quota(d, n)
     }
 
-    fn gc_allow(&self, d: DeviceId, now: u64) -> bool {
-        self.state.lock().expect("server state").gc_record(d, now)
+    fn release_quota(&self, d: DeviceId, n: u64) {
+        self.state
+            .lock()
+            .expect("server state")
+            .release_quota(d, n);
     }
 
     fn take_read(&self, d: DeviceId, n: u64, now: u64) -> bool {
@@ -379,25 +375,6 @@ impl Server {
         }
     }
 
-    /// Build the §15 `Stored` receipt, signed by the host receipt key when configured ([`with_receipts`];
-    /// else all-zero pubkey/signature).
-    fn receipt(&self, id: &[u8; 32], arrival_gen: u64, put_epoch: u64, now: u64) -> Response {
-        let (receipt_pubkey, signature) = match &self.receipts {
-            Some((key, host_id)) => (
-                secsec_proto::receipt::receipt_public(key),
-                secsec_proto::receipt::sign_receipt(key, id, host_id, arrival_gen, put_epoch, now),
-            ),
-            None => ([0u8; 32], [0u8; 64]),
-        };
-        Response::Stored {
-            arrival_gen,
-            put_epoch,
-            ts: now,
-            receipt_pubkey,
-            signature,
-        }
-    }
-
     /// Run the §12 pipeline for one request and return the response.
     pub fn handle(&self, inc: Incoming<'_>, now: u64) -> Response {
         // (0) Pairing mailbox (§7 invite onboarding): allowed PRE-enrollment (a joining device owns no
@@ -433,10 +410,10 @@ impl Server {
             }
         }
 
-        // gc has a state-dependent args_hash (§15 compare-and-swap), so it is authorized separately
+        // prune has a state-dependent args_hash (§5 compare-and-swap), so it is authorized separately
         // from the generic op_and_args path below.
-        if matches!(inc.request, Request::Gc { .. }) {
-            return self.handle_gc(inc, device_id, now);
+        if matches!(inc.request, Request::Prune { .. }) {
+            return self.handle_prune(inc, now);
         }
 
         // (2) per-op authorization: recompute args_hash from the request and verify the signature.
@@ -504,6 +481,7 @@ impl Server {
             Request::Put {
                 id,
                 declared_size,
+                push_id,
                 blob,
             } => {
                 // §11/§12 normative: MUST reject declared_size > 16 MiB outright (the wire decoder
@@ -514,23 +492,14 @@ impl Server {
                 if blob.len() != declared_size as usize {
                     return Response::Err(ErrorCode::BadRequest);
                 }
-                // write byte-rate limit (§19: 100 MB/s sustained, 1 GiB burst).
+                // write byte-rate limit (§19: 100 MB/s sustained, 1 GiB burst). The per-key storage
+                // cap is charged at promote (cas-head), so abandoned staging is never charged.
                 if !self.take_write(device_id, blob.len() as u64, now) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
-                // storage quota — only charge a genuinely new object (put is idempotent by id).
-                let present = self.store.has(&[id]).map(|b| b[0]).unwrap_or(false);
-                if !present && !self.add_quota(device_id, blob.len() as u64) {
-                    return Response::Err(ErrorCode::RateLimit);
-                }
-                // Store, then return the §15 arrival receipt (drives client gc_gen + the gc CAS).
-                match self.store.put(&id, &blob) {
-                    Ok(_) => match (self.store.arrival_epoch(&id), self.store.put_epoch()) {
-                        (Ok(Some(arrival_gen)), Ok(put_epoch)) => {
-                            self.receipt(&id, arrival_gen, put_epoch, now)
-                        }
-                        _ => Response::Err(ErrorCode::Internal),
-                    },
+                // Stage the object under this push; a winning cas-head promotes it durably (§3).
+                match self.store.stage(&push_id, &id, &blob, now) {
+                    Ok(()) => Response::Ok,
                     Err(_) => Response::Err(ErrorCode::Internal),
                 }
             }
@@ -538,6 +507,7 @@ impl Server {
                 ref_h,
                 old_head,
                 new_head,
+                promote,
                 new_blob,
             } => {
                 // The attached new head blob must hash to the signed new_head (§12 cas-head semantics).
@@ -547,11 +517,25 @@ impl Server {
                 if !self.take_write(device_id, new_blob.len() as u64, now) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
-                // Atomic compare-and-swap on the server-visible blob hash (blind server, §12).
-                match self.store.cas_ref(&ref_h, &old_head, &new_blob) {
-                    Ok(true) => Response::Ok,
-                    Ok(false) => Response::Err(ErrorCode::CasConflict),
-                    Err(_) => Response::Err(ErrorCode::Internal),
+                // Charge the per-key cap (§11) on the bytes this push would make durable, BEFORE
+                // promoting, so an over-cap promote is rejected rather than committed. A lost CAS
+                // promotes nothing, so its reservation is refunded.
+                let promote_bytes = self.store.staged_bytes(&promote).unwrap_or(0);
+                if promote_bytes > 0 && !self.add_quota(device_id, promote_bytes) {
+                    return Response::Err(ErrorCode::RateLimit);
+                }
+                // Atomic compare-and-swap on the server-visible blob hash, promoting this push's staged
+                // objects in the same transaction (blind server, §3/§12).
+                match self.store.cas_ref(&ref_h, &old_head, &new_blob, &promote) {
+                    Ok(outcome) if outcome.swapped => Response::Ok,
+                    Ok(_) => {
+                        self.release_quota(device_id, promote_bytes);
+                        Response::Err(ErrorCode::CasConflict)
+                    }
+                    Err(_) => {
+                        self.release_quota(device_id, promote_bytes);
+                        Response::Err(ErrorCode::Internal)
+                    }
                 }
             }
             Request::RosterAppend { old_tip, entry } => {
@@ -623,66 +607,56 @@ impl Server {
                 Ok(_) => Response::Ok,
                 Err(_) => Response::Err(ErrorCode::Internal),
             },
-            // gc is dispatched before this match (state-dependent auth, §15); never reached here.
-            Request::Gc { .. } => Response::Err(ErrorCode::Internal),
+            // prune is dispatched before this match (state-dependent auth, §5); never reached here.
+            Request::Prune { .. } => Response::Err(ErrorCode::Internal),
             // Pairing ops are dispatched at the top of `handle` (pre-enrollment); never reached here.
             Request::PairPut { .. } | Request::PairGet { .. } => Response::Err(ErrorCode::Internal),
         }
     }
 
-    /// §15 `gc`: `args_hash` is recomputed from the **server's** current state (`all_heads_hash` /
-    /// `roster_seq` / `put_epoch`), so verifying the client's signature over it **is** the
-    /// compare-and-swap — any concurrent mutation changes the recomputed message and the sweep
-    /// aborts (`BadAuth`) instead of deleting against stale state.
-    fn handle_gc(&self, inc: Incoming<'_>, device_id: DeviceId, now: u64) -> Response {
-        let Request::Gc { keep_set, gc_gen } = inc.request else {
+    /// §5 `prune`: `args_hash` is recomputed from the **server's** current head/roster state
+    /// (`all_heads_hash` / `roster_seq`), so verifying the client's signature over it **is** the
+    /// head-binding compare-and-swap — a concurrent `cas-head`/`roster-append` changes the recomputed
+    /// message and the prune aborts (`BadAuth`) instead of deleting an object a reverted head now
+    /// references. On success the `dead` set is removed from durable storage.
+    fn handle_prune(&self, inc: Incoming<'_>, now: u64) -> Response {
+        let Request::Prune { dead, .. } = &inc.request else {
             return Response::Err(ErrorCode::Internal);
         };
-        if keep_set.len() > limits::MAX_GC_KEEP_SET_IDS {
+        if dead.len() > limits::MAX_HAS_IDS {
             return Response::Err(ErrorCode::TooManyIds);
         }
         let Some(nonce) = inc.server_nonce else {
             return Response::Err(ErrorCode::BadAuth);
         };
 
-        // Recompute args_gc from the server's current state.
-        let (refs, roster_len, put_epoch) = match (
-            self.store.ref_blob_hashes(),
-            self.store.roster_len(),
-            self.store.put_epoch(),
-        ) {
-            (Ok(r), Ok(n), Ok(p)) => (r, n, p),
+        // Recompute args_prune from the server's CURRENT head/roster state — this IS the CAS.
+        let (refs, roster_len) = match (self.store.ref_blob_hashes(), self.store.roster_len()) {
+            (Ok(r), Ok(n)) => (r, n),
             _ => return Response::Err(ErrorCode::Internal),
         };
         let roster_seq = roster_len.saturating_sub(1);
-        let args_hash = gc::args_gc(
-            &gc::keep_set_hash(&keep_set),
-            gc_gen,
-            &gc::all_heads_hash(&refs),
+        let args_hash = prune::args_prune(
+            &prune::dead_set_hash(dead),
+            &prune::all_heads_hash(&refs),
             roster_seq,
-            put_epoch,
         );
 
         let wa = WriteAuth {
-            op: op::GC,
+            op: op::PRUNE,
             args_hash,
             session_transcript: inc.session_transcript,
             server_nonce: nonce,
         };
         if wa.verify(inc.pubkey, &inc.op_sig).is_err() {
-            // Bad signature OR a stale client view of the bound state — the §15 CAS failed.
+            // Bad signature OR a stale client view of the bound state — the §5 CAS failed.
             return Response::Err(ErrorCode::BadAuth);
         }
         if !self.consume_nonce(&nonce, now) {
             return Response::Err(ErrorCode::BadAuth);
         }
-        // §19: at most 4 gc calls per key per hour — rejected before any object scan.
-        if !self.gc_allow(device_id, now) {
-            return Response::Err(ErrorCode::RateLimit);
-        }
 
-        let keep: BTreeSet<[u8; 32]> = keep_set.into_iter().collect();
-        match self.store.gc(&keep, gc_gen) {
+        match self.store.delete_objects(dead) {
             Ok(_deleted) => Response::Ok,
             Err(_) => Response::Err(ErrorCode::Internal),
         }
@@ -751,6 +725,24 @@ mod tests {
 
     const T: [u8; 32] = [0x7a; 32];
 
+    /// Promote the objects staged under `push` to durable storage by advancing a throwaway ref under
+    /// it (each push gets a unique ref so the expect-absent swap always wins).
+    fn promote(s: &Server, dev: &DeviceKey, push: [u8; 16]) {
+        let ref_h = *blake3::hash(&push).as_bytes();
+        let blob = b"head".to_vec();
+        let new_head = *blake3::hash(&blob).as_bytes();
+        let nonce = [0xfe; 32];
+        s.issue_nonce(nonce, 0);
+        let cas = Request::CasHead {
+            ref_h,
+            old_head: [0u8; 32],
+            new_head,
+            promote: push,
+            new_blob: blob,
+        };
+        assert_eq!(s.handle(write_req(dev, cas, T, nonce), 0), Response::Ok);
+    }
+
     #[test]
     fn unenrolled_key_is_rejected() {
         let (s, _d) = server();
@@ -773,12 +765,12 @@ mod tests {
         let put = Request::Put {
             id,
             declared_size: blob.len() as u32,
+            push_id: [0xaa; 16],
             blob: blob.clone(),
         };
-        assert!(matches!(
-            s.handle(write_req(&dev, put, T, nonce), 0),
-            Response::Stored { .. }
-        ));
+        assert_eq!(s.handle(write_req(&dev, put, T, nonce), 0), Response::Ok);
+        // promote the staged object durable by advancing a ref under the same push.
+        promote(&s, &dev, [0xaa; 16]);
 
         // get it back.
         let got = s.handle(read_req(&dev, Request::Get { id }, T), 0);
@@ -823,13 +815,11 @@ mod tests {
         let put = Request::Put {
             id: [3; 32],
             declared_size: 1,
+            push_id: [0xbb; 16],
             blob: vec![0u8],
         };
         // first use ok.
-        assert!(matches!(
-            s.handle(write_req(&dev, put.clone(), T, nonce), 0),
-            Response::Stored { .. }
-        ));
+        assert_eq!(s.handle(write_req(&dev, put.clone(), T, nonce), 0), Response::Ok);
         // replay with the same nonce -> rejected (single-use).
         assert_eq!(
             s.handle(write_req(&dev, put, T, nonce), 0),
@@ -846,6 +836,7 @@ mod tests {
         let put = Request::Put {
             id: [4; 32],
             declared_size: 1,
+            push_id: [0; 16],
             blob: vec![0u8],
         };
         assert_eq!(
@@ -864,6 +855,7 @@ mod tests {
         let put = Request::Put {
             id: [5; 32],
             declared_size: 99, // lies about the size
+            push_id: [0; 16],
             blob: vec![0u8; 3],
         };
         assert_eq!(
@@ -883,6 +875,7 @@ mod tests {
         let put = Request::Put {
             id: [6; 32],
             declared_size: u32::MAX, // > 16 MiB
+            push_id: [0; 16],
             blob: vec![0u8; 8],
         };
         assert_eq!(
@@ -947,6 +940,7 @@ mod tests {
             ref_h,
             old_head: old,
             new_head: nh,
+            promote: [0u8; 16],
             new_blob: b,
         };
 
