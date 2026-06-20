@@ -529,8 +529,9 @@ impl Store {
         Ok(objs.len()?)
     }
 
-    /// Compact the database file (reclaims GC'd pages); `true` if it shrank. Requires exclusive
-    /// access — call at startup. Best-effort: failure leaves the store usable.
+    /// Compact the database file (reclaims freed pages after deletes); `true` if it shrank. Requires
+    /// exclusive access, so the client calls it at startup before the sync loop opens transactions.
+    /// Best-effort: failure leaves the store usable.
     pub fn compact(&mut self) -> Result<bool, StoreError> {
         Ok(self.db.compact()?)
     }

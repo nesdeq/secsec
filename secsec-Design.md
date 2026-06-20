@@ -1047,8 +1047,7 @@ frontier        the §8.5 local sealed state (anti-rollback counters), sealed un
 base, push_id   the last-synced root, plus the in-flight push id persisted for crash-resume (§15)
 ```
 The same root also holds the UI config/log (`ui.conf`, `ui/`) and the optional systemd per-instance
-env files (`sync@<dir>.conf`); a pre-consolidation `~/.local/state/secsec/<hash>` dir is migrated to
-`<root>/folders/<hash>` on first use. (The systemd **unit templates** unavoidably live in
+env files (`sync@<dir>.conf`). (The systemd **unit templates** unavoidably live in
 `~/.config/systemd/user/` per systemd; the **server** store is the `secsec serve <dir>` directory,
 not a client dotfile.) The object cache is encrypted (it is the same content-addressed blobs pushed
 to the server) and is a *cache*, not the source of truth — the plaintext folder is. This is why no

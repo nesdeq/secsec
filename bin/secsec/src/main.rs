@@ -457,26 +457,12 @@ fn set<T: std::str::FromStr>(field: &mut T, val: &str) {
 }
 
 /// The out-of-tree state directory for a synced folder: `<config_root>/folders/<hash(abspath)>/`
-/// (created if absent). Holds the per-folder link, the sealed cursor, the in-flight push id, and the object
-/// cache — so the synced folder itself stays nothing but the user's files. A pre-consolidation dir
-/// (`~/.local/state/secsec/<hash>`) is migrated on first use, so an existing link keeps its frontier.
+/// (created if absent). Holds the per-folder link, the sealed cursor, the in-flight push id, and the
+/// object cache — so the synced folder itself stays nothing but the user's files.
 fn state_dir_for(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let abs = std::fs::canonicalize(dir)?;
     let name = hex(blake3::hash(abs.to_string_lossy().as_bytes()).as_bytes());
     let sdir = config_root()?.join("folders").join(&name);
-    // Migrate the legacy ~/.local/state location (best-effort; same filesystem in practice) so an
-    // upgrader doesn't lose its anti-rollback frontier and re-clone.
-    if !sdir.exists() {
-        if let Ok(home) = home() {
-            let legacy = home.join(".local/state/secsec").join(&name);
-            if legacy.is_dir() {
-                if let Some(parent) = sdir.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let _ = std::fs::rename(&legacy, &sdir);
-            }
-        }
-    }
     std::fs::create_dir_all(&sdir)?;
     Ok(sdir)
 }
@@ -809,7 +795,7 @@ async fn run_sync(
     let mut roster_seq = anchor.max_seq;
 
     let mut keyring = data_keyring_remote(&rem, &mk).await?;
-    let store = Store::open(sdir.join("objects.secsec"))?;
+    let mut store = Store::open(sdir.join("objects.secsec"))?;
     let frontier_path = sdir.join("frontier");
     let base_path = sdir.join("base");
     // The per-attempt push id (§15): persisted before each push, removed after; a file left behind by a
@@ -840,12 +826,17 @@ async fn run_sync(
 
     // Startup store hygiene, once per session: drop local objects unreachable from our last-synced
     // head (orphans from cas-conflict retries / aborted pushes). Best-effort, never blocks syncing.
-    // (Trims the logical set; redb re-grows its file to working size on the next write.)
     if let Some(b) = base {
         match secsec_client::prune::local_sweep(&keyring, &store, &b) {
             Ok(n) if n > 0 => eprintln!("local sweep: dropped {n} unreachable object(s)"),
             _ => {}
         }
+    }
+    // Reclaim the freed pages so the cache file shrinks after a sweep / retention prune rather than
+    // re-growing to its high-water mark. Startup is the only point with exclusive store access (before
+    // the sync loop opens transactions); best-effort, leaves the store usable on failure.
+    if let Err(e) = store.compact() {
+        eprintln!("cache compaction skipped: {e}");
     }
 
     println!(
@@ -1464,22 +1455,16 @@ fn run_reset(dir: PathBuf, yes: bool) -> Result<(), Box<dyn Error>> {
     // (path, what-it-is, is_dir) for each piece of secsec state that actually exists at `dir`.
     let mut targets: Vec<(PathBuf, &str, bool)> = Vec::new();
 
-    // Client state: keyed by the folder's canonical path (must match `state_dir_for`). Check the
-    // current root and the pre-consolidation location, so `reset` fully cleans either.
+    // Client state: keyed by the folder's canonical path (must match `state_dir_for`).
     if let Ok(abs) = std::fs::canonicalize(&dir) {
         let name = hex(blake3::hash(abs.to_string_lossy().as_bytes()).as_bytes());
-        let candidates = [
-            config_root()?.join("folders").join(&name),
-            home()?.join(".local/state/secsec").join(&name),
-        ];
-        for cdir in candidates {
-            if cdir.exists() {
-                targets.push((
-                    cdir,
-                    "client sync state — link, object cache, rollback cursor",
-                    true,
-                ));
-            }
+        let cdir = config_root()?.join("folders").join(&name);
+        if cdir.exists() {
+            targets.push((
+                cdir,
+                "client sync state — link, object cache, rollback cursor",
+                true,
+            ));
         }
     }
     // Server state: lives directly in the serve dir (which holds nothing but these).
