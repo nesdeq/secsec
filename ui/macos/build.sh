@@ -25,6 +25,8 @@ build() {
     mkdir -p "$APP/Contents/MacOS"
     cp "$BIN" "$APP/Contents/MacOS/$BIN"
     cp Info.plist "$APP/Contents/Info.plist"
+    mkdir -p "$APP/Contents/Resources"
+    cp secsec.icns "$APP/Contents/Resources/secsec.icns"
 
     echo "built $APP"
 }

@@ -10,6 +10,8 @@
 	<string>secsec</string>
 	<key>CFBundleDisplayName</key>
 	<string>secsec</string>
+	<key>CFBundleIconFile</key>
+	<string>secsec</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

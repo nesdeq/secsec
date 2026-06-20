@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/secsec.svg">
+    <img alt="secsec" src="assets/secsec-light.svg" width="132">
+  </picture>
+</p>
+
 # secsec
 
 [![ci](https://github.com/nesdeq/secsec/actions/workflows/ci.yml/badge.svg)](https://github.com/nesdeq/secsec/actions/workflows/ci.yml)

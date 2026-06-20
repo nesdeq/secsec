@@ -92,14 +92,6 @@ function lastLogLine(path) {
     return lines.length ? lines[lines.length - 1] : '';
 }
 
-// Retro LED look per status: filled dot when running (green/amber/red), hollow when stopped.
-const LED = {
-    connected: {glyph: '●', color: '#33ff66'},
-    connecting: {glyph: '●', color: '#ffcc33'},
-    error: {glyph: '●', color: '#ff3b30'},
-    stopped: {glyph: '○', color: '#9aa0a6'},
-};
-
 // Health from process liveness + the log tail (the 15 s poll). Scans the log newest-first: a hard
 // error marker → 'error', a transient "connection lost" → 'connecting', a healthy sync line →
 // 'connected'; a running process with nothing notable is assumed 'connected'.
@@ -187,9 +179,10 @@ class Indicator extends PanelMenu.Button {
         super._init(0.0, 'secsec');
         this._ext = ext;
 
-        // Retro LED status dot — the panel "icon" is the connect indicator (set in refresh()).
-        this._dot = new St.Label({text: '○', y_align: Clutter.ActorAlign.CENTER});
-        this.add_child(this._dot);
+        // The secsec mark is the panel icon; its crossing-bar colour is the connect indicator
+        // (green when connected & syncing, orange otherwise — set in refresh()).
+        this._icon = new St.Icon({icon_size: 16, y_align: Clutter.ActorAlign.CENTER});
+        this.add_child(this._icon);
 
         this._status = new PopupMenu.PopupMenuItem('', {reactive: false, can_focus: false});
         this._status.label.clutter_text.set_line_wrap(true);
@@ -224,9 +217,9 @@ class Indicator extends PanelMenu.Button {
     refresh() {
         const running = this._ext.isRunning();
         const status = healthFromLog(this._ext.logPath, running);
-        const led = LED[status];
-        this._dot.set_text(led.glyph);
-        this._dot.set_style(`font-family: monospace; font-weight: bold; font-size: 14px; color: ${led.color};`);
+        const file = status === 'connected' ? 'secsec-syncing.svg' : 'secsec-idle.svg';
+        this._icon.set_gicon(Gio.icon_new_for_string(
+            GLib.build_filenamev([this._ext.path, 'icons', file])));
 
         this._toggle.label.text = running ? 'Stop sync' : 'Start sync';
         const cfg = readConfig();

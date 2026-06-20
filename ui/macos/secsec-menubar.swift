@@ -241,22 +241,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var isRunning: Bool { task?.isRunning ?? false }
 
+    // The menu-bar mark: a white diagonal "/" crossed by the status bar, drawn on top so its colour
+    // reads at menu-bar size — green when connected & syncing, orange otherwise. Matches assets/secsec.svg.
+    private static func markImage(connected: Bool) -> NSImage {
+        let px: CGFloat = 18
+        let img = NSImage(size: NSSize(width: px, height: px))
+        img.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .high
+        let k = px / 64.0
+        func point(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: x * k, y: (64 - y) * k) }
+        func stroke(_ a: NSPoint, _ b: NSPoint, _ color: NSColor) {
+            let p = NSBezierPath()
+            p.move(to: a); p.line(to: b)
+            p.lineWidth = 7 * k; p.lineCapStyle = .round
+            color.setStroke(); p.stroke()
+        }
+        stroke(point(17.858, 46.142), point(46.142, 17.858), .white)   // diagonal
+        let bar = connected
+            ? NSColor(srgbRed: 0x2a / 255.0, green: 0xa8 / 255.0, blue: 0x5a / 255.0, alpha: 1)
+            : NSColor(srgbRed: 0xe0 / 255.0, green: 0x8a / 255.0, blue: 0x30 / 255.0, alpha: 1)
+        stroke(point(12, 32), point(52, 32), bar)                       // status bar (foreground)
+        img.unlockFocus()
+        img.isTemplate = false
+        return img
+    }
+
     private func refresh() {
         let h = health(running: isRunning, log: log)
-        let (glyph, color): (String, NSColor) = {
-            switch h {
-            case .connected: return ("●", NSColor(srgbRed: 0.20, green: 1.00, blue: 0.40, alpha: 1))
-            case .connecting: return ("●", NSColor(srgbRed: 1.00, green: 0.80, blue: 0.20, alpha: 1))
-            case .error: return ("●", NSColor(srgbRed: 1.00, green: 0.23, blue: 0.19, alpha: 1))
-            case .stopped: return ("○", NSColor(srgbRed: 0.60, green: 0.63, blue: 0.65, alpha: 1))
-            }
-        }()
         if let button = statusItem.button {
-            button.image = nil
-            button.attributedTitle = NSAttributedString(string: glyph, attributes: [
-                .foregroundColor: color,
-                .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .bold),
-            ])
+            button.attributedTitle = NSAttributedString(string: "")
+            button.image = Self.markImage(connected: h == .connected)
+            button.imagePosition = .imageOnly
         }
         toggleItem.title = isRunning ? "Stop sync" : "Start sync"
         let folder = expandTilde(readConfig().folder)

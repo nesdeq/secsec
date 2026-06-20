@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none" stroke-width="7" stroke-linecap="round" role="img" aria-label="secsec">
+  <title>secsec</title>
+  <!-- diagonal "/" (bottom-left -> top-right): the brand stroke -->
+  <line x1="17.858" y1="46.142" x2="46.142" y2="17.858" stroke="#ffffff"/>
+  <!-- horizontal bar (foreground): the status stroke — green when connected & syncing -->
+  <line x1="12" y1="32" x2="52" y2="32" stroke="#2aa85a"/>
+</svg>

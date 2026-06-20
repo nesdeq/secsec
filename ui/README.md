@@ -7,9 +7,9 @@ Thin native shells around the `secsec` binary, one per platform. Each one:
   child's **stdin** — so the secret travels over a pipe and never appears on the command line
   (invisible to `ps`/`top`/`/proc`).
 - Redirects the sync process's stdout+stderr to `~/.config/secsec/ui/sync.log`.
-- Shows a **retro LED** in the menu bar as the connect status, refreshed every 15 s from process
-  liveness + the log: ● green = connected, ● amber = connecting/reconnecting, ● red = problem
-  (error/alarm in the log), ○ grey = stopped.
+- Shows the **secsec mark** in the menu bar / panel as the connect status, refreshed every 15 s from
+  process liveness + the log: the crossing bar is **green** when connected & syncing, **orange**
+  otherwise (connecting · reconnecting · problem · stopped). The status line spells out the exact state.
 - Menu: **status** (+ last log line) · **start/stop** · **restart** · **open log** · **settings**
   (folder + SSH key).
 
