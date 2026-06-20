@@ -197,12 +197,9 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
         }
         None => None,
     };
-    let (our_tree, our_salt) = snapshot_tree(
-        dir,
-        keys.current(),
-        store,
-        prev.as_ref().map(|(t, s)| (t, s)),
-    )?;
+    // Read through the whole key ring so the previous tree is legible across a rotation; new objects
+    // still seal under the current generation inside `snapshot_tree`.
+    let (our_tree, our_salt) = snapshot_tree(dir, keys, store, prev.as_ref().map(|(t, s)| (t, s)))?;
     let unchanged = prev.as_ref().is_some_and(|(t, _)| *t == our_tree);
 
     // No local changes: pull a newer head, or we are already up to date.

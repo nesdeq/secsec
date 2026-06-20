@@ -16,6 +16,7 @@ use secsec_object::{
     open_object, seal_object, unpad_chunk, Id, ObjError, Padding, PathSalt, ZERO_SALT,
 };
 use secsec_store::{Store, StoreError};
+use std::io::Write;
 use std::path::Path;
 
 /// Maximum length of a single path-component name (bytes).
@@ -38,7 +39,7 @@ pub enum Entry {
         name: String,
         /// Unix mode bits (0 on platforms without them).
         mode: u32,
-        /// Modification time, seconds since the Unix epoch (advisory).
+        /// Modification time, nanoseconds since the Unix epoch (advisory).
         mtime: u64,
         /// Plaintext size in bytes.
         size: u64,
@@ -53,7 +54,7 @@ pub enum Entry {
         name: String,
         /// Unix mode bits (0 on platforms without them).
         mode: u32,
-        /// Modification time, seconds since the Unix epoch (advisory).
+        /// Modification time, nanoseconds since the Unix epoch (advisory).
         mtime: u64,
         /// Content address of the subtree object.
         subtree: Id,
@@ -427,26 +428,30 @@ fn mode_of(_meta: &std::fs::Metadata) -> u32 {
     0
 }
 
+/// File modification time as nanoseconds since the Unix epoch — the fast-path's change signal (with
+/// size). Nanosecond resolution stops two distinct same-size writes from colliding on one value.
 fn mtime_of(meta: &std::fs::Metadata) -> u64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs())
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
 /// Snapshot the directory `root` into `store`, returning its root tree `(id, salt)` — the content
 /// half of a sync push ([`seal_signed_commit`] wraps it). `prev` is the previous snapshot's root
 /// (`None` on first sync); each path's salt is reused from it (§9.7 — salts are constant across
 /// versions, the basis for dedup and merge content-equality), fresh salts only for new paths.
-pub fn snapshot_tree(
+pub fn snapshot_tree<K: MasterKeys>(
     root: &Path,
-    mk: &MasterKey,
+    keys: &K,
     store: &Store,
     prev: Option<(&Id, &PathSalt)>,
 ) -> Result<(Id, PathSalt), SnapError> {
-    let chunker = secsec_chunk::Chunker::with_defaults(&mk.cdc_seed());
+    // New objects are chunked and sealed under the current generation; the previous tree may have been
+    // sealed under an older one, so it is read through the whole key ring (§8.2).
+    let chunker = secsec_chunk::Chunker::with_defaults(&keys.current().cdc_seed());
     let prev_tree = match prev {
-        Some((id, salt)) => Some(load_tree(id, salt, mk, store)?),
+        Some((id, salt)) => Some(load_tree(id, salt, keys, store)?),
         None => None,
     };
     // The root tree's own salt persists too (reused if the repo has synced before).
@@ -454,7 +459,21 @@ pub fn snapshot_tree(
         Some((_, salt)) => *salt,
         None => random_salt()?,
     };
-    snapshot_dir(root, mk, store, &chunker, 0, prev_tree.as_ref(), root_salt)
+    // Wall-clock at snapshot start: the fast-path reuses a file only when its mtime is strictly before
+    // this, so a file touched during the snapshot is never trusted as unchanged (racy-clean guard).
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    snapshot_dir(
+        root,
+        keys,
+        store,
+        &chunker,
+        0,
+        prev_tree.as_ref(),
+        root_salt,
+        now_nanos,
+    )
 }
 
 /// The name field of a tree entry (file or dir).
@@ -508,14 +527,15 @@ pub fn restore_commit_tree<K: MasterKeys>(
     restore_tree(&commit.root_tree, &commit.root_salt, keys, store, dest, 0)
 }
 
-fn snapshot_dir(
+fn snapshot_dir<K: MasterKeys>(
     dir: &Path,
-    mk: &MasterKey,
+    keys: &K,
     store: &Store,
     chunker: &secsec_chunk::Chunker,
     depth: usize,
     prev: Option<&Tree>,
     this_salt: PathSalt,
+    now_nanos: u64,
 ) -> Result<(Id, PathSalt), SnapError> {
     if depth >= MAX_TREE_DEPTH {
         return Err(SnapError::DepthExceeded);
@@ -536,24 +556,58 @@ fn snapshot_dir(
         // The same-named entry in the prior tree (if any), used to reuse this path's salt.
         let prev_entry = prev.and_then(|t| t.entries.iter().find(|e| entry_name(e) == name));
         if ft.is_file() {
-            let data = std::fs::read(&path)?;
+            let this_mtime = mtime_of(&meta);
+            // Fast path: a file with the same size and the same nanosecond mtime as the previous
+            // snapshot — and whose mtime is strictly before this snapshot started, so it cannot still
+            // be changing within the current clock tick — is taken as unchanged and reuses its prior
+            // chunk ids verbatim, with no read, re-chunk, or re-seal. Those ids stay valid across a key
+            // rotation (they address the old generation; cross-generation reads are legal, §8.2), so a
+            // revoke does not re-store the whole working set.
+            if let Some(Entry::File {
+                mtime: prev_mtime,
+                size: prev_size,
+                path_salt,
+                chunks,
+                ..
+            }) = prev_entry
+            {
+                if *prev_size == meta.len() && *prev_mtime == this_mtime && this_mtime < now_nanos {
+                    entries.push(Entry::File {
+                        name,
+                        mode: mode_of(&meta),
+                        mtime: this_mtime,
+                        size: *prev_size,
+                        path_salt: *path_salt,
+                        chunks: chunks.clone(),
+                    });
+                    continue;
+                }
+            }
             // Reuse the path's salt across versions (§9.7); a path first seen now gets a fresh one.
             let path_salt = match prev_entry {
                 Some(Entry::File { path_salt, .. }) => *path_salt,
                 _ => random_salt()?,
             };
+            // Stream the file through the chunker so a file larger than RAM is never read whole.
+            let file = std::fs::File::open(&path)?;
             let mut chunks = Vec::new();
-            for chunk in chunker.chunks(&data) {
-                let padded = secsec_object::pad_chunk(chunk, Padding::PowerOfTwo);
-                let (id, blob) = seal_object(mk, ObjType::Chunk, &path_salt, &padded);
-                store.put(&id, &blob)?;
-                chunks.push(id);
-            }
+            let size = chunker
+                .chunk_stream(file, |chunk| -> Result<(), SnapError> {
+                    let padded = secsec_object::pad_chunk(chunk, Padding::PowerOfTwo);
+                    let (id, blob) = seal_object(keys.current(), ObjType::Chunk, &path_salt, &padded);
+                    store.put(&id, &blob)?;
+                    chunks.push(id);
+                    Ok(())
+                })
+                .map_err(|e| match e {
+                    secsec_chunk::StreamError::Read(io) => SnapError::Io(io),
+                    secsec_chunk::StreamError::Emit(se) => se,
+                })?;
             entries.push(Entry::File {
                 name,
                 mode: mode_of(&meta),
-                mtime: mtime_of(&meta),
-                size: data.len() as u64,
+                mtime: this_mtime,
+                size,
                 path_salt,
                 chunks,
             });
@@ -565,19 +619,20 @@ fn snapshot_dir(
                     subtree_salt,
                     ..
                 }) => (
-                    Some(load_tree(subtree, subtree_salt, mk, store)?),
+                    Some(load_tree(subtree, subtree_salt, keys, store)?),
                     *subtree_salt,
                 ),
                 _ => (None, random_salt()?),
             };
             let (subtree, subtree_salt) = snapshot_dir(
                 &path,
-                mk,
+                keys,
                 store,
                 chunker,
                 depth + 1,
                 prev_sub.as_ref(),
                 sub_salt,
+                now_nanos,
             )?;
             entries.push(Entry::Dir {
                 name,
@@ -591,7 +646,7 @@ fn snapshot_dir(
     }
 
     let tree = Tree { entries };
-    let (id, blob) = seal_object(mk, ObjType::Tree, &this_salt, &encode_tree(&tree));
+    let (id, blob) = seal_object(keys.current(), ObjType::Tree, &this_salt, &encode_tree(&tree));
     store.put(&id, &blob)?;
     Ok((id, this_salt))
 }
@@ -647,19 +702,22 @@ fn restore_tree<K: MasterKeys>(
                 path_salt,
                 chunks,
             } => {
-                let mut data = Vec::new();
-                for cid in chunks {
-                    let padded = fetch_open(keys, ObjType::Chunk, path_salt, cid, store)?;
-                    data.extend_from_slice(unpad_chunk(&padded, Padding::PowerOfTwo)?);
-                }
-                if data.len() as u64 != *size {
-                    return Err(SnapError::Malformed("restored file size mismatch"));
-                }
                 let path = dir.join(name);
                 // Clear a non-file at this path first; a symlink is unlinked, never followed (the
                 // write must not dereference it onto a target outside the folder).
                 clear_for_regular_file(&path)?;
-                std::fs::write(&path, &data)?;
+                // Stream chunk-by-chunk to disk so a file larger than RAM is never held whole.
+                let mut file = std::fs::File::create(&path)?;
+                let mut written: u64 = 0;
+                for cid in chunks {
+                    let padded = fetch_open(keys, ObjType::Chunk, path_salt, cid, store)?;
+                    let plain = unpad_chunk(&padded, Padding::PowerOfTwo)?;
+                    file.write_all(plain)?;
+                    written += plain.len() as u64;
+                }
+                if written != *size {
+                    return Err(SnapError::Malformed("restored file size mismatch"));
+                }
                 apply_metadata(&path, *mode, *mtime)?;
             }
             Entry::Dir {
@@ -723,9 +781,11 @@ fn apply_metadata(path: &Path, mode: u32, mtime: u64) -> Result<(), SnapError> {
     }
     #[cfg(not(unix))]
     let _ = mode;
-    // mtime is member-authored: saturate so a hostile value can't wrap negative and break idempotence.
-    let secs = i64::try_from(mtime).unwrap_or(i64::MAX);
-    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(secs, 0))?;
+    // mtime is nanoseconds since the epoch, member-authored: split into whole seconds + sub-second
+    // nanos, saturating so a hostile value can't wrap and break restore→snapshot idempotence.
+    let secs = i64::try_from(mtime / 1_000_000_000).unwrap_or(i64::MAX);
+    let subsec_nanos = (mtime % 1_000_000_000) as u32;
+    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(secs, subsec_nanos))?;
     Ok(())
 }
 
@@ -955,15 +1015,17 @@ pub fn restore_path<K: MasterKeys>(
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut data = Vec::new();
+            let mut file = std::fs::File::create(&target)?;
+            let mut written: u64 = 0;
             for cid in &chunks {
                 let padded = fetch_open(keys, ObjType::Chunk, &path_salt, cid, store)?;
-                data.extend_from_slice(unpad_chunk(&padded, Padding::PowerOfTwo)?);
+                let plain = unpad_chunk(&padded, Padding::PowerOfTwo)?;
+                file.write_all(plain)?;
+                written += plain.len() as u64;
             }
-            if data.len() as u64 != size {
+            if written != size {
                 return Err(SnapError::Malformed("restored file size mismatch"));
             }
-            std::fs::write(&target, &data)?;
             apply_metadata(&target, mode, mtime)?;
         }
         PathNode::Dir {
@@ -1682,6 +1744,54 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(dst.path().join("mylink")).is_ok(),
             "an untracked symlink in the destination is preserved (never secsec's to delete)"
+        );
+    }
+
+    /// The mtime/size fast-path: re-snapshotting an unchanged file under a NEW generation reuses its
+    /// prior chunk ids verbatim (they address the old generation; cross-generation reads are legal,
+    /// §8.2), so a key rotation does not re-store the working set's chunks.
+    #[test]
+    fn unchanged_file_reuses_chunk_ids_across_a_rotation() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let mk1 = MasterKey::new(1, [0x11; 32]);
+        let mk2 = MasterKey::new(2, [0x22; 32]);
+
+        let src = tempfile::tempdir().unwrap();
+        let mut big = vec![0u8; 400 * 1024]; // multi-chunk so there are real ids to compare
+        getrandom::fill(&mut big).unwrap();
+        std::fs::write(src.path().join("f.bin"), &big).unwrap();
+
+        let file_chunks = |id: &Id, salt: &PathSalt, mk: &MasterKey| -> Vec<Id> {
+            let Entry::File { chunks, .. } = load_tree(id, salt, mk, &store)
+                .unwrap()
+                .entries
+                .into_iter()
+                .find(|e| entry_name(e) == "f.bin")
+                .unwrap()
+            else {
+                panic!("f.bin must be a file")
+            };
+            chunks
+        };
+
+        let (rt1, rs1) = snapshot_tree(src.path(), &mk1, &store, None).unwrap();
+        let ch1 = file_chunks(&rt1, &rs1, &mk1);
+
+        // Re-snapshot the UNCHANGED dir under generation 2, reading the prior tree through the key ring
+        // {1, 2}; the mtime/size fast-path reuses the gen-1 chunk ids (the new tree object is re-sealed
+        // under gen 2, but the bulk chunk content is not).
+        let ring: BTreeMap<u32, MasterKey> = [
+            (1u32, MasterKey::new(1, [0x11; 32])),
+            (2u32, MasterKey::new(2, [0x22; 32])),
+        ]
+        .into_iter()
+        .collect();
+        let (rt2, rs2) = snapshot_tree(src.path(), &ring, &store, Some((&rt1, &rs1))).unwrap();
+        let ch2 = file_chunks(&rt2, &rs2, &mk2);
+        assert_eq!(
+            ch1, ch2,
+            "an unchanged file keeps its chunk ids across a rotation"
         );
     }
 }
