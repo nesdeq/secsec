@@ -46,8 +46,6 @@ pub enum PqError {
     Malformed,
     /// The CTX AEAD failed to open (wrong recipient key or tampered blob).
     Aead,
-    /// The recovered key did not match `mk_commit_g` (§7/§8.3).
-    CommitMismatch,
     /// OS RNG failure.
     Rng,
     /// The FIPS 203 §7.1 keypair consistency check failed at key generation (§17; fatal).
@@ -59,7 +57,6 @@ impl core::fmt::Display for PqError {
         match self {
             PqError::Malformed => f.write_str("malformed X-Wing keyslot"),
             PqError::Aead => f.write_str("X-Wing keyslot AEAD open failed"),
-            PqError::CommitMismatch => f.write_str("recovered key fails mk_commit (§8.3)"),
             PqError::Rng => f.write_str("OS RNG failure"),
             PqError::Keygen => {
                 f.write_str("ML-KEM keypair consistency check failed (FIPS 203 §7.1)")
@@ -279,9 +276,10 @@ pub fn wrap_pq(
     Ok(out)
 }
 
-/// Unwrap an X-Wing keyslot to the **raw** 32-byte master key, **without** the `mk_commit` check —
-/// for the §8.1 cold-start bootstrap, where the commitment lives inside the still-encrypted sigchain
-/// (the fold verifies it). Every other caller MUST use [`unwrap_pq`], which checks the commitment.
+/// Unwrap an X-Wing keyslot to the raw 32-byte master key (X-Wing decaps + the CTX-committing AEAD
+/// over the wrap). Authenticity is verified separately at the §8.1 cold-start fold, against
+/// `mk_commit_g` from the sigchain — the only place the commitment is available, since it lives inside
+/// the chain this key decrypts.
 pub fn unwrap_pq_raw(
     keyslot: &[u8],
     gen: u32,
@@ -305,23 +303,6 @@ pub fn unwrap_pq_raw(
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&pt);
     Ok(key)
-}
-
-/// Unwrap an X-Wing keyslot with `secret`, verifying the recovered key against `expected_mk_commit`
-/// (§7/§8.3). Returns the generation-`gen` [`secsec_kdf::MasterKey`].
-pub fn unwrap_pq(
-    keyslot: &[u8],
-    gen: u32,
-    device_id: &[u8; 32],
-    secret: &XWingSecret,
-    expected_mk_commit: &[u8; 32],
-) -> Result<secsec_kdf::MasterKey, PqError> {
-    let key = unwrap_pq_raw(keyslot, gen, device_id, secret)?;
-    let mk = secsec_kdf::MasterKey::new(gen, *key);
-    if mk.mk_commit() != *expected_mk_commit {
-        return Err(PqError::CommitMismatch);
-    }
-    Ok(mk)
 }
 
 #[cfg(test)]
@@ -363,41 +344,37 @@ mod tests {
         let (sk, pk) = XWingSecret::generate().unwrap();
         let blob = wrap_pq(&MK, GEN, &DID, &pk).unwrap();
         assert_eq!(blob.len(), XWING_CT_LEN + 32 + 32);
-        let mk = unwrap_pq(&blob, GEN, &DID, &sk, &mk_commit()).unwrap();
-        assert_eq!(mk.generation(), GEN);
-        assert_eq!(mk.mk_commit(), mk_commit());
+        let key = unwrap_pq_raw(&blob, GEN, &DID, &sk).unwrap();
+        assert_eq!(*key, MK, "recovers the wrapped master key");
+        // The recovered key commits as expected; the cold-start fold checks this against the chain.
+        assert_eq!(MasterKey::new(GEN, *key).mk_commit(), mk_commit());
     }
 
     #[test]
-    fn rejects_wrong_recipient_tamper_and_commit() {
+    fn rejects_wrong_recipient_and_tamper() {
         let (sk, pk) = XWingSecret::generate().unwrap();
         let blob = wrap_pq(&MK, GEN, &DID, &pk).unwrap();
 
-        // `.err()` drops the Ok(MasterKey) (which has no Debug) and compares the error.
         // a different recipient cannot decaps to the same ss → AEAD fails.
         let (other_sk, _) = XWingSecret::generate().unwrap();
         assert_eq!(
-            unwrap_pq(&blob, GEN, &DID, &other_sk, &mk_commit()).err(),
+            unwrap_pq_raw(&blob, GEN, &DID, &other_sk).err(),
             Some(PqError::Aead)
         );
         // wrong device_id (AD mismatch) → AEAD fails.
         assert_eq!(
-            unwrap_pq(&blob, GEN, &[0x99; 32], &sk, &mk_commit()).err(),
+            unwrap_pq_raw(&blob, GEN, &[0x99; 32], &sk).err(),
             Some(PqError::Aead)
         );
         // tampered ciphertext → AEAD fails.
         let mut bad = blob.clone();
         *bad.last_mut().unwrap() ^= 1;
-        assert_eq!(
-            unwrap_pq(&bad, GEN, &DID, &sk, &mk_commit()).err(),
-            Some(PqError::Aead)
-        );
-        // a keyslot for a DIFFERENT master key opens but fails mk_commit (§8.3 anti-forgery).
+        assert_eq!(unwrap_pq_raw(&bad, GEN, &DID, &sk).err(), Some(PqError::Aead));
+        // A keyslot for a DIFFERENT master key still opens (the wrap commits to the shared secret, not
+        // the master key); its anti-forgery rejection is the `mk_commit` check at the cold-start fold
+        // (`secsec-roster`), not here.
         let fake = wrap_pq(&[0x77; 32], GEN, &DID, &pk).unwrap();
-        assert_eq!(
-            unwrap_pq(&fake, GEN, &DID, &sk, &mk_commit()).err(),
-            Some(PqError::CommitMismatch)
-        );
+        assert!(unwrap_pq_raw(&fake, GEN, &DID, &sk).is_ok());
     }
 
     #[test]
