@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::io::Read;
+
 /// Default FastCDC sizes (§19): 16 / 64 / 256 KiB.
 pub const DEFAULT_MIN: usize = 16 * 1024;
 /// Default average chunk size.
@@ -27,6 +29,26 @@ pub struct Chunker {
     mask_s: u64,
     mask_l: u64,
 }
+
+/// An error from [`Chunker::chunk_stream`]: reading the source, or the caller's `emit` callback.
+#[derive(Debug)]
+pub enum StreamError<E> {
+    /// Reading the input source failed.
+    Read(std::io::Error),
+    /// The `emit` callback returned an error (propagated unchanged).
+    Emit(E),
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for StreamError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            StreamError::Read(e) => write!(f, "chunk-stream read: {e}"),
+            StreamError::Emit(e) => write!(f, "chunk-stream emit: {e}"),
+        }
+    }
+}
+
+impl<E: std::error::Error> std::error::Error for StreamError<E> {}
 
 /// Build a 256-entry gear table by expanding `cdc_seed` with BLAKE3 in XOF mode.
 fn build_gear(cdc_seed: &[u8; 32]) -> [u64; 256] {
@@ -139,6 +161,50 @@ impl Chunker {
         }
         out
     }
+
+    /// Chunk `reader` as a stream, invoking `emit` once per content-defined chunk and holding at most
+    /// `max` bytes in memory regardless of input length. Returns the total bytes read.
+    ///
+    /// The cut points are **byte-identical** to [`Chunker::chunks`] over the whole input, the property
+    /// that keeps cross-device dedup and merge content-equality intact: a cut is decided only once the
+    /// window holds at least `max` bytes, or the reader is at EOF — so the window always covers exactly
+    /// the bytes the in-memory cutter (which scans at most `max` ahead) would have seen.
+    pub fn chunk_stream<R, E, F>(&self, mut reader: R, mut emit: F) -> Result<u64, StreamError<E>>
+    where
+        R: Read,
+        F: FnMut(&[u8]) -> Result<(), E>,
+    {
+        let mut buf: Vec<u8> = Vec::with_capacity(self.max);
+        let mut eof = false;
+        let mut total: u64 = 0;
+        loop {
+            // Refill the window up to `max` bytes; only EOF lets a shorter window be cut. The tail is
+            // zeroed once here (not per `read`), so a slow drip of tiny reads stays O(n), not O(n·max).
+            if !eof && buf.len() < self.max {
+                let mut filled = buf.len();
+                buf.resize(self.max, 0);
+                while filled < self.max {
+                    match reader.read(&mut buf[filled..]) {
+                        Ok(0) => {
+                            eof = true;
+                            break;
+                        }
+                        Ok(n) => filled += n,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(StreamError::Read(e)),
+                    }
+                }
+                buf.truncate(filled);
+            }
+            if buf.is_empty() {
+                return Ok(total);
+            }
+            let cut = self.next_cut(&buf);
+            emit(&buf[..cut]).map_err(StreamError::Emit)?;
+            total += cut as u64;
+            buf.drain(..cut);
+        }
+    }
 }
 
 /// floor(log2(x)) for x >= 1.
@@ -226,5 +292,74 @@ mod tests {
         assert_eq!(spread_mask(16).count_ones(), 16);
         assert_eq!(spread_mask(1).count_ones(), 1);
         assert_eq!(floor_log2(DEFAULT_AVG), 16);
+    }
+
+    /// A reader that yields at most `step` bytes per `read` — exercises read-width independence.
+    struct ChoppyReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        step: usize,
+    }
+    impl std::io::Read for ChoppyReader<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.step.min(out.len()).min(self.data.len() - self.pos);
+            out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    fn stream_cuts(c: &Chunker, data: &[u8], step: usize) -> Vec<usize> {
+        let mut got = Vec::new();
+        let total = c
+            .chunk_stream(
+                ChoppyReader {
+                    data,
+                    pos: 0,
+                    step: step.max(1),
+                },
+                |ch| {
+                    got.push(ch.len());
+                    Ok::<(), ()>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(total as usize, data.len(), "stream must read every byte");
+        got
+    }
+
+    /// The streaming cutter yields byte-identical boundaries to the in-RAM cutter, across the full
+    /// size matrix, high- and low-entropy inputs, and every read width.
+    #[test]
+    fn streaming_cuts_match_in_ram_across_sizes_and_read_widths() {
+        let c = Chunker::with_defaults(&SEED);
+        let sizes = [
+            0usize,
+            1,
+            2,
+            DEFAULT_MIN - 1,
+            DEFAULT_MIN,
+            DEFAULT_MIN + 1,
+            DEFAULT_AVG - 1,
+            DEFAULT_AVG,
+            DEFAULT_AVG + 1,
+            DEFAULT_MAX - 1,
+            DEFAULT_MAX,
+            DEFAULT_MAX + 1,
+            2 * DEFAULT_MAX,
+            3 * 1024 * 1024 + 7,
+        ];
+        for &sz in &sizes {
+            for input in [pseudo_random(&format!("stream-{sz}"), sz), vec![0u8; sz]] {
+                let want: Vec<usize> = c.chunks(&input).iter().map(|s| s.len()).collect();
+                for step in [1, 2, 3, 7, 13, DEFAULT_MIN, DEFAULT_MAX, DEFAULT_MAX + 1] {
+                    assert_eq!(
+                        stream_cuts(&c, &input, step),
+                        want,
+                        "size {sz}, read step {step}: streamed cuts differ from in-RAM"
+                    );
+                }
+            }
+        }
     }
 }
