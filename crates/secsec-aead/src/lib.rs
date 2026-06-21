@@ -1,5 +1,6 @@
 //! `secsec-aead` — the fully-committing (CMT-4) per-object AEAD of `secsec-Design.md` §9.4: the
-//! CTX construction (Chan & Rogaway) over raw ChaCha20-Poly1305.
+//! CTX construction (Chan & Rogaway) over RFC 8439 ChaCha20-Poly1305, composed here directly from
+//! the `chacha20` and `poly1305` primitives.
 //!
 //! ```text
 //! nonce   = 0                                   // sound ONLY because `key` is unique per object
