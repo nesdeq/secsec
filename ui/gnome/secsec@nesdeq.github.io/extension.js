@@ -287,11 +287,25 @@ export default class SecsecExtension extends Extension {
         this.openPreferences();
     }
 
-    // Prompt (unless already running / already prompting) and start the sync child. Config is read
-    // fresh here, so a folder/key changed in Settings takes effect on the next start or Restart.
+    // Maximum-aggressive clean slate: SIGKILL every `secsec` process (any folder, any subcommand) so a
+    // fresh sync can never race a stray, wedged, or orphaned one — there is no folder lock to stop two
+    // `secsec sync` at once. Matched by exact name, so gnome-shell and this extension are never
+    // targets. Synchronous, so the kill completes before we spawn.
+    killAllSecsec() {
+        try {
+            Gio.Subprocess.new(['pkill', '-KILL', '-x', 'secsec'], Gio.SubprocessFlags.NONE)
+                .wait(null);
+        } catch (_) {
+            // pkill missing or nothing matched — nothing to do
+        }
+    }
+
+    // Kill any running secsec, then prompt (unless already prompting) and start the sync child. Config
+    // is read fresh here, so a folder/key changed in Settings takes effect on the next start or Restart.
     start() {
         if (this._proc || this._dialog)
             return;
+        this.killAllSecsec();
         const cfg = readConfig();
         this._dialog = new PassphraseDialog(
             expandPath(cfg.folder),

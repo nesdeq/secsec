@@ -287,13 +287,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusLine.title = tail.isEmpty ? head : "\(head) — \(tail)"
     }
 
-    // Prompt for the passphrase (masked), cache it for the session, and start the sync child. Config
-    // is read fresh, so a folder/key changed from the menu takes effect on the next start/restart.
+    // Kill any running secsec, then prompt for a fresh passphrase and spawn — the user-initiated
+    // Start / Restart, and the launch prompt. Config is read fresh, so a folder/key changed from the
+    // menu takes effect here.
     private func promptAndStart() {
-        if isRunning { return }
+        killAllSecsec()
+        promptAndSpawn()
+    }
+
+    // Kill any running secsec, then relaunch reusing the session passphrase if it is still cached
+    // (seamless), else prompt. The wake-restart and folder/key reload paths.
+    private func startFromCacheOrPrompt() {
+        killAllSecsec()
+        if cache.hasValue {
+            intendRunning = true
+            spawn(readConfig())
+        } else {
+            promptAndSpawn()
+        }
+    }
+
+    // Prompt for the passphrase (masked), cache it for the session, spawn. The caller has already
+    // killed any running secsec.
+    private func promptAndSpawn() {
         let cfg = readConfig()
         guard let pass = promptPassphrase(folder: expandTilde(cfg.folder)) else {
-            refresh() // cancelled — user can Start from the menu later
+            intendRunning = false // cancelled — don't auto-relaunch on the next wake
+            refresh()
             return
         }
         cache.store(pass)
@@ -301,15 +321,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spawn(cfg)
     }
 
-    // Start from the cached passphrase if we have one (wake-restart, toggle, reload), else prompt.
-    private func startFromCacheOrPrompt() {
-        if isRunning { return }
-        if cache.hasValue {
-            intendRunning = true
-            spawn(readConfig())
-        } else {
-            promptAndStart()
-        }
+    // Maximum-aggressive clean slate: SIGKILL every `secsec` process (any folder, any subcommand) so a
+    // fresh sync can never race a stray, wedged, or orphaned one — there is no folder lock to stop two
+    // `secsec sync` at once. Matched by exact name, so this `secsec-menubar` agent is never a target.
+    // Synchronous, so the kill completes before we respawn.
+    private func killAllSecsec() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        p.arguments = ["-KILL", "-x", "secsec"]
+        try? p.run()
+        p.waitUntilExit()
+        task = nil
     }
 
     private func promptPassphrase(folder: String) -> String? {
@@ -346,10 +368,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stdinPipe = Pipe()
         proc.standardInput = stdinPipe
 
-        proc.terminationHandler = { [weak self] _ in
+        proc.terminationHandler = { [weak self] p in
             DispatchQueue.main.async {
-                self?.task = nil
-                self?.refresh()
+                guard let self else { return }
+                if self.task === p { // ignore a just-killed prior process's exit
+                    self.task = nil
+                    self.refresh()
+                }
             }
         }
         do {
@@ -379,32 +404,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Re-launch with current config (after a folder/key change) only if a sync is already running.
     private func reloadIfRunning() {
         if isRunning {
-            stop()
-            startFromCacheOrPrompt()
+            startFromCacheOrPrompt() // kills the old child + any stray, relaunches with new config
         } else {
             refresh()
         }
     }
 
     @objc private func toggle() {
-        if isRunning { stop(); refresh() } else { startFromCacheOrPrompt() }
+        if isRunning { stop(); refresh() } else { promptAndStart() }
     }
 
     @objc private func restart() {
-        stop()
-        startFromCacheOrPrompt()
+        promptAndStart() // kill any running secsec, re-ask the passphrase, respawn
     }
 
-    // Wake from sleep: the child's runtime is wedged, so terminate it and start a fresh process from
-    // the cached passphrase. A short delay lets Wi-Fi reassociate; the fresh child's own reconnect
-    // loop rides out any remaining settling.
+    // Wake from sleep: the child's runtime is wedged, so kill it (and any stray) and start a fresh
+    // process from the cached passphrase. A short delay lets Wi-Fi reassociate; the fresh child's own
+    // reconnect loop rides out any remaining settling.
     @objc private func systemDidWake(_ note: Notification) {
         guard intendRunning else { return } // sync not started, or stopped by the user — leave it
-        if let proc = task, proc.isRunning { proc.terminate() }
-        task = nil
+        killAllSecsec()
         refresh()
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self, self.intendRunning, !self.isRunning else { return }
+            guard let self, self.intendRunning, !self.isRunning, self.cache.hasValue else { return }
             self.spawn(readConfig())
         }
     }
