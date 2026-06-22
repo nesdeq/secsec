@@ -328,6 +328,11 @@ export default class SecsecExtension extends Extension {
             flags: Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDERR_MERGE,
         });
         launcher.set_stdout_file_path(this.logPath);
+        launcher.set_cwd(GLib.get_home_dir());
+        for (const v of ['NOTIFY_SOCKET', 'JOURNAL_STREAM', 'INVOCATION_ID', 'MEMORY_PRESSURE_WATCH',
+            'SYSTEMD_EXEC_PID', 'WATCHDOG_PID', 'WATCHDOG_USEC', 'LISTEN_PID', 'LISTEN_FDS',
+            'LISTEN_FDNAMES'])
+            launcher.unsetenv(v);
         let proc;
         try {
             proc = launcher.spawnv(argv);
