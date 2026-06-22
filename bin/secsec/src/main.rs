@@ -628,8 +628,13 @@ async fn run_serve(dir: PathBuf, port: Option<u16>) -> Result<(), Box<dyn Error>
     let before = std::fs::metadata(&store_path).map(|m| m.len()).unwrap_or(0);
     match store.compact() {
         Ok(true) => {
-            let after = std::fs::metadata(&store_path).map(|m| m.len()).unwrap_or(before);
-            println!("compacted {} ({before} → {after} bytes)", store_path.display());
+            let after = std::fs::metadata(&store_path)
+                .map(|m| m.len())
+                .unwrap_or(before);
+            println!(
+                "compacted {} ({before} → {after} bytes)",
+                store_path.display()
+            );
         }
         Ok(false) => {}
         Err(e) => eprintln!("repo compaction skipped: {e}"),
