@@ -309,8 +309,9 @@ fn hex12(b: &[u8; 32]) -> String {
 
 /// Drive the §10 rollback-aware merge of one sibling head: load the DAG, run the gates (rejection =
 /// [`MergeError::Rollback`], an alarm), and on Merge reconcile against the lowest common ancestor
-/// and author a signed merge commit. Precondition: the caller signature-verified the sibling and
-/// reachable commits against the roster (§9.6).
+/// and author a signed merge commit. Precondition: the caller signature-verified the sibling head and
+/// its tip commit against the roster (§9.6); ancestor commits are authenticated transitively by the
+/// member-signed head plus content-addressing (§9.2).
 pub fn merge_heads<K: MasterKeys>(
     frontier: &SyncFrontier,
     our_head_commit: &Id,

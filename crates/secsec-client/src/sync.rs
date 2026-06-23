@@ -21,7 +21,7 @@ use secsec_snapshot::{
     Commit,
 };
 use secsec_store::Store;
-use secsec_sync::rollback::{MergeReject, SiblingHead, SyncFrontier};
+use secsec_sync::rollback::{evaluate_merge, MergeDecision, MergeReject, SiblingHead, SyncFrontier};
 use secsec_sync::{Head, NO_PREV_HEAD};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -200,24 +200,62 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
     let (our_tree, our_salt) = snapshot_tree(dir, keys, store, prev.as_ref().map(|(t, s)| (t, s)))?;
     let unchanged = prev.as_ref().is_some_and(|(t, _)| *t == our_tree);
 
-    // No local changes: pull a newer head, or we are already up to date.
+    // No local changes: reconcile a differing remote head, or we are already up to date.
     if unchanged {
-        return match &head {
-            Some((h, sig, _)) if Some(h.commit_id) != base => {
-                let frontier = pull_to(remote, store, keys, frontier, members, h, sig, dir).await?;
+        let Some((h, sig, _blob)) = &head else {
+            return Ok(SyncOutcome {
+                kind: SyncKind::UpToDate,
+                base,
+                frontier: frontier.clone(),
+                conflicts: Vec::new(),
+            });
+        };
+        if Some(h.commit_id) == base {
+            return Ok(SyncOutcome {
+                kind: SyncKind::UpToDate,
+                base,
+                frontier: frontier.clone(),
+                conflicts: Vec::new(),
+            });
+        }
+        // The remote head differs from our base and we have no local changes. Classify it against
+        // base with the SAME rollback-gated DAG decision the merge path uses (§10): only a genuine
+        // fast-forward is restored. A replayed ancestor head — or a cas-unreachable incomparable fork
+        // — is NOT restored, so a malicious server cannot silently roll the working dir back (the §10
+        // "ancestor sibling is a no-op before the gates" rule).
+        let signer = resolve_head_signer(members, h, sig).ok_or(ClientError::HeadNotMember)?;
+        fetch_closure(remote, store, keys, &h.commit_id).await?;
+        let our = base.expect("the no-base clone path is handled above");
+        let (parents, meta) = secsec_engine::load_commit_dag(&[our, h.commit_id], keys, store)?;
+        let sibling = SiblingHead {
+            device_id: signer,
+            head_version: h.head_version,
+            roster_seq: h.roster_seq,
+            commit_id: h.commit_id,
+        };
+        return match evaluate_merge(frontier, &our, &sibling, &device_id, &parents, &meta) {
+            Ok(MergeDecision::FastForward) => {
+                let (commit, csig) = open_signed_commit(&h.commit_id, keys, store)?;
+                verify_commit(author_key(members, &commit)?, &commit, &csig)?;
+                restore_commit_tree(&commit, keys, store, dir)?;
+                let mut f = frontier.clone();
+                f.observe(&sibling, &parents, &meta);
                 Ok(SyncOutcome {
                     kind: SyncKind::Pulled,
                     base: Some(h.commit_id),
-                    frontier,
+                    frontier: f,
                     conflicts: Vec::new(),
                 })
             }
-            _ => Ok(SyncOutcome {
+            // Ancestor of our base (replayed) or a cas-unreachable incomparable fork: do not restore.
+            // A genuine fork reconciles keep-both on this device's next local change (the merge path).
+            Ok(MergeDecision::AlreadyHave | MergeDecision::Merge) => Ok(SyncOutcome {
                 kind: SyncKind::UpToDate,
                 base,
                 frontier: frontier.clone(),
                 conflicts: Vec::new(),
             }),
+            Err(reject) => Err(ClientError::Merge(MergeError::Rollback(reject))),
         };
     }
 
@@ -761,6 +799,147 @@ mod tests {
                 )))
             ),
             "a pulled head below the persisted head_version high-water must be a rollback alarm"
+        );
+    }
+
+    /// §10/P8: with no local changes, a malicious server replaying an OLDER (ancestor) head must NOT
+    /// roll the working dir back — even when that head is signed by a device whose per-device
+    /// head_version high-water equals the replayed head's version (so gate 2b alone would pass). The
+    /// pull path must apply the "ancestor sibling is a no-op before the gates" rule.
+    #[tokio::test]
+    async fn pull_path_refuses_ancestor_head_replay() {
+        use crate::{fetch_closure, fetch_head, push_head, push_objects};
+        use secsec_snapshot::{open_signed_commit, restore_commit_tree, seal_signed_commit};
+        use secsec_sync::ref_hash;
+
+        let dir = tempfile::tempdir().unwrap();
+        let m = MasterKey::new(1, [0x55; 32]);
+        let dev_a = DeviceKey::generate().unwrap();
+        let dev_b = DeviceKey::generate().unwrap();
+        let (ida, idb) = (dev_a.device_id().unwrap(), dev_b.device_id().unwrap());
+        let members: BTreeMap<DeviceId, DevicePublic> =
+            [(ida, dev_a.public()), (idb, dev_b.public())]
+                .into_iter()
+                .collect();
+        let remote = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
+        let auth = Store::open(dir.path().join("auth.redb")).unwrap();
+
+        // B publishes C_b (head v1).
+        let wb = tempfile::tempdir().unwrap();
+        std::fs::write(wb.path().join("f"), b"vB").unwrap();
+        let (tb, sb) = snapshot_tree(wb.path(), &m, &auth, None).unwrap();
+        let c_b = seal_signed_commit(
+            &m,
+            &auth,
+            &dev_b,
+            &Commit {
+                root_tree: tb,
+                root_salt: sb,
+                parents: vec![],
+                device_id: idb,
+                version: 1,
+                roster_seq: 0,
+                last_seen_head: [0; 32],
+                ts: 0,
+            },
+        )
+        .unwrap();
+        push_objects(&remote, &auth, &m, &c_b, &[1; 16]).await.unwrap();
+        let (head_b, blob_b) = push_head(&remote, &m, &dev_b, "main", c_b, 0, None, &[1; 16])
+            .await
+            .unwrap();
+
+        // A advances to C_a (head v2, descends from C_b).
+        std::fs::write(wb.path().join("f"), b"vA").unwrap();
+        let (ta, sa) = snapshot_tree(wb.path(), &m, &auth, Some((&tb, &sb))).unwrap();
+        let c_a = seal_signed_commit(
+            &m,
+            &auth,
+            &dev_a,
+            &Commit {
+                root_tree: ta,
+                root_salt: sa,
+                parents: vec![c_b],
+                device_id: ida,
+                version: 1,
+                roster_seq: 0,
+                last_seen_head: c_b,
+                ts: 0,
+            },
+        )
+        .unwrap();
+        push_objects(&remote, &auth, &m, &c_a, &[2; 16]).await.unwrap();
+        let (_head_a, blob_a) = push_head(
+            &remote,
+            &m,
+            &dev_a,
+            "main",
+            c_a,
+            0,
+            Some((&head_b, blob_b.as_slice())),
+            &[2; 16],
+        )
+        .await
+        .unwrap();
+
+        // Our device: at base C_a, working dir == C_a, frontier observed both heads.
+        let c_store = Store::open(dir.path().join("c.redb")).unwrap();
+        fetch_closure(&remote, &c_store, &m, &c_a).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let (ca_commit, _) = open_signed_commit(&c_a, &m, &c_store).unwrap();
+        restore_commit_tree(&ca_commit, &m, &c_store, work.path()).unwrap();
+        let frontier = SyncFrontier {
+            roster_seq: 0,
+            head_version_hwm: BTreeMap::from([(ida, 2), (idb, 1)]),
+            commit_version_hwm: BTreeMap::from([(ida, 1), (idb, 1)]),
+        };
+
+        // Malicious server rolls /refs/main back to C_b's head.
+        let ref_h = ref_hash(&m.ref_name_key(), "main");
+        remote
+            .store
+            .cas_ref(&ref_h, blake3::hash(&blob_a).as_bytes(), &blob_b, &[0; 16])
+            .unwrap();
+        assert_eq!(
+            fetch_head(&remote, &m, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .commit_id,
+            c_b,
+            "the server now serves the rolled-back head"
+        );
+
+        // Sync with no local change: must NOT roll the working dir back to C_b.
+        let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
+        let out = sync_once(
+            &remote,
+            &c_store,
+            work.path(),
+            &m,
+            &dev_a,
+            &members,
+            &frontier,
+            "main",
+            0,
+            Some(c_a),
+            0,
+            &[3; 16],
+            &seal,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.kind,
+            SyncKind::UpToDate,
+            "an ancestor-head replay must be a no-op, not a rollback"
+        );
+        assert_eq!(out.base, Some(c_a), "base must stay at C_a");
+        assert_eq!(
+            std::fs::read(work.path().join("f")).unwrap(),
+            b"vA",
+            "the working dir must not roll back to B's content"
         );
     }
 }

@@ -346,5 +346,9 @@ mod tests {
             hx(&roster_keyhist_key(&rk, 1)[..]),
             "3e5579e871ae6deb732e967391dcd05718a6c780ec82ece500235deb2b89d7d0"
         );
+        assert_eq!(
+            hx(&data_keyhist_key(&[0x11; 32], 1)[..]),
+            "6579b7397df7eec4ab045407b8ae9abf4fd8dead31d0ddc6a702252a89ad238b"
+        );
     }
 }

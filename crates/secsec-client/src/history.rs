@@ -16,13 +16,14 @@ use secsec_store::Store;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 enum Work {
-    Commit(Id),
-    Tree(Id, PathSalt),
+    Commit(Id, bool),
+    Tree(Id, PathSalt, bool),
 }
 
-/// Fetch every commit + tree reachable from `head_commit` into `store` — **not** the chunk blobs, which
-/// history listing/diffing never needs. Verifies each object on arrival (§9.2). A missing object is
-/// [`ClientError::MissingRemote`]; already-present objects are skipped.
+/// Fetch every commit + tree reachable from `head_commit` into `store` (not chunk blobs — listing and
+/// diffing never need them), verifying each on arrival (§9.2). Strict on the head commit and its own
+/// tree (a missing *current* object is a real error); skip-missing on ancestors, whose content may be
+/// pruned beyond retention (§15/I5), as in [`crate::fetch_closure`].
 pub async fn fetch_history<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
@@ -30,30 +31,33 @@ pub async fn fetch_history<R: Remote, K: MasterKeys>(
     head_commit: &Id,
 ) -> Result<(), ClientError> {
     let mut seen: BTreeSet<Id> = BTreeSet::new();
-    let mut work = vec![Work::Commit(*head_commit)];
+    let mut work = vec![Work::Commit(*head_commit, true)];
     while let Some(item) = work.pop() {
-        let id = match &item {
-            Work::Commit(id) | Work::Tree(id, _) => *id,
+        let (id, strict) = match &item {
+            Work::Commit(id, s) | Work::Tree(id, _, s) => (*id, *s),
         };
         if !seen.insert(id) {
             continue;
         }
         if store.get(&id)?.is_none() {
-            let blob = remote
-                .get_blob(&id)
-                .await?
-                .ok_or(ClientError::MissingRemote(id))?;
-            store.put(&id, &blob)?;
+            match remote.get_blob(&id).await? {
+                Some(blob) => {
+                    store.put(&id, &blob)?;
+                }
+                None if strict => return Err(ClientError::MissingRemote(id)),
+                None => continue, // pruned ancestor content (§15/I5)
+            }
         }
         match item {
-            Work::Commit(_) => {
+            Work::Commit(_, _) => {
                 let (commit, _sig) = open_signed_commit(&id, keys, store)?;
+                // Parents are ancestors (lenient); the head's own tree is current content (strict).
                 for p in &commit.parents {
-                    work.push(Work::Commit(*p));
+                    work.push(Work::Commit(*p, false));
                 }
-                work.push(Work::Tree(commit.root_tree, commit.root_salt));
+                work.push(Work::Tree(commit.root_tree, commit.root_salt, strict));
             }
-            Work::Tree(_, salt) => {
+            Work::Tree(_, salt, _) => {
                 let tree = load_tree(&id, &salt, keys, store)?;
                 for e in tree.entries {
                     if let Entry::Dir {
@@ -62,7 +66,7 @@ pub async fn fetch_history<R: Remote, K: MasterKeys>(
                         ..
                     } = e
                     {
-                        work.push(Work::Tree(subtree, subtree_salt));
+                        work.push(Work::Tree(subtree, subtree_salt, strict));
                     }
                 }
             }
@@ -158,8 +162,13 @@ pub(crate) async fn fetch_path_content<R: Remote, K: MasterKeys>(
     commit: &Commit,
     path: &str,
 ) -> Result<(), ClientError> {
-    let node = resolve_path(keys, store, &commit.root_tree, &commit.root_salt, path)?
-        .ok_or_else(|| ClientError::Snap(SnapError::PathNotFound(path.to_string())))?;
+    let node = match resolve_path(keys, store, &commit.root_tree, &commit.root_salt, path) {
+        Ok(Some(n)) => n,
+        Ok(None) => return Err(ClientError::Snap(SnapError::PathNotFound(path.to_string()))),
+        // Spine pruned beyond retention — nothing to fetch; restore_path reports PrunedBeyondRetention.
+        Err(SnapError::Missing(_)) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
     let mut chunk_ids: Vec<Id> = Vec::new();
     match node {
         PathNode::File { chunks, .. } => chunk_ids = chunks,
@@ -271,8 +280,32 @@ fn content_key(node: &Option<PathNode>) -> Option<Vec<Id>> {
     }
 }
 
+/// A path's state at a commit: `Resolved` (the spine is present, so the path is `Some`/`None` there)
+/// or `Pruned` (the spine was dropped beyond retention, §15 — unknown and unrestorable).
+enum PathState {
+    Resolved(Option<PathNode>),
+    Pruned,
+}
+
+/// Resolve `path` within a commit, mapping a pruned spine to [`PathState::Pruned`] rather than a fatal
+/// `Missing`, so [`path_history`] can skip versions it cannot characterize.
+fn resolve_state<K: MasterKeys>(
+    keys: &K,
+    store: &Store,
+    root_tree: &Id,
+    root_salt: &PathSalt,
+    path: &str,
+) -> Result<PathState, ClientError> {
+    match resolve_path(keys, store, root_tree, root_salt, path) {
+        Ok(node) => Ok(PathState::Resolved(node)),
+        Err(SnapError::Missing(_)) => Ok(PathState::Pruned),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The version history of one `path` (file or folder): the commits where its content changed, newest
-/// first. A commit is a version iff `path`'s content there differs from its first parent.
+/// first. A commit is a version iff `path`'s content there differs from its first parent. Versions
+/// whose spine is pruned beyond retention (§15/I5) are skipped — never surfaced as phantom deletions.
 pub fn path_history<K: MasterKeys>(
     keys: &K,
     store: &Store,
@@ -283,15 +316,26 @@ pub fn path_history<K: MasterKeys>(
     let mut out = Vec::new();
     for cid in order {
         let (commit, _sig) = open_signed_commit(&cid, keys, store)?;
-        let cur = resolve_path(keys, store, &commit.root_tree, &commit.root_salt, path)?;
+        // A pruned spine can't be characterized or restored — skip it (§15/I5).
+        let PathState::Resolved(cur) =
+            resolve_state(keys, store, &commit.root_tree, &commit.root_salt, path)?
+        else {
+            continue;
+        };
         let parent = match commit.parents.first() {
             Some(p) => {
                 let (pc, _) = open_signed_commit(p, keys, store)?;
-                resolve_path(keys, store, &pc.root_tree, &pc.root_salt, path)?
+                resolve_state(keys, store, &pc.root_tree, &pc.root_salt, path)?
             }
-            None => None,
+            None => PathState::Resolved(None),
         };
-        if content_key(&cur) != content_key(&parent) {
+        // Emit on a content change vs a resolvable parent; a pruned parent is the retention boundary,
+        // so the oldest still-present version is emitted there.
+        let changed = match parent {
+            PathState::Resolved(p) => content_key(&cur) != content_key(&p),
+            PathState::Pruned => cur.is_some(),
+        };
+        if changed {
             out.push(PathVersion {
                 commit_id: cid,
                 device_id: commit.device_id,

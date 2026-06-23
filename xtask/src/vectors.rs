@@ -3,7 +3,7 @@
 //! the human/cross-impl export can never drift from the implementation.
 
 use secsec_frame::{Frame, ObjType};
-use secsec_kdf::{obj_key, roster_entry_key, roster_keyhist_key, MasterKey};
+use secsec_kdf::{data_keyhist_key, obj_key, roster_entry_key, roster_keyhist_key, MasterKey};
 use secsec_roster::{seal_entry, seal_roster_keyhist};
 use secsec_sync::{ref_hash, seal_head, Head};
 use secsec_transport::auth::SessionTranscript;
@@ -42,6 +42,11 @@ fn computed() -> BTreeMap<String, String> {
     put(
         "roster_keyhist_key(roster_key[g=1], 1)",
         hx(&roster_keyhist_key(&rk, 1)[..]),
+    );
+    // DATA key-history forward-wrap key (§8.2): derive_key("secsec-keyhist-enc-v1", master_key ‖ le32(g)).
+    put(
+        "data_keyhist_key(master_key[g=1], 1)",
+        hx(&data_keyhist_key(&[0x11; 32], 1)[..]),
     );
 
     // [frame]

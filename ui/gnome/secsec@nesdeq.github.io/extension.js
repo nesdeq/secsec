@@ -23,6 +23,7 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {ModalDialog} from 'resource:///org/gnome/shell/ui/modalDialog.js';
 
 const PROMPT_DELAY_MS = 1200; // let the session settle before popping the login prompt
+const SPAWN_DELAY_MS = 10000; // after the passphrase: purge the log, wait, then launch secsec
 
 // Expand a leading `~` / `~/` to the home dir (config paths may be typed with a tilde).
 function expandPath(p) {
@@ -242,6 +243,7 @@ export default class SecsecExtension extends Extension {
         this._dialog = null;
         this._timeoutId = 0;
         this._pollId = 0;
+        this._spawnTimeoutId = 0;
 
         this._indicator = new Indicator(this);
         Main.panel.addToStatusArea(this.uuid, this._indicator);
@@ -303,7 +305,7 @@ export default class SecsecExtension extends Extension {
     // Kill any running secsec, then prompt (unless already prompting) and start the sync child. Config
     // is read fresh here, so a folder/key changed in Settings takes effect on the next start or Restart.
     start() {
-        if (this._proc || this._dialog)
+        if (this._proc || this._dialog || this._spawnTimeoutId)
             return;
         this.killAllSecsec();
         const cfg = readConfig();
@@ -311,12 +313,30 @@ export default class SecsecExtension extends Extension {
             expandPath(cfg.folder),
             pw => {
                 this._dialog = null;
-                this._spawn(cfg.bin, cfg.folder, cfg.key, pw);
+                // Purge the log, then wait SPAWN_DELAY_MS before launching: a clean slate plus a
+                // settle window after the passphrase, before secsec connects.
+                this.purgeLog();
+                this._indicator?.refresh();
+                this._spawnTimeoutId = GLib.timeout_add(
+                    GLib.PRIORITY_DEFAULT, SPAWN_DELAY_MS, () => {
+                        this._spawnTimeoutId = 0;
+                        this._spawn(cfg.bin, cfg.folder, cfg.key, pw);
+                        return GLib.SOURCE_REMOVE;
+                    });
             },
             () => {
                 this._dialog = null;
             });
         this._dialog.open(global.get_current_time());
+    }
+
+    // Delete the sync log so the next launch starts from a clean slate (matches a manual delete).
+    purgeLog() {
+        try {
+            Gio.File.new_for_path(this.logPath).delete(null);
+        } catch (_) {
+            // already absent — nothing to purge
+        }
     }
 
     _spawn(bin, folder, key, passphrase) {
@@ -365,17 +385,22 @@ export default class SecsecExtension extends Extension {
     }
 
     stop() {
-        if (!this._proc)
-            return;
-        try {
-            this._proc.send_signal(15); // SIGTERM — let secsec close its connection cleanly
-        } catch (_) {
-            try {
-                this._proc.force_exit();
-            } catch (_) {
-            }
+        // Cancel a pending post-passphrase launch (stop pressed during the settle window).
+        if (this._spawnTimeoutId) {
+            GLib.source_remove(this._spawnTimeoutId);
+            this._spawnTimeoutId = 0;
         }
-        this._proc = null;
+        if (this._proc) {
+            try {
+                this._proc.send_signal(15); // SIGTERM — let secsec close its connection cleanly
+            } catch (_) {
+                try {
+                    this._proc.force_exit();
+                } catch (_) {
+                }
+            }
+            this._proc = null;
+        }
         this._indicator?.refresh();
     }
 

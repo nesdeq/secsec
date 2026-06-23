@@ -390,6 +390,14 @@ pub fn rotate_repo(
     revoke: Option<DeviceId>,
     ts: u64,
 ) -> Result<(MasterKey, State), RepoError> {
+    // §16: with X-Wing the only keyslot algorithm, a floor above it cannot be satisfied — abort
+    // before minting a generation whose keyslots every member would reject at cold-start.
+    if state.min_algo > ALGO_XWING {
+        return Err(RepoError::AlgoTooWeak {
+            got: ALGO_XWING,
+            floor: state.min_algo,
+        });
+    }
     let g = mk.generation();
     let g1 = g + 1;
 
@@ -480,6 +488,14 @@ pub async fn rotate_repo_remote<R: Remote>(
     revoke: Option<DeviceId>,
     ts: u64,
 ) -> Result<(MasterKey, State), RepoError> {
+    // §16: with X-Wing the only keyslot algorithm, a floor above it cannot be satisfied — abort
+    // before minting a generation whose keyslots every member would reject at cold-start.
+    if state.min_algo > ALGO_XWING {
+        return Err(RepoError::AlgoTooWeak {
+            got: ALGO_XWING,
+            floor: state.min_algo,
+        });
+    }
     let g = mk.generation();
     let g1 = g + 1;
 

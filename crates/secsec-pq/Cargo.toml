@@ -16,6 +16,5 @@ secsec-canon = { path = "../secsec-canon" }
 libcrux-ml-kem = "0.0.9"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 sha3 = "0.10"
-blake3 = "1"
 zeroize = "1"
 getrandom = "0.3"

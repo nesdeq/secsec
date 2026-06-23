@@ -173,6 +173,13 @@ pub fn parse_authorized_keys(body: &str) -> BTreeSet<DeviceId> {
 impl Server {
     /// Build a handler over `store` with default limits and an open allow-list (tighten with
     /// [`with_limits`](Self::with_limits) / [`with_authorized_file`](Self::with_authorized_file)).
+    ///
+    /// # Safety
+    /// The default allow-list is [`Authorized::Any`] — **every** authenticated key may open a session
+    /// (the connection gate is off). Any networked deployment MUST call
+    /// [`with_authorized_file`](Self::with_authorized_file) to enable the mandatory `authorized_keys`
+    /// gate (§11); `secsec serve` does this and refuses to start without a usable file. The open
+    /// default exists only for in-process/test backends.
     #[must_use]
     pub fn new(store: Store) -> Self {
         Self {

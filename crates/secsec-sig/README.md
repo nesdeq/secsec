@@ -14,11 +14,12 @@ not parse, and `DevicePublic::verify` additionally rejects any non-Ed25519 key o
 
 ## Public API
 
-- `DeviceKey` — `generate()` / `from_openssh(pem)`; `sign(namespace, msg)`, `device_id()`,
-  `public()`, `to_canonical()`. Key-derived secrets: `local_seal_key` (§8.5 frontier seal),
-  `x25519_secret` / `x25519_public`, and `xwing_seed()` — the X-Wing decapsulation seed derived from
-  the raw Ed25519 **seed** (not the clamped scalar, so it is quantum-hard to recover from the public
-  key, §8.3).
-- `DevicePublic` — `from_canonical`, `verify(namespace, msg, sig)`, `device_id()`.
+- `DeviceKey` — `generate()` / `from_openssh(pem)` / `from_openssh_passphrase(pem, pass)`;
+  `sign(namespace, msg)`, `device_id()`, `public()`. Key-derived secrets: `local_seal_key()` (§8.5
+  frontier seal) and `xwing_seed()` — the X-Wing decapsulation seed derived from the raw Ed25519
+  **seed** (not the clamped scalar, so it is quantum-hard to recover from the public key, §8.3). (The
+  `x25519_secret` map is crate-internal.)
+- `DevicePublic` — `from_openssh`, `from_canonical` / `to_canonical`, `verify(namespace, msg, sig)`,
+  `device_id()`, `ssh_fingerprint()`.
 - Namespace constants: `NS_AUTH`, `NS_WRITE`, `NS_READ`, `NS_COMMIT`, `NS_HEAD`, `NS_ROSTER` (§9.6).
 - `DeviceId`, `SigError`.

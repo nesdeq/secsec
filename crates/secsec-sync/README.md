@@ -19,14 +19,14 @@ frontier and HWM checks (§8.5, [`rollback`]).
 
 ## Public API
 
-- Head: `build_head`, `sign_head` / `verify_head`, `seal_head` / `open_head`, `head_id`,
-  `is_head_successor`, `ref_hash`, `random_nonce`, `Head`, `HEAD_*`/`MAX_REF_NAME` constants.
-- Frontier seal (§8.5): `seal_frontier` / `open_frontier`.
-- `dag` — `ancestors`, `is_ancestor`, `incomparable`, `common_ancestors`, `lowest_common_ancestors`,
-  `CommitMeta`.
+- Head: `build_head`, `sign_head` / `verify_head`, `seal_head` / `open_head`, `head_id`, `ref_hash`,
+  `random_nonce`, `Head`, `HEAD_NONCE_LEN`, `NO_PREV_HEAD`.
+- Frontier seal (§8.5): `seal_frontier` / `open_frontier` (in `rollback`).
+- `dag` — `lowest_common_ancestors`, `ParentMap`, `Id` (the ancestry traversals it builds on are
+  crate-internal).
 - `merge` — `three_way_merge`, `Node`, `Merge`, `Conflict`, `ConflictKind`.
 - `rollback` — `evaluate_merge` (the roster_seq / version / `head_version` HWM gates; a
-  DAG-incomparable sibling routes to the three-way keep-both merge), `observe`, `MergeDecision`,
-  `MergeReject`.
+  DAG-incomparable sibling routes to the three-way keep-both merge), `SyncFrontier` (+ `observe`),
+  `SiblingHead`, `CommitMeta`, `MergeDecision`, `MergeReject`.
 
 The storage bridge that materializes `Node`s and re-seals the merge lives in `secsec-engine`.

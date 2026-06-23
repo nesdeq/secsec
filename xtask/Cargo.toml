@@ -15,6 +15,5 @@ secsec-frame = { path = "../crates/secsec-frame" }
 secsec-aead = { path = "../crates/secsec-aead" }
 secsec-object = { path = "../crates/secsec-object" }
 secsec-sync = { path = "../crates/secsec-sync" }
-secsec-proto = { path = "../crates/secsec-proto" }
 secsec-roster = { path = "../crates/secsec-roster" }
 secsec-transport = { path = "../crates/secsec-transport" }

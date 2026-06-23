@@ -387,8 +387,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Feed the cached passphrase over stdin, then close so `secsec` reads EOF. The secret only
         // ever travels this pipe — it is never an argument.
-        if let pass = cache.reveal() {
+        if var pass = cache.reveal() {
             try? stdinPipe.fileHandleForWriting.write(contentsOf: pass)
+            pass.resetBytes(in: 0..<pass.count) // scrub the transient plaintext copy
         }
         try? stdinPipe.fileHandleForWriting.close()
         refresh()

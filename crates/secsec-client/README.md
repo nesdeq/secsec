@@ -22,6 +22,8 @@ the QUIC adapter (`quic.rs`, over `secsec-transport`) is a thin layer on top.
 - **`sync`** — `sync_once` (clone / publish / pull / merge in one call), `SyncKind`, `SyncOutcome`.
 - Push/pull primitives: `push_objects` / `push_head`, `fetch_head` / `fetch_closure`,
   `sync_ref` (+ `resolve_head_signer`).
+- **`history`** (§10/§15) — the read side of `secsec log` / `secsec restore`: `fetch_history`,
+  `repo_log`, `path_history`, `commit_ids`, `restore`.
 - **`prune`** (§15) — `local_sweep` (drops cache orphans unreachable from the head) and
   `prune_history` (count-based retention: keep the last N versions per file, delete the rest under the
   head-CAS). (Driven automatically from the `sync` loop — no `prune` command.)

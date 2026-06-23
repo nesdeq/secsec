@@ -234,4 +234,94 @@ mod tests {
             .await
             .unwrap();
     }
+
+    /// Regression: once retention prunes an old version's tree, a *second* `prune_history` (and a
+    /// `log`) must walk the kept commit skeleton over those pruned ancestors without erroring —
+    /// skip-missing on pruned content (§15/I5), not a fatal `MissingRemote`. Before the fetch_history
+    /// fix this failed every run with "required object absent on remote".
+    #[tokio::test]
+    async fn prune_history_tolerates_already_pruned_ancestors() {
+        use crate::testmem::MemRemote;
+        use crate::{fetch_head, push_head, push_objects};
+        use secsec_sync::Head;
+
+        let dir = tempfile::tempdir().unwrap();
+        let m = MasterKey::new(1, [0x55; 32]);
+        let dev = DeviceKey::generate().unwrap();
+        let remote = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
+        let store = Store::open(dir.path().join("c.redb")).unwrap();
+
+        // Four fully-distinct versions of one file (each version's chunks are unique → prunable).
+        let work = tempfile::tempdir().unwrap();
+        let mut prev_tree: Option<(Id, [u8; 16])> = None;
+        let mut prev_head: Option<(Head, Vec<u8>)> = None;
+        let mut commits: Vec<Id> = Vec::new();
+        for v in 1..=4u8 {
+            let mut data = vec![0u8; 200 * 1024];
+            getrandom::fill(&mut data).unwrap();
+            std::fs::write(work.path().join("f.bin"), &data).unwrap();
+            let (rt, rs) = secsec_snapshot::snapshot_tree(
+                work.path(),
+                &m,
+                &store,
+                prev_tree.as_ref().map(|(t, s)| (t, s)),
+            )
+            .unwrap();
+            let parents = commits.last().copied().map(|c| vec![c]).unwrap_or_default();
+            let last_seen = prev_head
+                .as_ref()
+                .map(|(h, _)| secsec_sync::head_id(h))
+                .unwrap_or([0u8; 32]);
+            let commit = Commit {
+                root_tree: rt,
+                root_salt: rs,
+                parents,
+                device_id: dev.device_id().unwrap(),
+                version: u64::from(v),
+                roster_seq: 0,
+                last_seen_head: last_seen,
+                ts: u64::from(v),
+            };
+            let cid = seal_signed_commit(&m, &store, &dev, &commit).unwrap();
+            let push = [v; 16];
+            push_objects(&remote, &store, &m, &cid, &push).await.unwrap();
+            let (h, b) = push_head(
+                &remote,
+                &m,
+                &dev,
+                "main",
+                cid,
+                0,
+                prev_head.as_ref().map(|(h, b)| (h, b.as_slice())),
+                &push,
+            )
+            .await
+            .unwrap();
+            prev_tree = Some((rt, rs));
+            prev_head = Some((h, b));
+            commits.push(cid);
+        }
+
+        // First prune keeps the last 2 versions → v1/v2 trees + chunks are pruned on both sides.
+        prune_history(&remote, &store, &m, "main", 2, 0).await.unwrap();
+
+        // The regression: a second prune walks v1/v2's pruned trees without erroring, and `log` still
+        // lists every (kept) commit (I4).
+        prune_history(&remote, &store, &m, "main", 2, 0).await.unwrap();
+        let (head, _, _) = fetch_head(&remote, &m, "main").await.unwrap().unwrap();
+        crate::history::fetch_history(&remote, &store, &m, &head.commit_id)
+            .await
+            .unwrap();
+        let log = crate::history::repo_log(&m, &store, &head.commit_id).unwrap();
+        assert_eq!(log.len(), 4, "every commit is kept past the retention window (I4)");
+
+        // `log <path>` over the same pruned history lists only resolvable versions, never errors, and
+        // never reports a pruned version as a deletion (no phantom-delete).
+        let hist = crate::history::path_history(&m, &store, &head.commit_id, "f.bin").unwrap();
+        assert!(!hist.is_empty(), "the kept versions of f.bin remain listed");
+        assert!(
+            hist.iter().all(|v| v.present),
+            "a pruned version must never surface as a deletion"
+        );
+    }
 }

@@ -30,10 +30,11 @@ pipeline is unit-testable by calling `Server::handle` directly — no sockets.
 ## Public API
 
 - `Server` — `new(store)`, `with_limits(Limits)` (operator-tunable runtime limits, §15/§19),
-  `with_authorized(set)` / `with_authorized_file(path)` (the §11 connection gate), `is_authorized`,
-  `handle(request, now)` (the pure pipeline), `issue_nonce`, `store()`. It stages objects on `put`,
-  promotes them on `cas-head` (charging the per-key cap on promoted bytes), executes `prune` under a
-  head-binding CAS, and runs a background `reclaim_staging` sweep over idle pushes.
-- `parse_authorized_keys`, `Authorized` (`Any` / `Static` / `File`).
+  `with_authorized_file(path)` (the §11 connection gate), `conn_rate_per_sec`, `reclaim_staging`. It
+  stages objects on `put`, promotes them on `cas-head` (charging the per-key cap on promoted bytes),
+  executes `prune` under a head-binding CAS, and runs a background `reclaim_staging` sweep over idle
+  pushes. The per-op pipeline `handle(request, now)` is crate-internal (driven by `serve_connection`
+  and the in-crate unit tests) — clock-injected so it needs no sockets.
+- `parse_authorized_keys` (the allow-list `Any` / `File` source is crate-internal).
 - `serve` — `serve_connection` (the QUIC serve loop over `secsec-transport`; enforces the gate).
 - `Incoming`, `ServeError`.

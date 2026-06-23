@@ -11,7 +11,6 @@ workspace = true
 
 [dependencies]
 secsec-frame = { path = "../secsec-frame" }
-secsec-canon = { path = "../secsec-canon" }
 secsec-object = { path = "../secsec-object" }
 secsec-snapshot = { path = "../secsec-snapshot" }
 secsec-roster = { path = "../secsec-roster" }

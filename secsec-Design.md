@@ -597,8 +597,8 @@ listed above**.
 > where `master_key_g` serves as a BLAKE3 key argument; the two uses are domain-separated by
 > BLAKE3's internal API distinction. Implementors MUST NOT substitute `BLAKE3::derive_key` here.
 
-**Test vectors must be provided in the implementation for all nine derivations** (the eight
-`derive_key` derivations plus the `mk_commit_g` `keyed_hash`).
+**Test vectors must be provided in the implementation for all ten `derive_key` derivations** (the
+eight listed above plus `k_obj` (§9.4) and `k_keyhist` (§8.2)) **plus the `mk_commit_g` `keyed_hash`**.
 
 `roster_key_g` (= `derive_key("secsec-roster-enc-v1", master_key_g)`, **one per generation**)
 encrypts the sigchain entries written under generation `g` so the server cannot read them.
@@ -932,6 +932,14 @@ dispatched *before* this check — a joining device owns no keyslot yet — and 
 while the roster is empty** (`roster_len == 0`), letting the first device create the repo. Every
 other op from an unenrolled key is rejected.
 
+`delete-keyslot` is authorized as a generic `secsec-write-v1` op from any rostered key: the **blind**
+server cannot fold the encrypted sigchain to confirm that a deletion corresponds to a real
+`RevokeDevice`, so it cannot bind the delete to a legitimate revocation. A compromised *current
+member* could therefore delete another member's keyslot (a cold-start DoS on that peer) — a griefing
+vector inside the flat-trust member set (§8.4), not reachable by the threat-model adversaries: a
+malicious server mutates its own store directly regardless, and a revoked device is already rejected
+by the keyslot-existence check above. Closing it would require a non-blind server.
+
 The server SHOULD re-verify keyslot existence on each per-op request and MUST do so at least once
 per `server_nonce` TTL window (60 s, §19), closing the open-connection gap on cooperative
 deployments. (A revoked device cannot authenticate new connections once its keyslot is deleted on
@@ -1095,8 +1103,12 @@ and swaps the ref in one redb write transaction**:
 > object — and no separate sweep is ever needed to collect a half-finished push.
 
 Consequences:
-- `has(ids)` reports **durable** existence only (**I3**); a push checks its own not-yet-promoted objects
-  with `has_for_push(push_id, ids)`, so a crash-resumed attempt re-uploads only what is still missing.
+- `has(ids)` reports **durable** existence only (**I3**), so over the blind server a crash-resumed
+  attempt re-stages its still-unpromoted objects **idempotently** (`stage()` no-ops an already-durable
+  id; re-staging overwrites the same `push_id ‖ id` key). The `has_for_push(push_id, ids)` gap-only
+  optimization — re-uploading *only* what is still missing — is a property of the in-process object
+  store and is not exposed as a wire op; the QUIC transport relies on durable dedup (`has`) plus
+  idempotent re-staging, which is equally correct.
 - A `push_id` is **per attempt**, not per repo. A `cas-head` conflict (another device advanced the ref)
   makes the merge retry mint a fresh `push_id`; the losing attempt's staged objects are never promoted —
   its `cas-head` never ran — so a winning promote carries exactly that attempt's head closure, no
@@ -1313,7 +1325,7 @@ contract) or that bounds an attacker is **not** configurable. `[client]` keys ap
 | Max list fields (sigchain, keyhist, etc.) | 4,096 elements | decoders reject before allocating |
 ## 20. Crates
 
-`quinn`,`rustls` · `ssh-key`(SSHSIG, Ed25519-only),`ed25519-dalek`,`x25519-dalek` · `libcrux-ml-kem`
+`quinn`,`rustls` · `ssh-key`(SSHSIG, Ed25519-only),`x25519-dalek` · `libcrux-ml-kem`
 (ML-KEM-768 for the X-Wing keyslot),`sha3` · `blake3` · `chacha20`+`poly1305` (the §9.4 CTX
 committing AEAD) · `fastcdc` · `notify` · `redb` · `tokio` · `zeroize`,`subtle`,`getrandom`.
 Transport is **QUIC/TLS-only** (no SSH/stdio mode — it adds nothing over the pinned host key, §11).

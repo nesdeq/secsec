@@ -524,6 +524,16 @@ pub(crate) async fn sync_ref<R: Remote, K: MasterKeys>(
         .ok_or(ClientError::HeadNotMember)?;
     fetch_closure(remote, store, keys, &remote_head.commit_id).await?;
 
+    // Authenticate the sibling's tip commit against the roster (P3) before its metadata feeds the
+    // rollback gates — mirrors the pull path. Ancestor commits are authenticated transitively by the
+    // member-signed head + content-addressing (§9.2/§9.6).
+    let (sib_commit, sib_csig) =
+        secsec_snapshot::open_signed_commit(&remote_head.commit_id, keys, store)?;
+    let sib_author = members
+        .get(&sib_commit.device_id)
+        .ok_or(ClientError::HeadNotMember)?;
+    secsec_snapshot::verify_commit(sib_author, &sib_commit, &sib_csig)?;
+
     let sibling = SiblingHead {
         device_id: signer,
         head_version: remote_head.head_version,

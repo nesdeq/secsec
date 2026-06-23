@@ -30,6 +30,8 @@ mk_commit[g=1]                          = 73300b1d7cdd3cd2baeffd447f1b3ffdafde8e
 obj_key(roster_key[g=1], id)            = fe2d3fc22b54a0ca49b74df325a9f5202bf03e16b0ece7788f77236f3f18fe2b
 roster_entry_key(roster_key[g=1], 1)    = 0866a38d6c6924ac9b411189b06e3a7c15ad01c94ff4bae11f11fc6a53b640aa
 roster_keyhist_key(roster_key[g=1], 1)  = 3e5579e871ae6deb732e967391dcd05718a6c780ec82ece500235deb2b89d7d0
+# data_keyhist_key(master_key_next, g): master_key_next = master_key (0x11*32), g = 1 (§8.2 k_keyhist).
+data_keyhist_key(master_key[g=1], 1)    = 6579b7397df7eec4ab045407b8ae9abf4fd8dead31d0ddc6a702252a89ad238b
 
 [frame]   # asserts: secsec-frame  tests::frame_encode_kat
 # Frame::v1(gen=1, type=Chunk).encode() = MAGIC("ssec") | version(01) | algo(01) | gen(le32=01000000) | type(00)

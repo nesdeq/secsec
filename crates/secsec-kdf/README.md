@@ -21,4 +21,5 @@ of the codebase exactly. The sole exception is `mk_commit_g`, which uses
 - `SecretKey` (a `Zeroizing<[u8;32]>` alias).
 
 Pure derivation — key generation/storage policy lives in the key-management layer. Test vectors are
-provided for all nine derivations (the eight `derive_key`s + `mk_commit`); they are frozen as KATs.
+provided for all ten `derive_key` derivations (the eight in §9.5 plus `obj_key` and
+`data_keyhist_key`) plus `mk_commit`; they are frozen as KATs.
