@@ -21,7 +21,9 @@ use secsec_snapshot::{
     Commit,
 };
 use secsec_store::Store;
-use secsec_sync::rollback::{evaluate_merge, MergeDecision, MergeReject, SiblingHead, SyncFrontier};
+use secsec_sync::rollback::{
+    evaluate_merge, MergeDecision, MergeReject, SiblingHead, SyncFrontier,
+};
 use secsec_sync::{Head, NO_PREV_HEAD};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -844,7 +846,9 @@ mod tests {
             },
         )
         .unwrap();
-        push_objects(&remote, &auth, &m, &c_b, &[1; 16]).await.unwrap();
+        push_objects(&remote, &auth, &m, &c_b, &[1; 16])
+            .await
+            .unwrap();
         let (head_b, blob_b) = push_head(&remote, &m, &dev_b, "main", c_b, 0, None, &[1; 16])
             .await
             .unwrap();
@@ -868,7 +872,9 @@ mod tests {
             },
         )
         .unwrap();
-        push_objects(&remote, &auth, &m, &c_a, &[2; 16]).await.unwrap();
+        push_objects(&remote, &auth, &m, &c_a, &[2; 16])
+            .await
+            .unwrap();
         let (_head_a, blob_a) = push_head(
             &remote,
             &m,

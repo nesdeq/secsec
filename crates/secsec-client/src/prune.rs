@@ -284,7 +284,9 @@ mod tests {
             };
             let cid = seal_signed_commit(&m, &store, &dev, &commit).unwrap();
             let push = [v; 16];
-            push_objects(&remote, &store, &m, &cid, &push).await.unwrap();
+            push_objects(&remote, &store, &m, &cid, &push)
+                .await
+                .unwrap();
             let (h, b) = push_head(
                 &remote,
                 &m,
@@ -303,17 +305,25 @@ mod tests {
         }
 
         // First prune keeps the last 2 versions → v1/v2 trees + chunks are pruned on both sides.
-        prune_history(&remote, &store, &m, "main", 2, 0).await.unwrap();
+        prune_history(&remote, &store, &m, "main", 2, 0)
+            .await
+            .unwrap();
 
         // The regression: a second prune walks v1/v2's pruned trees without erroring, and `log` still
         // lists every (kept) commit (I4).
-        prune_history(&remote, &store, &m, "main", 2, 0).await.unwrap();
+        prune_history(&remote, &store, &m, "main", 2, 0)
+            .await
+            .unwrap();
         let (head, _, _) = fetch_head(&remote, &m, "main").await.unwrap().unwrap();
         crate::history::fetch_history(&remote, &store, &m, &head.commit_id)
             .await
             .unwrap();
         let log = crate::history::repo_log(&m, &store, &head.commit_id).unwrap();
-        assert_eq!(log.len(), 4, "every commit is kept past the retention window (I4)");
+        assert_eq!(
+            log.len(),
+            4,
+            "every commit is kept past the retention window (I4)"
+        );
 
         // `log <path>` over the same pruned history lists only resolvable versions, never errors, and
         // never reports a pruned version as a deletion (no phantom-delete).
