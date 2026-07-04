@@ -140,7 +140,10 @@ only: file-type bits are redundant (the entry kind already distinguishes file vs
 **setuid / setgid / sticky** bits are deliberately dropped on both snapshot and restore (§18), so a
 compromised member cannot author a tree that plants a setuid/setgid file on every device. Tree entry
 names are a single path component: never empty, `.`/`..`, a path separator, or a control character
-(§9.2/§18 path-traversal and terminal-escape guards).
+(§9.2/§18 path-traversal and terminal-escape guards). A working-folder entry whose name is **not** a
+valid tree entry name (non-UTF-8, or one of the above) is **skipped** on snapshot exactly like a
+symlink — symmetric with the decode-side guard, so an unsyncable name is never authored (macOS's
+`Icon\r` custom-folder-icon file, for one, is silently not synced rather than failing the snapshot).
 
 ---
 
@@ -1270,7 +1273,8 @@ X-Wing keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today
   `cargo-fuzz` targets for every decoder; reject non-canonical encodings.
 - **Secrets never logged;** structured redaction; no key material in error messages.
 - **Restore hygiene:** tree entry names are single path components with no separators, no `.`/`..`,
-  and **no control characters** (path-traversal + terminal-escape guards, enforced at decode); the
+  and **no control characters** (path-traversal + terminal-escape guards, enforced at decode and
+  skipped symmetrically at snapshot, §6); the
   restored `mode` is the 9 standard permission bits only — **setuid / setgid / sticky are dropped**,
   so a compromised member cannot plant a setuid/setgid file on every device. Writing a tree back to
   the working folder reconciles it (upstream deletions applied), never following or deleting an

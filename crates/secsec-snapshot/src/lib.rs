@@ -232,20 +232,17 @@ fn encode_tree(tree: &Tree) -> Vec<u8> {
     w.finish()
 }
 
-/// Path-traversal guard, enforced at decode (§18): a name MUST be a single non-empty path
-/// component — never `.`/`..`, a separator, or a control character (terminal-escape injection). A
-/// compromised member (§3) can author a tree, so restore must never join an unchecked name.
-fn validate_entry_name(name: &str) -> Result<(), SnapError> {
-    if name.is_empty()
+/// Path-traversal guard (§18): a name is safe iff it is a single non-empty path component — never
+/// `.`/`..`, a separator, or a control character (terminal-escape injection). Enforced both ways: the
+/// scanner ([`snapshot_dir`]) skips a name that fails this, [`decode_tree`] rejects one — so an
+/// unsyncable name is never authored, and a compromised member (§3) still cannot smuggle one past.
+fn is_safe_entry_name(name: &str) -> bool {
+    !(name.is_empty()
         || name == "."
         || name == ".."
         || name.contains('/')
         || name.contains('\\')
-        || name.chars().any(|c| c.is_control())
-    {
-        return Err(SnapError::Malformed("unsafe tree entry name"));
-    }
-    Ok(())
+        || name.chars().any(|c| c.is_control()))
 }
 
 fn decode_tree(bytes: &[u8]) -> Result<Tree, SnapError> {
@@ -260,7 +257,9 @@ fn decode_tree(bytes: &[u8]) -> Result<Tree, SnapError> {
         let name =
             String::from_utf8(r.bytes(MAX_NAME)?.to_vec()).map_err(|_| SnapError::NonUtf8Name)?;
         // Name guard + §9.3 canonical ordering: strictly ascending names (also bans duplicates).
-        validate_entry_name(&name)?;
+        if !is_safe_entry_name(&name) {
+            return Err(SnapError::Malformed("unsafe tree entry name"));
+        }
         if let Some(last) = entries.last() {
             if name.as_str() <= entry_name(last) {
                 return Err(SnapError::Malformed(
@@ -564,7 +563,16 @@ fn snapshot_dir<K: MasterKeys>(
 
     let mut entries = Vec::with_capacity(names.len());
     for name_os in names {
-        let name = name_os.to_str().ok_or(SnapError::NonUtf8Name)?.to_owned();
+        // §6: an entry whose name can't be a valid tree entry name — non-UTF-8, or one the decoder
+        // rejects (control char, backslash, `.`/`..`) — is skipped like a symlink, never authored.
+        // Keeps the macOS `Icon\r` custom-folder-icon file from failing the whole snapshot.
+        let Some(name) = name_os
+            .to_str()
+            .filter(|n| is_safe_entry_name(n))
+            .map(str::to_owned)
+        else {
+            continue;
+        };
         let path = dir.join(&name_os);
         let meta = std::fs::symlink_metadata(&path)?;
         let ft = meta.file_type();
@@ -1437,6 +1445,26 @@ mod tests {
         }
         // a benign single-component name still decodes.
         assert!(decode_tree(&encode_tree(&one("ok.txt"))).is_ok());
+    }
+
+    /// Scan/decode symmetry (§6): the scanner SKIPS a name the decoder would refuse — like a symlink —
+    /// rather than authoring it (which would wedge every reader) or failing the whole snapshot. The
+    /// macOS custom-folder-icon file `Icon\r` is the real trigger; the good file still snapshots and the
+    /// built tree omits the bad names and decodes cleanly.
+    #[test]
+    fn snapshot_skips_unsafe_names() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let m = mk();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("keep.txt"), b"good").unwrap();
+        std::fs::write(work.path().join("Icon\r"), b"resource fork").unwrap();
+        std::fs::write(work.path().join("tab\there"), b"weird").unwrap();
+
+        let (root, salt) = snapshot_tree(work.path(), &m, &store, None).unwrap();
+        let tree = load_tree(&root, &salt, &m, &store).unwrap();
+        let names: Vec<&str> = tree.entries.iter().map(entry_name).collect();
+        assert_eq!(names, vec!["keep.txt"], "only the safe name is authored");
     }
 
     /// Restore hardening (§18): setuid / setgid / sticky bits in a member-authored tree are stripped —
