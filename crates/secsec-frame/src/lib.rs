@@ -58,8 +58,6 @@ pub enum ObjType {
     Head = 3,
     /// Roster sigchain entry.
     RosterEntry = 4,
-    /// Per-device master-key wrap.
-    Keyslot = 5,
     /// Data key-history wrap (§8.2).
     Keyhist = 6,
     /// Roster-key history wrap (§8.2).
@@ -82,7 +80,6 @@ impl ObjType {
             2 => Self::Commit,
             3 => Self::Head,
             4 => Self::RosterEntry,
-            5 => Self::Keyslot,
             6 => Self::Keyhist,
             7 => Self::RosterKeyhist,
             _ => return None,
@@ -273,7 +270,6 @@ mod tests {
             ObjType::Commit,
             ObjType::Head,
             ObjType::RosterEntry,
-            ObjType::Keyslot,
             ObjType::Keyhist,
             ObjType::RosterKeyhist,
         ] {

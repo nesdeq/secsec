@@ -20,4 +20,3 @@ secsec-sig = { path = "../secsec-sig" }
 
 [dev-dependencies]
 tempfile = "3"
-getrandom = "0.3"

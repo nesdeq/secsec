@@ -16,4 +16,3 @@ zeroize = "1"
 
 [dev-dependencies]
 secsec-aead = { path = "../secsec-aead" } # integration: derived obj_key feeds the AEAD
-proptest.workspace = true

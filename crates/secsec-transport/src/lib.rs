@@ -404,7 +404,7 @@ mod tests {
             while (cur.position() as usize) < cur.get_ref().len() {
                 server.read_tls(&mut cur).unwrap();
             }
-            server.process_new_packets().map_err(map_err)?;
+            server.process_new_packets()?;
 
             let mut s2c = Vec::new();
             while server.wants_write() {
@@ -414,17 +414,13 @@ mod tests {
             while (cur.position() as usize) < cur.get_ref().len() {
                 client.read_tls(&mut cur).unwrap();
             }
-            client.process_new_packets().map_err(map_err)?; // verifier runs here
+            client.process_new_packets()?; // verifier runs here
 
             if !client.is_handshaking() && !server.is_handshaking() {
                 return Ok(());
             }
         }
         Ok(())
-    }
-
-    fn map_err(e: rustls::Error) -> rustls::Error {
-        e
     }
 
     #[test]

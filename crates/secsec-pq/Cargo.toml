@@ -11,10 +11,12 @@ workspace = true
 
 [dependencies]
 secsec-aead = { path = "../secsec-aead" }
-secsec-kdf = { path = "../secsec-kdf" }
 secsec-canon = { path = "../secsec-canon" }
 libcrux-ml-kem = "0.0.9"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 sha3 = "0.10"
 zeroize = "1"
 getrandom = "0.3"
+
+[dev-dependencies]
+secsec-kdf = { path = "../secsec-kdf" } # integration: unwrapped key must satisfy mk_commit

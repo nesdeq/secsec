@@ -96,8 +96,6 @@ pub enum RosterError {
     NotMember,
     /// An entry's signature did not verify.
     BadSignature,
-    /// A fetched chain was shorter than, or inconsistent with, the persisted frontier (rollback).
-    Rollback,
     /// An entry's encoded op carried an unknown tag.
     BadOp,
     /// Strict canonical decode failed (truncation, over-long field, trailing bytes, or
@@ -128,7 +126,6 @@ impl core::fmt::Display for RosterError {
             RosterError::ChainBreak => f.write_str("prev hash does not chain"),
             RosterError::NotMember => f.write_str("entry signed by a non-member (succession)"),
             RosterError::BadSignature => f.write_str("entry signature invalid"),
-            RosterError::Rollback => f.write_str("sigchain rolled back below frontier"),
             RosterError::BadOp => f.write_str("unknown roster op tag"),
             RosterError::Canon(e) => write!(f, "canon: {e}"),
             RosterError::Frame(e) => write!(f, "frame: {e}"),

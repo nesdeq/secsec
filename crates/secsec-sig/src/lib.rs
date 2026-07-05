@@ -39,8 +39,6 @@ pub enum SigError {
     NotEd25519,
     /// Signature verification failed (bad signature, wrong key, or wrong namespace).
     VerifyFailed,
-    /// Ed25519 → X25519 key conversion failed (malformed key point).
-    KeyConversion,
     /// The private key is passphrase-encrypted; load it with [`DeviceKey::from_openssh_passphrase`].
     Encrypted,
     /// Decrypting an encrypted private key failed — wrong passphrase.
@@ -53,7 +51,6 @@ impl core::fmt::Display for SigError {
             SigError::Ssh(e) => write!(f, "ssh-key: {e}"),
             SigError::NotEd25519 => f.write_str("key/signature is not Ed25519"),
             SigError::VerifyFailed => f.write_str("signature verification failed"),
-            SigError::KeyConversion => f.write_str("Ed25519 to X25519 conversion failed"),
             SigError::Encrypted => f.write_str("private key is passphrase-encrypted"),
             SigError::BadPassphrase => {
                 f.write_str("could not decrypt private key (wrong passphrase)")

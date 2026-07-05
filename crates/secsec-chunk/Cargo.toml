@@ -11,6 +11,3 @@ workspace = true
 
 [dependencies]
 blake3 = "1"
-
-[dev-dependencies]
-proptest.workspace = true

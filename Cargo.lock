@@ -1743,7 +1743,6 @@ name = "secsec-chunk"
 version = "0.0.0"
 dependencies = [
  "blake3",
- "proptest",
 ]
 
 [[package]]
@@ -1779,7 +1778,6 @@ dependencies = [
 name = "secsec-engine"
 version = "0.0.0"
 dependencies = [
- "getrandom 0.3.4",
  "secsec-frame",
  "secsec-kdf",
  "secsec-object",
@@ -1818,7 +1816,6 @@ name = "secsec-kdf"
 version = "0.0.0"
 dependencies = [
  "blake3",
- "proptest",
  "secsec-aead",
  "secsec-canon",
  "zeroize",
@@ -1829,7 +1826,6 @@ name = "secsec-object"
 version = "0.0.0"
 dependencies = [
  "blake3",
- "proptest",
  "secsec-aead",
  "secsec-chunk",
  "secsec-frame",
@@ -1900,7 +1896,6 @@ dependencies = [
  "rand_core 0.6.4",
  "sha2",
  "ssh-key",
- "x25519-dalek",
  "zeroize",
 ]
 

@@ -19,7 +19,7 @@ use secsec_server::{serve::serve_connection, Server};
 use secsec_sig::DeviceKey;
 use secsec_store::Store;
 use secsec_sync::rollback::SyncFrontier;
-use secsec_transport::handshake::client_handshake;
+use secsec_transport::handshake::{client_handshake, ClientSession};
 use secsec_transport::quic::{
     client_config_tofu, client_config_tuned, server_config_tuned, Tuning,
 };
@@ -581,6 +581,18 @@ async fn connect(
     Ok((ep, conn, host_id))
 }
 
+/// Connect to an already-linked folder's server (pinned `host_id`, default tuning) and run the
+/// §11 handshake. Returns the endpoint, connection, and post-handshake session.
+async fn connect_linked(
+    link: &Link,
+    device: &DeviceKey,
+) -> Result<(quinn::Endpoint, quinn::Connection, ClientSession), Box<dyn Error>> {
+    let addr = resolve_server(&link.server)?;
+    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id), Tuning::default()).await?;
+    let sess = client_handshake(&conn, device, host_id, rand32()?).await?;
+    Ok((endpoint, conn, sess))
+}
+
 // ---- host key (server) ----
 
 fn load_or_generate_hostkey(dir: &Path) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
@@ -738,7 +750,6 @@ async fn run_sync(
     let cfg = Config::load()?;
 
     let server_str = server_opt
-        .clone()
         .or_else(|| link.as_ref().map(|l| l.server.clone()))
         .ok_or("no server for this folder — pass --server host[:port] the first time")?;
     let addr = resolve_server(&server_str)?;
@@ -1115,9 +1126,7 @@ async fn run_invite(
     let link = read_link(&sdir)
         .ok_or("this folder isn't linked to a repo yet — run `secsec sync` on it first")?;
     let device = load_device(key, passphrase_stdin)?;
-    let addr = resolve_server(&link.server)?;
-    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id), Tuning::default()).await?;
-    let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
+    let (endpoint, conn, sess) = connect_linked(&link, &device).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
     let (mk, _st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
 
@@ -1133,7 +1142,7 @@ async fn run_invite(
         &device,
         &mk,
         &link.rfp,
-        &host_id,
+        &link.host_id,
         &code,
         PAIR_HOST_ROUNDS,
         unix_secs(),
@@ -1159,9 +1168,7 @@ async fn run_devices(
     let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
     let device = load_device(key, passphrase_stdin)?;
     let me = device.device_id()?;
-    let addr = resolve_server(&link.server)?;
-    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id), Tuning::default()).await?;
-    let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
+    let (endpoint, conn, sess) = connect_linked(&link, &device).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
     let (_mk, st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
     println!("{} device(s) in this repo:", st.members.len());
@@ -1279,9 +1286,7 @@ async fn run_log(
     let path = path.map(|p| normalize_repo_path(&p)).transpose()?;
 
     let device = load_device(key, passphrase_stdin)?;
-    let addr = resolve_server(&link.server)?;
-    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id), Tuning::default()).await?;
-    let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
+    let (endpoint, conn, sess) = connect_linked(&link, &device).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
     let (mk, _st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
     let keyring = data_keyring_remote(&rem, &mk).await?;
@@ -1344,9 +1349,7 @@ async fn run_restore(
     }
 
     let device = load_device(key, passphrase_stdin)?;
-    let addr = resolve_server(&link.server)?;
-    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id), Tuning::default()).await?;
-    let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
+    let (endpoint, conn, sess) = connect_linked(&link, &device).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
     let (mk, _st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
     let keyring = data_keyring_remote(&rem, &mk).await?;
@@ -1417,9 +1420,7 @@ async fn run_revoke(
     let sdir = state_dir_for(&dir)?;
     let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
     let device = load_device(key, passphrase_stdin)?;
-    let addr = resolve_server(&link.server)?;
-    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id), Tuning::default()).await?;
-    let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
+    let (endpoint, conn, sess) = connect_linked(&link, &device).await?;
     let rem = QuicRemote::new(&conn, sess.transcript, &device);
     let (mk, st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
 

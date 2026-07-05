@@ -18,4 +18,3 @@ subtle = "2"
 
 [dev-dependencies]
 secsec-chunk = { path = "../secsec-chunk" }
-proptest.workspace = true
