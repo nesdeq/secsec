@@ -41,7 +41,7 @@ dependencies, and assurance strategy are in `secsec-Implementation.md`.
 
 > **Scope.** secsec is single-host: `secsec sync` takes one `--server`, and every guarantee in §4
 > holds against that one blind server. One repo = one synced tree (ref `main`). The whole CLI is
-> `serve · sync · invite · devices · revoke · hostpin · log · restore`. Fork detection is the
+> `serve · sync · invite · devices · revoke · hostpin · log · restore · reset`. Fork detection is the
 > same-server DAG-incomparable check in the merge path (§10).
 
 ## 3. Threat model
@@ -56,8 +56,8 @@ the mandatory connection gate. This gate is necessary but **not** sufficient for
 even a listed key reads or writes nothing without a valid keyslot (§12), so the security claims
 below never rest on the gate alone.
 
-What the server sees: framed, equal-looking ciphertext; object byte-sizes (bucketed, §9.6);
-the set of device IDs (opaque); access timing. Nothing else.
+What the server sees: framed, equal-looking ciphertext; object byte-sizes (chunk sizes bucketed by
+padding, §9.7); the set of device IDs (opaque); access timing. Nothing else.
 
 ---
 
@@ -93,8 +93,8 @@ Each row is a guarantee and the mechanism that earns it. Residuals in §21.
   every commit/head/roster entry is verified by checking its signature against the pubkey that
   the roster maps this id to. A signer can never act under another device's id.
 - **`master_key`** — 256-bit, random, generated when the first device creates the repo, **RAM-only
-  on clients, never written to disk**, `zeroize`d, `mlock`ed. It has a **generation** `g` (starts at
-  1) advanced by rotation.
+  on clients, never written to disk**, held in `Zeroizing` (zeroized on drop). (Page-pinning via
+  `mlock` is **NOT WIRED**; §18.) It has a **generation** `g` (starts at 1) advanced by rotation.
 - **`mk_commit_g`** := `BLAKE3::keyed_hash(master_key_g, "secsec-mk-commit-v1" ‖ le32(g))` — a
   hiding, binding commitment recorded in the sigchain. Here `master_key_g` occupies the BLAKE3
   PRF **key** argument (not the IKM/message role); this is the only place where `master_key_g`
@@ -130,8 +130,9 @@ All objects are content-addressed, framed, encrypted (§9.1).
 | **Roster entry** | one signed, hash-chained sigchain record (§8) | by seq + hash |
 | **Keyslot** | versioned, authenticated wrap of `master_key_g` to a device key (§8.3) | device_id + gen |
 
-Files split by **keyed FastCDC** (§9.6); small chunks packed. Trees/commits/roster are blobs in
-the same store, so the server learns no structure beyond §4.3.
+Files split by **keyed FastCDC** (§9.7). (Small-chunk **packing** into 8 MiB packs is **NOT WIRED**:
+each chunk is stored as its own object; §19.) Trees/commits/roster are blobs in the same store, so
+the server learns no structure beyond §4.3.
 
 The synced object model is **regular files and directories only**. A symlink, FIFO, socket, or
 device node in the working folder is **skipped** — not synced, and **not** an error (a single such
@@ -694,8 +695,9 @@ reads until reconnect depends on whether the server re-verifies keyslot existenc
   `cdc_seed` is generation-scoped (rotated with each master-key rotation), so past boundary
   observations do not apply to future data; default-on object-size padding (below) eliminates the
   boundary signal required for key extraction; see §21.
-- **Padding:** size-bucket padding is **on by default for metadata objects** (trees/commits/roster
-  — small, cheap) and **on by default for chunk objects**. The default chunk policy pads each
+- **Padding:** size-bucket padding is **on by default for chunk objects**. (Padding of **metadata
+  objects** (trees/commits/roster) is **NOT WIRED**: they are sealed at their true size; §19.) The
+  default chunk policy pads each
   chunk to the next power-of-two size ≥ its size (reversible ISO/IEC 7816-4 bit padding), a bounded
   ≤2× overhead that blurs sizes into power-of-two buckets. This **substantially reduces — but does
   not fully eliminate** — the boundary-sequence signal (the bucket sequence still leaks coarse
@@ -1012,7 +1014,7 @@ paths below are logical key namespaces inside it), in the directory passed to `s
 the current dir). Alongside it the server keeps its self-signed host identity (`hostkey/`). All repo
 state is opaque:
 ```
-/objects/<id>            packed encrypted blobs (chunk/tree/commit)
+/objects/<id>            encrypted blobs (chunk/tree/commit), one object per id
 /keyslots/<device_id>/<g> versioned authenticated keyslots per device per generation
 /refs/<H>                the repo's single signed head (ref `main`); H = BLAKE3::keyed_hash(ref_name_key, ref_name)
 /roster-head             CAS-guarded sigchain tip
@@ -1044,8 +1046,10 @@ Path notes:
   (recoverable only by a client holding the current `head_key_g`), so the server sees only the hash
   `H` and ciphertext. This closes the ref-name leak.
 
-The server-side `redb` index holds **only** `{id, size, generation, pack-offset}` — never
-plaintext-derived metadata. One static binary; no external DB.
+The server-side `redb` store maps each `id` to its opaque blob (alongside the separate keyslot /
+ref / roster / key-history tables above) and holds no plaintext-derived metadata. One static
+binary; no external DB. (A packed-blob index carrying `{size, generation, pack-offset}` is **NOT
+WIRED**: objects are stored one-per-id, unpacked.)
 
 **Client.** The synced folder holds **nothing but the user's plaintext files** — no control files
 clutter it. All client state lives under a **single client root** — `$XDG_CONFIG_HOME/secsec` if that
@@ -1265,8 +1269,9 @@ is worthless), so a PQ signature is lower urgency and can be added through the s
 X-Wing keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today.
 ## 18. Implementation hardening
 
-- **Memory:** `master_key`, all derived subkeys, SSH private material → `secrecy`
-  wrappers, `zeroize` on drop, `mlock` where supported; never serialized to disk.
+- **Memory:** `master_key`, all derived subkeys, and SSH private material are held in
+  `zeroize::Zeroizing` (zeroized on drop), RAM-only, never serialized to disk. (`secrecy` wrappers
+  and `mlock`/`region` page-pinning are **NOT WIRED**.)
 - **Constant-time:** all tag/commit/MAC/invite-code-MAC/fingerprint comparisons via `subtle`.
 - **RNG:** OS CSPRNG (`getrandom`) only; no userspace PRNGs for keys/nonces.
 - **Parsers:** size/depth/fan-out/length bounds enforced pre-allocation per §19 normative constants;
@@ -1279,9 +1284,10 @@ X-Wing keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today
   so a compromised member cannot plant a setuid/setgid file on every device. Writing a tree back to
   the working folder reconciles it (upstream deletions applied), never following or deleting an
   untracked symlink (§6, §10).
-- **Supply chain:** minimal pinned deps; `cargo-audit` + `cargo-vet` in CI; reproducible static
-  `musl` build; no OpenSSL. (The PQ KEM rests on the formally-verified `libcrux-ml-kem`, pinned via
-  `Cargo.lock`; `cargo-audit` is clean of advisories.)
+- **Supply chain:** minimal pinned deps; `cargo-audit` in CI (`cargo-vet` is **NOT WIRED**);
+  reproducible static `musl` build; no OpenSSL. (The PQ KEM rests on the formally-verified
+  `libcrux-ml-kem`, pinned via `Cargo.lock`; `cargo-audit` reports no vulnerabilities, only
+  informational unmaintained/unsound warnings.)
 - Do not trust returned FRAME fields; derive from expected `(gen, type)` and verify equality.
 
 ## 19. Constants _(normative — required for conformance)_
@@ -1296,14 +1302,14 @@ contract) or that bounds an attacker is **not** configurable. `[client]` keys ap
 | Knob | Value | Note |
 |---|---|---|
 | FastCDC min/avg/max | 16 / 64 / 256 KiB | sync responsiveness vs object count |
-| Pack target | 8 MiB | bundle small chunks |
+| Pack target | 8 MiB | small-chunk **packing** is **NOT WIRED** (one object per chunk); target reserved for it |
 | Listen port | udp/8899 default | operator-tunable (`secsec.config`) |
 | QUIC idle / keepalive | 30 s / 10 s default | operator-tunable (`secsec.config`); keepalive forced below idle |
 | `server_nonce` size / TTL | 32 B / 60 s | single-use; replay bound; server SHOULD re-verify keyslot existence on each per-op request and MUST do so at least once per this TTL window (§9.6, §12) |
 | Push id length | 16 B | `PUSH_ID_LEN`; the per-attempt staging key (§15) |
 | Staging idle TTL | 24 h default | an abandoned push's staging is reclaimed past this idle window (§15); operator-tunable (`secsec.config`) |
 | Reclaim sweep cadence | 60 min default | how often the server sweeps idle staging (§15); operator-tunable (`secsec.config`) |
-| Metadata padding buckets | powers of two | default-on (small objects) |
+| Metadata padding buckets | powers of two | **NOT WIRED**: trees/commits/roster are sealed at true size (chunk padding, below, is wired) |
 | Chunk padding policy | power-of-two (default) / uniform (opt-in) / off (opt-out) | default pads to next power-of-two ≥ size (≤2× overhead) — *reduces* the boundary signal; uniform pads all chunks to one fixed size — *eliminates* it at higher cost; off saves space |
 | Per-key storage quota | unlimited default | operator-tunable (`secsec.config`); a finite cap is a per-session new-write anti-flood charge at promote (dedup store has no durable per-key byte ownership, §11/§15); durable disk limits are the operator's filesystem quota |
 | Per-key write / read rate | 100 / 200 MB/s sustained default | operator-tunable (`secsec.config`); server MUST enforce after auth; 2× read allows sync catch-up without unbounded egress |
@@ -1330,10 +1336,11 @@ contract) or that bounds an attacker is **not** configurable. `[client]` keys ap
 ## 20. Crates
 
 `quinn`,`rustls` · `ssh-key`(SSHSIG, Ed25519-only),`x25519-dalek` · `libcrux-ml-kem`
-(ML-KEM-768 for the X-Wing keyslot),`sha3` · `blake3` · `chacha20`+`poly1305` (the §9.4 CTX
-committing AEAD) · `fastcdc` · `notify` · `redb` · `tokio` · `zeroize`,`subtle`,`getrandom`.
-Transport is **QUIC/TLS-only** (no SSH/stdio mode — it adds nothing over the pinned host key, §11).
-Versions pinned; `cargo-audit`/`cargo-vet` gated.
+(ML-KEM-768 for the X-Wing keyslot),`sha3` · `blake3` (hashing, KDF, and the keyed-FastCDC gear
+table) · `chacha20`+`poly1305` (the §9.4 CTX committing AEAD) · `notify` · `redb` · `tokio` ·
+`zeroize`,`subtle`,`getrandom`. Transport is **QUIC/TLS-only** (no SSH/stdio mode; it adds nothing
+over the pinned host key, §11). Versions pinned; `cargo-audit` gated (`cargo-vet` **NOT WIRED**).
+The keyed-FastCDC gear table is hand-composed on `blake3`, not the `fastcdc` crate.
 
 ## 21. Residuals (proven-minimal)
 
@@ -1365,8 +1372,8 @@ These are impossibilities for a blind, untrusted server, with their mitigations 
   offline-crackable target on the untrusted server to back up what the SSH key already covers.
 
 - **Compromised client.** Plaintext and `master_key` live on the client by necessity; its
-  compromise is total for that device. Mitigation: prompt revoke+rotate; `mlock`/`zeroize` limit
-  key scavenging.
+  compromise is total for that device. Mitigation: prompt revoke+rotate; `zeroize` (keys are
+  RAM-only, zeroized on drop) limits key scavenging. (`mlock` page-pinning is **NOT WIRED**, §18.)
 
 - **Local frontier rollback by a disk-level attacker.** The sealed local-state file (§8.5) is
   encrypted under a *static* key (derived from the SSH private key), so an older sealed copy still

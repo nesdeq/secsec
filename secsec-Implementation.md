@@ -78,10 +78,11 @@ Pinned, minimal, no OpenSSL. The security-relevant choices:
 - **`ssh-key` (RustCrypto)** — SSHSIG with per-namespace domain separation (§9.6); Ed25519-only.
 - **`quinn` + `rustls`** — QUIC/TLS 1.3; the custom pinned `ServerCertVerifier` (R1) is the sole
   transport-auth path.
-- **`blake3`** — the KDF/hash backbone (§9.5); `x25519-dalek` for the X25519 half of the X-Wing
-  keyslot (the Ed25519→X25519 **secret** derivation is `clamp(SHA-512(seed)[..32])` via `sha2`, not a
-  library map); `fastcdc` (keyed gear table, §9.7); `redb` (embedded store); `notify`
-  (filesystem watch); `zeroize`/`secrecy`/`subtle`/`getrandom`/`region` for key hygiene.
+- **`blake3`** — the KDF/hash backbone (§9.5), and the keyed-FastCDC gear table (§9.7) is composed
+  directly on its XOF rather than a third-party chunking crate; `x25519-dalek` for the X25519 half of
+  the X-Wing keyslot (the Ed25519→X25519 **secret** derivation is `clamp(SHA-512(seed)[..32])` via
+  `sha2`, not a library map); `redb` (embedded store); `notify` (filesystem watch);
+  `zeroize`/`subtle`/`getrandom` for key hygiene (`secrecy`/`region`/`mlock` are **NOT WIRED**).
 
 ---
 
