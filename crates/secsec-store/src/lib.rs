@@ -58,6 +58,14 @@ fn staging_key(push_id: &[u8; PUSH_ID_LEN], id: &[u8; 32]) -> [u8; STAGING_KEY_L
     k
 }
 
+/// Inclusive `(lo, hi)` bounds covering every STAGING key under `push_id`.
+fn staging_range(push_id: &[u8; PUSH_ID_LEN]) -> ([u8; STAGING_KEY_LEN], [u8; STAGING_KEY_LEN]) {
+    (
+        staging_key(push_id, &[0u8; 32]),
+        staging_key(push_id, &[0xffu8; 32]),
+    )
+}
+
 /// The fixed length of a keyslot key: `device_id(32) ‖ le32(gen)`.
 const KEYSLOT_KEY_LEN: usize = 36;
 
@@ -258,8 +266,7 @@ impl Store {
                 let mut objs = wtx.open_table(OBJECTS)?;
                 let mut staging = wtx.open_table(STAGING)?;
                 let mut meta = wtx.open_table(STAGING_META)?;
-                let lo = staging_key(promote, &[0u8; 32]);
-                let hi = staging_key(promote, &[0xffu8; 32]);
+                let (lo, hi) = staging_range(promote);
                 let mut promoted_bytes = 0u64;
                 let mut staged_keys: Vec<Vec<u8>> = Vec::new();
                 for item in staging.range(&lo[..]..=&hi[..])? {
@@ -427,8 +434,7 @@ impl Store {
         let rtx = self.db.begin_read()?;
         let objs = rtx.open_table(OBJECTS)?;
         let staging = rtx.open_table(STAGING)?;
-        let lo = staging_key(push_id, &[0u8; 32]);
-        let hi = staging_key(push_id, &[0xffu8; 32]);
+        let (lo, hi) = staging_range(push_id);
         let mut total = 0u64;
         for item in staging.range(&lo[..]..=&hi[..])? {
             let (k, v) = item?;
@@ -462,8 +468,7 @@ impl Store {
                 }
             }
             for pid in &idle {
-                let lo = staging_key(pid, &[0u8; 32]);
-                let hi = staging_key(pid, &[0xffu8; 32]);
+                let (lo, hi) = staging_range(pid);
                 let mut keys: Vec<Vec<u8>> = Vec::new();
                 for item in staging.range(&lo[..]..=&hi[..])? {
                     keys.push(item?.0.value().to_vec());
@@ -494,6 +499,41 @@ impl Store {
         }
         wtx.commit()?;
         Ok(removed)
+    }
+
+    /// Atomic retention prune (§15): recompute the ref-blob-hashes + roster length and delete `ids`
+    /// only if `accept` approves, in one write transaction, so a racing `cas_ref`/`append_roster` aborts
+    /// it rather than dropping an object a moved head references. `Ok(false)` = `accept` rejected.
+    pub fn prune_if<F>(&self, ids: &[[u8; 32]], accept: F) -> Result<bool, StoreError>
+    where
+        F: FnOnce(&[RefBlobHash], u64) -> bool,
+    {
+        let wtx = self.db.begin_write()?;
+        let matched = {
+            // Recompute the CAS inputs inside the delete's own transaction.
+            let mut refs: Vec<RefBlobHash> = Vec::new();
+            {
+                let table = wtx.open_table(REFS)?;
+                for item in table.iter()? {
+                    let (k, v) = item?;
+                    if let Ok(ref_h) = <[u8; 32]>::try_from(k.value()) {
+                        refs.push((ref_h, *blake3::hash(v.value()).as_bytes()));
+                    }
+                }
+            }
+            let roster_len = wtx.open_table(ROSTER)?.len()?;
+            if accept(&refs, roster_len) {
+                let mut objs = wtx.open_table(OBJECTS)?;
+                for id in ids {
+                    objs.remove(&id[..])?;
+                }
+                true
+            } else {
+                false
+            }
+        };
+        wtx.commit()?;
+        Ok(matched)
     }
 
     /// Delete every durable object **not** in `keep` — the local cache's orphan sweep, dropping objects
@@ -780,6 +820,41 @@ mod tests {
         assert_eq!(s.get(&id(1)).unwrap(), None);
         assert_eq!(s.get(&id(2)).unwrap().as_deref(), Some(&b"b"[..]));
         assert_eq!(s.object_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn prune_if_deletes_only_when_the_predicate_accepts() {
+        let (_d, s) = temp_store();
+        s.put(&id(1), b"a").unwrap();
+        s.put(&id(2), b"b").unwrap();
+
+        // A rejecting predicate (the head-binding CAS lost) deletes nothing.
+        assert!(!s.prune_if(&[id(1)], |_refs, _n| false).unwrap());
+        assert_eq!(s.get(&id(1)).unwrap().as_deref(), Some(&b"a"[..]));
+        assert_eq!(s.object_count().unwrap(), 2);
+
+        // An accepting predicate deletes the dead set in the same transaction.
+        assert!(s.prune_if(&[id(1)], |_refs, _n| true).unwrap());
+        assert_eq!(s.get(&id(1)).unwrap(), None);
+        assert_eq!(s.get(&id(2)).unwrap().as_deref(), Some(&b"b"[..]));
+
+        // The predicate sees the refs + roster length inside the txn (the CAS inputs a concurrent
+        // cas_ref/append_roster would move): here one ref, roster length 1.
+        s.cas_ref(&id(0xCA), &ABSENT_HEAD, b"head", &[0u8; 16])
+            .unwrap();
+        s.append_roster(&ABSENT_HEAD, b"genesis").unwrap();
+        let mut seen = None;
+        s.prune_if(&[id(2)], |refs, n| {
+            seen = Some((refs.len(), n));
+            false
+        })
+        .unwrap();
+        assert_eq!(seen, Some((1usize, 1u64)));
+        assert_eq!(
+            s.get(&id(2)).unwrap().as_deref(),
+            Some(&b"b"[..]),
+            "a rejected prune leaves the object intact"
+        );
     }
 
     #[test]

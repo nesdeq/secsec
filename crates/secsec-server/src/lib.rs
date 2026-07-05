@@ -642,17 +642,14 @@ impl Server {
             return Response::Err(ErrorCode::BadAuth);
         };
 
-        // Recompute args_prune from the server's CURRENT head/roster state — this IS the CAS.
+        // Compare (§15 CAS): recompute the CAS inputs; the client's signature verifies only if its view matches.
         let (refs, roster_len) = match (self.store.ref_blob_hashes(), self.store.roster_len()) {
             (Ok(r), Ok(n)) => (r, n),
             _ => return Response::Err(ErrorCode::Internal),
         };
         let roster_seq = roster_len.saturating_sub(1);
-        let args_hash = prune::args_prune(
-            &prune::dead_set_hash(dead),
-            &prune::all_heads_hash(&refs),
-            roster_seq,
-        );
+        let expected_ahh = prune::all_heads_hash(&refs);
+        let args_hash = prune::args_prune(&prune::dead_set_hash(dead), &expected_ahh, roster_seq);
 
         let wa = WriteAuth {
             op: op::PRUNE,
@@ -668,8 +665,15 @@ impl Server {
             return Response::Err(ErrorCode::BadAuth);
         }
 
-        match self.store.delete_objects(dead) {
-            Ok(_deleted) => Response::Ok,
+        // Act under the same CAS, atomically: prune_if re-checks the inputs inside the delete's own txn,
+        // so a cas_head/roster_append racing between compare and delete aborts it (§15.2).
+        match self.store.prune_if(dead, |cur_refs, cur_roster_len| {
+            prune::all_heads_hash(cur_refs) == expected_ahh
+                && cur_roster_len.saturating_sub(1) == roster_seq
+        }) {
+            Ok(true) => Response::Ok,
+            // CAS lost (head/roster moved): same BadAuth as a stale-view prune; the client re-pulls and retries.
+            Ok(false) => Response::Err(ErrorCode::BadAuth),
             Err(_) => Response::Err(ErrorCode::Internal),
         }
     }
