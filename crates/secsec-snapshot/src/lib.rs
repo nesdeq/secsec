@@ -1447,10 +1447,11 @@ mod tests {
         assert!(decode_tree(&encode_tree(&one("ok.txt"))).is_ok());
     }
 
-    /// Scan/decode symmetry (§6): the scanner SKIPS a name the decoder would refuse — like a symlink —
-    /// rather than authoring it (which would wedge every reader) or failing the whole snapshot. The
-    /// macOS custom-folder-icon file `Icon\r` is the real trigger; the good file still snapshots and the
-    /// built tree omits the bad names and decodes cleanly.
+    /// Scan/decode symmetry (§6): the scanner SKIPS a name the decoder would refuse (like a symlink),
+    /// never authoring it or failing the snapshot. Unix-only: the fixture names (`Icon\r`, an embedded
+    /// tab) are invalid filenames on Windows and cannot be created there; the decode-side guard is
+    /// covered cross-platform by [`decode_tree_rejects_path_traversal_names`].
+    #[cfg(unix)]
     #[test]
     fn snapshot_skips_unsafe_names() {
         let store_dir = tempfile::tempdir().unwrap();
