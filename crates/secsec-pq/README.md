@@ -29,7 +29,8 @@ formally-verified [`libcrux_ml_kem`] + `x25519-dalek` (no third-party X-Wing cra
 - `XWingPublic` — `from_bytes` / `to_bytes`.
 - `wrap_pq(master_key, gen, device_id, pk)` → keyslot body; `unwrap_pq_raw` recovers the raw key
   (authenticity is the cold-start fold's `mk_commit` check, not the wrap).
-- Length constants: `XWING_SEED_LEN`, `XWING_CT_LEN`, `XWING_ESEED_LEN`, `ML_KEM_*`, `X_LEN`.
+- `XWING_SEED_LEN` — the decapsulation-key seed length (the ML-KEM `(d,z)`, X25519, ciphertext and
+  encapsulation-seed lengths are crate-internal; they are layout details of `wrap_pq` output).
 - `PqError`.
 
 ## Conformance (§17, normative)

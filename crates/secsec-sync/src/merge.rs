@@ -3,7 +3,7 @@
 //! (`name.conflict-<label>.ext`); divergent directories merge recursively. Equality is by content
 //! (chunk lists), never timestamps. The rollback gates live in [`crate::rollback`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A 256-bit chunk content-address (§9.2).
 pub type Id = [u8; 32];
@@ -105,6 +105,25 @@ fn conflict_name(name: &str, label: &str) -> String {
     }
 }
 
+/// A keep-both name that collides with nothing — neither a name already in play on any side, nor one
+/// already written out. Without this a real entry literally named `a.conflict-<label>.txt` would be
+/// overwritten by the copy, which is the single outcome keep-both exists to prevent. Deterministic:
+/// the suffix walks upward from the same starting name on every device.
+fn free_conflict_name(
+    name: &str,
+    label: &str,
+    names: &BTreeSet<&str>,
+    out: &BTreeMap<String, Node>,
+) -> String {
+    let mut candidate = conflict_name(name, label);
+    let mut n = 2u32;
+    while names.contains(candidate.as_str()) || out.contains_key(&candidate) {
+        candidate = conflict_name(name, &format!("{label}-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
 fn join(prefix: &str, name: &str) -> String {
     if prefix.is_empty() {
         name.to_string()
@@ -139,26 +158,26 @@ fn merge_dir(
     their_label: &str,
     out: &mut Merge,
 ) {
-    // Union of names across all three sides, sorted (BTreeSet-style via BTreeMap keys).
-    let mut names: BTreeMap<&String, ()> = BTreeMap::new();
+    // Union of names across all three sides, sorted.
+    let mut names: BTreeSet<&str> = BTreeSet::new();
     for k in base.keys().chain(ours.keys()).chain(theirs.keys()) {
-        names.insert(k, ());
+        names.insert(k.as_str());
     }
 
-    for name in names.keys().copied() {
+    for &name in &names {
         let path = join(prefix, name);
         let (b, o, t) = (base.get(name), ours.get(name), theirs.get(name));
 
         // Identical on both sides (incl. both absent), or one side unchanged: take, no conflict.
         if same_opt(o, t) || same_opt(t, b) {
             if let Some(node) = o {
-                out.tree.insert(name.clone(), node.clone());
+                out.tree.insert(name.to_string(), node.clone());
             }
             continue;
         }
         if same_opt(o, b) {
             if let Some(node) = t {
-                out.tree.insert(name.clone(), node.clone());
+                out.tree.insert(name.to_string(), node.clone());
             }
             continue;
         }
@@ -185,7 +204,7 @@ fn merge_dir(
                 };
                 merge_dir(&path, &bd, od, td, their_label, &mut sub);
                 out.tree.insert(
-                    name.clone(),
+                    name.to_string(),
                     Node::Dir {
                         mode: *omode,
                         mtime: *omtime,
@@ -198,11 +217,11 @@ fn merge_dir(
             _ => {
                 let kind = classify(b, o, t);
                 if let Some(node) = o {
-                    out.tree.insert(name.clone(), node.clone());
+                    out.tree.insert(name.to_string(), node.clone());
                 }
                 if let Some(node) = t {
-                    out.tree
-                        .insert(conflict_name(name, their_label), node.clone());
+                    let cname = free_conflict_name(name, their_label, &names, &out.tree);
+                    out.tree.insert(cname, node.clone());
                 }
                 out.conflicts.push(Conflict { path, kind });
             }
@@ -394,6 +413,28 @@ mod tests {
 
     fn dir_map_base() -> BTreeMap<String, Node> {
         map(&[("d", dir(&[("x", file(1)), ("y", file(1))]))])
+    }
+
+    /// An entry that happens to be named exactly like the keep-both copy must not be overwritten by
+    /// it. Names are iterated in sorted order, so the real `a.conflict-L.txt` is placed first and the
+    /// copy for `a.txt` would land on top of it — the one outcome keep-both exists to prevent.
+    #[test]
+    fn conflict_copy_never_overwrites_a_real_entry_of_that_name() {
+        let base = map(&[("a.txt", file(1))]);
+        let ours = map(&[("a.txt", file(2)), ("a.conflict-L.txt", file(8))]);
+        let theirs = map(&[("a.txt", file(3))]);
+        let m = three_way_merge(&base, &ours, &theirs, "L");
+        assert_eq!(m.tree.get("a.txt"), Some(&file(2)));
+        assert_eq!(
+            m.tree.get("a.conflict-L.txt"),
+            Some(&file(8)),
+            "the user's own file keeps its name and content"
+        );
+        assert_eq!(
+            m.tree.get("a.conflict-L-2.txt"),
+            Some(&file(3)),
+            "the keep-both copy moves to the next free name"
+        );
     }
 
     #[test]

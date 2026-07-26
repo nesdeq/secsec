@@ -18,12 +18,18 @@ two signed payloads and the per-op `args_hash` that binds the exact operation:
 
 ## Public API
 
-- `args_*` — the normative per-op `args_hash` binders: `args_put`, `args_cas_head`,
-  `args_roster_append`, `args_get_roster`, `args_get_keyslot`, `args_put_keyslot`, `args_keyhist`,
-  `args_pair`, `args_read`.
+- `op_and_args(request) -> (op, args_hash, is_write)` — the single shared binding. Client and server
+  both call it, so neither can disagree about what a signature covers. The individual `args_*` binders
+  behind it are crate-internal on purpose: computing one by hand at a call site is how the two sides
+  drift apart.
+- `op` — the op-label constants (`PUT`, `CAS_HEAD`, `ROSTER_APPEND`, `PRUNE`, `GET`, …).
+- `WriteAuth` / `ReadAuth` — `sign` / `verify` over `op ‖ args_hash ‖ transcript` (+ `server_nonce`
+  for writes, §9.6).
 - `prune` (§15) — `all_heads_hash`, `dead_set_hash` (canonical ascending id-list), `args_prune` (the
-  head-binding CAS input).
-- `Request` / `Response` — the wire messages (`encode` / `decode`, bounded by `MAX_REQUEST_LEN`).
-- The server-side replay/rate-limit state: a single-use **nonce** issuer (`issue` / `consume` /
-  `evict_expired`), a token-bucket rate limiter, and concurrency counters.
-- `ErrorCode`, `ProtoError`, `WireError`, `MAX_PUBKEY`, `MAX_SIG`.
+  head-binding CAS input). Public because `prune`'s binding is state-dependent, so it is computed
+  outside `op_and_args` by both the client driver and the server handler.
+- `wire` — `Request` / `Response` / `ClientHello` / `ServerHello` / `ClientAuth` / `AuthedRequest`
+  (`encode` / `decode`), `ErrorCode`, `WireError`.
+- `server` — the enforcement state, clock-injected: `NonceStore` (single-use `server_nonce`),
+  `TokenBucket`, `WindowCounter`, `StorageQuota`, `Limits`, and the normative `limits` constants.
+- `Id`, `PUSH_ID_LEN`, `ProtoError`.

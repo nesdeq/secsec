@@ -8,8 +8,8 @@
 //! per-device high-water.
 
 use crate::{
-    fetch_closure, fetch_head, push_head, push_objects, resolve_head_signer, sync_ref, ClientError,
-    CommitAuthor, Remote, SyncAction,
+    fetch_closure, fetch_head, push_head, push_objects, sync_ref, ClientError, CommitAuthor,
+    Remote, SyncAction,
 };
 use secsec_engine::MergeError;
 use secsec_kdf::MasterKeys;
@@ -59,6 +59,10 @@ pub struct SyncOutcome {
     /// surface them to the user. Empty unless `kind == Merged` with genuine conflicts; the conflicting
     /// content is preserved on disk as `name.conflict-<device>-<id>.ext` (no data is lost).
     pub conflicts: Vec<String>,
+    /// Working-folder paths the §19 bounds make unsyncable (a file needing more chunks than a tree
+    /// can encode). Already-synced paths freeze at their last version rather than being deleted, but
+    /// the user must be told — a file that silently stops syncing looks exactly like one that works.
+    pub skipped: Vec<String>,
 }
 
 /// Resolve a commit's author key from the folded roster (a commit by a non-member is rejected).
@@ -102,7 +106,9 @@ async fn pull_to<R: Remote, K: MasterKeys>(
     head_sig: &[u8],
     dir: &Path,
 ) -> Result<SyncFrontier, ClientError> {
-    let signer = resolve_head_signer(members, head, head_sig).ok_or(ClientError::HeadNotMember)?;
+    let sibling =
+        SiblingHead::verified(members, head, head_sig).ok_or(ClientError::HeadNotMember)?;
+    let signer = sibling.device_id;
 
     // §8.5/§10 anti-rollback on the PULL path (the merge path runs these gates inside
     // `merge_heads`): without them a malicious server could replay an older member-signed head and
@@ -134,12 +140,6 @@ async fn pull_to<R: Remote, K: MasterKeys>(
 
     // Observe the head into the frontier so later syncs gate against it (§8.5/§10).
     let (parents, meta) = secsec_engine::load_commit_dag(&[head.commit_id], keys, store)?;
-    let sibling = SiblingHead {
-        device_id: signer,
-        head_version: head.head_version,
-        roster_seq: head.roster_seq,
-        commit_id: head.commit_id,
-    };
     let mut f = frontier.clone();
     f.observe(&sibling, &parents, &meta);
     Ok(f)
@@ -184,6 +184,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                     base: Some(h.commit_id),
                     frontier,
                     conflicts: Vec::new(),
+                    skipped: Vec::new(),
                 });
             }
         }
@@ -199,7 +200,8 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
     };
     // Read through the whole key ring so the previous tree is legible across a rotation; new objects
     // still seal under the current generation inside `snapshot_tree`.
-    let (our_tree, our_salt) = snapshot_tree(dir, keys, store, prev.as_ref().map(|(t, s)| (t, s)))?;
+    let (our_tree, our_salt, skipped) =
+        snapshot_tree(dir, keys, store, prev.as_ref().map(|(t, s)| (t, s)))?;
     let unchanged = prev.as_ref().is_some_and(|(t, _)| *t == our_tree);
 
     // No local changes: reconcile a differing remote head, or we are already up to date.
@@ -210,6 +212,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                 base,
                 frontier: frontier.clone(),
                 conflicts: Vec::new(),
+                skipped,
             });
         };
         if Some(h.commit_id) == base {
@@ -218,6 +221,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                 base,
                 frontier: frontier.clone(),
                 conflicts: Vec::new(),
+                skipped,
             });
         }
         // The remote head differs from our base and we have no local changes. Classify it against
@@ -225,16 +229,10 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
         // fast-forward is restored. A replayed ancestor head — or a cas-unreachable incomparable fork
         // — is NOT restored, so a malicious server cannot silently roll the working dir back (the §10
         // "ancestor sibling is a no-op before the gates" rule).
-        let signer = resolve_head_signer(members, h, sig).ok_or(ClientError::HeadNotMember)?;
+        let sibling = SiblingHead::verified(members, h, sig).ok_or(ClientError::HeadNotMember)?;
         fetch_closure(remote, store, keys, &h.commit_id).await?;
         let our = base.expect("the no-base clone path is handled above");
         let (parents, meta) = secsec_engine::load_commit_dag(&[our, h.commit_id], keys, store)?;
-        let sibling = SiblingHead {
-            device_id: signer,
-            head_version: h.head_version,
-            roster_seq: h.roster_seq,
-            commit_id: h.commit_id,
-        };
         return match evaluate_merge(frontier, &our, &sibling, &device_id, &parents, &meta) {
             Ok(MergeDecision::FastForward) => {
                 let (commit, csig) = open_signed_commit(&h.commit_id, keys, store)?;
@@ -247,6 +245,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                     base: Some(h.commit_id),
                     frontier: f,
                     conflicts: Vec::new(),
+                    skipped,
                 })
             }
             // Ancestor of our base (replayed) or a cas-unreachable incomparable fork: do not restore.
@@ -256,6 +255,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                 base,
                 frontier: frontier.clone(),
                 conflicts: Vec::new(),
+                skipped,
             }),
             Err(reject) => Err(ClientError::Merge(MergeError::Rollback(reject))),
         };
@@ -317,6 +317,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                 base: Some(our_commit),
                 frontier: f,
                 conflicts: Vec::new(),
+                skipped,
             })
         }
         // Reconcile our commit against the remote head (push if we're ahead, else merge).
@@ -368,6 +369,7 @@ pub async fn sync_once<R: Remote, K: MasterKeys>(
                 base: Some(base),
                 frontier,
                 conflicts,
+                skipped,
             })
         }
     }
@@ -829,7 +831,7 @@ mod tests {
         // B publishes C_b (head v1).
         let wb = tempfile::tempdir().unwrap();
         std::fs::write(wb.path().join("f"), b"vB").unwrap();
-        let (tb, sb) = snapshot_tree(wb.path(), &m, &auth, None).unwrap();
+        let (tb, sb, _) = snapshot_tree(wb.path(), &m, &auth, None).unwrap();
         let c_b = seal_signed_commit(
             &m,
             &auth,
@@ -855,7 +857,7 @@ mod tests {
 
         // A advances to C_a (head v2, descends from C_b).
         std::fs::write(wb.path().join("f"), b"vA").unwrap();
-        let (ta, sa) = snapshot_tree(wb.path(), &m, &auth, Some((&tb, &sb))).unwrap();
+        let (ta, sa, _) = snapshot_tree(wb.path(), &m, &auth, Some((&tb, &sb))).unwrap();
         let c_a = seal_signed_commit(
             &m,
             &auth,

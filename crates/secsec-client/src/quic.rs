@@ -59,8 +59,10 @@ impl Remote for QuicRemote<'_> {
         blob: &[u8],
         push_id: &[u8; PUSH_ID_LEN],
     ) -> Result<(), RemoteError> {
-        // Blobs are bounded by the §19 16 MiB object cap, so the length fits a u32 declared_size.
-        let declared_size = blob.len() as u32;
+        // The §19 object cap keeps this far inside u32, but a silent `as` truncation would declare a
+        // size the server then validates against a different number of bytes — check it instead.
+        let declared_size = u32::try_from(blob.len())
+            .map_err(|_| RemoteError(format!("blob of {} bytes exceeds u32", blob.len())))?;
         match self
             .call(Request::Put {
                 id: *id,
@@ -372,7 +374,7 @@ mod tests {
             std::fs::write(src.path().join("a.txt"), b"over-quic").unwrap();
             std::fs::write(src.path().join("b.txt"), [9u8; 5000]).unwrap();
             let a_store = Store::open(srv_dir.path().join("a.redb")).unwrap();
-            let (rt_id, rs) =
+            let (rt_id, rs, _) =
                 secsec_snapshot::snapshot_tree(src.path(), &m, &a_store, None).unwrap();
             let commit = secsec_snapshot::Commit {
                 root_tree: rt_id,
@@ -620,7 +622,7 @@ mod tests {
             let src = tempfile::tempdir().unwrap();
             std::fs::write(src.path().join("keep.txt"), b"reachable-data").unwrap();
             let a_store = Store::open(srv_dir.path().join("a.redb")).unwrap();
-            let (rt_id, rs) =
+            let (rt_id, rs, _) =
                 secsec_snapshot::snapshot_tree(src.path(), &m, &a_store, None).unwrap();
             let commit = secsec_snapshot::Commit {
                 root_tree: rt_id,

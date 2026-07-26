@@ -11,24 +11,29 @@ the QUIC adapter (`quic.rs`, over `secsec-transport`) is a thin layer on top.
 
 ## Modules / public API
 
-- **`repo`** — repository lifecycle. The networked path the CLI uses: `init_repo_remote` (first-device
-  genesis), `open_repo_remote` (§8.1 cold-start fold), `grant_device_remote`, `rotate_repo_remote`
-  (also the engine of `revoke`), `data_keyring_remote` (§8.2 key ring), `fetch_roster_entries`. Local
-  in-process variants (`init_repo` / `open_repo` / `rotate_repo` / `data_keyring`) back the tests.
-  `device_xwing_pub`, `RepoError`, `ALGO_XWING`.
-- **`pair`** (§7) — **invite-code pairing**, the shipped enrollment flow: `new_invite` / `encode_code`
-  / `decode_code`, `run_host` (`secsec invite`) and `run_join` (`secsec sync --invite`) — MAC-under-code
-  through the server's transient mailbox; `PairError`.
-- **`sync`** — `sync_once` (clone / publish / pull / merge in one call), `SyncKind`, `SyncOutcome`.
-- Push/pull primitives: `push_objects` / `push_head`, `fetch_head` / `fetch_closure`,
-  `sync_ref` (+ `resolve_head_signer`).
+- **`repo`** — repository lifecycle over the wire, the path the CLI drives: `init_repo_remote`
+  (first-device genesis), `open_repo_remote` (§8.1 cold-start fold, carrying the `RosterAnchor`
+  anti-rollback anchor), `rotate_repo_remote` (also the engine of `revoke`), `data_keyring_remote`
+  (§8.2 key ring); `RepoError`.
+- **`pair`** (§7) — **invite-code pairing**, the shipped enrollment flow: `new_invite` /
+  `decode_code`, `run_host` (`secsec invite`) and `run_join` (`secsec sync --invite`) —
+  MAC-under-code through the server's transient mailbox; `PairError`.
+- **`sync`** — `sync_once` (clone / publish / pull / merge in one call), `SyncKind`, `SyncOutcome`
+  (which carries the merge `conflicts` and the §19 `skipped` paths for the caller to surface).
 - **`history`** (§10/§15) — the read side of `secsec log` / `secsec restore`: `fetch_history`,
-  `repo_log`, `path_history`, `commit_ids`, `restore`.
+  `repo_log`, `path_history`, `commit_ids`, `restore`; `LogEntry`, `PathVersion`.
 - **`prune`** (§15) — `local_sweep` (drops cache orphans unreachable from the head) and
   `prune_history` (count-based retention: keep the last N versions per file, delete the rest under the
   head-CAS). (Driven automatically from the `sync` loop — no `prune` command.)
-- **`watcher`** — `notify`-driven debounced change ticks for live sync.
-- Frontier persistence: `load_frontier` / `save_frontier` (§8.5), `Remote`, `ClientError`.
+- **`quic`** — `QuicRemote`, the `Remote` implementation over a handshaken connection.
+- **`watcher`** — `notify`-driven debounced change ticks for live sync; `watch_dir`, `WatchError`.
+- Crate root: the `Remote` trait and `RemoteError`, `fetch_head`, frontier persistence
+  `load_frontier` / `save_frontier` + `FrontierLoad` (§8.5), `SyncReport`, `ClientError`.
+
+The push/pull primitives `sync_once` composes — `push_objects` / `push_head`, `fetch_closure`,
+`sync_ref` — and the in-process `init_repo` / `open_repo` / `rotate_repo` / `data_keyring` variants
+that back the tests are crate-internal: driving them individually is how the §8.5 seal-before-publish
+ordering gets skipped.
 
 Fork detection is the **same-server DAG-incomparable check** in the merge path (a divergence is kept
 both-sides as a `name.conflict-*` copy and surfaced to the user); there is no multi-remote or gossip

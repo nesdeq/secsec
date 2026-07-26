@@ -26,6 +26,14 @@ pub enum HandshakeError {
     Wire(WireError),
     /// The server presented a `host_id` other than the one the client pinned.
     HostIdMismatch,
+    /// The peer speaks a different `secsec_version`. There is no negotiation and no compatibility
+    /// window, so this is fatal; it is checked explicitly only so the failure names its cause.
+    VersionMismatch {
+        /// The version this build speaks.
+        ours: u16,
+        /// The version the peer announced.
+        theirs: u16,
+    },
     /// The connection-auth signature did not verify (or the presented key was malformed).
     Auth,
     /// The TLS keying-material exporter was unavailable.
@@ -40,6 +48,12 @@ impl core::fmt::Display for HandshakeError {
             HandshakeError::Frame(e) => write!(f, "frame: {e}"),
             HandshakeError::Wire(e) => write!(f, "wire: {e}"),
             HandshakeError::HostIdMismatch => f.write_str("server host_id does not match the pin"),
+            HandshakeError::VersionMismatch { ours, theirs } => {
+                write!(
+                    f,
+                    "peer speaks secsec_version {theirs}, this build speaks {ours}"
+                )
+            }
             HandshakeError::Auth => f.write_str("connection auth failed"),
             HandshakeError::Exporter => f.write_str("TLS exporter unavailable"),
             HandshakeError::Stream(e) => write!(f, "stream: {e}"),
@@ -99,6 +113,15 @@ pub async fn client_handshake(
     write_frame(&mut send, &hello.encode()).await?;
 
     let server_hello = ServerHello::decode(&read_frame(&mut recv, MAX_FRAME_LEN).await?)?;
+    // A version mismatch already fails below — each side folds its OWN SECSEC_VERSION into the
+    // transcript, so the auth signature will not verify — but it fails as a bad signature. Check it
+    // here so the error names the actual cause.
+    if server_hello.version != SECSEC_VERSION {
+        return Err(HandshakeError::VersionMismatch {
+            ours: SECSEC_VERSION,
+            theirs: server_hello.version,
+        });
+    }
     // Cross-check: the server must claim the host_id we already pinned (the TLS pin guaranteed it).
     if server_hello.host_id != host_id {
         return Err(HandshakeError::HostIdMismatch);
@@ -149,6 +172,12 @@ pub async fn server_handshake(
         .map_err(|e| HandshakeError::Stream(e.to_string()))?;
 
     let client_hello = ClientHello::decode(&read_frame(&mut recv, MAX_FRAME_LEN).await?)?;
+    if client_hello.version != SECSEC_VERSION {
+        return Err(HandshakeError::VersionMismatch {
+            ours: SECSEC_VERSION,
+            theirs: client_hello.version,
+        });
+    }
     let server_hello = ServerHello {
         version: SECSEC_VERSION,
         server_nonce,

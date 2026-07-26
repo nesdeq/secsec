@@ -56,3 +56,45 @@ fn release_help() {
          # verify reproducibility by building twice and comparing sha256."
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    /// Every workspace member must carry `[lints] workspace = true`. That inheritance is what actually
+    /// applies `unsafe_code = "forbid"`, `unreachable_pub` and `clippy::all = deny` to a crate; a new
+    /// member that omits it silently opts out of all three, and nothing else in the build would notice.
+    #[test]
+    fn every_workspace_member_inherits_the_workspace_lints() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("root manifest");
+        let array = manifest
+            .split_once("members")
+            .and_then(|(_, rest)| rest.split_once('['))
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(inner, _)| inner)
+            .expect("workspace.members array");
+        let members: Vec<&str> = array
+            .split(',')
+            .filter_map(|m| m.trim().trim_matches('"').into())
+            .filter(|m: &&str| !m.is_empty())
+            .collect();
+        assert!(members.len() > 10, "parsed too few members: {members:?}");
+
+        for member in members {
+            let path = root.join(member).join("Cargo.toml");
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let after = text
+                .split_once("[lints]")
+                .unwrap_or_else(|| panic!("{member} has no [lints] section"))
+                .1;
+            // Only look as far as the next section header, so a later table cannot satisfy this.
+            let section = after.split_once("\n[").map_or(after, |(head, _)| head);
+            assert!(
+                section.contains("workspace = true"),
+                "{member} does not inherit the workspace lints"
+            );
+        }
+    }
+}

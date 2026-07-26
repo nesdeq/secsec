@@ -43,6 +43,10 @@ pub const MAX_TREE_FANOUT: usize = 65_536;
 pub const MAX_ROSTER_ENTRY_SIZE: usize = 4 * 1024;
 /// Maximum number of elements in any decoded list field.
 pub const MAX_LIST_ELEMENTS: usize = 4_096;
+/// Maximum chunk ids in one file's chunk list: exactly what a [`MAX_BLOB_SIZE`] tree blob can hold at
+/// [`ID_LEN`] bytes per id. Derived from the object cap rather than chosen, so it bounds the decoder's
+/// pre-allocation without capping file size below what the format can already express.
+pub const MAX_CHUNKS_PER_FILE: usize = MAX_BLOB_SIZE / ID_LEN;
 
 /// The object `type` byte. Feeds `enc_key[g][t]` / `id_key[g][t]` (§9.5) and the FRAME.
 #[repr(u8)]
@@ -342,7 +346,11 @@ mod tests {
         let k_obj = secsec_kdf::obj_key(&enc, &id);
 
         let ad = aead_ad(&frame, &id);
-        let (tag, ct) = secsec_aead::seal(&k_obj, &ad, b"file chunk contents");
+        let (tag, ct) = secsec_aead::seal(
+            secsec_aead::UniqueKey::new(&k_obj),
+            &ad,
+            b"file chunk contents",
+        );
         let blob = assemble_blob(&frame, &tag, &ct);
 
         let (got_tag, got_ct) = parse_blob(&blob, &frame).unwrap();

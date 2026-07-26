@@ -17,8 +17,11 @@ helper.
 
 ## Public API
 
-- `merge_heads(...) -> SyncPlan` — the rollback-gated merge decision + the authored two-parent merge
-  commit (`SyncAction`: `Merged` / `AlreadyHave` / `FastForward`).
+- `merge_heads(frontier, our_head, sibling, members, author, keys, store) -> SyncPlan` — the
+  rollback-gated merge decision + the authored two-parent merge commit (`SyncAction`: `Merged` /
+  `AlreadyHave` / `FastForward`). It authenticates the sibling's tip commit against `members` itself
+  (P3); the head's own signature is established by `SiblingHead::verified`, the only constructor. No
+  verification is left to the caller — the gates are exactly as sound as those two checks.
 - `load_commit_dag` — load a commit DAG's parents + metadata for the ancestry checks.
 - `CommitAuthor`, `Reconciled`, `SyncPlan`, `SyncAction`, `EngineError`, `MergeError`, `PathSalt`.
 

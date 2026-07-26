@@ -294,7 +294,7 @@ pub fn seal_entry(roster_key_g: &[u8; 32], gen: u32, seq: u64, entry_plaintext: 
     let k = roster_entry_key(roster_key_g, seq);
     let frame = Frame::v1(gen, ObjType::RosterEntry);
     let ad = ad_roster(&frame, seq);
-    let (ctx_tag, ct) = secsec_aead::seal(&k, &ad, entry_plaintext);
+    let (ctx_tag, ct) = secsec_aead::seal(secsec_aead::UniqueKey::new(&k), &ad, entry_plaintext);
     assemble_blob(&frame, &ctx_tag, &ct)
 }
 
@@ -333,7 +333,7 @@ pub fn seal_roster_keyhist(
 ) -> [u8; ROSTER_KEYHIST_LEN] {
     let k = roster_keyhist_key(roster_key_next, g);
     let ad = Frame::v1(g, ObjType::RosterKeyhist).encode();
-    let (ctx_tag, ct) = secsec_aead::seal(&k, &ad, roster_key_g);
+    let (ctx_tag, ct) = secsec_aead::seal(secsec_aead::UniqueKey::new(&k), &ad, roster_key_g);
     let mut out = [0u8; ROSTER_KEYHIST_LEN];
     out[..CTX_TAG_LEN].copy_from_slice(&ctx_tag);
     out[CTX_TAG_LEN..].copy_from_slice(&ct);
@@ -406,7 +406,7 @@ pub fn seal_data_keyhist(
 ) -> [u8; DATA_KEYHIST_LEN] {
     let k = data_keyhist_key(master_key_next, g);
     let ad = Frame::v1(g, ObjType::Keyhist).encode();
-    let (ctx_tag, ct) = secsec_aead::seal(&k, &ad, master_key_g);
+    let (ctx_tag, ct) = secsec_aead::seal(secsec_aead::UniqueKey::new(&k), &ad, master_key_g);
     let mut out = [0u8; DATA_KEYHIST_LEN];
     out[..CTX_TAG_LEN].copy_from_slice(&ctx_tag);
     out[CTX_TAG_LEN..].copy_from_slice(&ct);

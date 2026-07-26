@@ -57,7 +57,7 @@ fn computed() -> BTreeMap<String, String> {
 
     // [aead] — CTX seal.
     let (ctx_tag, ct) = secsec_aead::seal(
-        &[0x42; 32],
+        secsec_aead::UniqueKey::new(&[0x42; 32]),
         b"secsec-aead-kat-ad",
         b"secsec aead kat plaintext",
     );
@@ -106,6 +106,39 @@ fn computed() -> BTreeMap<String, String> {
     );
 
     v
+}
+
+/// Names the vectors file documents as **inputs** rather than computed outputs. Everything else in
+/// the file must be produced by [`computed`]; see the reverse check in [`run`].
+const INPUT_NAMES: &[&str] = &[
+    "master_key",
+    "generation",
+    "obj_type",
+    "obj_key.id",
+    "roster_entry.seq",
+    "roster_keyhist.g",
+    "key",
+    "ad",
+    "plaintext",
+    "gen",
+    "path_salt",
+    "ref_name",
+    "head_nonce",
+    "roster_entry.plaintext",
+    "roster_keyhist.roster_key_g",
+];
+
+/// Names in `file` that are neither a computed vector nor a documented input — a value that used to
+/// be computed and no longer is. Without this the comparison is one-directional: dropping a vector
+/// from `computed()` would leave a stale line in the file that still "passes".
+fn stale_names(
+    computed: &BTreeMap<String, String>,
+    file: &BTreeMap<String, String>,
+) -> Vec<String> {
+    file.keys()
+        .filter(|k| !computed.contains_key(*k) && !INPUT_NAMES.contains(&k.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// Parse `name = value` lines from the committed vectors file (stripping trailing `# comments`).
@@ -160,7 +193,9 @@ pub(crate) fn run(check: bool) -> Result<(), String> {
         }
     }
 
-    if !mismatches.is_empty() || !missing.is_empty() {
+    let stale = stale_names(&computed, &file);
+
+    if !mismatches.is_empty() || !missing.is_empty() || !stale.is_empty() {
         let mut msg = String::new();
         if !mismatches.is_empty() {
             msg.push_str(&format!(
@@ -174,6 +209,13 @@ pub(crate) fn run(check: bool) -> Result<(), String> {
                 "{} computed vector(s) absent from the file: {}\n",
                 missing.len(),
                 missing.join(", ")
+            ));
+        }
+        if !stale.is_empty() {
+            msg.push_str(&format!(
+                "{} file entr(y/ies) are neither computed nor a documented input (stale?): {}\n",
+                stale.len(),
+                stale.join(", ")
             ));
         }
         return Err(msg);
@@ -207,5 +249,10 @@ mod tests {
                 "vector `{name}` drifted: file vs live code"
             );
         }
+        assert!(
+            stale_names(&computed, &file).is_empty(),
+            "file has entries no longer produced by live code: {:?}",
+            stale_names(&computed, &file)
+        );
     }
 }

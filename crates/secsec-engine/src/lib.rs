@@ -7,7 +7,7 @@
 
 use secsec_kdf::{MasterKey, MasterKeys};
 use secsec_object::Id;
-use secsec_sig::{DeviceKey, SigError};
+use secsec_sig::{DeviceId, DeviceKey, DevicePublic, SigError};
 use secsec_snapshot::{Commit, Entry, SnapError, Tree};
 use secsec_store::Store;
 use secsec_sync::dag::{lowest_common_ancestors, ParentMap};
@@ -199,6 +199,9 @@ pub enum MergeError {
     /// A rollback gate rejected the sibling — a **security event** to alarm on (§10), not a normal
     /// failure: the server presented a head that would roll back the persisted frontier.
     Rollback(MergeReject),
+    /// The sibling's tip commit names an author who is not a current roster member: forged, or from a
+    /// device revoked since it was written (P3).
+    NotMember(DeviceId),
     /// Commit-signing/key error.
     Sig(SigError),
 }
@@ -207,6 +210,9 @@ impl core::fmt::Display for MergeError {
         match self {
             MergeError::Engine(e) => write!(f, "{e}"),
             MergeError::Rollback(r) => write!(f, "rollback rejected: {r:?}"),
+            MergeError::NotMember(_) => {
+                f.write_str("sibling commit is authored by a device that is not a current member")
+            }
             MergeError::Sig(e) => write!(f, "sig: {e}"),
         }
     }
@@ -307,20 +313,33 @@ fn hex12(b: &[u8; 32]) -> String {
     b[..6].iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Drive the §10 rollback-aware merge of one sibling head: load the DAG, run the gates (rejection =
-/// [`MergeError::Rollback`], an alarm), and on Merge reconcile against the lowest common ancestor
-/// and author a signed merge commit. Precondition: the caller signature-verified the sibling head and
-/// its tip commit against the roster (§9.6); ancestor commits are authenticated transitively by the
-/// member-signed head plus content-addressing (§9.2).
+/// Drive the §10 rollback-aware merge of one sibling head: load the DAG, authenticate the sibling's
+/// tip commit against `members`, run the gates (rejection = [`MergeError::Rollback`], an alarm), and
+/// on Merge reconcile against the lowest common ancestor and author a signed merge commit.
+///
+/// The sibling head's own signature is established by [`SiblingHead::verified`], the only way to
+/// build one; its tip commit is verified here. Ancestor commits are authenticated transitively by the
+/// member-signed head plus content-addressing (§9.2/§9.6). Nothing is left as a caller obligation —
+/// the gates are exactly as sound as these checks, so they run where the gates do.
 pub fn merge_heads<K: MasterKeys>(
     frontier: &SyncFrontier,
     our_head_commit: &Id,
     sibling: &SiblingHead,
+    members: &BTreeMap<DeviceId, DevicePublic>,
     author: CommitAuthor<'_>,
     keys: &K,
     store: &Store,
 ) -> Result<SyncPlan, MergeError> {
     let (parents, meta) = load_commit_dag(&[*our_head_commit, sibling.commit_id], keys, store)?;
+
+    // Authenticate the tip commit before any of its metadata reaches the gates (P3).
+    let (sib_commit, sib_sig) =
+        secsec_snapshot::open_signed_commit(&sibling.commit_id, keys, store)?;
+    let sib_author = members
+        .get(&sib_commit.device_id)
+        .ok_or(MergeError::NotMember(sib_commit.device_id))?;
+    secsec_snapshot::verify_commit(sib_author, &sib_commit, &sib_sig)?;
+
     let local_device = author.device.device_id()?;
     let decision = evaluate_merge(
         frontier,
@@ -443,7 +462,7 @@ mod tests {
         std::fs::create_dir_all(src.path().join("sub")).unwrap();
         std::fs::write(src.path().join("sub/b.bin"), [3u8; 9000]).unwrap();
 
-        let (root_tree, root_salt) =
+        let (root_tree, root_salt, _) =
             secsec_snapshot::snapshot_tree(src.path(), &m, &store, None).unwrap();
         // load to the merge model, re-seal it unchanged, restore — must be byte-identical.
         let nodes = load_nodes(&root_tree, &root_salt, &m, &store).unwrap();
@@ -454,6 +473,22 @@ mod tests {
     }
 
     use secsec_sig::DeviceKey;
+
+    /// The roster view for a set of devices.
+    fn members(devs: &[&DeviceKey]) -> BTreeMap<DeviceId, DevicePublic> {
+        devs.iter()
+            .map(|d| (d.device_id().unwrap(), d.public()))
+            .collect()
+    }
+
+    /// A sibling head genuinely signed by `dev`, built through the verifying constructor — the only
+    /// way to obtain a `SiblingHead`, so the tests exercise the same path production does.
+    fn sibling(dev: &DeviceKey, commit: Id, head_version: u64, roster_seq: u64) -> SiblingHead {
+        let mut head = secsec_sync::build_head("main", commit, roster_seq, None);
+        head.head_version = head_version;
+        let sig = secsec_sync::sign_head(dev, &head).unwrap();
+        SiblingHead::verified(&members(&[dev]), &head, &sig).expect("signed by a member")
+    }
 
     /// Snapshot `dir` (descending from `prev`), then seal a signed commit for it; returns the commit
     /// id and its `(root_tree, salt)`.
@@ -468,7 +503,7 @@ mod tests {
         mk: &MasterKey,
         store: &Store,
     ) -> (Id, Id, PathSalt) {
-        let (rt, rs) = secsec_snapshot::snapshot_tree(dir, mk, store, prev).unwrap();
+        let (rt, rs, _) = secsec_snapshot::snapshot_tree(dir, mk, store, prev).unwrap();
         let commit = Commit {
             root_tree: rt,
             root_salt: rs,
@@ -530,12 +565,7 @@ mod tests {
         );
 
         // A merges B's head.
-        let sibling = SiblingHead {
-            device_id: dev_b.device_id().unwrap(),
-            head_version: 1,
-            roster_seq: 0,
-            commit_id: theirs_id,
-        };
+        let sibling = sibling(&dev_b, theirs_id, 1, 0);
         let author = CommitAuthor {
             device: &dev_a,
             version: 3,
@@ -546,6 +576,7 @@ mod tests {
             &SyncFrontier::default(),
             &ours_id,
             &sibling,
+            &members(&[&dev_a, &dev_b]),
             author,
             &m,
             &store,
@@ -626,16 +657,12 @@ mod tests {
         };
 
         // our head = base; sibling = next (descends from base) → fast-forward.
-        let sib_next = SiblingHead {
-            device_id: dev_a.device_id().unwrap(),
-            head_version: 2,
-            roster_seq: 0,
-            commit_id: next_id,
-        };
+        let sib_next = sibling(&dev_a, next_id, 2, 0);
         let plan = merge_heads(
             &SyncFrontier::default(),
             &base_id,
             &sib_next,
+            &members(&[&dev_a]),
             author(),
             &m,
             &store,
@@ -647,16 +674,12 @@ mod tests {
         ));
 
         // our head = next; sibling = base (an ancestor) → already have.
-        let sib_base = SiblingHead {
-            device_id: dev_a.device_id().unwrap(),
-            head_version: 1,
-            roster_seq: 0,
-            commit_id: base_id,
-        };
+        let sib_base = sibling(&dev_a, base_id, 1, 0);
         let plan = merge_heads(
             &SyncFrontier::default(),
             &next_id,
             &sib_base,
+            &members(&[&dev_a]),
             author(),
             &m,
             &store,
@@ -709,19 +732,23 @@ mod tests {
             roster_seq: 5,
             ..Default::default()
         };
-        let sibling = SiblingHead {
-            device_id: dev_b.device_id().unwrap(),
-            head_version: 1,
-            roster_seq: 4,
-            commit_id: theirs_id,
-        };
+        let sibling = sibling(&dev_b, theirs_id, 1, 4);
         let author = CommitAuthor {
             device: &dev_a,
             version: 3,
             roster_seq: 4,
             ts: 0,
         };
-        let err = merge_heads(&frontier, &ours_id, &sibling, author, &m, &store).unwrap_err();
+        let err = merge_heads(
+            &frontier,
+            &ours_id,
+            &sibling,
+            &members(&[&dev_a, &dev_b]),
+            author,
+            &m,
+            &store,
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             MergeError::Rollback(MergeReject::RosterRollback {

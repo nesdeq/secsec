@@ -1007,6 +1007,95 @@ mod tests {
         );
     }
 
+    /// Sign a §15 prune the way the client driver does: over the **state-bound** `args_prune`, not the
+    /// placeholder binding `op_and_args` returns for this op.
+    fn prune_req(
+        dev: &DeviceKey,
+        dead: Vec<[u8; 32]>,
+        all_heads_hash: [u8; 32],
+        roster_seq: u64,
+        nonce: [u8; 32],
+    ) -> Incoming<'_> {
+        let args_hash =
+            prune::args_prune(&prune::dead_set_hash(&dead), &all_heads_hash, roster_seq);
+        let wa = WriteAuth {
+            op: op::PRUNE,
+            args_hash,
+            session_transcript: T,
+            server_nonce: nonce,
+        };
+        let sig = wa.sign(dev).unwrap();
+        Incoming {
+            pubkey: Box::leak(Box::new(dev.public())),
+            request: Request::Prune {
+                dead,
+                all_heads_hash,
+                roster_seq,
+            },
+            op_sig: sig,
+            session_transcript: T,
+            server_nonce: Some(nonce),
+        }
+    }
+
+    /// The §15 head-binding compare-and-swap: because the server recomputes `all_heads_hash` and
+    /// `roster_seq` from its own state, verifying the client's signature over them **is** the CAS. A
+    /// prune carrying a stale view must delete nothing — this is what closes the
+    /// resurrection-via-dedup race, where a reverted head starts referencing an id already in flight
+    /// to be deleted.
+    #[test]
+    fn prune_is_bound_to_the_servers_own_head_and_roster_state() {
+        let (s, _d) = server();
+        let dev = DeviceKey::generate().unwrap();
+        enroll(&s, &dev);
+
+        // One durable object under a ref, so there is something to prune and a head to bind against.
+        let id = [0x70; 32];
+        let push = [0xcc; 16];
+        let n1 = [0x50; 32];
+        s.issue_nonce(n1, 0);
+        let put = Request::Put {
+            id,
+            declared_size: 4,
+            push_id: push,
+            blob: b"data".to_vec(),
+        };
+        assert_eq!(s.handle(write_req(&dev, put, T, n1), 0), Response::Ok);
+        promote(&s, &dev, push);
+        assert_eq!(
+            s.handle(read_req(&dev, Request::Get { id }, T), 0),
+            Response::Blob(Some(b"data".to_vec()))
+        );
+
+        // A prune against a head state the server does not have deletes nothing.
+        let n2 = [0x51; 32];
+        s.issue_nonce(n2, 0);
+        assert_eq!(
+            s.handle(prune_req(&dev, vec![id], [0xAB; 32], 0, n2), 0),
+            Response::Err(ErrorCode::BadAuth)
+        );
+        assert_eq!(
+            s.handle(read_req(&dev, Request::Get { id }, T), 0),
+            Response::Blob(Some(b"data".to_vec())),
+            "a stale-view prune must never delete live data"
+        );
+
+        // The same delete-set against the server's actual state is honoured.
+        let refs = s.store().ref_blob_hashes().unwrap();
+        let ahh = prune::all_heads_hash(&refs);
+        let roster_seq = s.store().roster_len().unwrap().saturating_sub(1);
+        let n3 = [0x52; 32];
+        s.issue_nonce(n3, 0);
+        assert_eq!(
+            s.handle(prune_req(&dev, vec![id], ahh, roster_seq, n3), 0),
+            Response::Ok
+        );
+        assert_eq!(
+            s.handle(read_req(&dev, Request::Get { id }, T), 0),
+            Response::Blob(None)
+        );
+    }
+
     #[test]
     fn concurrent_connection_cap_per_key() {
         let (s, _d) = server();

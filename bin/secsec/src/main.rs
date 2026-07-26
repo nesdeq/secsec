@@ -203,6 +203,43 @@ fn rand16() -> Result<[u8; 16], Box<dyn Error>> {
     Ok(n)
 }
 
+/// Create `dir` and its parents owner-only (0700 on unix). Everything under the client root is either
+/// a trust anchor (the link's pinned `host_id`/RFP/rollback anchor) or the sealed frontier, and the
+/// serve dir holds the TLS host key; no other user has business reading them.
+fn create_dir_private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+}
+
+/// Write `contents` to `path` owner-only (0600 on unix), created with the mode already set so the
+/// bytes are never briefly world-readable. The mode is re-applied for a pre-existing file, so an
+/// install that predates this also gets tightened.
+fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(contents)
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, contents)
+}
+
 fn home() -> Result<PathBuf, Box<dyn Error>> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -369,7 +406,7 @@ impl Config {
             Ok(t) => t,
             Err(_) => {
                 if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    create_dir_private(parent)?;
                 }
                 std::fs::write(&path, CONFIG_TEMPLATE)?;
                 CONFIG_TEMPLATE.to_string()
@@ -465,7 +502,7 @@ fn state_dir_for(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let abs = std::fs::canonicalize(dir)?;
     let name = hex(blake3::hash(abs.to_string_lossy().as_bytes()).as_bytes());
     let sdir = config_root()?.join("folders").join(&name);
-    std::fs::create_dir_all(&sdir)?;
+    create_dir_private(&sdir)?;
     Ok(sdir)
 }
 
@@ -547,7 +584,7 @@ fn write_link(sdir: &Path, l: &Link) -> Result<(), Box<dyn Error>> {
             hex(&a.tip_hash)
         ));
     }
-    std::fs::write(sdir.join("link"), body)?;
+    write_private(&sdir.join("link"), body.as_bytes())?;
     Ok(())
 }
 
@@ -599,13 +636,19 @@ fn load_or_generate_hostkey(dir: &Path) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Er
     let cert_path = dir.join("hostkey.crt");
     let key_path = dir.join("hostkey.key");
     if cert_path.exists() && key_path.exists() {
+        // Tighten a key left world-readable by an older build before handing it out; idempotent.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+        }
         return Ok((std::fs::read(cert_path)?, std::fs::read(key_path)?));
     }
     let ck = rcgen::generate_simple_self_signed(vec!["secsec.invalid".to_string()])?;
     let (cert, key) = (ck.cert.der().to_vec(), ck.key_pair.serialize_der());
-    std::fs::create_dir_all(dir)?;
+    create_dir_private(dir)?;
     std::fs::write(&cert_path, &cert)?;
-    std::fs::write(&key_path, &key)?;
+    write_private(&key_path, &key)?;
     Ok((cert, key))
 }
 
@@ -1004,7 +1047,7 @@ async fn run_sync(
         };
         {
             let tmp = push_id_path.with_extension("tmp");
-            std::fs::write(&tmp, push_id)?;
+            write_private(&tmp, &push_id)?;
             std::fs::rename(&tmp, &push_id_path)?;
         }
         let seal = |fr: &SyncFrontier| save_frontier(&frontier_path, fr, &device);
@@ -1031,7 +1074,7 @@ async fn run_sync(
                 // which the pre-push seal (observations only) need not have included.
                 save_frontier(&frontier_path, &outcome.frontier, &device)?;
                 if let Some(b) = outcome.base {
-                    std::fs::write(&base_path, hex(&b))?;
+                    write_private(&base_path, hex(&b).as_bytes())?;
                 }
                 if initial || !matches!(outcome.kind, secsec_client::sync::SyncKind::UpToDate) {
                     println!("sync: {:?}", outcome.kind);
@@ -1045,6 +1088,18 @@ async fn run_sync(
                     );
                     for p in &outcome.conflicts {
                         eprintln!("  {p}  →  see the name.conflict-* copy alongside it");
+                    }
+                }
+                // §19: a file too large to encode into a decodable tree is held at its last synced
+                // version rather than deleted — but a file that has silently stopped moving is
+                // indistinguishable from one that works, so say so every sync.
+                if !outcome.skipped.is_empty() {
+                    eprintln!(
+                        "warning: {} path(s) are too large to sync and are frozen at their last synced version:",
+                        outcome.skipped.len()
+                    );
+                    for p in &outcome.skipped {
+                        eprintln!("  {p}");
                     }
                 }
                 frontier = outcome.frontier;

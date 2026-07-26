@@ -15,4 +15,6 @@ fuzzing via the targets is the additional, toolchain-gated layer.
 
 - `fuzz_frame`, `fuzz_wire`, `fuzz_roster_entry`, `fuzz_object`, `fuzz_head`, `fuzz_tree`,
   `fuzz_commit` — one per untrusted-input decoder.
-- `DECODERS` — the `(name, Decoder)` table the stable robustness test iterates; `Decoder` type alias.
+
+(`DECODERS` — the `(name, Decoder)` table the stable robustness test iterates — and its `Decoder`
+alias are `#[cfg(test)]`: they exist to drive that test, not for callers.)

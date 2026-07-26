@@ -6,8 +6,9 @@
 use secsec_canon::Writer;
 use secsec_sig::{DeviceKey, DevicePublic, NS_AUTH};
 
-/// The wire `secsec_version` carried in the handshake hellos (§11). A peer at a different version
-/// fails the hello — there is no negotiation or backward compatibility.
+/// The wire `secsec_version` carried in the handshake hellos (§11). A peer at a different version is
+/// rejected at the hello, and would fail connection auth regardless: each side folds its own value
+/// into the session transcript, so the two never agree. No negotiation, no compatibility window.
 pub(crate) const SECSEC_VERSION: u16 = 2;
 /// Handshake nonce length (client/server), in bytes (§11).
 pub(crate) const NONCE_LEN: usize = 32;

@@ -146,6 +146,16 @@ valid tree entry name (non-UTF-8, or one of the above) is **skipped** on snapsho
 symlink — symmetric with the decode-side guard, so an unsyncable name is never authored (macOS's
 `Icon\r` custom-folder-icon file, for one, is silently not synced rather than failing the snapshot).
 
+**Every §19 decoder bound is enforced symmetrically on the write side**, so a snapshot can never
+author an object no device — the author included — is able to decode:
+- A file needing more than the §19 chunk-id cap is **skipped and reported to the user**. If the path
+  was already synced it keeps its **previous** tree entry: an omitted name reaches every other device
+  as a *deletion*, so a file that outgrows the limit freezes at its last syncable version rather than
+  disappearing from everyone's folder.
+- A directory that would exceed the fan-out cap or whose encoded tree would exceed the object cap is
+  a hard **error** naming the directory. Neither is attributable to one entry, and silently truncating
+  a directory would read as a bulk deletion downstream.
+
 ---
 
 ## 7. Trust bootstrap & device enrollment
@@ -832,8 +842,12 @@ The §8.5 local sealed-state blob uses this same construction with `key = local_
 ---
 ## 11. Transport & authentication
 
-- **QUIC + TLS 1.3** (`quinn`+`rustls`), udp/8899 (overridable). Fixed ciphersuites (ChaCha20-
-  Poly1305 / AES-256-GCM) and X25519 KX — **no negotiation/downgrade**.
+- **QUIC + TLS 1.3** (`quinn`+`rustls`), udp/8899 (overridable). The suite list and key exchange are
+  **pinned, not negotiated**: X25519 only, and exactly the TLS 1.3 AEADs ChaCha20-Poly1305,
+  AES-256-GCM, and AES-128-GCM. The last is not optional — RFC 9001 §5.2 fixes QUIC Initial packet
+  protection to AEAD_AES_128_GCM, and rustls derives those keys from the same suite list, so removing
+  it makes the transport unusable. Initial packets carry no secrecy regardless (their keys derive
+  from the public connection ID). TLS 1.2 is refused outright by the verifier — **no downgrade**.
 - **`authorized_keys` is the mandatory connection gate.** `secsec serve` reads the operator's
   `~/.ssh/authorized_keys` (standard OpenSSH format, Ed25519 lines) and **refuses to start** if it
   is missing or has no usable key. After the handshake, the server computes
@@ -1277,6 +1291,12 @@ X-Wing keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today
 - **Parsers:** size/depth/fan-out/length bounds enforced pre-allocation per §19 normative constants;
   `cargo-fuzz` targets for every decoder; reject non-canonical encodings.
 - **Secrets never logged;** structured redaction; no key material in error messages.
+- **On-disk state is owner-only** (0600 files / 0700 directories on unix, set at creation so the bytes
+  are never briefly world-readable): the server's self-signed TLS host key, and every client trust
+  anchor — the per-folder `link` (pinned `host_id`, RFP, anti-rollback anchor), the sealed `frontier`,
+  `base`, and `push_id`. The host key grants no data access (the server is blind), but leaking it
+  hands an attacker a MITM position against clients that already pinned it; the link and frontier are
+  the §21 disk-level rollback surface.
 - **Restore hygiene:** tree entry names are single path components with no separators, no `.`/`..`,
   and **no control characters** (path-traversal + terminal-escape guards, enforced at decode and
   skipped symmetrically at snapshot, §6); the
@@ -1333,6 +1353,7 @@ contract) or that bounds an attacker is **not** configurable. `[client]` keys ap
 | Max tree fan-out per node | 65,536 entries | decoders reject before allocating |
 | Max roster entry size | 4 KiB | decoders reject before allocating |
 | Max list fields (sigchain, keyhist, etc.) | 4,096 elements | decoders reject before allocating |
+| Max chunk ids per file | 524,288 (= max blob size / 32) | derived, not chosen: exactly what a 16 MiB tree blob can hold at one 32-byte id each. The **binding** limit is the encoded tree, which is a per-directory budget — chunk ids from all of a directory's files share the same 16 MiB. Enforced on **both** sides (§6): a decoder rejects a longer list, and a snapshot never authors one |
 ## 20. Crates
 
 `quinn`,`rustls` · `ssh-key`(SSHSIG, Ed25519-only),`x25519-dalek` · `libcrux-ml-kem`

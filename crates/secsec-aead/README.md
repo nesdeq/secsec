@@ -17,16 +17,22 @@ partitioning-oracle / invisible-salamander attacks across the multi-generation, 
 surface. There is no stored `T`, and the high-level AEAD "open" is never used.
 
 **Contract:** `key` is `k_obj` (§9.4) and MUST be unique per sealed object — the fixed `nonce=0` is
-sound only under that uniqueness. Never `seal` twice with the same key and different plaintext.
+sound only under that uniqueness. That obligation is carried by the `UniqueKey` type rather than by
+this paragraph alone.
 
 ## Public API
 
-- `seal(key, ad, plaintext) -> (CtxTag, ct)` / `open(key, ad, ctx_tag, ct) -> plaintext` — the
+- `seal(UniqueKey, ad, plaintext) -> (CtxTag, ct)` / `open(key, ad, ctx_tag, ct) -> plaintext` — the
   committing construction above.
-- `seal_mut(key, nonce, ad, pt)` / `open_mut(key, nonce, ad, tag, ct)` — the **mutable** variant
-  (§9.8): plain RFC 8439 ChaCha20-Poly1305 with a caller-supplied **fresh nonce per write**, for
+- `seal_mut(key, FreshNonce, ad, pt)` / `open_mut(key, nonce, ad, tag, ct)` — the **mutable** variant
+  (§9.8): plain RFC 8439 ChaCha20-Poly1305 with a **fresh nonce per write**, for
   re-encrypted-in-place objects (the per-ref Head, local sealed state). Deliberately *not*
   key-committing; its contract is a fresh random nonce, not a unique key.
+- `UniqueKey` / `FreshNonce` — the two contracts the compiler cannot check, carried as types instead
+  of comments. `unsafe fn` is the usual marker for "the caller must uphold this", but
+  `unsafe_code = "forbid"` rules it out workspace-wide, so each `UniqueKey::new` / `FreshNonce::new`
+  is a proof site and one grep enumerates every one of them. Opening carries no such obligation, so
+  `open` / `open_mut` take the raw key and nonce.
 - `CtxTag`, `AeadError`.
 
 The foundation primitive; gets the most tests (KATs, committing property tests, a byte-for-byte

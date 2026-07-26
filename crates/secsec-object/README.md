@@ -21,7 +21,8 @@ to the requested id.
   commit, and content-address.
 - `open_object(keys, type, path_salt, id, blob) -> plaintext` — the three-way-verified open
   (generic over `MasterKeys`, so it resolves the blob's own generation across rotations, §8.2).
-- `content_id(...)` — re-derive an id from plaintext.
-- `pad_chunk` / `unpad_chunk` + `Padding` (`PowerOfTwo` default / `Uniform` / `Off`, §9.7) —
-  reversible size-bucket padding that blurs object sizes.
+- `pad_chunk` / `unpad_chunk` + `Padding` — reversible size-bucket padding that blurs object sizes
+  (§9.7). Two policies are wired: `PowerOfTwo` (the default) and `None` (opt out); the §9.7 *uniform*
+  policy is not implemented. (Re-deriving an id from plaintext — `content_id` — is crate-internal;
+  `open_object` does it as part of its three-way verify.)
 - `Id`, `PathSalt`, `ZERO_SALT` (the fixed empty salt for commits/heads/roster entries), `ObjError`.

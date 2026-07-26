@@ -19,11 +19,16 @@ persisted and enforced by the client cold-start (`secsec-client::repo::open_repo
 
 ## Public API
 
-- Sigchain: `Op` (`Genesis`/`AddDevice`/`RevokeDevice`/`Rotate`/`SetMinAlgo`), `genesis`, `append`,
-  `append_many`, `encode_entry`/`decode_entry`, `entry_hash`, `fold`, `is_member`.
+- Sigchain: `Op` (`Genesis`/`AddDevice`/`RevokeDevice`/`Rotate`/`SetMinAlgo`), `Entry`, `genesis`,
+  `append`, `append_many`, `encode_entry` / `decode_entry`.
 - Per-entry AEAD: `seal_entry` / `open_entry`.
-- Key-histories (§8.2): `seal_roster_keyhist`/`peel_roster_keys`/`open_roster_keyhist`,
-  `seal_data_keyhist`/`peel_data_keys`/`open_data_keyhist`.
-- Cold-start: `cold_start_fold` (peel, decrypt, fold, verify RFP + `mk_commit`).
-- Revocation: `revoke_closure` (transitive add-by closure), `devices_added_by`, `revoke_rotate_ops`.
-- `State`, `RosterError`; `ROSTER_KEYHIST_LEN`, `DATA_KEYHIST_LEN`.
+- Key-histories (§8.2): `seal_roster_keyhist`, `seal_data_keyhist`, `peel_data_keys`.
+- Cold-start: `cold_start_fold` (peel, decrypt, fold, verify RFP + `mk_commit`) — the one entry point
+  for turning a fetched chain into trusted state.
+- Revocation: `revoke_closure` (transitive add-by closure), `revoke_rotate_ops`.
+- `State` (+ `is_member`), `MkCommit`, `RosterError`.
+
+The pieces `cold_start_fold` composes — `fold` itself, `entry_hash`, `peel_roster_keys`,
+`open_roster_keyhist` / `open_data_keyhist`, `devices_added_by`, and the wrap-length constants — are
+crate-internal: folding a chain without the RFP anchor and the `mk_commit` check is precisely the
+mistake the cold-start entry point exists to prevent.

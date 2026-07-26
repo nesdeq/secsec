@@ -17,15 +17,17 @@ are opaque.
 - Transactional push (§15): `stage(push_id, id, blob, now)` (buffers a blob under `push_id`),
   `staged_bytes`, `cas_ref(ref_h, expected_old, new_blob, promote)` (promotes the named push's
   staging into durable objects and swaps the ref in one redb txn), `reclaim_staging(now, ttl)`
-  (drops idle pushes), `retain(keep)` (count-based history retention), `delete_objects(ids)`,
-  `compact`.
+  (drops idle pushes), `delete_objects(ids)`, `prune_if(ids, accept)` (the §15 head-binding prune:
+  re-checks the CAS inputs inside the delete's own txn), `retain(keep)` (the local cache's
+  keep-only-reachable orphan sweep), `compact`.
 - Keyslots: `put_keyslot` / `get_keyslot` / `keyslot_exists` (drives the §12 keyslot-existence auth
   check) / `delete_keyslot` (§8.4 revocation).
 - Refs: `cas_ref` (blind compare-and-swap on `BLAKE3` of the stored tip blob, §12), `get_ref`,
   `ref_blob_hashes`, `ABSENT_HEAD`.
 - Sigchain: `append_roster`, `get_roster_entry`, `roster_len`.
 - Key-histories: `put_keyhist` / `get_keyhist`, `put_roster_keyhist` / `get_roster_keyhist`.
-- `Store`, `StoreError`, `RefBlobHash`.
+- `Store`, `StoreError`, `RefBlobHash`, `CasOutcome` (`swapped` + `promoted_bytes`, the
+  §15 per-key cap is charged on the latter).
 
 The store is lock-free (redb-transactional), so a `serve` loop can share one `Store` across
 connections concurrently.

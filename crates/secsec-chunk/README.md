@@ -16,7 +16,11 @@ deterministic (same `cdc_seed` + same input ⇒ same cut points).
 
 ## Public API
 
-- `Chunker::with_defaults(cdc_seed)` / `Chunker::new(cdc_seed, min, avg, max)` — build a keyed chunker.
-- `chunks(data)` — iterate content-defined slices; `cut_points(data)` / `next_cut(...)` — the raw
-  boundary positions.
-- `DEFAULT_MIN` / `DEFAULT_AVG` / `DEFAULT_MAX` (16 / 64 / 256 KiB, §19).
+- `Chunker::with_defaults(cdc_seed)` — a keyed chunker at the §19 sizes (16 / 64 / 256 KiB).
+- `chunks(data)` — content-defined slices of an in-memory buffer.
+- `chunk_stream(reader, emit)` — the same cut points over a reader, holding at most one max-size
+  window in memory so a file larger than RAM is never read whole. Boundaries are byte-identical to
+  `chunks`, which is what cross-device dedup and merge content-equality rest on.
+- `StreamError`.
+
+(The gear table, the size constants, and the raw `next_cut` boundary search are crate-internal.)

@@ -127,7 +127,7 @@ mod tests {
         // Commit a folder → the store holds exactly the head's reachable closure.
         let src = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("f"), b"data").unwrap();
-        let (rt, rs) = snapshot_tree(src.path(), &m, &store, None).unwrap();
+        let (rt, rs, _) = snapshot_tree(src.path(), &m, &store, None).unwrap();
         let commit = Commit {
             root_tree: rt,
             root_salt: rs,
@@ -171,7 +171,7 @@ mod tests {
             let mut data = vec![0u8; 200 * 1024];
             getrandom::fill(&mut data).unwrap();
             std::fs::write(work.path().join("f.bin"), &data).unwrap();
-            let (rt, rs) = snapshot_tree(
+            let (rt, rs, _) = snapshot_tree(
                 work.path(),
                 &m,
                 &store,
@@ -260,7 +260,7 @@ mod tests {
             let mut data = vec![0u8; 200 * 1024];
             getrandom::fill(&mut data).unwrap();
             std::fs::write(work.path().join("f.bin"), &data).unwrap();
-            let (rt, rs) = secsec_snapshot::snapshot_tree(
+            let (rt, rs, _) = secsec_snapshot::snapshot_tree(
                 work.path(),
                 &m,
                 &store,

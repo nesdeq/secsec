@@ -1,4 +1,7 @@
 /target
+# `fuzz/` is its own workspace (libfuzzer-sys needs nightly), so it builds to its own target dir.
+/fuzz/target
+/fuzz/Cargo.lock
 **/*.rs.bk
 .DS_Store
 

@@ -10,10 +10,12 @@
 //! ```
 //!
 //! Open recomputes `T` from `(AD, ct)`, constant-time-compares the recomputed `ctx_tag`, and only
-//! then decrypts (full procedure: §9.4). **Contract:** `key` MUST be unique per sealed object —
-//! never [`seal`] twice with the same key. The caller owns key zeroization (§18); this crate
-//! zeroizes only its Poly1305 one-time key. [`seal_mut`]/[`open_mut`] are the §9.8 mutable-object
-//! variant: plain RFC 8439 with a caller-supplied **fresh nonce per write**, not key-committing.
+//! then decrypts (full procedure: §9.4). The two contracts Rust cannot check are carried by types
+//! rather than prose: [`seal`] takes a [`UniqueKey`] (never sealed under twice) and [`seal_mut`] a
+//! [`FreshNonce`], so each obligation is a named construction the reader must justify. Opening has
+//! no such obligation, so [`open`]/[`open_mut`] take the raw material. The caller owns key
+//! zeroization (§18); this crate zeroizes only its Poly1305 one-time key. [`seal_mut`]/[`open_mut`]
+//! are the §9.8 mutable-object variant: plain RFC 8439, not key-committing.
 
 #![forbid(unsafe_code)]
 
@@ -32,6 +34,43 @@ const CTX_LABEL: &[u8] = b"secsec-ctx-v1";
 
 /// The 32-byte CTX commitment tag, stored in place of the raw Poly1305 tag.
 pub type CtxTag = [u8; 32];
+
+/// A key used for **exactly one** [`seal`], ever — the contract that makes the fixed zero nonce sound
+/// (§9.4). Rust cannot check it and `unsafe` is forbidden workspace-wide, so the obligation rides in
+/// the type instead of a comment: every [`UniqueKey::new`] is a proof site, and the full set of them
+/// is enumerable with one grep.
+#[derive(Clone, Copy)]
+pub struct UniqueKey<'a>(&'a [u8; 32]);
+
+impl<'a> UniqueKey<'a> {
+    /// Assert that `key` is unique to a single sealing.
+    ///
+    /// # Uniqueness
+    /// The caller MUST derive `key` so no two [`seal`] calls can ever receive the same bytes — bind it
+    /// to a content address (`secsec_kdf::obj_key`), to a `(generation, sequence)` pair, or to a fresh
+    /// KEM shared secret. Reuse repeats the keystream *and* voids the CMT-4 commitment.
+    #[must_use]
+    pub fn new(key: &'a [u8; 32]) -> Self {
+        Self(key)
+    }
+}
+
+/// A 96-bit nonce never before paired with the accompanying key, and never again — the contract
+/// [`seal_mut`] rests on (§9.8). Same role as [`UniqueKey`]: a named construction rather than a note.
+#[derive(Clone, Copy)]
+pub struct FreshNonce<'a>(&'a [u8; 12]);
+
+impl<'a> FreshNonce<'a> {
+    /// Assert that `nonce` was drawn from the OS CSPRNG for this one write.
+    ///
+    /// # Freshness
+    /// `(key, nonce)` reuse is catastrophic — it repeats both the keystream and the Poly1305 one-time
+    /// key. Never a counter, never carried across writes.
+    #[must_use]
+    pub fn new(nonce: &'a [u8; 12]) -> Self {
+        Self(nonce)
+    }
+}
 
 /// Authentication failure on [`open`]. Deliberately opaque: it never reveals *which* check failed
 /// (commitment mismatch is the only observable outcome), and decryption never runs on failure.
@@ -71,10 +110,11 @@ fn ctx_commit(key: &[u8; 32], ad: &[u8], t: &[u8; 16]) -> CtxTag {
     *h.finalize().as_bytes()
 }
 
-/// Seal `plaintext` under a **unique per-object** `key` (the crate-doc contract) with AD `ad`.
-/// Returns `(ctx_tag, ciphertext)`; the raw Poly1305 tag is folded into `ctx_tag`, never stored.
+/// Seal `plaintext` under a [`UniqueKey`] with AD `ad`. Returns `(ctx_tag, ciphertext)`; the raw
+/// Poly1305 tag is folded into `ctx_tag`, never stored.
 #[must_use]
-pub fn seal(key: &[u8; 32], ad: &[u8], plaintext: &[u8]) -> (CtxTag, Vec<u8>) {
+pub fn seal(key: UniqueKey<'_>, ad: &[u8], plaintext: &[u8]) -> (CtxTag, Vec<u8>) {
+    let key = key.0;
     let mut cipher = ChaCha20::new_from_slices(key, &NONCE).expect("32-byte key / 12-byte nonce");
     // Block 0 -> Poly1305 one-time key (RFC 8439 §2.6); zeroized on drop.
     let mut otk = Zeroizing::new([0u8; 32]);
@@ -116,16 +156,16 @@ pub fn open(
     Ok(pt)
 }
 
-/// The §9.8 mutable-object AEAD: plain RFC 8439 ChaCha20-Poly1305, raw tag stored. **Contract:**
-/// the caller MUST pass a fresh OS-CSPRNG nonce on every call with a given `key` — `(key, nonce)`
-/// reuse is catastrophic. Not key-committing; authenticity rests on the object's signature (§9.8).
+/// The §9.8 mutable-object AEAD: plain RFC 8439 ChaCha20-Poly1305, raw tag stored, under a
+/// [`FreshNonce`]. Not key-committing; authenticity rests on the object's signature (§9.8).
 #[must_use]
 pub fn seal_mut(
     key: &[u8; 32],
-    nonce: &[u8; 12],
+    nonce: FreshNonce<'_>,
     ad: &[u8],
     plaintext: &[u8],
 ) -> ([u8; 16], Vec<u8>) {
+    let nonce = nonce.0;
     let mut cipher = ChaCha20::new_from_slices(key, nonce).expect("32-byte key / 12-byte nonce");
     let mut otk = Zeroizing::new([0u8; 32]);
     cipher.apply_keystream(&mut *otk);
@@ -168,7 +208,7 @@ mod tests {
         let key = [9u8; 32];
         let ad = b"FRAME||id";
         let pt = b"the quick brown fox";
-        let (tag, ct) = seal(&key, ad, pt);
+        let (tag, ct) = seal(UniqueKey::new(&key), ad, pt);
         assert_ne!(&ct[..], &pt[..], "ciphertext must differ from plaintext");
         assert_eq!(open(&key, ad, &tag, &ct).unwrap(), pt);
     }
@@ -176,7 +216,7 @@ mod tests {
     #[test]
     fn empty_plaintext_round_trip() {
         let key = [3u8; 32];
-        let (tag, ct) = seal(&key, b"", b"");
+        let (tag, ct) = seal(UniqueKey::new(&key), b"", b"");
         assert!(ct.is_empty());
         assert_eq!(open(&key, b"", &tag, &ct).unwrap(), b"");
     }
@@ -216,7 +256,7 @@ mod tests {
     fn tampered_ciphertext_rejected() {
         let key = [1u8; 32];
         let ad = b"ad";
-        let (tag, mut ct) = seal(&key, ad, b"important bytes");
+        let (tag, mut ct) = seal(UniqueKey::new(&key), ad, b"important bytes");
         ct[0] ^= 0x01;
         assert_eq!(open(&key, ad, &tag, &ct), Err(AeadError));
     }
@@ -224,7 +264,7 @@ mod tests {
     #[test]
     fn tampered_ad_rejected() {
         let key = [1u8; 32];
-        let (tag, ct) = seal(&key, b"ad-one", b"important bytes");
+        let (tag, ct) = seal(UniqueKey::new(&key), b"ad-one", b"important bytes");
         assert_eq!(open(&key, b"ad-two", &tag, &ct), Err(AeadError));
     }
 
@@ -232,7 +272,7 @@ mod tests {
     fn tampered_tag_rejected() {
         let key = [1u8; 32];
         let ad = b"ad";
-        let (mut tag, ct) = seal(&key, ad, b"important bytes");
+        let (mut tag, ct) = seal(UniqueKey::new(&key), ad, b"important bytes");
         tag[0] ^= 0x01;
         assert_eq!(open(&key, ad, &tag, &ct), Err(AeadError));
     }
@@ -243,7 +283,7 @@ mod tests {
         let k1 = [1u8; 32];
         let k2 = [2u8; 32];
         let ad = b"ad";
-        let (tag, ct) = seal(&k1, ad, b"secret");
+        let (tag, ct) = seal(UniqueKey::new(&k1), ad, b"secret");
         assert_eq!(open(&k1, ad, &tag, &ct).unwrap(), b"secret");
         assert_eq!(open(&k2, ad, &tag, &ct), Err(AeadError));
     }
@@ -260,7 +300,7 @@ mod tests {
         let key = [0x42u8; 32];
         let ad: &[u8] = b"secsec-aead-kat-ad";
         let pt: &[u8] = b"secsec aead kat plaintext";
-        let (ctx_tag, ct) = seal(&key, ad, pt);
+        let (ctx_tag, ct) = seal(UniqueKey::new(&key), ad, pt);
         assert_eq!(
             hx(&ctx_tag),
             "03f2eb3d9adf7ce304751d18f32d02e9e169bf00cbea129e2a46cdfa3a141273"
@@ -279,7 +319,7 @@ mod tests {
         let key = [7u8; 32];
         let nonce = [0x11u8; 12];
         let ad = b"FRAME||H";
-        let (tag, ct) = seal_mut(&key, &nonce, ad, b"head plaintext");
+        let (tag, ct) = seal_mut(&key, FreshNonce::new(&nonce), ad, b"head plaintext");
         assert_eq!(
             open_mut(&key, &nonce, ad, &tag, &ct).unwrap(),
             b"head plaintext"
@@ -298,7 +338,7 @@ mod tests {
         let ad: &[u8] = b"associated data";
         let pt: &[u8] = b"plaintext of arbitrary, non-block-aligned length!";
 
-        let (my_tag, my_ct) = seal_mut(&key, &nonce, ad, pt);
+        let (my_tag, my_ct) = seal_mut(&key, FreshNonce::new(&nonce), ad, pt);
 
         let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
         let mut ref_ct = pt.to_vec();
@@ -319,7 +359,7 @@ mod tests {
         let key = [7u8; 32];
         let nonce = [0x11u8; 12];
         let ad = b"ad";
-        let (tag, ct) = seal_mut(&key, &nonce, ad, b"secret head");
+        let (tag, ct) = seal_mut(&key, FreshNonce::new(&nonce), ad, b"secret head");
 
         let mut bad_ct = ct.clone();
         bad_ct[0] ^= 0x01;
@@ -342,8 +382,8 @@ mod tests {
         let key = [7u8; 32];
         let ad = b"ad";
         let pt = b"same plaintext, two writes";
-        let (t1, c1) = seal_mut(&key, &[1u8; 12], ad, pt);
-        let (t2, c2) = seal_mut(&key, &[2u8; 12], ad, pt);
+        let (t1, c1) = seal_mut(&key, FreshNonce::new(&[1u8; 12]), ad, pt);
+        let (t2, c2) = seal_mut(&key, FreshNonce::new(&[2u8; 12]), ad, pt);
         assert_ne!(c1, c2, "different nonce must give different ciphertext");
         assert_eq!(open_mut(&key, &[1u8; 12], ad, &t1, &c1).unwrap(), pt);
         assert_eq!(open_mut(&key, &[2u8; 12], ad, &t2, &c2).unwrap(), pt);
@@ -353,7 +393,7 @@ mod tests {
         #[test]
         fn prop_round_trip(key: [u8; 32], ad in proptest::collection::vec(any::<u8>(), 0..64),
                            pt in proptest::collection::vec(any::<u8>(), 0..1024)) {
-            let (tag, ct) = seal(&key, &ad, &pt);
+            let (tag, ct) = seal(UniqueKey::new(&key), &ad, &pt);
             prop_assert_eq!(open(&key, &ad, &tag, &ct).unwrap(), pt);
         }
 
@@ -361,7 +401,7 @@ mod tests {
         fn prop_wrong_key_rejected(k1: [u8; 32], k2: [u8; 32],
                                    pt in proptest::collection::vec(any::<u8>(), 0..256)) {
             prop_assume!(k1 != k2);
-            let (tag, ct) = seal(&k1, b"ad", &pt);
+            let (tag, ct) = seal(UniqueKey::new(&k1), b"ad", &pt);
             prop_assert_eq!(open(&k2, b"ad", &tag, &ct), Err(AeadError));
         }
 
@@ -369,7 +409,7 @@ mod tests {
         fn prop_flip_any_ct_byte_rejected(key: [u8; 32],
                                           pt in proptest::collection::vec(any::<u8>(), 1..256),
                                           idx: usize, bit in 0u8..8) {
-            let (tag, mut ct) = seal(&key, b"ad", &pt);
+            let (tag, mut ct) = seal(UniqueKey::new(&key), b"ad", &pt);
             let i = idx % ct.len();
             ct[i] ^= 1 << bit;
             prop_assert_eq!(open(&key, b"ad", &tag, &ct), Err(AeadError));

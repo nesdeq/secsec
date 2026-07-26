@@ -288,7 +288,7 @@ mod tests {
         );
 
         let ad = b"FRAME||id_a";
-        let (tag, ct) = secsec_aead::seal(&k_a, ad, b"object bytes");
+        let (tag, ct) = secsec_aead::seal(secsec_aead::UniqueKey::new(&k_a), ad, b"object bytes");
         assert_eq!(
             secsec_aead::open(&k_a, ad, &tag, &ct).unwrap(),
             b"object bytes"

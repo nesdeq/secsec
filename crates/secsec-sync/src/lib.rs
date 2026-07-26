@@ -242,7 +242,12 @@ pub fn seal_head(
     let h = ref_hash(ref_name_key, &head.ref_name);
     let ad = head_ad(&frame, &h);
     let key = mk.head_key();
-    let (tag, ct) = secsec_aead::seal_mut(&key, nonce, &ad, &encode_head(head, sig));
+    let (tag, ct) = secsec_aead::seal_mut(
+        &key,
+        secsec_aead::FreshNonce::new(nonce),
+        &ad,
+        &encode_head(head, sig),
+    );
 
     let mut out = Vec::with_capacity(FRAME_LEN + HEAD_NONCE_LEN + HEAD_TAG_LEN + ct.len());
     out.extend_from_slice(&frame.encode());

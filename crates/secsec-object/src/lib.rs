@@ -107,7 +107,7 @@ pub fn seal_object(
     let enc_key = mk.enc_key(obj_type.as_u8());
     let k_obj = obj_key(&enc_key, &id);
     let ad = aead_ad(&frame, &id);
-    let (ctx_tag, ct) = secsec_aead::seal(&k_obj, &ad, plaintext);
+    let (ctx_tag, ct) = secsec_aead::seal(secsec_aead::UniqueKey::new(&k_obj), &ad, plaintext);
     let blob = assemble_blob(&frame, &ctx_tag, &ct);
     (id, blob)
 }

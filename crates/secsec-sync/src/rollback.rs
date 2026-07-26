@@ -5,9 +5,10 @@
 //! before writing the merge commit (§8.5). The sealed local-state codec is also here.
 
 use crate::dag::{self, Id, ParentMap};
-use secsec_canon::{CanonError, Reader, Writer};
+use crate::{verify_head, Head};
+use secsec_canon::{verify_reencode, CanonError, Reader, Writer};
 use secsec_frame::MAX_LIST_ELEMENTS;
-use secsec_sig::DeviceId;
+use secsec_sig::{DeviceId, DevicePublic};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Local sealed-state nonce length (§9.8): 96-bit.
@@ -28,7 +29,12 @@ pub struct SyncFrontier {
 }
 
 /// A fetched, signature-verified sibling head (the inputs the gates need from it).
+///
+/// `#[non_exhaustive]`, so [`SiblingHead::verified`] is the only way to build one outside this crate.
+/// "A current member signed this head" is the precondition every gate below silently rests on, and a
+/// note on the caller was not enough to keep it true — the constructor establishes it instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SiblingHead {
     /// The device that authored (signed) this head.
     pub device_id: DeviceId,
@@ -38,6 +44,31 @@ pub struct SiblingHead {
     pub roster_seq: u64,
     /// The commit this head points at.
     pub commit_id: Id,
+}
+
+impl SiblingHead {
+    /// Verify `sig` over `head` against the folded roster and, on success, capture the signing member
+    /// as `device_id`. `None` if no current member signed it — a forged head, or one from a device
+    /// revoked since it was written.
+    ///
+    /// Verification happens here rather than at the call site so the gates cannot be reached with an
+    /// unauthenticated head (§9.6/§10).
+    #[must_use]
+    pub fn verified(
+        members: &BTreeMap<DeviceId, DevicePublic>,
+        head: &Head,
+        sig: &[u8],
+    ) -> Option<Self> {
+        let device_id = members
+            .iter()
+            .find_map(|(id, pk)| verify_head(pk, head, sig).is_ok().then_some(*id))?;
+        Some(Self {
+            device_id,
+            head_version: head.head_version,
+            roster_seq: head.roster_seq,
+            commit_id: head.commit_id,
+        })
+    }
 }
 
 /// Per-commit metadata the gates read (decoded from each [`secsec_snapshot::Commit`]).
@@ -78,6 +109,12 @@ pub enum MergeReject {
         version: u64,
         /// The persisted high-water.
         hwm: u64,
+    },
+    /// The caller supplied a DAG that does not cover every commit the gates must examine, so gate 2a
+    /// would have silently skipped one. Fails closed: an unexamined commit is not an accepted commit.
+    IncompleteDag {
+        /// The commit reachable from the sibling that carried no metadata.
+        commit: Id,
     },
     /// Gate 2b: the sibling device's `head_version` is below its persisted high-water.
     HeadRollback {
@@ -130,22 +167,26 @@ pub fn evaluate_merge(
     // Gate 2a: every newly-accepted commit's version must exceed its device's high-water; the local
     // device's own commits are exempt (fn docs).
     for c in new_commits(parents, our_head, &sibling.commit_id) {
-        if let Some(meta) = commit_meta.get(&c) {
-            if meta.device_id == *local_device {
-                continue;
-            }
-            let hwm = frontier
-                .commit_version_hwm
-                .get(&meta.device_id)
-                .copied()
-                .unwrap_or(0);
-            if meta.version <= hwm {
-                return Err(MergeReject::CommitReplay {
-                    device: meta.device_id,
-                    version: meta.version,
-                    hwm,
-                });
-            }
+        // Fail closed on a commit the caller supplied no metadata for: skipping it would quietly
+        // narrow the replay check to whatever happened to be loaded. `load_commit_dag` fills both maps
+        // together, so this only fires when the precondition is actually broken.
+        let Some(meta) = commit_meta.get(&c) else {
+            return Err(MergeReject::IncompleteDag { commit: c });
+        };
+        if meta.device_id == *local_device {
+            continue;
+        }
+        let hwm = frontier
+            .commit_version_hwm
+            .get(&meta.device_id)
+            .copied()
+            .unwrap_or(0);
+        if meta.version <= hwm {
+            return Err(MergeReject::CommitReplay {
+                device: meta.device_id,
+                version: meta.version,
+                hwm,
+            });
         }
     }
 
@@ -265,11 +306,16 @@ impl SyncFrontier {
         let commit_version_hwm = decode_hwm(&mut r)?;
         let head_version_hwm = decode_hwm(&mut r)?;
         r.finish()?;
-        Ok(SyncFrontier {
+        let frontier = SyncFrontier {
             roster_seq,
             commit_version_hwm,
             head_version_hwm,
-        })
+        };
+        // §9.3 re-encode guard, as on every other decoder: a map whose ids are out of ascending order
+        // or repeated decodes to a frontier that would not round-trip, so reject it rather than let
+        // two byte strings mean the same anti-rollback state.
+        verify_reencode(bytes, &frontier, SyncFrontier::encode)?;
+        Ok(frontier)
     }
 }
 
@@ -283,7 +329,12 @@ pub fn seal_frontier(
 ) -> Option<Vec<u8>> {
     let mut nonce = [0u8; FRONTIER_NONCE_LEN];
     getrandom::fill(&mut nonce).ok()?;
-    let (tag, ct) = secsec_aead::seal_mut(local_seal_key, &nonce, device_id, &frontier.encode());
+    let (tag, ct) = secsec_aead::seal_mut(
+        local_seal_key,
+        secsec_aead::FreshNonce::new(&nonce),
+        device_id,
+        &frontier.encode(),
+    );
     let mut out = Vec::with_capacity(FRONTIER_NONCE_LEN + FRONTIER_TAG_LEN + ct.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&tag);
@@ -520,6 +571,56 @@ mod tests {
                 hwm: 3
             })
         );
+    }
+
+    /// A DAG that does not cover every reachable commit must fail closed. Skipping the commits it
+    /// carries no metadata for would silently narrow gate 2a to whatever happened to be loaded — the
+    /// replay check would pass on state it never examined.
+    #[test]
+    fn incomplete_dag_is_rejected_rather_than_skipped() {
+        let g = dag(&[(2, &[1]), (3, &[2])]); // sibling 3 descends from 2 descends from 1
+        let f = SyncFrontier::default();
+        let sib = SiblingHead {
+            device_id: dev(2),
+            head_version: 1,
+            roster_seq: 0,
+            commit_id: id(3),
+        };
+        // Only the tip has metadata: the walk hits commit 1 with nothing to check it against.
+        assert_eq!(
+            evaluate_merge(&f, &id(9), &sib, &dev(9), &g, &meta(&[(3, 2, 2)])),
+            Err(MergeReject::IncompleteDag { commit: id(1) })
+        );
+        // Complete metadata for the same DAG passes the gates.
+        assert_eq!(
+            evaluate_merge(
+                &f,
+                &id(9),
+                &sib,
+                &dev(9),
+                &g,
+                &meta(&[(1, 1, 1), (2, 2, 1), (3, 2, 2)])
+            ),
+            Ok(MergeDecision::Merge)
+        );
+    }
+
+    /// The sealed frontier gets the §9.3 re-encode guard every other decoder has: a high-water map
+    /// whose ids are out of ascending order does not round-trip, so two byte strings would otherwise
+    /// mean the same anti-rollback state.
+    #[test]
+    fn frontier_decode_rejects_non_canonical_hwm_order() {
+        let mut w = Writer::new();
+        w.u64(0); // roster_seq
+        w.u64(2); // commit_version_hwm, written in DESCENDING id order
+        w.raw(&dev(2)).u64(1);
+        w.raw(&dev(1)).u64(1);
+        w.u64(0); // head_version_hwm
+        let bytes = w.finish();
+        assert!(matches!(
+            SyncFrontier::decode(&bytes),
+            Err(FrontierError::Canon(CanonError::NonCanonical))
+        ));
     }
 
     #[test]

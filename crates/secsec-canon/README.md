@@ -16,7 +16,7 @@ deterministic and canonical or the whole authenticity story breaks. This crate g
 ## Public API
 
 - `Writer` — append fields (`u8`/`u16`/`u32`/`u64`, length-prefixed `bytes`, fixed-width `raw`) →
-  `finish()` / `as_bytes()`.
+  `finish()`.
 - `Reader` — read the same fields in the same order; `bytes(max)` enforces the bound before
   allocating; `finish()` asserts the buffer is exhausted.
 - `verify_reencode(received, value, encode)` — confirms a decoded value re-encodes to the bytes that

@@ -950,7 +950,7 @@ mod tests {
         // Publish a head at generation 1.
         let src = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("f.txt"), b"v1").unwrap();
-        let (rt, rs) =
+        let (rt, rs, _) =
             secsec_snapshot::snapshot_tree(src.path(), &mk1, &remote.store, None).unwrap();
         let commit = secsec_snapshot::Commit {
             root_tree: rt,

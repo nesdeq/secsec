@@ -6,7 +6,8 @@
 use crate::{HostPin, PinnedServerVerifier};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, ServerConfig, TransportConfig};
-use rustls::crypto::ring::default_provider;
+use rustls::crypto::ring::{cipher_suite, default_provider, kx_group};
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +47,30 @@ impl core::fmt::Display for ConfigError {
 }
 impl std::error::Error for ConfigError {}
 
+/// §11: the suite list and key exchange are **fixed, not negotiated**. Pinning the protocol version
+/// alone leaves both to whatever the ring provider happens to ship, so they are enumerated here — a
+/// provider that later adds a group or drops a suite changes nothing silently.
+///
+/// `TLS13_AES_128_GCM_SHA256` is in the list because QUIC cannot run without it: RFC 9001 §5.2 fixes
+/// Initial packet protection to AEAD_AES_128_GCM, and rustls sources those keys from this same list
+/// ("no initial cipher suite found" otherwise). Initial packets carry no secrecy in any case — their
+/// keys derive from the public connection ID.
+///
+/// Signature verification keeps the provider's full algorithm list: it must verify whatever the
+/// pinned host certificate was signed with, and that certificate is trusted by SPKI pin, not by
+/// algorithm.
+fn pinned_provider() -> CryptoProvider {
+    CryptoProvider {
+        cipher_suites: vec![
+            cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+            cipher_suite::TLS13_AES_256_GCM_SHA384,
+            cipher_suite::TLS13_AES_128_GCM_SHA256,
+        ],
+        kx_groups: vec![kx_group::X25519],
+        ..default_provider()
+    }
+}
+
 /// The shared transport tuning (idle / keepalive) for `t`.
 fn transport_config(t: Tuning) -> TransportConfig {
     let mut tc = TransportConfig::default();
@@ -60,7 +85,7 @@ fn transport_config(t: Tuning) -> TransportConfig {
 
 /// A pinned TLS 1.3 rustls `ClientConfig` (no ALPN here; set by the caller if needed).
 fn rustls_client_config(pin: HostPin) -> rustls::ClientConfig {
-    rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+    rustls::ClientConfig::builder_with_provider(Arc::new(pinned_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .expect("TLS 1.3 supported")
         .dangerous()
@@ -76,7 +101,7 @@ fn rustls_server_config(
 ) -> Result<rustls::ServerConfig, ConfigError> {
     let certs = vec![CertificateDer::from(cert_der.to_vec())];
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der.to_vec()));
-    rustls::ServerConfig::builder_with_provider(Arc::new(default_provider()))
+    rustls::ServerConfig::builder_with_provider(Arc::new(pinned_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .expect("TLS 1.3 supported")
         .with_no_client_auth()
@@ -105,7 +130,7 @@ pub type CapturedHostPin = Arc<std::sync::Mutex<Option<[u8; 32]>>>;
 /// the returned cell; the caller confirms out-of-band and pins it ([`client_config`] thereafter).
 pub fn client_config_tofu() -> Result<(ClientConfig, CapturedHostPin), ConfigError> {
     let captured = Arc::new(std::sync::Mutex::new(None));
-    let rcc = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+    let rcc = rustls::ClientConfig::builder_with_provider(Arc::new(pinned_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .expect("TLS 1.3 supported")
         .dangerous()

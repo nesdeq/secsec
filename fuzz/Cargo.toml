@@ -2,6 +2,11 @@
 # member — libfuzzer-sys needs nightly + LLVM sanitizers, so it builds out-of-band from the main
 # workspace. Each target is a thin wrapper over a `secsec_fuzz::fuzz_*` function, which is itself
 # exercised on stable by `secsec-fuzz`'s `every_decoder_survives_arbitrary_input` test.
+
+# An empty workspace table is what actually keeps this package out of the root workspace; without it
+# cargo walks up, finds the root manifest, and refuses to build ("believes it's in a workspace").
+[workspace]
+
 [package]
 name = "secsec-fuzz-targets"
 version = "0.0.0"

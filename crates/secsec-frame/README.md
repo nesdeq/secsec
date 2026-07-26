@@ -16,12 +16,16 @@ Two spec rules are enforced here:
 
 ## Public API
 
-- `Frame` — `v1(gen, type)`, `encode()` / `decode()`, `aead_ad(id)`.
-- `ObjType` — `Chunk` / `Tree` / `Commit` / `Head` / `Roster` / … (`as_u8` / `from_u8`).
+- `Frame` — `v1(gen, type)`, `encode()` / `decode()`; `aead_ad(frame, id)` is a free function.
+- `ObjType` — `Chunk` / `Tree` / `Commit` / `Head` / `RosterEntry` / `Keyhist` / `RosterKeyhist`
+  (`as_u8`; the `from_u8` parse is crate-internal).
 - `assemble_blob` / `parse_blob` — build / strictly verify `FRAME ‖ ctx_tag ‖ ct`.
-- Normative constants (§19): `FRAME_LEN`, `ID_LEN`, `CTX_TAG_LEN`, `MAGIC`, `MAX_BLOB_SIZE`,
-  `MAX_TREE_DEPTH`, `MAX_TREE_FANOUT`, `MAX_ROSTER_ENTRY_SIZE`, `MAX_LIST_ELEMENTS`, `MIN_ALGO_ID`,
-  `MIN_FORMAT_VERSION`, `FORMAT_VERSION_V1`.
+- Normative constants (§19): `FRAME_LEN`, `ID_LEN`, `CTX_TAG_LEN`, `MAX_BLOB_SIZE`,
+  `MAX_TREE_DEPTH`, `MAX_TREE_FANOUT`, `MAX_ROSTER_ENTRY_SIZE`, `MAX_LIST_ELEMENTS`,
+  `MAX_CHUNKS_PER_FILE` (= `MAX_BLOB_SIZE / ID_LEN`, the ids one tree blob can hold), `MIN_ALGO_ID`.
 - `FrameError`.
+
+(`MAGIC`, `MIN_FORMAT_VERSION` and `FORMAT_VERSION_V1` are crate-internal — they are enforced by
+`Frame::decode`, not chosen by callers.)
 
 The decoder is fuzzed (one of the §3 targets).

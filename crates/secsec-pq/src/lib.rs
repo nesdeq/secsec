@@ -268,7 +268,7 @@ pub fn wrap_pq(
 ) -> Result<Vec<u8>, PqError> {
     let (keyslot_ct, ss) = encapsulate(recipient)?;
     let ad = keyslot_ad(device_id, gen);
-    let (ctx_tag, ct) = secsec_aead::seal(&ss, &ad, master_key);
+    let (ctx_tag, ct) = secsec_aead::seal(secsec_aead::UniqueKey::new(&ss), &ad, master_key);
     let mut out = Vec::with_capacity(XWING_CT_LEN + 32 + ct.len());
     out.extend_from_slice(&keyslot_ct);
     out.extend_from_slice(&ctx_tag);

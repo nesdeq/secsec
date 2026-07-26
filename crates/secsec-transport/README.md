@@ -18,14 +18,17 @@ The mandatory negative tests (wrong pin fails; tampered/garbage handshake fails)
 
 ## Public API
 
-- `HostPin` — `from_cert` / `from_spki` / `from_host_id` (re-pin a stored `host_id`); `host_id()`, `spki()`.
-- `client_config_tofu` — a first-contact client config that captures the server's `host_id` for pinning.
-- `PinnedServerVerifier` — the custom `rustls` `ServerCertVerifier`.
-- `client_config` / `server_config` — `quinn` configs wired to the pin.
+- `HostPin` — `from_cert` (what TOFU records) / `from_host_id` (re-pin a stored fingerprint);
+  `host_id()`.
+- `quic` — `client_config` / `server_config` (+ `_tuned` variants taking `Tuning`), and
+  `client_config_tofu`, the first-contact config that captures the server's `host_id` for pinning
+  (`CapturedHostPin`). Every config pins TLS 1.3, the suite list, and X25519 KX.
 - `handshake` — `client_handshake` / `server_handshake` → `ClientSession` / `ServerSession`.
-- `auth` — `SessionTranscript` (the §11 BLAKE3-over-hellos channel binding), `ConnectionAuth`
-  (`secsec-auth-v1` sign/verify), `SECSEC_VERSION`, `NONCE_LEN`.
+- `auth` — `SessionTranscript` (the §11 BLAKE3-over-hellos transcript).
 - `frame` — length-prefixed framing (`read_frame` / `write_frame`, `MAX_FRAME_LEN`).
 - `rpc` — per-op `request` / `request_prune` (the §15 head-binding retention prune).
-- `IDLE_TIMEOUT_SECS`, `KEEPALIVE_SECS` (§19); `AuthError`, `HandshakeError`, `FrameError`,
-  `RpcError`, `PinError`, `ConfigError`.
+- `AuthError`, `HandshakeError`, `FrameError`, `RpcError`, `PinError`, `ConfigError`.
+
+The pieces callers must not be able to bypass or misassemble are crate-internal: the
+`PinnedServerVerifier` itself (reachable only by building a config through `quic`), `ConnectionAuth`,
+`SECSEC_VERSION` / `NONCE_LEN`, and the §19 idle/keepalive defaults behind `Tuning::default()`.

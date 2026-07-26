@@ -11,10 +11,13 @@ of the codebase exactly. The sole exception is `mk_commit_g`, which uses
 
 ## Public API
 
-- `MasterKey` — a generation-tagged 256-bit master key (RAM-only, zeroized on drop). Derives every
-  subkey: `enc_key` / `id_key` (per `gen`,`type`), `obj_key`, `cdc_seed`, `head_key`, `roster_key`,
-  `ref_name_key`, `roster_entry_key`, `roster_keyhist_key`, `data_keyhist_key`, and the public
-  `mk_commit`. `generation()` / `expose_secret()`.
+- `MasterKey` — a generation-tagged 256-bit master key (RAM-only, zeroized on drop). Its methods
+  derive the subkeys that hang off the master key itself: `enc_key` / `id_key` (per `gen`,`type`),
+  `cdc_seed`, `head_key`, `roster_key`, `ref_name_key`, and the public `mk_commit`;
+  `generation()` / `expose_secret()`.
+- Free functions for the subkeys derived from *another* subkey rather than from the master key:
+  `obj_key(enc_key, id)`, `roster_entry_key(roster_key_g, seq)`,
+  `roster_keyhist_key(roster_key_next, g)`, `data_keyhist_key(master_key_next, g)`.
 - `MasterKeys` — a resolver trait (`current()`, `for_gen(g)`) so cross-generation readers can select
   the right-generation key after a rotation (§8.2); implemented for `MasterKey` and
   `BTreeMap<u32, MasterKey>` (the peeled key ring).

@@ -1,8 +1,9 @@
 //! `secsec-client` — client orchestration over a [`Remote`] (`secsec-Design.md` §10, §12): push the
 //! reachable object closure of a commit, advance the per-ref head via the blind-server CAS, and on
 //! the read side fetch a head + closure **verifying every object on arrival** (§9.2). Cross-device
-//! sync ([`sync_ref`]): fetch the remote head, [`resolve_head_signer`] against the folded roster,
-//! bring the closure local, run the rollback-gated merge ([`secsec_engine::merge_heads`]), push.
+//! sync ([`sync_ref`]): fetch the remote head, verify it against the folded roster
+//! ([`SiblingHead::verified`]), bring the closure local, run the rollback-gated merge
+//! ([`secsec_engine::merge_heads`]), push.
 //! The [`Remote`] trait abstracts the server; the QUIC adapter is a thin layer on top.
 
 #![forbid(unsafe_code)]
@@ -32,8 +33,7 @@ use secsec_sync::rollback::{
     open_frontier, seal_frontier, FrontierError, SiblingHead, SyncFrontier,
 };
 use secsec_sync::{
-    build_head, open_head, random_nonce, ref_hash, seal_head, sign_head, verify_head, Head,
-    HeadError,
+    build_head, open_head, random_nonce, ref_hash, seal_head, sign_head, Head, HeadError,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -441,20 +441,6 @@ pub(crate) async fn fetch_closure<R: Remote, K: MasterKeys>(
 
 // ---- cross-device sync (fetch → resolve signer → rollback-gated merge → push) ----
 
-/// Resolve which roster member signed `head` by trying each member's key — the head carries no
-/// `device_id` (§9.6), so the signer is the one member key that verifies. `None` if no current
-/// member signed it (forged / stale-roster head).
-#[must_use]
-pub(crate) fn resolve_head_signer(
-    members: &BTreeMap<DeviceId, DevicePublic>,
-    head: &Head,
-    sig: &[u8],
-) -> Option<DeviceId> {
-    members
-        .iter()
-        .find_map(|(id, pk)| verify_head(pk, head, sig).is_ok().then_some(*id))
-}
-
 /// The outcome of [`sync_ref`].
 #[derive(Debug, Clone)]
 pub struct SyncReport {
@@ -518,31 +504,15 @@ pub(crate) async fn sync_ref<R: Remote, K: MasterKeys>(
         });
     };
 
-    // 2. Resolve the signer (and thereby verify the head against a member key) and bring its closure
-    //    local so the DAG/merge can read both histories (across generations via `keys`, §8.2).
-    let signer = resolve_head_signer(members, &remote_head, &remote_sig)
+    // 2. Verify the head against the roster (the constructor is the only way to get a SiblingHead)
+    //    and bring its closure local so the DAG/merge can read both histories (§8.2).
+    let sibling = SiblingHead::verified(members, &remote_head, &remote_sig)
         .ok_or(ClientError::HeadNotMember)?;
     fetch_closure(remote, store, keys, &remote_head.commit_id).await?;
 
-    // Authenticate the sibling's tip commit against the roster (P3) before its metadata feeds the
-    // rollback gates — mirrors the pull path. Ancestor commits are authenticated transitively by the
-    // member-signed head + content-addressing (§9.2/§9.6).
-    let (sib_commit, sib_csig) =
-        secsec_snapshot::open_signed_commit(&remote_head.commit_id, keys, store)?;
-    let sib_author = members
-        .get(&sib_commit.device_id)
-        .ok_or(ClientError::HeadNotMember)?;
-    secsec_snapshot::verify_commit(sib_author, &sib_commit, &sib_csig)?;
-
-    let sibling = SiblingHead {
-        device_id: signer,
-        head_version: remote_head.head_version,
-        roster_seq: remote_head.roster_seq,
-        commit_id: remote_head.commit_id,
-    };
-
     // 3. Rollback-gated merge decision (reads cross-generation, seals the merge under current gen).
-    let plan = merge_heads(frontier, our_commit, &sibling, author, keys, store)?;
+    //    `merge_heads` authenticates the sibling's tip commit itself (P3).
+    let plan = merge_heads(frontier, our_commit, &sibling, members, author, keys, store)?;
 
     // 4. Apply: push whatever we authored and advance the ref (or fast-forward to the remote).
     let new_commit = match &plan.action {
@@ -622,9 +592,30 @@ pub fn save_frontier(
         ClientError::Io(std::io::Error::other("OS CSPRNG failure sealing frontier"))
     })?;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &blob)?;
+    write_owner_only(&tmp, &blob)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Write owner-only (0600 on unix). The frontier is the §8.5 anti-rollback state: its AEAD already
+/// makes it unreadable, but restoring an older copy is the §21 disk-level rollback, so it is not
+/// another user's to read or replace.
+fn write_owner_only(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(contents)
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, contents)
 }
 
 #[cfg(test)]
@@ -680,7 +671,7 @@ mod tests {
         // v1
         let src = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("f"), b"one").unwrap();
-        let (rt1, rs1) = secsec_snapshot::snapshot_tree(src.path(), &m, &a_store, None).unwrap();
+        let (rt1, rs1, _) = secsec_snapshot::snapshot_tree(src.path(), &m, &a_store, None).unwrap();
         let c1 = secsec_snapshot::Commit {
             root_tree: rt1,
             root_salt: rs1,
@@ -701,7 +692,7 @@ mod tests {
 
         // v2 chained on v1.
         std::fs::write(src.path().join("f"), b"two").unwrap();
-        let (rt2, rs2) =
+        let (rt2, rs2, _) =
             secsec_snapshot::snapshot_tree(src.path(), &m, &a_store, Some((&rt1, &rs1))).unwrap();
         let c2 = secsec_snapshot::Commit {
             root_tree: rt2,
@@ -734,7 +725,7 @@ mod tests {
 
         // A stale CAS token (re-using v1's blob as `prev`) must now lose the race.
         std::fs::write(src.path().join("f"), b"three").unwrap();
-        let (rt3, rs3) =
+        let (rt3, rs3, _) =
             secsec_snapshot::snapshot_tree(src.path(), &m, &a_store, Some((&rt2, &rs2))).unwrap();
         let c3 = secsec_snapshot::Commit {
             root_tree: rt3,
@@ -814,7 +805,7 @@ mod tests {
         // base (A, v1): {keep:k0, shared:s0} → push + create head v1.
         let base = tempfile::tempdir().unwrap();
         write_dir(base.path(), &[("keep", b"k0"), ("shared", b"s0")]);
-        let (bt, bs) = secsec_snapshot::snapshot_tree(base.path(), &m, &a_store, None).unwrap();
+        let (bt, bs, _) = secsec_snapshot::snapshot_tree(base.path(), &m, &a_store, None).unwrap();
         let c_base = seal_commit(&a_store, &m, &dev_a, bt, bs, vec![], 1, [0u8; 32]);
         push_objects(&remote, &a_store, &m, &c_base, &[0x10; 16])
             .await
@@ -829,7 +820,7 @@ mod tests {
         // A edits "shared" → c_A (a, v2), advances the ref to head v2.
         let a_wt = tempfile::tempdir().unwrap();
         write_dir(a_wt.path(), &[("keep", b"k0"), ("shared", b"sA")]);
-        let (at, asalt) =
+        let (at, asalt, _) =
             secsec_snapshot::snapshot_tree(a_wt.path(), &m, &a_store, Some((&bt, &bs))).unwrap();
         let c_a = seal_commit(&a_store, &m, &dev_a, at, asalt, vec![c_base], 2, c_base);
         push_objects(&remote, &a_store, &m, &c_a, &[0x11; 16])
@@ -851,7 +842,7 @@ mod tests {
         // B edits "shared" DIFFERENTLY → c_B (b, v1), divergent, NOT pushed.
         let b_wt = tempfile::tempdir().unwrap();
         write_dir(b_wt.path(), &[("keep", b"k0"), ("shared", b"sB")]);
-        let (bt2, bs2) =
+        let (bt2, bs2, _) =
             secsec_snapshot::snapshot_tree(b_wt.path(), &m, &b_store, Some((&bt, &bs))).unwrap();
         let c_b = seal_commit(&b_store, &m, &dev_b, bt2, bs2, vec![c_base], 1, c_base);
 
@@ -898,7 +889,7 @@ mod tests {
         let (rh, rsig, _) = fetch_head(&remote, &m, "main").await.unwrap().unwrap();
         assert_eq!(rh.commit_id, merge_id);
         assert_eq!(
-            resolve_head_signer(&members, &rh, &rsig),
+            SiblingHead::verified(&members, &rh, &rsig).map(|s| s.device_id),
             Some(dev_b.device_id().unwrap())
         );
 
