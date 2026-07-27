@@ -1307,7 +1307,8 @@ X-Wing keyslot) is the harvest-now-decrypt-later target, and it is PQ-safe today
 - **Supply chain:** minimal pinned deps; `cargo-audit` in CI (`cargo-vet` is **NOT WIRED**);
   reproducible static `musl` build; no OpenSSL. (The PQ KEM rests on the formally-verified
   `libcrux-ml-kem`, pinned via `Cargo.lock`; `cargo-audit` reports no vulnerabilities, only
-  informational unmaintained/unsound warnings.)
+  informational unmaintained/unsound/yanked warnings on crates that are present in `Cargo.lock` but
+  compiled into no target.)
 - Do not trust returned FRAME fields; derive from expected `(gen, type)` and verify equality.
 
 ## 19. Constants _(normative — required for conformance)_
