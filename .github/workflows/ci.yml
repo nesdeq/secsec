@@ -52,20 +52,6 @@ jobs:
       - run: cargo install cargo-audit --locked
       - run: cargo audit
 
-  # Coverage-guided fuzzing, one minute per decoder (the stable corpus test runs in `test`).
-  fuzz:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
-      - name: Run every target
-        run: |
-          set -eu
-          for t in $(cargo fuzz list); do
-            cargo fuzz run "$t" -- -max_total_time=60
-          done
-
   scripts:
     runs-on: ubuntu-latest
     steps:

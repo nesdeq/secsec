@@ -13,11 +13,11 @@ Targets: `frame`, `wire`, `roster_entry`, `keyhist`, `keyslot`, `object`, `head`
 cargo install cargo-fuzz --locked
 cargo +nightly fuzz list
 cargo +nightly fuzz run frame                        # or any target above
-cargo +nightly fuzz run wire -- -max_total_time=60   # what CI runs for every target
+cargo +nightly fuzz run wire -- -max_total_time=60   # a one-minute run
 ```
 
 This package is **not** a workspace member (libFuzzer needs nightly and sanitizers; an empty
-`[workspace]` table keeps cargo from adopting it). CI's `fuzz` job runs every target for one minute.
+`[workspace]` table keeps cargo from adopting it).
 
 ## Stable coverage (no fuzz toolchain needed)
 

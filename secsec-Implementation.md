@@ -150,12 +150,11 @@ Every security-critical crate carries, in the same change as the code:
   (`every_workspace_member_inherits_the_workspace_lints`) enforces; release builds keep overflow
   checks and abort on panic.
 
-**CI** (`ci.yml`, seven jobs, `RUSTFLAGS=-D warnings`): `lint` (`cargo fmt --check`, `cargo clippy
+**CI** (`ci.yml`, six jobs, `RUSTFLAGS=-D warnings`): `lint` (`cargo fmt --check`, `cargo clippy
 --all-targets --all-features -D warnings`, `cargo xtask vectors --check`); `test` (`cargo test --all
 --all-features` on Linux, macOS, and Windows); `msrv` (`cargo check` on Rust 1.89); `audit`
 (`cargo audit`, ignoring only `RUSTSEC-2023-0071` in `.cargo/audit.toml`: the optional `rsa`
-dependency of `ssh-key` this workspace never enables); `fuzz` (every target for one minute on
-nightly); `scripts` (shellcheck of `install.sh`, `ui/install.sh`, `ui/macos/build.sh`, and `node
+dependency of `ssh-key` this workspace never enables); `scripts` (shellcheck of `install.sh`, `ui/install.sh`, `ui/macos/build.sh`, and `node
 --check` of the GNOME extension); `menubar` (builds the macOS app). Every cargo step runs `--locked`.
 
 **Release** (`release.yml`, on `rc*` and `v*` tags): runs CI, builds `secsec` for Linux (static
