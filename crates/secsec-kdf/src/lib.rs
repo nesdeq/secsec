@@ -1,18 +1,13 @@
-//! `secsec-kdf` — the key-derivation hierarchy (`secsec-Design.md` §5, §9.5).
-//!
-//! Every subkey is `BLAKE3::derive_key(label, IKM)` with a distinct hardcoded label and the secret
-//! in the IKM role; `mk_commit_g` is the sole `keyed_hash` exception (§9.5 note). All secret
-//! outputs are [`Zeroizing`]; the master key is RAM-only (§18).
+//! The key-derivation hierarchy (`secsec-Design.md` §5, §9.5); every secret output is [`Zeroizing`].
 
 #![forbid(unsafe_code)]
 
-use secsec_canon::Writer;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// A 256-bit secret key, zeroized on drop.
 pub type SecretKey = Zeroizing<[u8; 32]>;
 
-// Domain-separation context labels (globally unique, hardcoded — §9.5).
+// Domain-separation context labels (§9.5).
 const L_ENC: &str = "secsec-enc-key-v1";
 const L_ID: &str = "secsec-id-key-v1";
 const L_CDC: &str = "secsec-cdc-seed-v1";
@@ -20,20 +15,27 @@ const L_HEAD: &str = "secsec-head-enc-v1";
 const L_ROSTER: &str = "secsec-roster-enc-v1";
 const L_REFNAME: &str = "secsec-ref-name-v1";
 const L_ROSTER_ENTRY: &str = "secsec-roster-entry-v1";
+const L_ROSTER_ENTRY_V2: &str = "secsec-roster-entry-v2";
 const L_ROSTER_KEYHIST: &str = "secsec-roster-keyhist-v1";
 const L_KEYHIST: &str = "secsec-keyhist-enc-v1";
 const L_OBJ: &str = "secsec-obj-key-v1";
 const MK_COMMIT_MSG_LABEL: &[u8] = b"secsec-mk-commit-v1";
 
-/// `derive_key(label, IKM)` with the IKM assembled (and zeroized) via a canonical [`Writer`].
-fn derive(label: &'static str, build: impl FnOnce(&mut Writer)) -> SecretKey {
-    let mut w = Writer::new();
-    build(&mut w);
-    let ikm = Zeroizing::new(w.finish());
-    Zeroizing::new(blake3::derive_key(label, &ikm))
+/// Per-seal roster-entry salt length (§9.5 v2 entries).
+pub const ROSTER_ENTRY_SALT_LEN: usize = 32;
+
+/// `BLAKE3::derive_key(label, part_0 ‖ part_1 ‖ …)`, streamed into a hasher that is wiped afterwards.
+fn derive(label: &'static str, parts: &[&[u8]]) -> SecretKey {
+    let mut h = blake3::Hasher::new_derive_key(label);
+    for p in parts {
+        h.update(p);
+    }
+    let out = Zeroizing::new(*h.finalize().as_bytes());
+    h.zeroize();
+    out
 }
 
-/// The repository master key at a given generation `g` (§5). RAM-only; zeroized on drop.
+/// The repository master key at generation `g` (§5); RAM-only, zeroized on drop.
 pub struct MasterKey {
     generation: u32,
     key: SecretKey,
@@ -55,86 +57,74 @@ impl MasterKey {
         self.generation
     }
 
-    /// The raw 32-byte master-key material — only for keyslot wrapping (§8.3); everything else
-    /// derives subkeys instead.
+    /// The raw key bytes, only for keyslot and key-history wrapping (§8.2, §8.3).
     #[must_use]
     pub fn expose_secret(&self) -> &[u8; 32] {
         &self.key
     }
 
-    /// `enc_key[g][t]` — the per-(generation, type) key from which per-object keys are derived (§9.4).
+    /// `enc_key[g][t]`, from which per-object keys derive (§9.4).
     #[must_use]
     pub fn enc_key(&self, obj_type: u8) -> SecretKey {
-        derive(L_ENC, |w| {
-            w.raw(&self.key[..]).u32(self.generation).u8(obj_type);
-        })
+        derive(
+            L_ENC,
+            &[&self.key[..], &self.generation.to_le_bytes(), &[obj_type]],
+        )
     }
 
-    /// `id_key[g][t]` — the keyed-hash key for content addressing (§9.2).
+    /// `id_key[g][t]`, the content-addressing key (§9.2).
     #[must_use]
     pub fn id_key(&self, obj_type: u8) -> SecretKey {
-        derive(L_ID, |w| {
-            w.raw(&self.key[..]).u32(self.generation).u8(obj_type);
-        })
+        derive(
+            L_ID,
+            &[&self.key[..], &self.generation.to_le_bytes(), &[obj_type]],
+        )
     }
 
-    /// `cdc_seed[g]` — the keyed-FastCDC gear seed (§9.7).
+    /// `cdc_seed[g]`, the keyed-FastCDC gear seed (§9.7).
     #[must_use]
     pub fn cdc_seed(&self) -> SecretKey {
-        derive(L_CDC, |w| {
-            w.raw(&self.key[..]).u32(self.generation);
-        })
+        derive(L_CDC, &[&self.key[..], &self.generation.to_le_bytes()])
     }
 
-    /// `head_key_g` — the per-generation key for the mutable Head-blob AEAD (§9.8). Fresh-nonce
-    /// ChaCha20-Poly1305 (`secsec_aead::seal_mut`), distinct from the content-addressed object key.
+    /// `head_key_g`, the fresh-nonce head-blob key (§9.8).
     #[must_use]
     pub fn head_key(&self) -> SecretKey {
-        derive(L_HEAD, |w| {
-            w.raw(&self.key[..]).u32(self.generation);
-        })
+        derive(L_HEAD, &[&self.key[..], &self.generation.to_le_bytes()])
     }
 
-    /// `roster_key_g` — the generation-`g` roster-encryption key (§8, §9.5).
+    /// `roster_key_g`, the generation-`g` roster-encryption key (§8, §9.5).
     #[must_use]
     pub fn roster_key(&self) -> SecretKey {
-        derive(L_ROSTER, |w| {
-            w.raw(&self.key[..]);
-        })
+        derive(L_ROSTER, &[&self.key[..]])
     }
 
-    /// `ref_name_key` — keyed hash that obfuscates ref names in storage paths (§13).
+    /// `ref_name_key`, the keyed hash hiding ref names in storage paths (§13).
     #[must_use]
     pub fn ref_name_key(&self) -> SecretKey {
-        derive(L_REFNAME, |w| {
-            w.raw(&self.key[..]);
-        })
+        derive(L_REFNAME, &[&self.key[..]])
     }
 
-    /// `mk_commit_g` — the public, hiding, binding generation commitment (§5). The one `keyed_hash`
-    /// in the hierarchy (§9.5 note); `g` is bound into the message (generation-rollback guard).
+    /// `mk_commit_g`, the generation commitment and the one `keyed_hash` in the hierarchy (§5, §9.5).
     #[must_use]
     pub fn mk_commit(&self) -> [u8; 32] {
-        let mut w = Writer::new();
-        w.raw(MK_COMMIT_MSG_LABEL).u32(self.generation);
-        let msg = w.finish();
         let mut h = blake3::Hasher::new_keyed(&self.key);
-        h.update(&msg);
-        *h.finalize().as_bytes()
+        h.update(MK_COMMIT_MSG_LABEL);
+        h.update(&self.generation.to_le_bytes());
+        let out = *h.finalize().as_bytes();
+        h.zeroize();
+        out
     }
 }
 
-/// Generation → [`MasterKey`] resolver — the read-side key ring for §8.2 cross-rotation reads.
-/// Implemented for a single [`MasterKey`] (its own generation only) and for
-/// `BTreeMap<u32, MasterKey>` (the peeled key history).
+/// Generation → [`MasterKey`] resolver, the read-side key ring for §8.2 cross-rotation reads.
 pub trait MasterKeys {
     /// The master key for generation `g`, or `None` if this resolver does not hold it.
     fn for_gen(&self, g: u32) -> Option<&MasterKey>;
-    /// The current (highest) generation's master key — what new objects are sealed under.
+    /// The highest generation's key, which new objects are sealed under.
     fn current(&self) -> &MasterKey;
 
-    /// The rotation-stable ref-name key (§9.5/§13): derived from the **genesis** generation so the
-    /// ref path never moves on rotation. A single-generation resolver falls back to its own key.
+    /// The rotation-stable ref-name key, derived from generation 1 when held, else the current key (§9.5, §13).
     fn ref_name_key(&self) -> SecretKey {
         self.for_gen(1)
             .unwrap_or_else(|| self.current())
@@ -156,48 +146,45 @@ impl MasterKeys for std::collections::BTreeMap<u32, MasterKey> {
         self.get(&g)
     }
     fn current(&self) -> &MasterKey {
-        // BTreeMap iterates in ascending key order; the last value is the highest generation. A key
-        // ring is never empty (it always holds at least the current generation).
+        // Ascending iteration: the last value is the highest generation; a ring is never empty.
         self.values()
             .next_back()
             .expect("master-key ring is never empty")
     }
 }
 
-/// `k_obj` — the unique per-object AEAD key (§9.4): `derive_key("secsec-obj-key-v1", enc_key ‖ id)`.
-///
-/// Because `id` is the content address (collision-resistant over the plaintext), `k_obj` is unique
-/// per object — which is exactly what makes the fixed-nonce AEAD in `secsec-aead` sound.
+/// `k_obj = derive_key("secsec-obj-key-v1", enc_key ‖ id)`, unique per content address (§9.4).
 #[must_use]
 pub fn obj_key(enc_key: &[u8; 32], id: &[u8; 32]) -> SecretKey {
-    derive(L_OBJ, |w| {
-        w.raw(enc_key).raw(id);
-    })
+    derive(L_OBJ, &[enc_key, id])
 }
 
-/// `k_roster_entry[g][seq]` (§8.1, §9.5): per-sequence roster-entry key under `roster_key_g`.
+/// Legacy v1 roster-entry key `k_roster_entry[g][seq]` (§9.5); read-only, v1 entries are never written.
 #[must_use]
 pub fn roster_entry_key(roster_key_g: &[u8; 32], seq: u64) -> SecretKey {
-    derive(L_ROSTER_ENTRY, |w| {
-        w.raw(roster_key_g).u64(seq);
-    })
+    derive(L_ROSTER_ENTRY, &[roster_key_g, &seq.to_le_bytes()])
 }
 
-/// `k_rkh_g` (§8.2): roster-key-history forward-wrap key, derived from `roster_key_{g+1}`.
+/// v2 roster-entry key `derive_key("secsec-roster-entry-v2", roster_key_g ‖ le64(seq) ‖ salt)` (§9.5).
+#[must_use]
+pub fn roster_entry_key_v2(
+    roster_key_g: &[u8; 32],
+    seq: u64,
+    salt: &[u8; ROSTER_ENTRY_SALT_LEN],
+) -> SecretKey {
+    derive(L_ROSTER_ENTRY_V2, &[roster_key_g, &seq.to_le_bytes(), salt])
+}
+
+/// `k_rkh_g`, the roster-key-history wrap key from `roster_key_{g+1}` (§8.2).
 #[must_use]
 pub fn roster_keyhist_key(roster_key_next: &[u8; 32], g: u32) -> SecretKey {
-    derive(L_ROSTER_KEYHIST, |w| {
-        w.raw(roster_key_next).u32(g);
-    })
+    derive(L_ROSTER_KEYHIST, &[roster_key_next, &g.to_le_bytes()])
 }
 
-/// `k_keyhist_g` (§8.2): DATA-key-history forward-wrap key, derived from `master_key_{g+1}` —
-/// distinct label and IKM from [`roster_keyhist_key`].
+/// `k_keyhist_g`, the data-key-history wrap key from `master_key_{g+1}` (§8.2).
 #[must_use]
 pub fn data_keyhist_key(master_key_next: &[u8; 32], g: u32) -> SecretKey {
-    derive(L_KEYHIST, |w| {
-        w.raw(master_key_next).u32(g);
-    })
+    derive(L_KEYHIST, &[master_key_next, &g.to_le_bytes()])
 }
 
 #[cfg(test)]
@@ -208,11 +195,7 @@ mod tests {
     const MK: [u8; 32] = [0x11; 32];
 
     fn hx(b: &[u8]) -> String {
-        let mut s = String::with_capacity(b.len() * 2);
-        for x in b {
-            s.push_str(&format!("{x:02x}"));
-        }
-        s
+        b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
     #[test]
@@ -222,10 +205,42 @@ mod tests {
         assert_eq!(mk.mk_commit(), mk.mk_commit());
     }
 
+    /// The streamed derivation equals the one-shot `blake3::derive_key` over the concatenated IKM.
+    #[test]
+    fn streamed_derivation_matches_one_shot_formula() {
+        let mk = MasterKey::new(7, MK);
+        let cat = |parts: &[&[u8]]| parts.concat();
+        let g = 7u32.to_le_bytes();
+        assert_eq!(
+            *mk.enc_key(3),
+            blake3::derive_key(L_ENC, &cat(&[&MK, &g, &[3]]))
+        );
+        assert_eq!(
+            *mk.id_key(3),
+            blake3::derive_key(L_ID, &cat(&[&MK, &g, &[3]]))
+        );
+        assert_eq!(*mk.cdc_seed(), blake3::derive_key(L_CDC, &cat(&[&MK, &g])));
+        assert_eq!(*mk.head_key(), blake3::derive_key(L_HEAD, &cat(&[&MK, &g])));
+        assert_eq!(*mk.roster_key(), blake3::derive_key(L_ROSTER, &MK));
+        assert_eq!(*mk.ref_name_key(), blake3::derive_key(L_REFNAME, &MK));
+        let seq = 9u64.to_le_bytes();
+        assert_eq!(
+            *roster_entry_key(&MK, 9),
+            blake3::derive_key(L_ROSTER_ENTRY, &cat(&[&MK, &seq]))
+        );
+        assert_eq!(
+            *roster_entry_key_v2(&MK, 9, &[0x5a; 32]),
+            blake3::derive_key(L_ROSTER_ENTRY_V2, &cat(&[&MK, &seq, &[0x5a; 32]]))
+        );
+        let mut keyed = blake3::Hasher::new_keyed(&MK);
+        keyed.update(MK_COMMIT_MSG_LABEL);
+        keyed.update(&g);
+        assert_eq!(mk.mk_commit(), *keyed.finalize().as_bytes());
+    }
+
     /// Every derivation family/parameterization yields a distinct key (§9.5 domain separation).
     #[test]
     fn domain_separation_all_distinct() {
-        // g2 gets different key bytes, as a real Rotate mints a fresh random master key.
         let g1 = MasterKey::new(1, MK);
         let g2 = MasterKey::new(2, [0x22; 32]);
         let rk1 = g1.roster_key();
@@ -234,7 +249,6 @@ mod tests {
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         let mut push = |k: [u8; 32]| assert!(seen.insert(k), "derivation collision: {}", hx(&k));
 
-        // label separation + type separation + generation separation
         push(*g1.enc_key(0));
         push(*g1.enc_key(1));
         push(*g2.enc_key(0));
@@ -247,17 +261,18 @@ mod tests {
         push(*g2.head_key());
         push(*rk1);
         push(*rk2);
-        push(*g1.ref_name_key()); // ref_name_key has no gen input → same across g; push once
+        push(*g1.ref_name_key());
         push(g1.mk_commit());
         push(g2.mk_commit());
         push(*obj_key(&rk1, &[0xAA; 32]));
-        push(*obj_key(&rk1, &[0xBB; 32])); // different id
-        push(*obj_key(&rk2, &[0xAA; 32])); // different enc_key input
+        push(*obj_key(&rk1, &[0xBB; 32]));
+        push(*obj_key(&rk2, &[0xAA; 32]));
         push(*roster_entry_key(&rk1, 0));
         push(*roster_entry_key(&rk1, 1));
+        push(*roster_entry_key_v2(&rk1, 1, &[0; 32]));
+        push(*roster_entry_key_v2(&rk1, 1, &[1; 32]));
         push(*roster_keyhist_key(&rk2, 1));
         push(*roster_keyhist_key(&rk2, 2));
-        // DATA key-history: distinct from roster_keyhist (different label) and gen-separated.
         push(*data_keyhist_key(&[0x22; 32], 1));
         push(*data_keyhist_key(&[0x22; 32], 2));
     }
@@ -271,8 +286,7 @@ mod tests {
         );
     }
 
-    /// The kdf -> aead bridge: a key derived here must seal/open under `secsec-aead`, and the
-    /// per-object key must be unique per id (so the fixed nonce is sound).
+    /// A derived key drives `secsec-aead`, and per-object keys are unique per id.
     #[test]
     fn derived_obj_key_drives_aead() {
         let mk = MasterKey::new(7, MK);
@@ -293,15 +307,13 @@ mod tests {
             secsec_aead::open(&k_a, ad, &tag, &ct).unwrap(),
             b"object bytes"
         );
-        // the other object's key must not open it
         assert_eq!(
             secsec_aead::open(&k_b, ad, &tag, &ct),
             Err(secsec_aead::AeadError)
         );
     }
 
-    /// Frozen §9.5 KATs for `master_key = [0x11; 32]`, mirrored in `vectors/secsec-kat-v1.txt [kdf]`
-    /// (drift-checked by `cargo xtask vectors --check`).
+    /// Frozen §9.5 KATs for `master_key = [0x11; 32]`, mirrored in `vectors/secsec-kat-v1.txt [kdf]`.
     #[test]
     fn kat_frozen() {
         let g1 = MasterKey::new(1, MK);
@@ -341,6 +353,10 @@ mod tests {
         assert_eq!(
             hx(&roster_entry_key(&rk, 1)[..]),
             "0866a38d6c6924ac9b411189b06e3a7c15ad01c94ff4bae11f11fc6a53b640aa"
+        );
+        assert_eq!(
+            hx(&roster_entry_key_v2(&rk, 1, &[0x5a; 32])[..]),
+            "8bb3d6118b8427d58c2424cd8e16fb2d746f74a7618582b47c631b4a72259634"
         );
         assert_eq!(
             hx(&roster_keyhist_key(&rk, 1)[..]),

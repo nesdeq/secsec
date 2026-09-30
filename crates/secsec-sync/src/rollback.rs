@@ -1,8 +1,4 @@
-//! Rollback-aware merge gates + fork detection (`secsec-Design.md` §10, §8.5; risk R4):
-//! [`evaluate_merge`] runs the three §10 gates against the persisted frontier so a malicious server
-//! cannot replay an old branch into a merge; a DAG-incomparable sibling routes to the keep-both
-//! merge. After acceptance the caller applies [`SyncFrontier::observe`] and MUST seal the frontier
-//! before writing the merge commit (§8.5). The sealed local-state codec is also here.
+//! Rollback-aware merge gates, fork classification, and the sealed local frontier (`secsec-Design.md` §8.5, §10; R4).
 
 use crate::dag::{self, Id, ParentMap};
 use crate::{verify_head, Head};
@@ -11,32 +7,27 @@ use secsec_frame::MAX_LIST_ELEMENTS;
 use secsec_sig::{DeviceId, DevicePublic};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Local sealed-state nonce length (§9.8): 96-bit.
+/// Local sealed-state nonce length (§9.8).
 pub(crate) const FRONTIER_NONCE_LEN: usize = 12;
 /// Poly1305 tag length in the sealed frontier blob (§9.8).
 pub(crate) const FRONTIER_TAG_LEN: usize = 16;
 
-/// The persisted, monotonic client frontier (§8.5) the merge gates check against. Sealed locally
-/// under the device key (§8.5/§9.8); this is just the in-memory state.
+/// The persisted, monotonic client frontier the gates check against (§8.5).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncFrontier {
     /// Highest accepted sigchain `roster_seq` (gate 1).
     pub roster_seq: u64,
-    /// Per-device highest commit `version` observed — the replay high-water (gate 2a, §8.5).
+    /// Per-device highest commit `version` accepted into this device's history (gate 2a).
     pub commit_version_hwm: BTreeMap<DeviceId, u64>,
-    /// Per-device highest `head_version` observed, incl. indirect (gate 2b, §8.5/§10).
+    /// Per-device highest `head_version` observed (gate 2b).
     pub head_version_hwm: BTreeMap<DeviceId, u64>,
 }
 
-/// A fetched, signature-verified sibling head (the inputs the gates need from it).
-///
-/// `#[non_exhaustive]`, so [`SiblingHead::verified`] is the only way to build one outside this crate.
-/// "A current member signed this head" is the precondition every gate below silently rests on, and a
-/// note on the caller was not enough to keep it true — the constructor establishes it instead.
+/// A fetched head whose signature a current member made; [`SiblingHead::verified`] is the only constructor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SiblingHead {
-    /// The device that authored (signed) this head.
+    /// The device that signed this head.
     pub device_id: DeviceId,
     /// The head's per-ref version (§8.5).
     pub head_version: u64,
@@ -47,12 +38,7 @@ pub struct SiblingHead {
 }
 
 impl SiblingHead {
-    /// Verify `sig` over `head` against the folded roster and, on success, capture the signing member
-    /// as `device_id`. `None` if no current member signed it — a forged head, or one from a device
-    /// revoked since it was written.
-    ///
-    /// Verification happens here rather than at the call site so the gates cannot be reached with an
-    /// unauthenticated head (§9.6/§10).
+    /// Verify `sig` over `head` against the current `members`; `None` if no member signed it.
     #[must_use]
     pub fn verified(
         members: &BTreeMap<DeviceId, DevicePublic>,
@@ -71,7 +57,7 @@ impl SiblingHead {
     }
 }
 
-/// Per-commit metadata the gates read (decoded from each [`secsec_snapshot::Commit`]).
+/// Per-commit metadata the gates read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitMeta {
     /// The authoring device.
@@ -80,28 +66,28 @@ pub struct CommitMeta {
     pub version: u64,
 }
 
-/// What to do with an accepted sibling (after the gates pass).
+/// What to do with a sibling that passed the gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeDecision {
-    /// The sibling is an ancestor of (or equal to) our head — nothing new; ignore.
+    /// The sibling is an ancestor of (or equal to) our head.
     AlreadyHave,
-    /// Our head is an ancestor of the sibling — advance to it, no merge needed.
+    /// Our head is an ancestor of the sibling: advance, no merge.
     FastForward,
-    /// DAG-incomparable and all gates pass — run a three-way merge ([`crate::merge`]).
+    /// DAG-incomparable: three-way merge ([`crate::merge`]).
     Merge,
 }
 
-/// A specific rollback rejection (§10). Each carries the observed vs expected values for the alarm.
+/// A specific rollback rejection (§10), carrying observed vs expected values for the alarm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeReject {
-    /// Gate 1: the sibling's `roster_seq` is below the persisted frontier.
+    /// Gate 1: the sibling's `roster_seq` is below the frontier.
     RosterRollback {
         /// The sibling's roster_seq.
         sibling: u64,
         /// The client's frontier.
         frontier: u64,
     },
-    /// Gate 2a: a new commit's `version` did not exceed that device's high-water (replay).
+    /// Gate 2a: a new commit's `version` did not exceed its device's high-water (replay).
     CommitReplay {
         /// The authoring device.
         device: DeviceId,
@@ -110,13 +96,12 @@ pub enum MergeReject {
         /// The persisted high-water.
         hwm: u64,
     },
-    /// The caller supplied a DAG that does not cover every commit the gates must examine, so gate 2a
-    /// would have silently skipped one. Fails closed: an unexamined commit is not an accepted commit.
+    /// The caller's DAG lacks metadata for a commit the gates must examine; fails closed.
     IncompleteDag {
-        /// The commit reachable from the sibling that carried no metadata.
+        /// The reachable commit that carried no metadata.
         commit: Id,
     },
-    /// Gate 2b: the sibling device's `head_version` is below its persisted high-water.
+    /// Gate 2b: the sibling device's `head_version` is below its high-water.
     HeadRollback {
         /// The sibling's device.
         device: DeviceId,
@@ -127,21 +112,7 @@ pub enum MergeReject {
     },
 }
 
-/// The commits reachable from `sibling` that are **not** already in our history — the ones a merge or
-/// fast-forward would newly accept.
-fn new_commits(parents: &ParentMap, our_head: &Id, sibling: &Id) -> BTreeSet<Id> {
-    let ours = dag::ancestors(parents, our_head);
-    dag::ancestors(parents, sibling)
-        .into_iter()
-        .filter(|c| !ours.contains(c))
-        .collect()
-}
-
-/// Run the §10 gates against the persisted `frontier` and classify the sibling; `parents`/
-/// `commit_meta` MUST cover both reachable histories. Commits authored by `local_device` are exempt
-/// from gate 2a (§10: own history re-encountered after a re-link is not a replay; self-replay via a
-/// stale head is gate 2b's job, and ancestor authorship is pinned by the verified head's
-/// content-address chain). Returns the decision or the [`MergeReject`] to alarm on.
+/// Run the §10 gates for `sibling` against `frontier`; commits by `local_device` are exempt from gate 2a.
 pub fn evaluate_merge(
     frontier: &SyncFrontier,
     our_head: &Id,
@@ -150,28 +121,41 @@ pub fn evaluate_merge(
     parents: &ParentMap,
     commit_meta: &BTreeMap<Id, CommitMeta>,
 ) -> Result<MergeDecision, MergeReject> {
-    // Before the gates: a sibling already in our history is a no-op, never a rollback (a peer that
-    // folds the roster late, stamping an older roster_seq on a held commit, must not alarm).
+    // A sibling already in our history is a no-op, never a rollback (checked before the gates).
     if dag::is_ancestor(parents, &sibling.commit_id, our_head) {
         return Ok(MergeDecision::AlreadyHave);
     }
+    check_gates(
+        frontier,
+        sibling,
+        local_device,
+        &dag::new_commits(parents, Some(our_head), &sibling.commit_id),
+        commit_meta,
+    )?;
+    if dag::is_ancestor(parents, our_head, &sibling.commit_id) {
+        Ok(MergeDecision::FastForward)
+    } else {
+        Ok(MergeDecision::Merge)
+    }
+}
 
-    // Gate 1: roster_seq frontier — reject sibling state authored under a roster older than ours.
+/// Gates 1, 2a, 2b over the commits `new` to this device.
+pub fn check_gates(
+    frontier: &SyncFrontier,
+    sibling: &SiblingHead,
+    local_device: &DeviceId,
+    new: &BTreeSet<Id>,
+    commit_meta: &BTreeMap<Id, CommitMeta>,
+) -> Result<(), MergeReject> {
     if sibling.roster_seq < frontier.roster_seq {
         return Err(MergeReject::RosterRollback {
             sibling: sibling.roster_seq,
             frontier: frontier.roster_seq,
         });
     }
-
-    // Gate 2a: every newly-accepted commit's version must exceed its device's high-water; the local
-    // device's own commits are exempt (fn docs).
-    for c in new_commits(parents, our_head, &sibling.commit_id) {
-        // Fail closed on a commit the caller supplied no metadata for: skipping it would quietly
-        // narrow the replay check to whatever happened to be loaded. `load_commit_dag` fills both maps
-        // together, so this only fires when the precondition is actually broken.
-        let Some(meta) = commit_meta.get(&c) else {
-            return Err(MergeReject::IncompleteDag { commit: c });
+    for c in new {
+        let Some(meta) = commit_meta.get(c) else {
+            return Err(MergeReject::IncompleteDag { commit: *c });
         };
         if meta.device_id == *local_device {
             continue;
@@ -189,8 +173,6 @@ pub fn evaluate_merge(
             });
         }
     }
-
-    // Gate 2b: the sibling device's head_version must not be below its high-water (≥, §10).
     let head_hwm = frontier
         .head_version_hwm
         .get(&sibling.device_id)
@@ -203,34 +185,42 @@ pub fn evaluate_merge(
             hwm: head_hwm,
         });
     }
-
-    // Gate 3 / decision: fast-forward if our head is an ancestor of the sibling, else a real merge.
-    if dag::is_ancestor(parents, our_head, &sibling.commit_id) {
-        Ok(MergeDecision::FastForward)
-    } else {
-        Ok(MergeDecision::Merge)
-    }
+    Ok(())
 }
 
 impl SyncFrontier {
-    /// The §10 HWM update rule: raise `roster_seq`, the sibling's `head_version` high-water, and the
-    /// commit-version high-water of every device in its reachable chain. The caller MUST seal the
-    /// updated frontier before writing the merge commit (§8.5).
+    /// The §8.5 HWM rule: raise `roster_seq`, the sibling's head high-water, and every new commit's version high-water.
     pub fn observe(
         &mut self,
         sibling: &SiblingHead,
-        parents: &ParentMap,
+        new: &BTreeSet<Id>,
         commit_meta: &BTreeMap<Id, CommitMeta>,
     ) {
-        self.roster_seq = self.roster_seq.max(sibling.roster_seq);
-        let e = self.head_version_hwm.entry(sibling.device_id).or_insert(0);
-        *e = (*e).max(sibling.head_version);
-        for c in dag::ancestors(parents, &sibling.commit_id) {
-            if let Some(meta) = commit_meta.get(&c) {
+        self.observe_head(sibling);
+        for c in new {
+            if let Some(meta) = commit_meta.get(c) {
                 let e = self.commit_version_hwm.entry(meta.device_id).or_insert(0);
                 *e = (*e).max(meta.version);
             }
         }
+    }
+
+    /// Raise only `roster_seq` and the sibling device's head high-water.
+    pub fn observe_head(&mut self, sibling: &SiblingHead) {
+        self.roster_seq = self.roster_seq.max(sibling.roster_seq);
+        let e = self.head_version_hwm.entry(sibling.device_id).or_insert(0);
+        *e = (*e).max(sibling.head_version);
+    }
+
+    /// The pre-push seal (§8.5): `observed`'s roster/head high-waters, our commit high-waters, and `own` for us.
+    #[must_use]
+    pub fn with_heads_of(&self, observed: &SyncFrontier, own: (DeviceId, u64)) -> SyncFrontier {
+        let mut out = self.clone();
+        out.roster_seq = observed.roster_seq;
+        out.head_version_hwm = observed.head_version_hwm.clone();
+        let e = out.commit_version_hwm.entry(own.0).or_insert(0);
+        *e = (*e).max(own.1);
+        out
     }
 }
 
@@ -241,10 +231,9 @@ impl SyncFrontier {
 pub enum FrontierError {
     /// Blob too short for `nonce ‖ tag ‖ ct`.
     BadBlobSize,
-    /// The §9.8 AEAD failed to open — wrong device key, wrong device_id AD, or a tampered/rolled-back
-    /// blob from a different device. A **lost-frontier event** (§8.5): alarm and treat as a reinstall.
+    /// The AEAD failed (wrong key or device, or a tampered blob): a §8.5 lost-frontier event.
     Aead,
-    /// The decrypted state was not canonical (truncation, over-long map, trailing bytes).
+    /// The decrypted state was not canonical.
     Canon(CanonError),
 }
 impl core::fmt::Display for FrontierError {
@@ -264,7 +253,6 @@ impl From<CanonError> for FrontierError {
 }
 
 fn encode_hwm(w: &mut Writer, map: &BTreeMap<DeviceId, u64>) {
-    // BTreeMap iterates in ascending key order → canonical.
     w.u64(map.len() as u64);
     for (id, v) in map {
         w.raw(id).u64(*v);
@@ -272,10 +260,10 @@ fn encode_hwm(w: &mut Writer, map: &BTreeMap<DeviceId, u64>) {
 }
 
 fn decode_hwm(r: &mut Reader<'_>) -> Result<BTreeMap<DeviceId, u64>, CanonError> {
-    let n = r.u64()? as usize;
-    if n > MAX_LIST_ELEMENTS {
+    let n = r.u64()?;
+    if n > MAX_LIST_ELEMENTS as u64 {
         return Err(CanonError::LengthExceedsMax {
-            len: n as u64,
+            len: n,
             max: MAX_LIST_ELEMENTS,
         });
     }
@@ -289,7 +277,7 @@ fn decode_hwm(r: &mut Reader<'_>) -> Result<BTreeMap<DeviceId, u64>, CanonError>
 }
 
 impl SyncFrontier {
-    /// Canonical plaintext encoding of the frontier (the inner of the §8.5 sealed blob).
+    /// Canonical plaintext encoding (the inner of the §8.5 sealed blob).
     #[must_use]
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
@@ -299,7 +287,7 @@ impl SyncFrontier {
         w.finish()
     }
 
-    /// Strictly decode a frontier plaintext (inverse of [`Self::encode`]).
+    /// Strictly decode a frontier plaintext, with the §9.3 re-encode guard (ids ascending and unique).
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, FrontierError> {
         let mut r = Reader::new(bytes);
         let roster_seq = r.u64()?;
@@ -311,16 +299,12 @@ impl SyncFrontier {
             commit_version_hwm,
             head_version_hwm,
         };
-        // §9.3 re-encode guard, as on every other decoder: a map whose ids are out of ascending order
-        // or repeated decodes to a frontier that would not round-trip, so reject it rather than let
-        // two byte strings mean the same anti-rollback state.
         verify_reencode(bytes, &frontier, SyncFrontier::encode)?;
         Ok(frontier)
     }
 }
 
-/// Seal the frontier as the §8.5 local-state blob `nonce(12) ‖ tag(16) ‖ ct` (§9.8 AEAD, fresh
-/// OS-CSPRNG nonce per write, AD = `device_id`). `None` on RNG failure.
+/// Seal the frontier as `nonce(12) ‖ tag(16) ‖ ct` (§9.8, fresh nonce, AD = `device_id`); `None` on RNG failure.
 #[must_use]
 pub fn seal_frontier(
     frontier: &SyncFrontier,
@@ -342,8 +326,7 @@ pub fn seal_frontier(
     Some(out)
 }
 
-/// Open a sealed frontier blob. Any failure is a §8.5 **lost-frontier event**: the caller must
-/// alarm and treat the session as a reinstall. The `device_id` AD binds the blob to this device.
+/// Open a sealed frontier; any failure is a §8.5 lost-frontier event.
 pub fn open_frontier(
     local_seal_key: &[u8; 32],
     device_id: &DeviceId,
@@ -365,6 +348,12 @@ pub fn open_frontier(
     SyncFrontier::decode(&pt)
 }
 
+/// Fuzz hook: the frontier plaintext decoder on arbitrary bytes.
+#[doc(hidden)]
+pub fn __fuzz_decode_frontier(bytes: &[u8]) {
+    let _ = SyncFrontier::decode(bytes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,7 +371,6 @@ mod tests {
             .collect()
     }
     fn meta(entries: &[(u8, u8, u64)]) -> BTreeMap<Id, CommitMeta> {
-        // (commit, device, version)
         entries
             .iter()
             .map(|(c, d, v)| {
@@ -396,6 +384,14 @@ mod tests {
             })
             .collect()
     }
+    fn sib(d: u8, head_version: u64, roster_seq: u64, c: u8) -> SiblingHead {
+        SiblingHead {
+            device_id: dev(d),
+            head_version,
+            roster_seq,
+            commit_id: id(c),
+        }
+    }
 
     #[test]
     fn gate1_roster_rollback_rejected() {
@@ -403,17 +399,11 @@ mod tests {
             roster_seq: 10,
             ..Default::default()
         };
-        let sib = SiblingHead {
-            device_id: dev(2),
-            head_version: 1,
-            roster_seq: 9, // below frontier
-            commit_id: id(2),
-        };
         assert_eq!(
             evaluate_merge(
                 &f,
                 &id(1),
-                &sib,
+                &sib(2, 1, 9, 2),
                 &dev(9),
                 &dag(&[(2, &[])]),
                 &meta(&[(2, 2, 1)])
@@ -426,50 +416,17 @@ mod tests {
     }
 
     #[test]
-    fn already_have_when_sibling_is_ancestor() {
-        // our head 3 descends from sibling 2.
+    fn already_have_when_sibling_is_ancestor_even_with_stale_roster_seq() {
         let g = dag(&[(2, &[1]), (3, &[2])]);
-        let f = SyncFrontier::default();
-        let sib = SiblingHead {
-            device_id: dev(2),
-            head_version: 1,
-            roster_seq: 0,
-            commit_id: id(2),
-        };
-        assert_eq!(
-            evaluate_merge(
-                &f,
-                &id(3),
-                &sib,
-                &dev(9),
-                &g,
-                &meta(&[(1, 1, 1), (2, 2, 1), (3, 1, 2)])
-            ),
-            Ok(MergeDecision::AlreadyHave)
-        );
-    }
-
-    /// A sibling we already contain must be `AlreadyHave` even when it carries an **older** `roster_seq`
-    /// than our frontier (a peer that folded the roster later than we did). It must NOT trip gate 1's
-    /// rollback alarm — adopting a commit already in our history changes nothing (regression for M3).
-    #[test]
-    fn already_held_ancestor_with_stale_roster_seq_is_not_a_rollback() {
-        let g = dag(&[(2, &[1]), (3, &[2])]); // our head 3 descends from sibling 2
         let f = SyncFrontier {
-            roster_seq: 7, // we have advanced past the sibling's roster_seq
+            roster_seq: 7,
             ..Default::default()
         };
-        let sib = SiblingHead {
-            device_id: dev(2),
-            head_version: 1,
-            roster_seq: 4, // below our frontier — would trip gate 1 if checked first
-            commit_id: id(2),
-        };
         assert_eq!(
             evaluate_merge(
                 &f,
                 &id(3),
-                &sib,
+                &sib(2, 1, 4, 2),
                 &dev(9),
                 &g,
                 &meta(&[(2, 2, 1), (3, 1, 2)])
@@ -479,55 +436,49 @@ mod tests {
     }
 
     #[test]
-    fn fast_forward_when_our_head_is_ancestor() {
-        // our head 1; sibling 2 descends from 1.
+    fn fast_forward_and_merge_classification() {
         let g = dag(&[(2, &[1])]);
-        let f = SyncFrontier::default();
-        let sib = SiblingHead {
-            device_id: dev(2),
-            head_version: 1,
-            roster_seq: 0,
-            commit_id: id(2),
-        };
         assert_eq!(
-            evaluate_merge(&f, &id(1), &sib, &dev(9), &g, &meta(&[(2, 2, 1)])),
+            evaluate_merge(
+                &SyncFrontier::default(),
+                &id(1),
+                &sib(2, 1, 0, 2),
+                &dev(9),
+                &g,
+                &meta(&[(2, 2, 1)])
+            ),
             Ok(MergeDecision::FastForward)
         );
-    }
-
-    #[test]
-    fn merge_when_incomparable_and_gates_pass() {
-        // fork: 1 root; our head 2, sibling 3.
         let g = dag(&[(2, &[1]), (3, &[1])]);
-        let f = SyncFrontier::default();
-        let sib = SiblingHead {
-            device_id: dev(2),
-            head_version: 1,
-            roster_seq: 0,
-            commit_id: id(3),
-        };
         assert_eq!(
-            evaluate_merge(&f, &id(2), &sib, &dev(9), &g, &meta(&[(3, 2, 1)])),
+            evaluate_merge(
+                &SyncFrontier::default(),
+                &id(2),
+                &sib(2, 1, 0, 3),
+                &dev(9),
+                &g,
+                &meta(&[(3, 2, 1)])
+            ),
             Ok(MergeDecision::Merge)
         );
     }
 
     #[test]
     fn gate2a_commit_replay_rejected() {
-        // sibling 3 authored by device 2 at version 1, but we already saw version 5 from device 2.
         let g = dag(&[(2, &[1]), (3, &[1])]);
         let f = SyncFrontier {
             commit_version_hwm: BTreeMap::from([(dev(2), 5)]),
             ..Default::default()
         };
-        let sib = SiblingHead {
-            device_id: dev(2),
-            head_version: 9,
-            roster_seq: 0,
-            commit_id: id(3),
-        };
         assert_eq!(
-            evaluate_merge(&f, &id(2), &sib, &dev(9), &g, &meta(&[(3, 2, 1)])),
+            evaluate_merge(
+                &f,
+                &id(2),
+                &sib(2, 9, 0, 3),
+                &dev(9),
+                &g,
+                &meta(&[(3, 2, 1)])
+            ),
             Err(MergeReject::CommitReplay {
                 device: dev(2),
                 version: 1,
@@ -536,35 +487,21 @@ mod tests {
         );
     }
 
-    /// Re-link / reinstall (fresh frontier, parentless local commit): the genuine head contains the
-    /// local device's OWN earlier commits. Gate 2a must exempt them (history, not replays) — while a
-    /// peer's stale commit in the same history is still rejected for any other local device.
+    /// Re-link: the local device's own earlier commits in the head are history, not replays.
     #[test]
     fn gate2a_exempts_local_devices_own_history() {
-        // Disjoint roots: our fresh parentless commit 9 vs head 4, whose history holds our own old
-        // commits 2 (v1) → 3 (v2) and peer dev(2)'s commit 4 (v1) on top.
         let g = dag(&[(3, &[2]), (4, &[3])]);
-        let sib = SiblingHead {
-            device_id: dev(2),
-            head_version: 7,
-            roster_seq: 0,
-            commit_id: id(4),
-        };
-        // Our frontier already carries our NEW commit's version (3 = old max 2 + 1), exactly as
-        // sync_once records it before merging.
         let f = SyncFrontier {
             commit_version_hwm: BTreeMap::from([(dev(1), 3)]),
             ..Default::default()
         };
         let cm = meta(&[(2, 1, 1), (3, 1, 2), (4, 2, 1)]);
-        // As local device dev(1): its own old v1/v2 (≤ hwm 3) are exempt → the join merges.
         assert_eq!(
-            evaluate_merge(&f, &id(9), &sib, &dev(1), &g, &cm),
+            evaluate_merge(&f, &id(9), &sib(2, 7, 0, 4), &dev(1), &g, &cm),
             Ok(MergeDecision::Merge)
         );
-        // For any OTHER local device there is no exemption: dev(1)'s v1 ≤ hwm 3 is a replay.
         assert_eq!(
-            evaluate_merge(&f, &id(9), &sib, &dev(9), &g, &cm),
+            evaluate_merge(&f, &id(9), &sib(2, 7, 0, 4), &dev(9), &g, &cm),
             Err(MergeReject::CommitReplay {
                 device: dev(1),
                 version: 1,
@@ -573,30 +510,26 @@ mod tests {
         );
     }
 
-    /// A DAG that does not cover every reachable commit must fail closed. Skipping the commits it
-    /// carries no metadata for would silently narrow gate 2a to whatever happened to be loaded — the
-    /// replay check would pass on state it never examined.
     #[test]
     fn incomplete_dag_is_rejected_rather_than_skipped() {
-        let g = dag(&[(2, &[1]), (3, &[2])]); // sibling 3 descends from 2 descends from 1
+        let g = dag(&[(2, &[1]), (3, &[2])]);
         let f = SyncFrontier::default();
-        let sib = SiblingHead {
-            device_id: dev(2),
-            head_version: 1,
-            roster_seq: 0,
-            commit_id: id(3),
-        };
-        // Only the tip has metadata: the walk hits commit 1 with nothing to check it against.
-        assert_eq!(
-            evaluate_merge(&f, &id(9), &sib, &dev(9), &g, &meta(&[(3, 2, 2)])),
-            Err(MergeReject::IncompleteDag { commit: id(1) })
-        );
-        // Complete metadata for the same DAG passes the gates.
         assert_eq!(
             evaluate_merge(
                 &f,
                 &id(9),
-                &sib,
+                &sib(2, 1, 0, 3),
+                &dev(9),
+                &g,
+                &meta(&[(3, 2, 2)])
+            ),
+            Err(MergeReject::IncompleteDag { commit: id(1) })
+        );
+        assert_eq!(
+            evaluate_merge(
+                &f,
+                &id(9),
+                &sib(2, 1, 0, 3),
                 &dev(9),
                 &g,
                 &meta(&[(1, 1, 1), (2, 2, 1), (3, 2, 2)])
@@ -605,17 +538,14 @@ mod tests {
         );
     }
 
-    /// The sealed frontier gets the §9.3 re-encode guard every other decoder has: a high-water map
-    /// whose ids are out of ascending order does not round-trip, so two byte strings would otherwise
-    /// mean the same anti-rollback state.
     #[test]
     fn frontier_decode_rejects_non_canonical_hwm_order() {
         let mut w = Writer::new();
-        w.u64(0); // roster_seq
-        w.u64(2); // commit_version_hwm, written in DESCENDING id order
+        w.u64(0);
+        w.u64(2);
         w.raw(&dev(2)).u64(1);
         w.raw(&dev(1)).u64(1);
-        w.u64(0); // head_version_hwm
+        w.u64(0);
         let bytes = w.finish();
         assert!(matches!(
             SyncFrontier::decode(&bytes),
@@ -630,14 +560,15 @@ mod tests {
             head_version_hwm: BTreeMap::from([(dev(2), 7)]),
             ..Default::default()
         };
-        let sib = SiblingHead {
-            device_id: dev(2),
-            head_version: 6, // below the high-water 7
-            roster_seq: 0,
-            commit_id: id(3),
-        };
         assert_eq!(
-            evaluate_merge(&f, &id(2), &sib, &dev(9), &g, &meta(&[(3, 2, 9)])),
+            evaluate_merge(
+                &f,
+                &id(2),
+                &sib(2, 6, 0, 3),
+                &dev(9),
+                &g,
+                &meta(&[(3, 2, 9)])
+            ),
             Err(MergeReject::HeadRollback {
                 device: dev(2),
                 head_version: 6,
@@ -646,36 +577,43 @@ mod tests {
         );
     }
 
+    /// `observe` raises the roster and head high-waters and the new commits' version high-waters, never lowering any.
     #[test]
-    fn observe_raises_all_high_waters() {
-        // sibling 4 (dev2,v3) descends from 2 (dev2,v2) and 1 (dev1,v1).
-        let g = dag(&[(2, &[1]), (4, &[2])]);
+    fn observe_raises_new_high_waters_only() {
         let cm = meta(&[(1, 1, 1), (2, 2, 2), (4, 2, 3)]);
         let mut f = SyncFrontier {
             roster_seq: 1,
             ..Default::default()
         };
-        let sib = SiblingHead {
-            device_id: dev(2),
-            head_version: 5,
-            roster_seq: 4,
-            commit_id: id(4),
-        };
-        f.observe(&sib, &g, &cm);
+        let s = sib(2, 5, 4, 4);
+        f.observe(&s, &BTreeSet::from([id(2), id(4)]), &cm);
         assert_eq!(f.roster_seq, 4);
         assert_eq!(f.head_version_hwm.get(&dev(2)), Some(&5));
-        // commit-version HWM updated for every device in the reachable chain.
-        assert_eq!(f.commit_version_hwm.get(&dev(1)), Some(&1));
         assert_eq!(f.commit_version_hwm.get(&dev(2)), Some(&3));
-        // idempotent / monotonic: re-observing a lower head_version doesn't lower it.
-        let older = SiblingHead {
-            head_version: 2,
-            roster_seq: 0,
-            ..sib
-        };
-        f.observe(&older, &g, &cm);
+        assert_eq!(f.commit_version_hwm.get(&dev(1)), None);
+        f.observe(&sib(2, 2, 0, 4), &BTreeSet::new(), &cm);
         assert_eq!(f.head_version_hwm.get(&dev(2)), Some(&5));
         assert_eq!(f.roster_seq, 4);
+    }
+
+    /// The pre-push seal carries the observed head/roster high-waters but no other device's commit high-water.
+    #[test]
+    fn with_heads_of_keeps_commit_hwms_behind_the_base() {
+        let old = SyncFrontier {
+            roster_seq: 1,
+            commit_version_hwm: BTreeMap::from([(dev(2), 4)]),
+            head_version_hwm: BTreeMap::new(),
+        };
+        let observed = SyncFrontier {
+            roster_seq: 3,
+            commit_version_hwm: BTreeMap::from([(dev(2), 9)]),
+            head_version_hwm: BTreeMap::from([(dev(2), 7)]),
+        };
+        let pre = old.with_heads_of(&observed, (dev(1), 6));
+        assert_eq!(pre.roster_seq, 3);
+        assert_eq!(pre.head_version_hwm.get(&dev(2)), Some(&7));
+        assert_eq!(pre.commit_version_hwm.get(&dev(2)), Some(&4));
+        assert_eq!(pre.commit_version_hwm.get(&dev(1)), Some(&6));
     }
 
     fn sample_frontier() -> SyncFrontier {
@@ -690,10 +628,8 @@ mod tests {
     fn frontier_encode_round_trips_and_rejects_trailing() {
         let f = sample_frontier();
         assert_eq!(SyncFrontier::decode(&f.encode()).unwrap(), f);
-        // empty frontier too.
         let empty = SyncFrontier::default();
         assert_eq!(SyncFrontier::decode(&empty.encode()).unwrap(), empty);
-        // trailing bytes are rejected (malleability guard).
         let mut bytes = f.encode();
         bytes.push(0);
         assert!(matches!(
@@ -707,13 +643,9 @@ mod tests {
         let key = [0x5a; 32];
         let device = dev(1);
         let f = sample_frontier();
-
         let b1 = seal_frontier(&f, &key, &device).unwrap();
         let b2 = seal_frontier(&f, &key, &device).unwrap();
-        assert_ne!(
-            b1, b2,
-            "a fresh nonce must change the sealed blob each write (§9.8)"
-        );
+        assert_ne!(b1, b2, "a fresh nonce must change the sealed blob");
         assert_eq!(open_frontier(&key, &device, &b1).unwrap(), f);
         assert_eq!(open_frontier(&key, &device, &b2).unwrap(), f);
     }
@@ -723,25 +655,20 @@ mod tests {
         let key = [0x5a; 32];
         let device = dev(1);
         let blob = seal_frontier(&sample_frontier(), &key, &device).unwrap();
-
-        // tampered ciphertext.
         let mut bad = blob.clone();
         *bad.last_mut().unwrap() ^= 1;
         assert!(matches!(
             open_frontier(&key, &device, &bad),
             Err(FrontierError::Aead)
         ));
-        // a different device key cannot open it (lost-frontier on that device).
         assert!(matches!(
             open_frontier(&[0x5b; 32], &device, &blob),
             Err(FrontierError::Aead)
         ));
-        // the device_id AD binds the blob to this device; another device's id won't open.
         assert!(matches!(
             open_frontier(&key, &dev(2), &blob),
             Err(FrontierError::Aead)
         ));
-        // too-short blob.
         assert!(matches!(
             open_frontier(&key, &device, &blob[..10]),
             Err(FrontierError::BadBlobSize)

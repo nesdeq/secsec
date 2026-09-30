@@ -2,6 +2,6 @@
   <title>secsec</title>
   <!-- diagonal "/" (bottom-left -> top-right): the brand stroke -->
   <line x1="17.858" y1="46.142" x2="46.142" y2="17.858" stroke="#ffffff"/>
-  <!-- horizontal bar (foreground): the status stroke — green when connected & syncing -->
+  <!-- horizontal bar (foreground): the status stroke, green when connected & syncing -->
   <line x1="12" y1="32" x2="52" y2="32" stroke="#2aa85a"/>
 </svg>

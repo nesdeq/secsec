@@ -1,6 +1,4 @@
-//! Robustness: `open` must **never panic** on arbitrary `(key, ad, tag, ciphertext)` — it must
-//! return `Err(AeadError)` for anything that is not a genuine sealing. Stable-Rust stand-in for
-//! libFuzzer coverage of the AEAD open path.
+//! Robustness: `open` never panics on arbitrary `(key, ad, tag, ciphertext)`, only rejects.
 
 use proptest::prelude::*;
 use secsec_aead::open;
@@ -13,7 +11,6 @@ proptest! {
         ad in proptest::collection::vec(any::<u8>(), 0..128),
         ct in proptest::collection::vec(any::<u8>(), 0..4096),
     ) {
-        // Random tag over random ciphertext: must reject, never panic.
         let _ = open(&key, &ad, &tag, &ct);
     }
 }

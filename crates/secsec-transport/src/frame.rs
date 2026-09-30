@@ -1,19 +1,13 @@
-//! Length-prefixed message framing over QUIC streams (`secsec-Design.md` §11/§12). Each protocol
-//! message (handshake hello, RPC request/response) is sent as `le32(len) ‖ payload` on a stream, with
-//! the length bounded by [`MAX_FRAME_LEN`] **before allocation** (alloc-bomb guard, §9.1/§19).
+//! Length-prefixed message framing on QUIC streams (`secsec-Design.md` §11/§12): `le32(len) ‖ payload`, bounded, allocated as it arrives.
 
 use quinn::{RecvStream, SendStream};
-use secsec_frame::MAX_BLOB_SIZE;
-
-/// Maximum framed payload: a 16 MiB object blob (§19) plus modest protocol-envelope overhead.
-pub const MAX_FRAME_LEN: usize = MAX_BLOB_SIZE + 4096;
 
 /// Errors reading/writing a stream frame.
 #[derive(Debug)]
 pub enum FrameError {
-    /// The frame's declared length exceeded the caller's maximum (or `u32`).
+    /// The declared length exceeded the caller's maximum (or `u32`).
     TooLarge(usize),
-    /// The stream ended before a full frame was read.
+    /// The stream ended before a full frame arrived.
     Truncated,
     /// Underlying QUIC stream I/O error.
     Io(String),
@@ -30,7 +24,7 @@ impl core::fmt::Display for FrameError {
 }
 impl std::error::Error for FrameError {}
 
-/// Write one length-prefixed frame: `le32(len) ‖ payload`.
+/// Write one frame `le32(len) ‖ payload`.
 pub async fn write_frame(send: &mut SendStream, payload: &[u8]) -> Result<(), FrameError> {
     let len = u32::try_from(payload.len()).map_err(|_| FrameError::TooLarge(payload.len()))?;
     send.write_all(&len.to_le_bytes())
@@ -42,25 +36,29 @@ pub async fn write_frame(send: &mut SendStream, payload: &[u8]) -> Result<(), Fr
     Ok(())
 }
 
-/// Read one length-prefixed frame, rejecting any declared length greater than `max` **before**
-/// allocating the body.
+/// Read one frame, rejecting a declared length over `max`; memory grows only with bytes actually received.
 pub async fn read_frame(recv: &mut RecvStream, max: usize) -> Result<Vec<u8>, FrameError> {
     let mut len_buf = [0u8; 4];
-    read_exact(recv, &mut len_buf).await?;
+    recv.read_exact(&mut len_buf).await.map_err(|e| match e {
+        quinn::ReadExactError::FinishedEarly(_) => FrameError::Truncated,
+        quinn::ReadExactError::ReadError(e) => FrameError::Io(e.to_string()),
+    })?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > max {
         return Err(FrameError::TooLarge(len));
     }
-    let mut buf = vec![0u8; len];
-    read_exact(recv, &mut buf).await?;
+    let mut buf = Vec::new();
+    while buf.len() < len {
+        match recv
+            .read_chunk(len - buf.len(), true)
+            .await
+            .map_err(|e| FrameError::Io(e.to_string()))?
+        {
+            Some(chunk) => buf.extend_from_slice(&chunk.bytes),
+            None => return Err(FrameError::Truncated),
+        }
+    }
     Ok(buf)
-}
-
-async fn read_exact(recv: &mut RecvStream, buf: &mut [u8]) -> Result<(), FrameError> {
-    recv.read_exact(buf).await.map_err(|e| match e {
-        quinn::ReadExactError::FinishedEarly(_) => FrameError::Truncated,
-        quinn::ReadExactError::ReadError(e) => FrameError::Io(e.to_string()),
-    })
 }
 
 #[cfg(test)]
@@ -70,16 +68,14 @@ mod tests {
     use crate::HostPin;
     use quinn::Endpoint;
     use rcgen::generate_simple_self_signed;
-    use secsec_proto::wire::{ErrorCode, Request, Response};
+    use secsec_proto::wire::{ErrorCode, Request, Response, MAX_REQUEST_LEN};
     use std::net::{Ipv4Addr, SocketAddr};
 
     fn loopback() -> SocketAddr {
         (Ipv4Addr::LOCALHOST, 0).into()
     }
 
-    /// End-to-end over a live QUIC connection: the client sends a framed `Request`, the server reads
-    /// then decodes it, replies with a framed `Response`, and the client decodes that — proving the
-    /// wire model flows through the real transport with framing.
+    /// A framed request and response flow through a live QUIC connection; an over-cap length and a short body are refused.
     #[test]
     fn framed_request_response_over_quic() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -94,21 +90,24 @@ mod tests {
             let server = Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
             let addr = server.local_addr().unwrap();
 
-            // server: accept, read a framed request, reply with a framed response.
             let srv = tokio::spawn(async move {
                 let conn = server.accept().await.unwrap().await.unwrap();
                 let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-                let req_bytes = read_frame(&mut recv, MAX_FRAME_LEN).await.unwrap();
-                let req = Request::decode(&req_bytes).unwrap();
-                // reply Ok to a Put, NotEnrolled otherwise (just to exercise both directions).
+                let req = Request::decode(&read_frame(&mut recv, MAX_REQUEST_LEN).await.unwrap())
+                    .unwrap();
                 let resp = match req {
                     Request::Put { .. } => Response::Ok,
                     _ => Response::Err(ErrorCode::NotEnrolled),
                 };
                 write_frame(&mut send, &resp.encode()).await.unwrap();
                 send.finish().unwrap();
-                conn.closed().await;
-                req
+                // A frame declaring more than the cap is refused before its body arrives.
+                let (_s2, mut r2) = conn.accept_bi().await.unwrap();
+                let big = read_frame(&mut r2, 8).await;
+                // A frame whose body ends early is truncated, not padded.
+                let (_s3, mut r3) = conn.accept_bi().await.unwrap();
+                let short = read_frame(&mut r3, 64).await;
+                (req, big, short)
             });
 
             let mut client = Endpoint::client(loopback()).unwrap();
@@ -119,7 +118,6 @@ mod tests {
                 .await
                 .unwrap();
             let (mut send, mut recv) = conn.open_bi().await.unwrap();
-
             let request = Request::Put {
                 id: [0x11; 32],
                 declared_size: 5,
@@ -128,12 +126,22 @@ mod tests {
             };
             write_frame(&mut send, &request.encode()).await.unwrap();
             send.finish().unwrap();
-            let resp_bytes = read_frame(&mut recv, MAX_FRAME_LEN).await.unwrap();
-            assert_eq!(Response::decode(&resp_bytes).unwrap(), Response::Ok);
-            conn.close(0u32.into(), b"done");
+            let resp = Response::decode(&read_frame(&mut recv, 1024).await.unwrap()).unwrap();
+            assert_eq!(resp, Response::Ok);
 
-            // the server decoded exactly what we sent.
-            assert_eq!(srv.await.unwrap(), request);
+            let (mut s2, _r2) = conn.open_bi().await.unwrap();
+            s2.write_all(&1_000_000u32.to_le_bytes()).await.unwrap();
+            s2.finish().unwrap();
+            let (mut s3, _r3) = conn.open_bi().await.unwrap();
+            s3.write_all(&10u32.to_le_bytes()).await.unwrap();
+            s3.write_all(b"abc").await.unwrap();
+            s3.finish().unwrap();
+
+            let (got, big, short) = srv.await.unwrap();
+            conn.close(0u32.into(), b"done");
+            assert_eq!(got, request);
+            assert!(matches!(big, Err(FrameError::TooLarge(1_000_000))));
+            assert!(matches!(short, Err(FrameError::Truncated)));
         });
     }
 }

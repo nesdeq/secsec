@@ -1,14 +1,4 @@
-// secsec — GNOME Shell extension (GNOME 45+ ESM).
-//
-// A thin shell around the `secsec` binary: at login it prompts for the SSH-key passphrase, spawns
-// `secsec sync <folder> --passphrase-stdin [--key <keyfile>]`, and feeds the passphrase over the
-// child's stdin pipe — so the secret never appears in argv (invisible to `ps`/`top`). The child's
-// stdout+stderr are redirected to ~/.config/secsec/ui/sync.log; the panel menu shows status,
-// tails that log, and opens Settings (folder + SSH key) in the preferences window.
-//
-// Config: ~/.config/secsec/ui.conf — `folder=<path>` (default ~/cloud), optional `key=<ssh key>`,
-// optional `bin=<path to secsec>`. The folder must already be linked by a manual first
-// `secsec sync <folder> --server …`. `~` is expanded in `folder` and `key`.
+// secsec GNOME Shell extension (GNOME 45+): runs `secsec sync` for one folder, feeding the key passphrase over a pipe, and shows its status.
 
 import GObject from 'gi://GObject';
 import St from 'gi://St';
@@ -22,10 +12,10 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {ModalDialog} from 'resource:///org/gnome/shell/ui/modalDialog.js';
 
-const PROMPT_DELAY_MS = 1200; // let the session settle before popping the login prompt
-const SPAWN_DELAY_MS = 10000; // after the passphrase: purge the log, wait, then launch secsec
+const PROMPT_DELAY_MS = 1200; // let the session settle before the login prompt
+const SPAWN_DELAY_MS = 10000; // after the passphrase, give the network time to come up before secsec connects
+const POLL_SECONDS = 15; // status refresh cadence
 
-// Expand a leading `~` / `~/` to the home dir (config paths may be typed with a tilde).
 function expandPath(p) {
     if (!p)
         return p;
@@ -36,18 +26,16 @@ function expandPath(p) {
     return p;
 }
 
-function defaultFolder() {
-    return GLib.build_filenamev([GLib.get_home_dir(), 'cloud']);
+function configDir() {
+    return GLib.build_filenamev([GLib.get_user_config_dir(), 'secsec']);
 }
 
-// Parse ~/.config/secsec/ui.conf — simple `key=value` lines; `#` comments and blanks ignored.
-// `folder` defaults to ~/cloud; `key` empty means the default ~/.ssh/id_ed25519.
+// secsec/ui.conf under the user config dir as {folder, key, bin}; a blank folder means ~/cloud, a blank key the default SSH key.
 function readConfig() {
-    const path = GLib.build_filenamev([GLib.get_user_config_dir(), 'secsec', 'ui.conf']);
     const cfg = {folder: '', bin: 'secsec', key: ''};
-    let bytes;
+    let bytes = null;
     try {
-        [, bytes] = GLib.file_get_contents(path);
+        [, bytes] = GLib.file_get_contents(GLib.build_filenamev([configDir(), 'ui.conf']));
     } catch (_) {
         bytes = null;
     }
@@ -70,62 +58,87 @@ function readConfig() {
         }
     }
     if (!cfg.folder)
-        cfg.folder = defaultFolder();
+        cfg.folder = GLib.build_filenamev([GLib.get_home_dir(), 'cloud']);
     return cfg;
 }
 
+// The configured binary, else the first secsec on PATH or in the installer's directories.
+function resolveBin(configured) {
+    const c = expandPath(configured);
+    if (c.includes('/'))
+        return c;
+    const onPath = GLib.find_program_in_path(c);
+    if (onPath)
+        return onPath;
+    for (const cand of [GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', c]), `/usr/local/bin/${c}`]) {
+        if (GLib.file_test(cand, GLib.FileTest.IS_EXECUTABLE))
+            return cand;
+    }
+    return c;
+}
+
+// The sync log, in an owner-only directory beside ui.conf.
 function logPath() {
-    // Kept under ~/.config/secsec/ alongside ui.conf so the UI's files don't scatter.
-    const dir = GLib.build_filenamev([GLib.get_user_config_dir(), 'secsec', 'ui']);
-    GLib.mkdir_with_parents(dir, 0o755);
+    const dir = GLib.build_filenamev([configDir(), 'ui']);
+    GLib.mkdir_with_parents(dir, 0o700);
+    GLib.chmod(dir, 0o700);
     return GLib.build_filenamev([dir, 'sync.log']);
 }
 
-// Last non-empty line of the log, or '' if none — used for the inline status.
-function lastLogLine(path) {
-    let bytes;
+// Start the log empty and owner-only, so the child's output is never readable by others.
+function resetLog(path) {
     try {
-        [, bytes] = GLib.file_get_contents(path);
+        GLib.file_set_contents_full(path, '', GLib.FileSetContentsFlags.NONE, 0o600);
+        GLib.chmod(path, 0o600);
     } catch (_) {
-        return '';
+        // the child's own launch reports an unwritable log
     }
-    const lines = new TextDecoder().decode(bytes).split('\n').filter(l => l.trim());
-    return lines.length ? lines[lines.length - 1] : '';
 }
 
-// Health from process liveness + the log tail (the 15 s poll). Scans the log newest-first: a hard
-// error marker → 'error', a transient "connection lost" → 'connecting', a healthy sync line →
-// 'connected'; a running process with nothing notable is assumed 'connected'.
-function healthFromLog(path, running) {
-    if (!running)
-        return 'stopped';
-    let bytes;
+// Run `secsec <args>` and pass its stdout to done(); a failure passes ''.
+function runSecsec(bin, args, done) {
+    let proc;
     try {
-        [, bytes] = GLib.file_get_contents(path);
+        proc = Gio.Subprocess.new([resolveBin(bin), ...args],
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
     } catch (_) {
-        return 'connected';
+        done('');
+        return;
     }
-    const lines = new TextDecoder().decode(bytes).split('\n').map(l => l.trim().toLowerCase());
-    const HARD = ['reconnect failed', 'sync error', 'alarm', 'wrong passphrase', 'could not', 'no server'];
-    const WARN = ['connection lost'];
-    const OK = ['watching', 'sync: uptodate', 'sync: pushed', 'sync: pulled', 'sync: merged',
-        'sync: published', 'sync: cloned', 'synced '];
-    for (let i = lines.length - 1; i >= 0; i--) {
-        const l = lines[i];
-        if (!l)
-            continue;
-        if (HARD.some(m => l.includes(m)))
-            return 'error';
-        if (WARN.some(m => l.includes(m)))
-            return 'connecting';
-        if (OK.some(m => l.includes(m)))
-            return 'connected';
+    proc.communicate_utf8_async(null, null, (p, res) => {
+        let out = '';
+        try {
+            [, out] = p.communicate_utf8_finish(res);
+        } catch (_) {
+            out = '';
+        }
+        done(out || '');
+    });
+}
+
+// `secsec status` key=value lines as an object.
+function parseStatus(text) {
+    const st = {};
+    for (const line of text.split('\n')) {
+        const eq = line.indexOf('=');
+        if (eq > 0)
+            st[line.slice(0, eq)] = line.slice(eq + 1);
     }
+    return st;
+}
+
+// Panel health from a status: stopped, error, connecting, or connected.
+function health(st, ownChild) {
+    if (st.running !== 'yes')
+        return ownChild ? 'connecting' : 'stopped';
+    if (st.state === 'error' || st.state === 'alarm')
+        return 'error';
+    if (['starting', 'connecting', 'stopping'].includes(st.state))
+        return 'connecting';
     return 'connected';
 }
 
-// A native modal asking for the key passphrase (masked). Calls onSubmit(passphrase) on Unlock,
-// onCancel() on Cancel/Escape.
+// A modal asking for the key passphrase; the entry is cleared as soon as it is read.
 const PassphraseDialog = GObject.registerClass(
 class PassphraseDialog extends ModalDialog {
     _init(folder, onSubmit, onCancel) {
@@ -147,11 +160,7 @@ class PassphraseDialog extends ModalDialog {
         this._entry.clutter_text.connect('activate', () => this._submit());
         box.add_child(this._entry);
 
-        this.addButton({
-            label: 'Cancel',
-            action: () => this._cancel(),
-            key: Clutter.KEY_Escape,
-        });
+        this.addButton({label: 'Cancel', action: () => this._cancel(), key: Clutter.KEY_Escape});
         this.addButton({label: 'Unlock', action: () => this._submit(), default: true});
         this.setInitialKeyFocus(this._entry.clutter_text);
     }
@@ -161,6 +170,7 @@ class PassphraseDialog extends ModalDialog {
             return;
         this._done = true;
         const pw = this._entry.get_text();
+        this._entry.set_text('');
         this.close(global.get_current_time());
         this._onSubmit(pw);
     }
@@ -169,6 +179,7 @@ class PassphraseDialog extends ModalDialog {
         if (this._done)
             return;
         this._done = true;
+        this._entry.set_text('');
         this.close(global.get_current_time());
         this._onCancel();
     }
@@ -180,8 +191,7 @@ class Indicator extends PanelMenu.Button {
         super._init(0.0, 'secsec');
         this._ext = ext;
 
-        // The secsec mark is the panel icon; its crossing-bar colour is the connect indicator
-        // (green when connected & syncing, orange otherwise — set in refresh()).
+        // The mark's bar is green while connected and syncing, orange otherwise.
         this._icon = new St.Icon({icon_size: 16, y_align: Clutter.ActorAlign.CENTER});
         this.add_child(this._icon);
 
@@ -207,32 +217,27 @@ class Indicator extends PanelMenu.Button {
         settings.connect('activate', () => this._ext.openSettings());
         this.menu.addMenuItem(settings);
 
-        // Refresh the status text each time the menu opens.
         this.menu.connect('open-state-changed', (_m, open) => {
             if (open)
-                this.refresh();
+                this._ext.refresh();
         });
-        this.refresh();
+        this.show({running: 'no'}, false);
     }
 
-    refresh() {
-        const running = this._ext.isRunning();
-        const status = healthFromLog(this._ext.logPath, running);
-        const file = status === 'connected' ? 'secsec-syncing.svg' : 'secsec-idle.svg';
+    show(st, ownChild) {
+        const h = health(st, ownChild);
+        const file = h === 'connected' ? 'secsec-syncing.svg' : 'secsec-idle.svg';
         this._icon.set_gicon(Gio.icon_new_for_string(
             GLib.build_filenamev([this._ext.path, 'icons', file])));
-
-        this._toggle.label.text = running ? 'Stop sync' : 'Start sync';
-        const cfg = readConfig();
-        const folder = expandPath(cfg.folder);
+        this._toggle.label.text = h === 'stopped' ? 'Start sync' : 'Stop sync';
+        const folder = expandPath(readConfig().folder);
         const head = {
             connected: `secsec: connected · ${folder}`,
             connecting: `secsec: connecting… · ${folder}`,
             error: `secsec: problem · ${folder}`,
             stopped: `secsec: stopped · ${folder}`,
-        }[status];
-        const tail = lastLogLine(this._ext.logPath);
-        this._status.label.text = tail ? `${head}\n${tail}` : head;
+        }[h];
+        this._status.label.text = st.message ? `${head}\n${st.message}` : head;
     }
 });
 
@@ -244,85 +249,100 @@ export default class SecsecExtension extends Extension {
         this._timeoutId = 0;
         this._pollId = 0;
         this._spawnTimeoutId = 0;
+        this._status = {running: 'no'};
 
         this._indicator = new Indicator(this);
         Main.panel.addToStatusArea(this.uuid, this._indicator);
 
-        // Pop the login prompt shortly after the session settles. If the user cancels, they can
-        // still start it from the menu later.
+        // The sync keeps running on the lock screen; only the panel UI hides there.
+        this._sessionId = Main.sessionMode.connect('updated', () => this._applySessionMode());
+        this._applySessionMode();
+
         this._timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, PROMPT_DELAY_MS, () => {
             this._timeoutId = 0;
             this.start();
             return GLib.SOURCE_REMOVE;
         });
-
-        // Every 15 s: refresh the retro connect LED from process liveness + the log tail.
-        this._pollId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 15, () => {
-            this._indicator?.refresh();
+        this._pollId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, POLL_SECONDS, () => {
+            this.refresh();
             return GLib.SOURCE_CONTINUE;
         });
+        this.refresh();
     }
 
     disable() {
-        if (this._timeoutId) {
-            GLib.source_remove(this._timeoutId);
-            this._timeoutId = 0;
+        for (const id of [this._timeoutId, this._pollId, this._spawnTimeoutId]) {
+            if (id)
+                GLib.source_remove(id);
         }
-        if (this._pollId) {
-            GLib.source_remove(this._pollId);
-            this._pollId = 0;
+        this._timeoutId = 0;
+        this._pollId = 0;
+        this._spawnTimeoutId = 0;
+        if (this._sessionId) {
+            Main.sessionMode.disconnect(this._sessionId);
+            this._sessionId = 0;
         }
         if (this._dialog) {
             this._dialog.close(global.get_current_time());
             this._dialog = null;
         }
-        this.stop();
+        if (this._proc) {
+            this._proc.send_signal(15);
+            this._proc = null;
+        }
         this._indicator?.destroy();
         this._indicator = null;
     }
 
+    _applySessionMode() {
+        const locked = Main.sessionMode.isLocked;
+        if (this._indicator)
+            this._indicator.visible = !locked;
+        if (locked && this._dialog) {
+            this._dialog.close(global.get_current_time());
+            this._dialog = null;
+        }
+    }
+
+    refresh() {
+        const cfg = readConfig();
+        runSecsec(cfg.bin, ['status', expandPath(cfg.folder)], out => {
+            this._status = parseStatus(out);
+            this._indicator?.show(this._status, this._proc !== null);
+        });
+    }
+
     isRunning() {
-        return this._proc !== null;
+        return this._proc !== null || this._status.running === 'yes';
     }
 
     openSettings() {
         this.openPreferences();
     }
 
-    // Maximum-aggressive clean slate: SIGKILL every `secsec` process (any folder, any subcommand) so a
-    // fresh sync can never race a stray, wedged, or orphaned one — there is no folder lock to stop two
-    // `secsec sync` at once. Matched by exact name, so gnome-shell and this extension are never
-    // targets. Synchronous, so the kill completes before we spawn.
-    killAllSecsec() {
-        try {
-            Gio.Subprocess.new(['pkill', '-KILL', '-x', 'secsec'], Gio.SubprocessFlags.NONE)
-                .wait(null);
-        } catch (_) {
-            // pkill missing or nothing matched — nothing to do
-        }
+    // Stop whatever sync holds the folder (secsec signals it by its lock pid and waits), then continue.
+    _stopFolderSync(cfg, next) {
+        runSecsec(cfg.bin, ['stop', expandPath(cfg.folder)], () => next());
     }
 
-    // Kill any running secsec, then prompt (unless already prompting) and start the sync child. Config
-    // is read fresh here, so a folder/key changed in Settings takes effect on the next start or Restart.
     start() {
-        if (this._proc || this._dialog || this._spawnTimeoutId)
+        if (this._proc || this._dialog || this._spawnTimeoutId || Main.sessionMode.isLocked)
             return;
-        this.killAllSecsec();
         const cfg = readConfig();
         this._dialog = new PassphraseDialog(
             expandPath(cfg.folder),
             pw => {
                 this._dialog = null;
-                // Purge the log, then wait SPAWN_DELAY_MS before launching: a clean slate plus a
-                // settle window after the passphrase, before secsec connects.
-                this.purgeLog();
-                this._indicator?.refresh();
-                this._spawnTimeoutId = GLib.timeout_add(
-                    GLib.PRIORITY_DEFAULT, SPAWN_DELAY_MS, () => {
+                this._stopFolderSync(cfg, () => {
+                    resetLog(this.logPath);
+                    this.refresh();
+                    this._spawnTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SPAWN_DELAY_MS, () => {
                         this._spawnTimeoutId = 0;
-                        this._spawn(cfg.bin, cfg.folder, cfg.key, pw);
+                        this._spawn(cfg, pw);
+                        pw = null;
                         return GLib.SOURCE_REMOVE;
                     });
+                });
             },
             () => {
                 this._dialog = null;
@@ -330,19 +350,10 @@ export default class SecsecExtension extends Extension {
         this._dialog.open(global.get_current_time());
     }
 
-    // Delete the sync log so the next launch starts from a clean slate (matches a manual delete).
-    purgeLog() {
-        try {
-            Gio.File.new_for_path(this.logPath).delete(null);
-        } catch (_) {
-            // already absent — nothing to purge
-        }
-    }
-
-    _spawn(bin, folder, key, passphrase) {
-        const argv = [bin, 'sync', expandPath(folder), '--passphrase-stdin'];
-        if (key)
-            argv.push('--key', expandPath(key));
+    _spawn(cfg, passphrase) {
+        const argv = [resolveBin(cfg.bin), 'sync', expandPath(cfg.folder), '--passphrase-stdin'];
+        if (cfg.key)
+            argv.push('--key', expandPath(cfg.key));
 
         const launcher = new Gio.SubprocessLauncher({
             flags: Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDERR_MERGE,
@@ -362,14 +373,15 @@ export default class SecsecExtension extends Extension {
         }
         this._proc = proc;
 
-        // Feed the passphrase over stdin, then close so `secsec` reads EOF. The secret only ever
-        // travels this pipe — it is never an argument.
+        // The passphrase only ever travels this pipe; its bytes are zeroed once written.
         const stdin = proc.get_stdin_pipe();
+        const bytes = new TextEncoder().encode(passphrase);
         try {
-            stdin.write_all(new TextEncoder().encode(passphrase), null);
+            stdin.write_all(bytes, null);
         } catch (_) {
-            // best-effort; secsec will report a decrypt failure in the log
+            // secsec reports a failed decrypt in the log
         }
+        bytes.fill(0);
         stdin.close(null);
 
         proc.wait_async(null, (p, res) => {
@@ -379,40 +391,41 @@ export default class SecsecExtension extends Extension {
             }
             if (this._proc === p)
                 this._proc = null;
-            this._indicator?.refresh();
+            this.refresh();
         });
-        this._indicator?.refresh();
+        this.refresh();
     }
 
     stop() {
-        // Cancel a pending post-passphrase launch (stop pressed during the settle window).
         if (this._spawnTimeoutId) {
             GLib.source_remove(this._spawnTimeoutId);
             this._spawnTimeoutId = 0;
         }
         if (this._proc) {
-            try {
-                this._proc.send_signal(15); // SIGTERM — let secsec close its connection cleanly
-            } catch (_) {
-                try {
-                    this._proc.force_exit();
-                } catch (_) {
-                }
-            }
+            this._proc.send_signal(15);
             this._proc = null;
+            this.refresh();
+        } else {
+            this._stopFolderSync(readConfig(), () => this.refresh());
         }
-        this._indicator?.refresh();
     }
 
     toggle() {
-        if (this._proc)
+        if (this.isRunning())
             this.stop();
         else
             this.start();
     }
 
     restart() {
-        this.stop();
+        if (this._spawnTimeoutId) {
+            GLib.source_remove(this._spawnTimeoutId);
+            this._spawnTimeoutId = 0;
+        }
+        if (this._proc) {
+            this._proc.send_signal(15);
+            this._proc = null;
+        }
         this.start();
     }
 

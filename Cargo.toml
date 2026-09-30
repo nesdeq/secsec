@@ -1,17 +1,17 @@
-# secsec — Cargo workspace. See secsec-Implementation.md for the crate map.
+# secsec Cargo workspace; secsec-Implementation.md maps the crates.
 [workspace]
 resolver = "2"
 members = ["crates/secsec-canon", "crates/secsec-aead", "crates/secsec-kdf", "crates/secsec-frame", "crates/secsec-chunk", "crates/secsec-object", "crates/secsec-store", "crates/secsec-snapshot", "crates/secsec-sig", "crates/secsec-roster", "crates/secsec-sync", "crates/secsec-transport", "crates/secsec-proto", "crates/secsec-server", "crates/secsec-engine", "crates/secsec-client", "crates/secsec-pq", "crates/secsec-fuzz", "bin/secsec", "xtask"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.85"          # floor (ssh-key MSRV); built with stable ≥ this
+rust-version = "1.89"          # std::fs::File::try_lock; CI builds this version
 license = "GPL-2.0-only"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
-unreachable_pub = "warn"          # flag over-exposed `pub`; `dead_code` then guards pub(crate) items
+unreachable_pub = "warn"          # flags an over-exposed `pub`; dead_code then guards pub(crate) items
 rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
@@ -20,7 +20,7 @@ all = { level = "deny", priority = -1 }
 [workspace.dependencies]
 proptest = "1"
 
-# Release profile: the security cores must not have overflow checks compiled out.
+# Release builds keep overflow checks and abort on panic.
 [profile.release]
 overflow-checks = true
 panic = "abort"

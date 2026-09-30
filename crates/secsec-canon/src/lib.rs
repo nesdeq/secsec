@@ -1,9 +1,4 @@
-//! `secsec-canon` — canonical, deterministic wire encoding (`secsec-Design.md` §9.3).
-//!
-//! Fixed-width little-endian integers, fixed field order, no floats, no type tags. Decoding is
-//! strict: length prefixes are bounded before allocation (§19), truncation is rejected, and a
-//! decoded buffer must be exhausted via [`Reader::finish`]. [`verify_reencode`] is the §9.3
-//! malleability guard on the verify path.
+//! Canonical, deterministic encoding for hashed/signed/addressed structures (`secsec-Design.md` §9.3).
 
 #![forbid(unsafe_code)]
 
@@ -26,12 +21,12 @@ pub enum CanonError {
         /// The maximum the caller permitted.
         max: usize,
     },
-    /// Bytes remained in the buffer after a top-level value was fully decoded.
+    /// Bytes remained after a top-level value was fully decoded.
     TrailingBytes {
         /// Number of unconsumed bytes.
         remaining: usize,
     },
-    /// A decoded value did not re-encode to the bytes that were received (non-canonical input).
+    /// A decoded value did not re-encode to the received bytes (non-canonical input).
     NonCanonical,
 }
 
@@ -57,8 +52,7 @@ impl fmt::Display for CanonError {
 
 impl std::error::Error for CanonError {}
 
-/// Canonical encoder. Append fields in a fixed order; the byte layout *is* the encoding (no
-/// schema on the wire — the decoder reads the same fields in the same order).
+/// Canonical encoder: fields appended in a fixed order, no schema on the wire.
 #[derive(Debug, Default, Clone)]
 pub struct Writer {
     buf: Vec<u8>,
@@ -85,29 +79,25 @@ impl Writer {
         self
     }
 
-    /// Append a `u16` in little-endian order.
+    /// Append a little-endian `u16`.
     pub fn u16(&mut self, v: u16) -> &mut Self {
         self.buf.extend_from_slice(&v.to_le_bytes());
         self
     }
 
-    /// Append a `u32` in little-endian order (the `le32` of the spec).
+    /// Append a little-endian `u32` (the spec's `le32`).
     pub fn u32(&mut self, v: u32) -> &mut Self {
         self.buf.extend_from_slice(&v.to_le_bytes());
         self
     }
 
-    /// Append a `u64` in little-endian order (the `le64` of the spec).
+    /// Append a little-endian `u64` (the spec's `le64`).
     pub fn u64(&mut self, v: u64) -> &mut Self {
         self.buf.extend_from_slice(&v.to_le_bytes());
         self
     }
 
-    /// Append a length-prefixed byte string: a `u32` little-endian length, then the bytes.
-    ///
-    /// # Panics
-    /// Panics if `b.len() > u32::MAX`. Object-level length bounds (§19) keep real inputs far
-    /// below this; exceeding it is an encoder bug, not attacker-reachable input.
+    /// Append `le32(len) ‖ bytes`; panics past `u32::MAX`, which the §19 bounds keep unreachable.
     pub fn bytes(&mut self, b: &[u8]) -> &mut Self {
         let len = u32::try_from(b.len()).expect("canon: byte string longer than u32::MAX");
         self.u32(len);
@@ -115,8 +105,7 @@ impl Writer {
         self
     }
 
-    /// Append fixed-length raw bytes with **no** length prefix. The length is fixed by the
-    /// schema (e.g. a 32-byte hash) and the decoder reads exactly that many via [`Reader::raw`].
+    /// Append fixed-length bytes with no prefix; the decoder reads them via [`Reader::raw`].
     pub fn raw(&mut self, b: &[u8]) -> &mut Self {
         self.buf.extend_from_slice(b);
         self
@@ -129,8 +118,7 @@ impl Writer {
     }
 }
 
-/// Strict canonical decoder over a borrowed buffer. Read the same fields, in the same order,
-/// that the [`Writer`] wrote, then call [`Reader::finish`] to assert the buffer was exhausted.
+/// Strict canonical decoder; read fields in writer order, then [`Reader::finish`].
 #[derive(Debug)]
 pub struct Reader<'a> {
     buf: &'a [u8],
@@ -185,24 +173,22 @@ impl<'a> Reader<'a> {
         ]))
     }
 
-    /// Read a length-prefixed byte string, rejecting any length prefix greater than `max`
-    /// **before** consuming the body (alloc-bomb guard).
+    /// Read a length-prefixed byte string, rejecting a prefix over `max` before consuming the body.
     pub fn bytes(&mut self, max: usize) -> Result<&'a [u8], CanonError> {
         let len = u64::from(self.u32()?);
         if len > max as u64 {
             return Err(CanonError::LengthExceedsMax { len, max });
         }
-        // `len <= max <= usize::MAX`, so the cast is lossless here.
+        // Lossless: `len <= max <= usize::MAX`.
         self.take(len as usize)
     }
 
-    /// Read exactly `n` fixed-length raw bytes (no length prefix).
+    /// Read exactly `n` fixed-length bytes.
     pub fn raw(&mut self, n: usize) -> Result<&'a [u8], CanonError> {
         self.take(n)
     }
 
-    /// Assert the buffer is fully consumed. Call once a top-level value has been decoded;
-    /// trailing bytes are rejected as non-canonical framing.
+    /// Assert the buffer is fully consumed; trailing bytes are non-canonical.
     pub fn finish(self) -> Result<(), CanonError> {
         let remaining = self.remaining();
         if remaining == 0 {
@@ -213,9 +199,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// §9.3 malleability guard: re-encoding `value` must reproduce the exact `received` bytes, else
-/// [`CanonError::NonCanonical`]. Call before trusting a signature/id computed over `received`.
-/// Public bytes only, so a non-constant-time compare is fine.
+/// §9.3 malleability guard: re-encoding `value` must reproduce `received` exactly (public bytes only).
 pub fn verify_reencode<T>(
     received: &[u8],
     value: &T,
@@ -235,7 +219,6 @@ mod tests {
 
     #[test]
     fn kat_layout() {
-        // Known-answer: u32(1) then bytes(b"hi") => 01 00 00 00 | 02 00 00 00 | 'h' 'i'.
         let mut w = Writer::new();
         w.u32(1).bytes(b"hi");
         assert_eq!(w.finish(), vec![0x01, 0, 0, 0, 0x02, 0, 0, 0, b'h', b'i']);
@@ -282,7 +265,7 @@ mod tests {
 
     #[test]
     fn rejects_trailing_bytes() {
-        let buf = [0x01, 0x00, 0x00, 0x00, 0xFF]; // a u32 plus one extra byte
+        let buf = [0x01, 0x00, 0x00, 0x00, 0xFF];
         let mut r = Reader::new(&buf);
         assert_eq!(r.u32().unwrap(), 1);
         assert_eq!(r.finish(), Err(CanonError::TrailingBytes { remaining: 1 }));
@@ -290,7 +273,7 @@ mod tests {
 
     #[test]
     fn rejects_truncated() {
-        let buf = [0x01, 0x02]; // only 2 bytes, u32 wants 4
+        let buf = [0x01, 0x02];
         let mut r = Reader::new(&buf);
         assert_eq!(
             r.u32(),
@@ -300,8 +283,7 @@ mod tests {
 
     #[test]
     fn bytes_enforces_max_before_reading_body() {
-        // Length prefix says 1 MiB but max is 16; must reject on the prefix, not allocate.
-        let buf = [0x00, 0x00, 0x10, 0x00]; // u32 = 0x0010_0000 = 1_048_576
+        let buf = [0x00, 0x00, 0x10, 0x00];
         let mut r = Reader::new(&buf);
         assert_eq!(
             r.bytes(16),
@@ -321,7 +303,6 @@ mod tests {
         };
         let received = encode(&42);
         assert!(verify_reencode(&received, &42u32, encode).is_ok());
-        // Bytes that decode to 42 but with a trailing byte are not the canonical encoding of 42.
         let mut non_canon = received.clone();
         non_canon.push(0x00);
         assert_eq!(
@@ -351,7 +332,6 @@ mod tests {
             let encode = |x: &u64| { let mut w = Writer::new(); w.u64(*x); w.finish() };
             let mut buf = encode(&v);
             buf.push(extra);
-            // Re-encoding `v` yields 8 bytes; the 9-byte buffer can never match.
             prop_assert_eq!(verify_reencode(&buf, &v, encode), Err(CanonError::NonCanonical));
         }
     }

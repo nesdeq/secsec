@@ -1,6 +1,4 @@
-//! Robustness: the strict decoder must **never panic** on arbitrary input — only ever return
-//! `Err`. This is the stable-Rust stand-in for libFuzzer coverage of the `canon` decoder
-//! (continuous libFuzzer fuzzing is a nightly follow-up; see `.github/workflows/ci.yml`).
+//! Robustness: the strict decoder never panics on arbitrary input, only returns `Err`.
 
 use proptest::prelude::*;
 use secsec_canon::Reader;
@@ -19,7 +17,7 @@ proptest! {
         let _ = r.bytes(max);
         let _ = r.raw(13);
         let _ = r.remaining();
-        // A second reader with an enormous max must stay slice-bounded (no over-allocation/panic).
+        // An enormous max stays slice-bounded.
         let mut r2 = Reader::new(&data);
         let _ = r2.bytes(usize::MAX);
     }

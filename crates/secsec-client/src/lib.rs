@@ -1,10 +1,4 @@
-//! `secsec-client` — client orchestration over a [`Remote`] (`secsec-Design.md` §10, §12): push the
-//! reachable object closure of a commit, advance the per-ref head via the blind-server CAS, and on
-//! the read side fetch a head + closure **verifying every object on arrival** (§9.2). Cross-device
-//! sync ([`sync_ref`]): fetch the remote head, verify it against the folded roster
-//! ([`SiblingHead::verified`]), bring the closure local, run the rollback-gated merge
-//! ([`secsec_engine::merge_heads`]), push.
-//! The [`Remote`] trait abstracts the server; the QUIC adapter is a thin layer on top.
+//! Client orchestration over a [`Remote`] (`secsec-Design.md` §10, §12, §15): verified fetch, minimal push, head CAS, sealed frontier.
 
 #![forbid(unsafe_code)]
 
@@ -16,18 +10,17 @@ pub mod repo;
 pub mod sync;
 pub mod watcher;
 
-/// Shared in-process [`Remote`] used by the test modules (consolidates four identical copies).
 #[cfg(test)]
 mod testmem;
 
-use secsec_engine::{merge_heads, CommitAuthor, MergeError, SyncAction};
-use secsec_frame::ObjType;
+use secsec_engine::{EngineError, MergeError};
+use secsec_frame::MAX_TREE_DEPTH;
 use secsec_kdf::MasterKeys;
-use secsec_object::{open_object, Id, ObjError, PathSalt};
-use secsec_proto::server::limits::MAX_HAS_IDS;
+use secsec_object::{Id, PathSalt};
+use secsec_proto::wire::{ErrorCode, HeadPut, KeyslotPut};
 use secsec_proto::PUSH_ID_LEN;
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
-use secsec_snapshot::{Entry, SnapError};
+use secsec_snapshot::{open_signed_commit, Entry, SnapError};
 use secsec_store::{Store, StoreError, ABSENT_HEAD};
 use secsec_sync::rollback::{
     open_frontier, seal_frontier, FrontierError, SiblingHead, SyncFrontier,
@@ -36,64 +29,86 @@ use secsec_sync::{
     build_head, open_head, random_nonce, ref_hash, seal_head, sign_head, Head, HeadError,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::Path;
 
-/// An opaque error from a [`Remote`] implementation (network, storage, protocol). Carried as a string
-/// so the trait stays object-friendly across the in-process and QUIC backends.
+/// A failure on the far side of a [`Remote`].
 #[derive(Debug)]
-pub struct RemoteError(pub String);
+pub enum RemoteError {
+    /// The server refused `op` with a §12 error code.
+    Refused(&'static str, ErrorCode),
+    /// The reply to `op` did not fit the request (wrong kind or length).
+    Protocol(&'static str),
+    /// The connection or RPC failed.
+    Transport(String),
+    /// An in-process backend failed.
+    Local(String),
+}
+
+impl RemoteError {
+    /// Whether the server refused because this device owns no keyslot.
+    #[must_use]
+    pub fn is_not_enrolled(&self) -> bool {
+        matches!(self, RemoteError::Refused(_, ErrorCode::NotEnrolled))
+    }
+}
+
 impl core::fmt::Display for RemoteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "remote: {}", self.0)
+        match self {
+            RemoteError::Refused(op, code) => write!(f, "server refused {op}: {code}"),
+            RemoteError::Protocol(op) => write!(f, "unexpected server reply to {op}"),
+            RemoteError::Transport(e) => write!(f, "connection: {e}"),
+            RemoteError::Local(e) => write!(f, "remote store: {e}"),
+        }
     }
 }
 impl std::error::Error for RemoteError {}
 
-/// A content-addressed object + mutable-ref store on the far side of a connection (§12, §13). The
-/// blind server exposes exactly this surface; an in-process backing store implements it identically.
+/// Every roster-side write of one sigchain operation, applied atomically by the server (§8.1, §8.4, §12).
+#[derive(Debug, Clone, Default)]
+pub struct RosterWrite {
+    /// `BLAKE3` of the current tip entry blob, or [`ABSENT_HEAD`] for genesis.
+    pub old_tip: Id,
+    /// Sealed entries appended in order.
+    pub entries: Vec<Vec<u8>>,
+    /// Keyslots written.
+    pub keyslots: Vec<KeyslotPut>,
+    /// Data key-history wrap `(g, wrap)`.
+    pub keyhist: Option<(u32, Vec<u8>)>,
+    /// Roster-key-history wrap `(g, wrap)`.
+    pub roster_keyhist: Option<(u32, Vec<u8>)>,
+    /// Devices whose keyslots at every generation are deleted.
+    pub revoke: Vec<Id>,
+    /// A head re-sign under its own CAS.
+    pub head: Option<HeadPut>,
+}
+
+/// The §12 server surface; the QUIC adapter and the in-process test backend implement it identically.
 #[allow(async_fn_in_trait)]
 pub trait Remote {
-    /// Fetch a blob by id (`None` if absent).
+    /// Fetch a durable blob by id.
     async fn get_blob(&self, id: &Id) -> Result<Option<Vec<u8>>, RemoteError>;
-    /// Stage a blob under an in-flight `push_id` (idempotent by id). It becomes durable only when this
-    /// push's [`Self::cas_head`] promotes it (§15).
+    /// Stage a blob under `push_id`; it becomes durable when that push's [`Self::cas_head`] promotes it (§15).
     async fn put_blob(
         &self,
         id: &Id,
         blob: &[u8],
         push_id: &[u8; PUSH_ID_LEN],
     ) -> Result<(), RemoteError>;
-    /// Existence check against **durable** storage (drives dedup; a staged-but-unpromoted object is
-    /// reported absent). Batched at `<= MAX_HAS_IDS` by the caller.
+    /// Durable existence per id, one answer per id in order; staged objects count as absent.
     async fn has(&self, ids: &[Id]) -> Result<Vec<bool>, RemoteError>;
-    /// Existence check that also counts objects already staged under `push_id` — lets a resumed push
-    /// skip re-uploading what it staged before a crash (§15).
-    async fn has_for_push(
-        &self,
-        push_id: &[u8; PUSH_ID_LEN],
-        ids: &[Id],
-    ) -> Result<Vec<bool>, RemoteError>;
-    /// Fetch the stored head blob for `/refs/<ref_h>` (`None` if absent).
+    /// The head blob at `/refs/<ref_h>`.
     async fn get_ref(&self, ref_h: &Id) -> Result<Option<Vec<u8>>, RemoteError>;
-    /// Fetch the sigchain entry blob at `seq` (`None` past the tip) — cold-start fold (§8.1).
+    /// The sigchain entry at `seq`, `None` past the tip.
     async fn get_roster_entry(&self, seq: u64) -> Result<Option<Vec<u8>>, RemoteError>;
-    /// Fetch a device's keyslot blob for generation `gen` (`None` if absent) — cold-start unwrap.
+    /// A device's keyslot at generation `gen`.
     async fn get_keyslot(&self, device_id: &Id, gen: u32) -> Result<Option<Vec<u8>>, RemoteError>;
-    /// Fetch the roster-key-history wrap for generation `gen` (`None` if absent) — rotation-era
-    /// cold-start (§8.2). Default returns `None` so in-process backends without keyhist still compile.
-    async fn get_roster_keyhist(&self, _gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
-        Ok(None)
-    }
-    /// Fetch the DATA key-history wrap for generation `gen` (`None` if absent) — peeling
-    /// `master_key_g` to read pre-rotation object content (§8.2 `/keyhist/<g>`). Default returns
-    /// `None` so in-process backends without keyhist still compile.
-    async fn get_keyhist(&self, _gen: u32) -> Result<Option<Vec<u8>>, RemoteError> {
-        Ok(None)
-    }
-    /// Blind compare-and-swap with staged-object promotion (§15/§12): replace `/refs/<ref_h>` with
-    /// `new_blob` iff `BLAKE3(current stored blob)` (or [`ABSENT_HEAD`]) equals `expected_old`, and in
-    /// the same transaction promote every object staged under `promote` to durable storage. Returns
-    /// `true` on swap, `false` on conflict.
+    /// The roster-key-history wrap for `gen` (§8.2).
+    async fn get_roster_keyhist(&self, gen: u32) -> Result<Option<Vec<u8>>, RemoteError>;
+    /// The data key-history wrap for `gen` (§8.2).
+    async fn get_keyhist(&self, gen: u32) -> Result<Option<Vec<u8>>, RemoteError>;
+    /// Swap `/refs/<ref_h>` to `new_blob` iff its blob hash is `expected_old`, promoting `promote`'s staging; `false` on conflict.
     async fn cas_head(
         &self,
         ref_h: &Id,
@@ -101,65 +116,19 @@ pub trait Remote {
         new_blob: &[u8],
         promote: &[u8; PUSH_ID_LEN],
     ) -> Result<bool, RemoteError>;
-    /// Request a §15 retention prune: delete the durable objects in `dead` that no longer belong to any
-    /// kept version. The `all_heads_hash`/`roster_seq` are the client's view; the server recomputes
-    /// them and the prune is a head-binding compare-and-swap. Returns `true` on success, `false` on a
-    /// CAS conflict (a concurrent head/roster mutation — re-pull and retry).
+    /// Apply one sigchain operation atomically; `false` when the tip, the head, or a key-history slot moved.
+    async fn roster_batch(&self, write: &RosterWrite) -> Result<bool, RemoteError>;
+    /// Delete `dead` iff the server's heads and roster length still equal the claimed ones (§15); `false` when they moved.
     async fn prune(
         &self,
         dead: &[Id],
         all_heads_hash: &[u8; 32],
-        roster_seq: u64,
+        roster_len: u64,
     ) -> Result<bool, RemoteError>;
-    /// Store a device's keyslot blob (§13) — the network half of enrollment (§7/§8.4). Defaults to an
-    /// error so read-only / in-process backends need not implement it.
-    async fn put_keyslot(
-        &self,
-        _device_id: &Id,
-        _gen: u32,
-        _blob: &[u8],
-    ) -> Result<(), RemoteError> {
-        Err(RemoteError(
-            "put_keyslot unsupported by this remote".to_string(),
-        ))
-    }
-    /// Append a sigchain entry CAS-guarded by `old_tip` (§8.1): `Ok(true)` = appended, `Ok(false)` =
-    /// CAS conflict (re-fold + retry). Defaults to an error for read-only backends.
-    async fn roster_append(&self, _old_tip: &Id, _entry: &[u8]) -> Result<bool, RemoteError> {
-        Err(RemoteError(
-            "roster_append unsupported by this remote".to_string(),
-        ))
-    }
-    /// Post an opaque blob to the §7 invite-onboarding pairing mailbox slot. Allowed pre-enrollment.
-    async fn pair_put(&self, _slot: &Id, _blob: &[u8]) -> Result<(), RemoteError> {
-        Err(RemoteError(
-            "pair_put unsupported by this remote".to_string(),
-        ))
-    }
-    /// Read a §7 pairing mailbox slot (`None` if empty/expired). Allowed pre-enrollment.
-    async fn pair_get(&self, _slot: &Id) -> Result<Option<Vec<u8>>, RemoteError> {
-        Err(RemoteError(
-            "pair_get unsupported by this remote".to_string(),
-        ))
-    }
-    /// Store a DATA key-history wrap for generation `gen` (§8.2) — the network half of rotation.
-    async fn put_keyhist(&self, _gen: u32, _blob: &[u8]) -> Result<(), RemoteError> {
-        Err(RemoteError(
-            "put_keyhist unsupported by this remote".to_string(),
-        ))
-    }
-    /// Store a roster-key-history wrap for generation `gen` (§8.2) — the network half of rotation.
-    async fn put_roster_keyhist(&self, _gen: u32, _blob: &[u8]) -> Result<(), RemoteError> {
-        Err(RemoteError(
-            "put_roster_keyhist unsupported by this remote".to_string(),
-        ))
-    }
-    /// Delete a device's keyslot at generation `gen` (§8.4 revocation, over the wire).
-    async fn delete_keyslot(&self, _device_id: &Id, _gen: u32) -> Result<(), RemoteError> {
-        Err(RemoteError(
-            "delete_keyslot unsupported by this remote".to_string(),
-        ))
-    }
+    /// Post to a §7 pairing slot.
+    async fn pair_put(&self, slot: &Id, blob: &[u8]) -> Result<(), RemoteError>;
+    /// Take a §7 pairing slot's message, `None` if it is empty.
+    async fn pair_get(&self, slot: &Id) -> Result<Option<Vec<u8>>, RemoteError>;
 }
 
 /// Errors from client orchestration.
@@ -169,65 +138,66 @@ pub enum ClientError {
     Remote(RemoteError),
     /// Local store error.
     Store(StoreError),
-    /// Snapshot/restore error.
+    /// Snapshot, restore, or object verification error.
     Snap(SnapError),
-    /// Object open/verify error (a fetched object failed §9.2 content-address verification).
-    Object(ObjError),
     /// Head seal/open/verify error.
     Head(HeadError),
-    /// An object expected in the local store was absent (push side).
+    /// An object the push needs is absent from the local store.
     MissingLocal(Id),
-    /// An object required to complete a fetch closure was absent on the remote.
+    /// An object the fetch needs is absent on the server.
     MissingRemote(Id),
-    /// The `cas-head` lost the race (a concurrent writer advanced the ref).
+    /// The `cas-head` lost to a concurrent writer.
     CasConflict,
-    /// A fetched head's signature matched no current roster member (forged or stale-roster head).
+    /// The fetched head is signed by no current member (a stale roster, or a forgery).
     HeadNotMember,
-    /// The rollback-aware merge errored — notably [`MergeError::Rollback`], a §10 security alarm.
+    /// Sibling acceptance or merge failed; [`MergeError::Rollback`] is a §10 alarm.
     Merge(MergeError),
-    /// Filesystem I/O error (state-file read/write).
+    /// Filesystem I/O error.
     Io(std::io::Error),
-    /// The persisted local frontier exists but failed to open (corrupt / MAC-fail / wrong device) — a
-    /// §8.5 **lost-frontier event**: the caller MUST alarm and treat the session as a reinstall.
+    /// The sealed frontier exists but does not open: a §8.5 lost-frontier event.
     FrontierLost(FrontierError),
-    /// Key/signing error (e.g. deriving the local-seal key).
+    /// Key/signing error.
     Sig(secsec_sig::SigError),
-    /// Engine error loading the commit DAG.
-    Engine(secsec_engine::EngineError),
+    /// Commit-DAG load error.
+    Engine(EngineError),
+    /// This device's commit version cannot advance past `u64::MAX`.
+    VersionExhausted,
 }
 
 impl core::fmt::Display for ClientError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ClientError::Remote(e) => write!(f, "{e}"),
-            ClientError::Store(e) => write!(f, "store: {e}"),
-            ClientError::Snap(e) => write!(f, "snapshot: {e}"),
-            ClientError::Object(e) => write!(f, "object: {e}"),
+            ClientError::Store(e) => write!(f, "{e}"),
+            ClientError::Snap(e) => write!(f, "{e}"),
             ClientError::Head(e) => write!(f, "head: {e}"),
-            ClientError::MissingLocal(_) => f.write_str("object missing from local store"),
-            ClientError::MissingRemote(_) => f.write_str("required object absent on remote"),
-            ClientError::CasConflict => {
-                f.write_str("cas-head conflict (ref advanced concurrently)")
+            ClientError::MissingLocal(id) => write!(
+                f,
+                "object {} is missing from the local cache",
+                secsec_snapshot::hex12(id)
+            ),
+            ClientError::MissingRemote(id) => write!(
+                f,
+                "object {} is absent on the server",
+                secsec_snapshot::hex12(id)
+            ),
+            ClientError::CasConflict => f.write_str("the ref advanced concurrently"),
+            ClientError::HeadNotMember => {
+                f.write_str("the server's head is signed by a device that is not a member")
             }
-            ClientError::HeadNotMember => f.write_str("fetched head signed by a non-member"),
-            ClientError::Merge(e) => write!(f, "merge: {e}"),
+            ClientError::Merge(e) => write!(f, "{e}"),
             ClientError::Io(e) => write!(f, "io: {e}"),
             ClientError::FrontierLost(e) => write!(f, "lost local frontier: {e}"),
             ClientError::Sig(e) => write!(f, "sig: {e}"),
-            ClientError::Engine(e) => write!(f, "engine: {e}"),
+            ClientError::Engine(e) => write!(f, "{e}"),
+            ClientError::VersionExhausted => f.write_str("commit version exhausted"),
         }
     }
 }
 impl std::error::Error for ClientError {}
-impl From<secsec_engine::EngineError> for ClientError {
-    fn from(e: secsec_engine::EngineError) -> Self {
+impl From<EngineError> for ClientError {
+    fn from(e: EngineError) -> Self {
         ClientError::Engine(e)
-    }
-}
-impl From<repo::RepoError> for ClientError {
-    fn from(e: repo::RepoError) -> Self {
-        // From the orchestration's view a cold-start/rotate RepoError is a remote-state failure.
-        ClientError::Remote(RemoteError(e.to_string()))
     }
 }
 impl From<std::io::Error> for ClientError {
@@ -260,74 +230,111 @@ impl From<SnapError> for ClientError {
         ClientError::Snap(e)
     }
 }
-impl From<ObjError> for ClientError {
-    fn from(e: ObjError) -> Self {
-        ClientError::Object(e)
-    }
-}
 impl From<HeadError> for ClientError {
     fn from(e: HeadError) -> Self {
         ClientError::Head(e)
     }
 }
 
+/// Whether `id` is stored locally.
+fn stored(store: &Store, id: &Id) -> Result<bool, StoreError> {
+    Ok(store.has(std::slice::from_ref(id))?.contains(&true))
+}
+
 // ---- push ----
 
-/// Stage the reachable object closure of `commit_id` from `store` to `remote` under `push_id`: upload
-/// only what the server does not already hold (durably, or already staged under this push), so a
-/// resumed push re-sends just the gap. The objects become durable when [`push_head`] promotes this
-/// push (§15). The closure is `commit + ancestors + trees + chunks`.
+/// Stage what `commit_id` adds over `remote_head`: the head's closure strictly, older new commits' objects when held (§15).
 pub(crate) async fn push_objects<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
     keys: &K,
     commit_id: &Id,
+    remote_head: Option<&Id>,
     push_id: &[u8; PUSH_ID_LEN],
 ) -> Result<(), ClientError> {
-    let ids: Vec<Id> = secsec_snapshot::reachable_objects(keys, store, &[*commit_id])?
-        .into_iter()
+    let heads: Vec<Id> = std::iter::once(*commit_id)
+        .chain(remote_head.copied())
         .collect();
-    for chunk in ids.chunks(MAX_HAS_IDS) {
-        let present = remote.has_for_push(push_id, chunk).await?;
-        for (id, p) in chunk.iter().zip(present) {
-            if !p {
-                // Upload what we hold; an object absent locally is pruned old content the server either
-                // keeps or has dropped too — never re-uploaded (§15/I5).
-                if let Some(blob) = store.get(id)? {
-                    remote.put_blob(id, &blob, push_id).await?;
-                }
-            }
+    let (parents, _) = secsec_engine::load_commit_dag(&heads, keys, store)?;
+    let new = secsec_sync::dag::new_commits(&parents, remote_head, commit_id);
+
+    // The remote head's tree is durable there: its subtrees are never walked, its ids never sent.
+    let mut known = BTreeSet::new();
+    if let Some(h) = remote_head {
+        let (hc, _) = open_signed_commit(h, keys, store)?;
+        secsec_snapshot::tree_closure(
+            keys,
+            store,
+            &hc.root_tree,
+            &hc.root_salt,
+            &BTreeSet::new(),
+            &mut known,
+        )?;
+    }
+    let mut strict: BTreeSet<Id> = new.clone();
+    let (head, _) = open_signed_commit(commit_id, keys, store)?;
+    secsec_snapshot::tree_closure(
+        keys,
+        store,
+        &head.root_tree,
+        &head.root_salt,
+        &known,
+        &mut strict,
+    )?;
+    // Older new commits keep their trees; their chunks may be pruned locally, which only thins their history.
+    let mut lenient: BTreeSet<Id> = BTreeSet::new();
+    for c in new.iter().filter(|c| *c != commit_id) {
+        let (commit, _) = open_signed_commit(c, keys, store)?;
+        secsec_snapshot::tree_closure(
+            keys,
+            store,
+            &commit.root_tree,
+            &commit.root_salt,
+            &known,
+            &mut lenient,
+        )?;
+    }
+    let want: Vec<(Id, bool)> = strict
+        .difference(&known)
+        .map(|id| (*id, true))
+        .chain(
+            lenient
+                .iter()
+                .filter(|id| !known.contains(*id) && !strict.contains(*id))
+                .map(|id| (*id, false)),
+        )
+        .collect();
+    // Staged even when the server holds it: a copy skipped on `has` could be pruned before our cas-head promotes.
+    for (id, required) in &want {
+        match store.get(id)? {
+            Some(blob) => remote.put_blob(id, &blob, push_id).await?,
+            None if *required => return Err(ClientError::MissingLocal(*id)),
+            None => {}
         }
     }
     Ok(())
 }
 
-/// Advance `/refs/<ref_name>` to `commit_id`: seal a signed head (chained on `prev`), then blind-CAS
-/// it onto the remote. `prev` is the `(head, stored_blob)` the client last observed for this ref
-/// (`None` for the first head); the old CAS token is `BLAKE3(prev_blob)` (or [`ABSENT_HEAD`]). Returns
-/// the new `(head, stored_blob)` to carry as `prev` next time. The caller pushes objects first.
+/// Seal a signed head for `commit_id` chained on `prev` under the current generation and CAS it onto the remote (§12).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn push_head<R: Remote, K: MasterKeys>(
     remote: &R,
     keys: &K,
-    device: &secsec_sig::DeviceKey,
+    device: &DeviceKey,
     ref_name: &str,
     commit_id: Id,
     roster_seq: u64,
     prev: Option<(&Head, &[u8])>,
     push_id: &[u8; PUSH_ID_LEN],
 ) -> Result<(Head, Vec<u8>), ClientError> {
-    let head = build_head(ref_name, commit_id, roster_seq, prev.map(|(h, _)| h));
+    let head = build_head(ref_name, commit_id, roster_seq, prev.map(|(h, _)| h))?;
     let sig = sign_head(device, &head)?;
     let nonce = random_nonce()?;
-    // Sealed under the current generation's `head_key_g`, but addressed at the generation-stable
-    // ref path (§13), so the ref does not move on rotation.
+    // The ref path is generation-stable (§13); the seal uses the current generation's head key.
     let rnk = keys.ref_name_key();
     let blob = seal_head(keys.current(), &rnk, &head, &sig, &nonce);
-
     let ref_h = ref_hash(&rnk, ref_name);
     let old = prev.map_or(ABSENT_HEAD, |(_, b)| *blake3::hash(b).as_bytes());
-    // The cas-head promotes the objects staged under `push_id` atomically with the ref swap (§15).
     if remote.cas_head(&ref_h, &old, &blob, push_id).await? {
         Ok((head, blob))
     } else {
@@ -337,9 +344,7 @@ pub(crate) async fn push_head<R: Remote, K: MasterKeys>(
 
 // ---- fetch ----
 
-/// Fetch the stored head blob for `ref_name`, open it (§9.8: FRAME check, AEAD open, ref-slot binding,
-/// strict decode), and return `(head, sig, stored_blob)`. The caller MUST then [`verify_head`] against
-/// the signer's roster key and check the frontier (§8.5). `None` if the ref is absent.
+/// Fetch and open `ref_name`'s head as `(head, sig, stored_blob)` (§9.8); the signature is not yet checked.
 pub async fn fetch_head<R: Remote, K: MasterKeys>(
     remote: &R,
     keys: &K,
@@ -350,237 +355,263 @@ pub async fn fetch_head<R: Remote, K: MasterKeys>(
     let Some(blob) = remote.get_ref(&ref_h).await? else {
         return Ok(None);
     };
-    // `open_head` resolves the head's own generation against `keys` (§8.2 peel), so a head written
-    // before a rotation is still readable by a current member.
     let (head, sig) = open_head(keys, &rnk, ref_name, &blob)?;
     Ok(Some((head, sig, blob)))
 }
 
-/// One item of the typed fetch traversal (we know each id's role from its parent, so we can open and
-/// verify it correctly without trusting a server-supplied type). The bool is `strict`: the head
-/// commit's own content must be present; ancestor content is skip-missing (pruned history, §15/I5).
-enum Work {
-    Commit(Id, bool),
-    Tree(Id, PathSalt, bool),
-    Chunk(Id, PathSalt, bool),
+/// A fetched head whose signature a current member made.
+#[derive(Debug, Clone)]
+pub struct RemoteHead {
+    /// The opened head.
+    pub head: Head,
+    /// Its stored blob, the next `cas-head` token.
+    pub blob: Vec<u8>,
+    /// The verified signer view the gates read.
+    pub sibling: SiblingHead,
 }
 
-/// Fetch the full reachable closure of `commit_id` from `remote` into `store`, **verifying every
-/// object on arrival** (§9.2): commits/trees are opened to discover their children, chunks under
-/// their file's `path_salt`. Idempotent (present objects skipped); returns the count fetched.
+/// [`fetch_head`] plus the member-signature check; a head no current member signed is [`ClientError::HeadNotMember`].
+pub async fn fetch_verified_head<R: Remote, K: MasterKeys>(
+    remote: &R,
+    keys: &K,
+    members: &BTreeMap<DeviceId, DevicePublic>,
+    ref_name: &str,
+) -> Result<Option<RemoteHead>, ClientError> {
+    let Some((head, sig, blob)) = fetch_head(remote, keys, ref_name).await? else {
+        return Ok(None);
+    };
+    let sibling = SiblingHead::verified(members, &head, &sig).ok_or(ClientError::HeadNotMember)?;
+    Ok(Some(RemoteHead {
+        head,
+        blob,
+        sibling,
+    }))
+}
+
+/// Fetch every commit of `commit_id`'s history not stored locally, verifying each before it is stored (§9.2).
+pub(crate) async fn fetch_commits<R: Remote, K: MasterKeys>(
+    remote: &R,
+    store: &Store,
+    keys: &K,
+    commit_id: &Id,
+) -> Result<usize, ClientError> {
+    let mut fetched: Vec<(Id, Vec<u8>)> = Vec::new();
+    let mut seen: BTreeSet<Id> = BTreeSet::new();
+    let mut work = vec![*commit_id];
+    while let Some(id) = work.pop() {
+        // A stored commit's history is already stored: commits land in one transaction per fetch.
+        if !seen.insert(id) || stored(store, &id)? {
+            continue;
+        }
+        let blob = remote
+            .get_blob(&id)
+            .await?
+            .ok_or(ClientError::MissingRemote(id))?;
+        let (commit, _) = secsec_snapshot::verified_commit(keys, &id, &blob)?;
+        work.extend(commit.parents);
+        fetched.push((id, blob));
+    }
+    let items: Vec<(Id, &[u8])> = fetched.iter().map(|(id, b)| (*id, b.as_slice())).collect();
+    store.put_many(&items)?;
+    Ok(fetched.len())
+}
+
+/// What a tree walk brings local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Walk {
+    /// Trees only; a stored tree's subtrees are already stored.
+    Trees,
+    /// Trees and chunks; stored trees are still walked, since retention may have dropped their chunks.
+    WithChunks,
+}
+
+/// Bring a tree local, verifying every object before it is stored; each tree is stored after its children.
+pub(crate) async fn fetch_tree<R: Remote, K: MasterKeys>(
+    remote: &R,
+    store: &Store,
+    keys: &K,
+    root: &Id,
+    salt: &PathSalt,
+    walk: Walk,
+) -> Result<usize, ClientError> {
+    enum Step {
+        Enter(Id, PathSalt, usize),
+        Store(Id, Vec<u8>),
+    }
+    let mut fetched = 0usize;
+    let mut seen: BTreeSet<Id> = BTreeSet::new();
+    let mut stack = vec![Step::Enter(*root, *salt, 0)];
+    while let Some(step) = stack.pop() {
+        let (id, salt, depth) = match step {
+            Step::Store(id, blob) => {
+                store.put(&id, &blob)?;
+                fetched += 1;
+                continue;
+            }
+            Step::Enter(id, salt, depth) => (id, salt, depth),
+        };
+        if depth >= MAX_TREE_DEPTH {
+            return Err(SnapError::DepthExceeded.into());
+        }
+        if !seen.insert(id) || (walk == Walk::Trees && stored(store, &id)?) {
+            continue;
+        }
+        let tree = match store.get(&id)? {
+            Some(blob) => secsec_snapshot::verified_tree(keys, &id, &salt, &blob)?,
+            None => {
+                let blob = remote
+                    .get_blob(&id)
+                    .await?
+                    .ok_or(ClientError::MissingRemote(id))?;
+                let tree = secsec_snapshot::verified_tree(keys, &id, &salt, &blob)?;
+                stack.push(Step::Store(id, blob));
+                tree
+            }
+        };
+        let mut chunks: Vec<(Id, PathSalt)> = Vec::new();
+        for e in tree.entries {
+            match e {
+                Entry::File {
+                    path_salt,
+                    chunks: cs,
+                    ..
+                } if walk == Walk::WithChunks => {
+                    chunks.extend(cs.into_iter().map(|c| (c, path_salt)));
+                }
+                Entry::File { .. } => {}
+                Entry::Dir {
+                    subtree,
+                    subtree_salt,
+                    ..
+                } => stack.push(Step::Enter(subtree, subtree_salt, depth + 1)),
+            }
+        }
+        chunks.retain(|(c, _)| seen.insert(*c));
+        let ids: Vec<Id> = chunks.iter().map(|(c, _)| *c).collect();
+        for ((cid, csalt), have) in chunks.iter().zip(store.has(&ids)?) {
+            if have {
+                continue;
+            }
+            let blob = remote
+                .get_blob(cid)
+                .await?
+                .ok_or(ClientError::MissingRemote(*cid))?;
+            secsec_snapshot::verify_chunk(keys, cid, csalt, &blob)?;
+            store.put(cid, &blob)?;
+            fetched += 1;
+        }
+    }
+    Ok(fetched)
+}
+
+/// Bring `commit_id`'s history and its full tree local, every object verified before it is stored (§9.2).
 pub(crate) async fn fetch_closure<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
     keys: &K,
     commit_id: &Id,
 ) -> Result<usize, ClientError> {
-    let mut seen: BTreeSet<Id> = BTreeSet::new();
-    let mut work = vec![Work::Commit(*commit_id, true)];
-    let mut fetched = 0;
+    let commits = fetch_commits(remote, store, keys, commit_id).await?;
+    let (head, _) = open_signed_commit(commit_id, keys, store)?;
+    let content = fetch_tree(
+        remote,
+        store,
+        keys,
+        &head.root_tree,
+        &head.root_salt,
+        Walk::WithChunks,
+    )
+    .await?;
+    Ok(commits + content)
+}
 
-    while let Some(item) = work.pop() {
-        let (id, strict) = match &item {
-            Work::Commit(id, s) | Work::Tree(id, _, s) | Work::Chunk(id, _, s) => (*id, *s),
-        };
-        if !seen.insert(id) {
-            continue;
-        }
-        // Fetch + store unless already local. The head's own content is strict (a missing current
-        // object is a real error); ancestor content is skip-missing — history pruned beyond retention
-        // is simply gone (§15/I5).
-        if store.get(&id)?.is_none() {
-            match remote.get_blob(&id).await? {
-                Some(blob) => {
-                    store.put(&id, &blob)?;
-                    fetched += 1;
-                }
-                None if strict => return Err(ClientError::MissingRemote(id)),
-                None => continue,
-            }
-        }
-        match item {
-            Work::Commit(_, _) => {
-                // open_signed_commit re-verifies the content address and decodes (§9.2).
-                let (commit, _sig) = secsec_snapshot::open_signed_commit(&id, keys, store)?;
-                // Parents are ancestors: their content is fetched leniently (kept history is brought
-                // local for merge; pruned history is skipped).
-                for p in &commit.parents {
-                    work.push(Work::Commit(*p, false));
-                }
-                work.push(Work::Tree(commit.root_tree, commit.root_salt, strict));
-            }
-            Work::Tree(_, salt, _) => {
-                let tree = secsec_snapshot::load_tree(&id, &salt, keys, store)?;
-                for e in tree.entries {
-                    match e {
-                        Entry::File {
-                            path_salt, chunks, ..
-                        } => {
-                            for c in chunks {
-                                work.push(Work::Chunk(c, path_salt, strict));
-                            }
-                        }
-                        Entry::Dir {
-                            subtree,
-                            subtree_salt,
-                            ..
-                        } => work.push(Work::Tree(subtree, subtree_salt, strict)),
-                    }
-                }
-            }
-            Work::Chunk(_, salt, _) => {
-                // Leaf: verify the chunk's content address (§9.2); `open_object` resolves its
-                // generation from `keys` (§8.2).
-                let blob = store.get(&id)?.ok_or(ClientError::MissingLocal(id))?;
-                open_object(keys, ObjType::Chunk, &salt, &id, &blob)?;
-            }
-        }
+// ---- local state files ----
+
+/// Replace `path` atomically with owner-only contents: same-directory temp file, fsync, rename, directory fsync.
+pub fn write_private_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("state path has no file name"))?;
+    let mut suffix = [0u8; 8];
+    getrandom::fill(&mut suffix).map_err(|_| std::io::Error::other("OS CSPRNG failure"))?;
+    let hex: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
+    let tmp = dir.join(format!(".{}.{hex}.tmp", name.to_string_lossy()));
+    let result = (|| {
+        let mut f = create_private(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        sync_dir(dir)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    Ok(fetched)
+    result
 }
 
-// ---- cross-device sync (fetch → resolve signer → rollback-gated merge → push) ----
-
-/// The outcome of [`sync_ref`].
-#[derive(Debug, Clone)]
-pub struct SyncReport {
-    /// What was done with the ref (reuses the engine's classification).
-    pub action: SyncAction,
-    /// The frontier advanced by observing the remote head (§8.5: seal before the next write).
-    pub frontier: SyncFrontier,
-    /// The head we wrote, if we advanced the ref (merge or fast-forward-the-remote-to-us).
-    pub wrote: Option<(Head, Vec<u8>)>,
+/// Create a new file readable and writable by its owner only (0600 on unix).
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
 }
 
-/// Reconcile our local `our_commit` for `ref_name` against the remote (§10): fetch the remote head
-/// (absent → push ours and create it), resolve its signer, bring the closure local, run the
-/// rollback-gated [`merge_heads`], then push whatever we authored and advance the ref (or adopt a
-/// remote fast-forward). A gate rejection surfaces as [`ClientError::Merge`] — a §10 alarm.
-///
-/// `seal` persists the advanced frontier and is invoked **before** any ref-advancing push (§8.5);
-/// a `seal` failure aborts before publishing. Restoring the working tree is the caller's step.
-// All distinct caller-supplied inputs with no cohesive subgroup; a parameter object would only
-// exist to satisfy the lint.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn sync_ref<R: Remote, K: MasterKeys>(
-    remote: &R,
-    store: &Store,
-    keys: &K,
-    members: &BTreeMap<DeviceId, DevicePublic>,
-    frontier: &SyncFrontier,
-    ref_name: &str,
-    our_commit: &Id,
-    author: CommitAuthor<'_>,
-    push_id: &[u8; PUSH_ID_LEN],
-    seal: &dyn Fn(&SyncFrontier) -> Result<(), ClientError>,
-) -> Result<SyncReport, ClientError> {
-    let device: &DeviceKey = author.device;
-    let roster_seq = author.roster_seq;
-
-    // 1. Fetch the remote head (current generation). Absent → we are the first writer for this ref.
-    let Some((remote_head, remote_sig, remote_blob)) = fetch_head(remote, keys, ref_name).await?
-    else {
-        // §8.5: seal the frontier (carrying our commit's version, set by the caller) before the
-        // ref-advancing push.
-        seal(frontier)?;
-        push_objects(remote, store, keys, our_commit, push_id).await?;
-        let (head, blob) = push_head(
-            remote,
-            keys,
-            device,
-            ref_name,
-            *our_commit,
-            roster_seq,
-            None,
-            push_id,
-        )
-        .await?;
-        return Ok(SyncReport {
-            action: SyncAction::FastForward {
-                commit_id: *our_commit,
-            },
-            frontier: frontier.clone(),
-            wrote: Some((head, blob)),
-        });
-    };
-
-    // 2. Verify the head against the roster (the constructor is the only way to get a SiblingHead)
-    //    and bring its closure local so the DAG/merge can read both histories (§8.2).
-    let sibling = SiblingHead::verified(members, &remote_head, &remote_sig)
-        .ok_or(ClientError::HeadNotMember)?;
-    fetch_closure(remote, store, keys, &remote_head.commit_id).await?;
-
-    // 3. Rollback-gated merge decision (reads cross-generation, seals the merge under current gen).
-    //    `merge_heads` authenticates the sibling's tip commit itself (P3).
-    let plan = merge_heads(frontier, our_commit, &sibling, members, author, keys, store)?;
-
-    // 4. Apply: push whatever we authored and advance the ref (or fast-forward to the remote).
-    let new_commit = match &plan.action {
-        SyncAction::Merged { commit_id, .. } => Some(*commit_id),
-        SyncAction::AlreadyHave => Some(*our_commit), // we are ahead → publish our commit
-        SyncAction::FastForward { .. } => None,       // remote is ahead → adopt, nothing to push
-    };
-
-    let wrote = if let Some(commit_id) = new_commit {
-        // §8.5: seal the observed frontier BEFORE publishing a head that descends from those
-        // observations — a crash post-push must not leave the head uncovered by the frontier.
-        seal(&plan.frontier)?;
-        push_objects(remote, store, keys, &commit_id, push_id).await?;
-        let (head, blob) = push_head(
-            remote,
-            keys,
-            device,
-            ref_name,
-            commit_id,
-            roster_seq,
-            Some((&remote_head, &remote_blob)),
-            push_id,
-        )
-        .await?;
-        Some((head, blob))
-    } else {
-        None
-    };
-
-    Ok(SyncReport {
-        action: plan.action,
-        frontier: plan.frontier,
-        wrote,
-    })
+/// Make a rename in `dir` durable (unix; other platforms have no directory handle to sync).
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
-
-// ---- local frontier persistence (§8.5 / §9.8) ----
 
 /// The result of [`load_frontier`].
 #[derive(Debug)]
 pub enum FrontierLoad {
-    /// No state file. A genuine first run starts from a default frontier; for a repo known to be
-    /// initialized, a missing file is itself a §8.5 lost-frontier event — the caller's policy.
+    /// No state file: a first run, or for a linked folder a §8.5 lost-frontier event (the caller's policy).
     Absent,
-    /// Loaded and authenticated against `device`.
+    /// Loaded and authenticated against the device.
     Loaded(SyncFrontier),
 }
 
-/// Load `device`'s sealed frontier from `path` (§8.5/§9.8). Missing file → [`FrontierLoad::Absent`];
-/// present-but-unopenable → [`ClientError::FrontierLost`], the §8.5 lost-frontier event: the caller
-/// MUST alarm and treat the session as a reinstall.
+/// Load the sealed frontier (§8.5); one sealed under the legacy v1 key is resealed under v2 on the way.
 pub fn load_frontier(path: &Path, device: &DeviceKey) -> Result<FrontierLoad, ClientError> {
     let blob = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FrontierLoad::Absent),
         Err(e) => return Err(ClientError::Io(e)),
     };
-    let key = device.local_seal_key()?;
     let device_id = device.device_id()?;
-    match open_frontier(&key, &device_id, &blob) {
-        Ok(f) => Ok(FrontierLoad::Loaded(f)),
-        Err(e) => Err(ClientError::FrontierLost(e)),
+    let current = device.local_seal_key()?;
+    let err = match open_frontier(&current, &device_id, &blob) {
+        Ok(f) => return Ok(FrontierLoad::Loaded(f)),
+        Err(e) => e,
+    };
+    let legacy = device.local_seal_key_v1()?;
+    match open_frontier(&legacy, &device_id, &blob) {
+        Ok(f) => {
+            save_frontier(path, &f, device)?;
+            Ok(FrontierLoad::Loaded(f))
+        }
+        Err(_) => Err(ClientError::FrontierLost(err)),
     }
 }
 
-/// Seal `frontier` under `device`'s local-seal key (§8.5) and write it to `path` **atomically**
-/// (temp file + rename, so a crash can't tear it). Per §8.5 the caller persists the advanced
-/// frontier *before* publishing the head it authorized.
+/// Seal `frontier` under the device's local-seal key (§8.5) and replace `path` atomically.
 pub fn save_frontier(
     path: &Path,
     frontier: &SyncFrontier,
@@ -591,31 +622,8 @@ pub fn save_frontier(
     let blob = seal_frontier(frontier, &key, &device_id).ok_or_else(|| {
         ClientError::Io(std::io::Error::other("OS CSPRNG failure sealing frontier"))
     })?;
-    let tmp = path.with_extension("tmp");
-    write_owner_only(&tmp, &blob)?;
-    std::fs::rename(&tmp, path)?;
+    write_private_atomic(path, &blob)?;
     Ok(())
-}
-
-/// Write owner-only (0600 on unix). The frontier is the §8.5 anti-rollback state: its AEAD already
-/// makes it unreadable, but restoring an older copy is the §21 disk-level rollback, so it is not
-/// another user's to read or replace.
-fn write_owner_only(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(contents)
-    }
-    #[cfg(not(unix))]
-    std::fs::write(path, contents)
 }
 
 #[cfg(test)]
@@ -623,7 +631,7 @@ mod tests {
     use super::*;
     use crate::testmem::MemRemote;
     use secsec_kdf::MasterKey;
-    use secsec_sig::DeviceKey;
+    use secsec_snapshot::{seal_signed_commit, snapshot_tree, Commit, Prior, SnapshotMemo};
 
     fn mk() -> MasterKey {
         MasterKey::new(1, [0x33; 32])
@@ -633,317 +641,235 @@ mod tests {
         Store::open(dir.join(name)).unwrap()
     }
 
-    fn read_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
-        let mut out = Vec::new();
-        fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
-            let mut es: Vec<_> = std::fs::read_dir(dir)
-                .unwrap()
-                .map(|e| e.unwrap())
-                .collect();
-            es.sort_by_key(std::fs::DirEntry::file_name);
-            for e in es {
-                let name = e.file_name().to_str().unwrap().to_owned();
-                let rel = if prefix.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{prefix}/{name}")
-                };
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, &rel, out);
-                } else {
-                    out.push((rel, std::fs::read(&p).unwrap()));
-                }
-            }
-        }
-        walk(root, "", &mut out);
-        out
+    /// Snapshot `dir` and seal a signed commit on `parents`.
+    fn commit_dir(
+        dir: &Path,
+        store: &Store,
+        dev: &DeviceKey,
+        prior: Option<&Commit>,
+        parents: Vec<Id>,
+        version: u64,
+    ) -> (Id, Commit) {
+        let snap = snapshot_tree(
+            dir,
+            &mk(),
+            store,
+            prior.map(|c| Prior {
+                root: &c.root_tree,
+                salt: &c.root_salt,
+                fast_path: true,
+            }),
+            &mut SnapshotMemo::default(),
+        )
+        .unwrap();
+        let commit = Commit {
+            root_tree: snap.root,
+            root_salt: snap.salt,
+            parents,
+            device_id: dev.device_id().unwrap(),
+            version,
+            roster_seq: 0,
+            last_seen_head: [0; 32],
+            ts: 0,
+        };
+        (
+            seal_signed_commit(&mk(), store, dev, &commit).unwrap(),
+            commit,
+        )
     }
 
     #[tokio::test]
-    async fn second_push_chains_head_and_first_cas_token_guards() {
+    async fn second_push_chains_head_and_a_stale_token_loses() {
         let dir = tempfile::tempdir().unwrap();
         let m = mk();
-        let device = DeviceKey::generate().unwrap();
-        let a_store = open_store(dir.path(), "a.redb");
-        let remote = MemRemote::new(open_store(dir.path(), "remote.redb"));
-
-        // v1
+        let dev = DeviceKey::generate().unwrap();
+        let a = open_store(dir.path(), "a.redb");
+        let remote = MemRemote::new(open_store(dir.path(), "r.redb"));
         let src = tempfile::tempdir().unwrap();
+
         std::fs::write(src.path().join("f"), b"one").unwrap();
-        let (rt1, rs1, _) = secsec_snapshot::snapshot_tree(src.path(), &m, &a_store, None).unwrap();
-        let c1 = secsec_snapshot::Commit {
-            root_tree: rt1,
-            root_salt: rs1,
-            parents: vec![],
-            device_id: device.device_id().unwrap(),
-            version: 1,
-            roster_seq: 0,
-            last_seen_head: [0u8; 32],
-            ts: 0,
-        };
-        let id1 = secsec_snapshot::seal_signed_commit(&m, &a_store, &device, &c1).unwrap();
-        push_objects(&remote, &a_store, &m, &id1, &[0x01; 16])
+        let (id1, c1) = commit_dir(src.path(), &a, &dev, None, vec![], 1);
+        push_objects(&remote, &a, &m, &id1, None, &[1; 16])
             .await
             .unwrap();
-        let (h1, b1) = push_head(&remote, &m, &device, "main", id1, 0, None, &[0x01; 16])
+        let (h1, b1) = push_head(&remote, &m, &dev, "main", id1, 0, None, &[1; 16])
             .await
             .unwrap();
 
-        // v2 chained on v1.
         std::fs::write(src.path().join("f"), b"two").unwrap();
-        let (rt2, rs2, _) =
-            secsec_snapshot::snapshot_tree(src.path(), &m, &a_store, Some((&rt1, &rs1))).unwrap();
-        let c2 = secsec_snapshot::Commit {
-            root_tree: rt2,
-            root_salt: rs2,
-            parents: vec![id1],
-            device_id: device.device_id().unwrap(),
-            version: 2,
-            roster_seq: 0,
-            last_seen_head: id1,
-            ts: 0,
-        };
-        let id2 = secsec_snapshot::seal_signed_commit(&m, &a_store, &device, &c2).unwrap();
-        push_objects(&remote, &a_store, &m, &id2, &[0x02; 16])
+        let (id2, _) = commit_dir(src.path(), &a, &dev, Some(&c1), vec![id1], 2);
+        push_objects(&remote, &a, &m, &id2, Some(&id1), &[2; 16])
             .await
             .unwrap();
-        let (h2, _b2) = push_head(
+        let (h2, _) = push_head(
             &remote,
             &m,
-            &device,
+            &dev,
             "main",
             id2,
             0,
             Some((&h1, &b1)),
-            &[0x02; 16],
+            &[2; 16],
         )
         .await
         .unwrap();
         assert_eq!(h2.head_version, 2);
         assert_eq!(h2.prev_head, secsec_sync::head_id(&h1));
 
-        // A stale CAS token (re-using v1's blob as `prev`) must now lose the race.
-        std::fs::write(src.path().join("f"), b"three").unwrap();
-        let (rt3, rs3, _) =
-            secsec_snapshot::snapshot_tree(src.path(), &m, &a_store, Some((&rt2, &rs2))).unwrap();
-        let c3 = secsec_snapshot::Commit {
-            root_tree: rt3,
-            root_salt: rs3,
-            parents: vec![id2],
-            device_id: device.device_id().unwrap(),
-            version: 3,
-            roster_seq: 0,
-            last_seen_head: id2,
-            ts: 0,
-        };
-        let id3 = secsec_snapshot::seal_signed_commit(&m, &a_store, &device, &c3).unwrap();
-        push_objects(&remote, &a_store, &m, &id3, &[0x03; 16])
-            .await
-            .unwrap();
         let stale = push_head(
             &remote,
             &m,
-            &device,
+            &dev,
             "main",
-            id3,
+            id2,
             0,
             Some((&h1, &b1)),
-            &[0x03; 16],
+            &[3; 16],
         )
         .await;
         assert!(matches!(stale, Err(ClientError::CasConflict)));
     }
 
-    fn write_dir(dir: &Path, files: &[(&str, &[u8])]) {
-        for (name, content) in files {
-            std::fs::write(dir.join(name), content).unwrap();
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn seal_commit(
-        store: &Store,
-        m: &MasterKey,
-        dev: &DeviceKey,
-        root_tree: Id,
-        root_salt: PathSalt,
-        parents: Vec<Id>,
-        version: u64,
-        last_seen: Id,
-    ) -> Id {
-        let commit = secsec_snapshot::Commit {
-            root_tree,
-            root_salt,
-            parents,
-            device_id: dev.device_id().unwrap(),
-            version,
-            roster_seq: 0,
-            last_seen_head: last_seen,
-            ts: 0,
-        };
-        secsec_snapshot::seal_signed_commit(m, store, dev, &commit).unwrap()
-    }
-
+    /// A tampered object is rejected before it is stored, and the fetch stores nothing of it.
     #[tokio::test]
-    async fn two_devices_reconcile_through_blind_remote() {
+    async fn fetch_verifies_every_object_before_storing_it() {
         let dir = tempfile::tempdir().unwrap();
         let m = mk();
-        let dev_a = DeviceKey::generate().unwrap();
-        let dev_b = DeviceKey::generate().unwrap();
-        let members: BTreeMap<DeviceId, DevicePublic> = [
-            (dev_a.device_id().unwrap(), dev_a.public()),
-            (dev_b.device_id().unwrap(), dev_b.public()),
-        ]
-        .into_iter()
-        .collect();
+        let dev = DeviceKey::generate().unwrap();
+        let a = open_store(dir.path(), "a.redb");
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), vec![7u8; 20_000]).unwrap();
+        let (id, commit) = commit_dir(src.path(), &a, &dev, None, vec![], 1);
 
-        let remote = MemRemote::new(open_store(dir.path(), "remote.redb"));
-        let a_store = open_store(dir.path(), "a.redb");
-        let b_store = open_store(dir.path(), "b.redb");
+        // A server holding every object, one chunk flipped.
+        let tree =
+            secsec_snapshot::load_tree(&commit.root_tree, &commit.root_salt, &m, &a).unwrap();
+        let Entry::File { chunks, .. } = &tree.entries[0] else {
+            panic!("f is a file")
+        };
+        let bad = chunks[0];
+        let remote = MemRemote::new(open_store(dir.path(), "r.redb"));
+        for obj in secsec_snapshot::reachable_objects(&m, &a, &id).unwrap() {
+            let mut blob = a.get(&obj).unwrap().unwrap();
+            if obj == bad {
+                *blob.last_mut().unwrap() ^= 1;
+            }
+            remote.store.put(&obj, &blob).unwrap();
+        }
+        let b = open_store(dir.path(), "b.redb");
+        assert!(matches!(
+            fetch_closure(&remote, &b, &m, &id).await,
+            Err(ClientError::Snap(SnapError::Object(_)))
+        ));
+        assert!(b.get(&bad).unwrap().is_none(), "the bad chunk never lands");
+        assert!(b.get(&commit.root_tree).unwrap().is_none(), "nor its tree");
+    }
 
-        // base (A, v1): {keep:k0, shared:s0} → push + create head v1.
-        let base = tempfile::tempdir().unwrap();
-        write_dir(base.path(), &[("keep", b"k0"), ("shared", b"s0")]);
-        let (bt, bs, _) = secsec_snapshot::snapshot_tree(base.path(), &m, &a_store, None).unwrap();
-        let c_base = seal_commit(&a_store, &m, &dev_a, bt, bs, vec![], 1, [0u8; 32]);
-        push_objects(&remote, &a_store, &m, &c_base, &[0x10; 16])
+    /// A second push sends only what the remote head lacks: nothing under an unchanged file.
+    #[tokio::test]
+    async fn push_sends_only_the_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mk();
+        let dev = DeviceKey::generate().unwrap();
+        let a = open_store(dir.path(), "a.redb");
+        let remote = MemRemote::new(open_store(dir.path(), "r.redb"));
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("keep"), vec![1u8; 30_000]).unwrap();
+        std::fs::write(src.path().join("edit"), b"v1").unwrap();
+        let (id1, c1) = commit_dir(src.path(), &a, &dev, None, vec![], 1);
+        push_objects(&remote, &a, &m, &id1, None, &[1; 16])
             .await
             .unwrap();
-        let (h_base, b_base) = push_head(&remote, &m, &dev_a, "main", c_base, 0, None, &[0x10; 16])
+        push_head(&remote, &m, &dev, "main", id1, 0, None, &[1; 16])
             .await
             .unwrap();
+        let after_first = remote.store.object_count().unwrap();
 
-        // B clones the base so it can build on it.
-        fetch_closure(&remote, &b_store, &m, &c_base).await.unwrap();
-
-        // A edits "shared" → c_A (a, v2), advances the ref to head v2.
-        let a_wt = tempfile::tempdir().unwrap();
-        write_dir(a_wt.path(), &[("keep", b"k0"), ("shared", b"sA")]);
-        let (at, asalt, _) =
-            secsec_snapshot::snapshot_tree(a_wt.path(), &m, &a_store, Some((&bt, &bs))).unwrap();
-        let c_a = seal_commit(&a_store, &m, &dev_a, at, asalt, vec![c_base], 2, c_base);
-        push_objects(&remote, &a_store, &m, &c_a, &[0x11; 16])
+        std::fs::write(src.path().join("edit"), b"v2").unwrap();
+        let (id2, _) = commit_dir(src.path(), &a, &dev, Some(&c1), vec![id1], 2);
+        push_objects(&remote, &a, &m, &id2, Some(&id1), &[2; 16])
             .await
             .unwrap();
+        // Commit, root tree, and the edited file's chunk: nothing under the unchanged file is re-sent.
+        let fresh = remote
+            .store
+            .cas_ref(&[9; 32], &ABSENT_HEAD, b"h", &[2; 16])
+            .unwrap();
+        assert!(fresh.swapped);
+        assert_eq!(remote.store.object_count().unwrap(), after_first + 3);
+    }
+
+    /// §15: a prune racing a push never dangles the new head, even for an object the server already held.
+    #[tokio::test]
+    async fn a_prune_racing_a_push_cannot_dangle_the_new_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mk();
+        let dev = DeviceKey::generate().unwrap();
+        let a = open_store(dir.path(), "a.redb");
+        let remote = MemRemote::new(open_store(dir.path(), "r.redb"));
+        let src = tempfile::tempdir().unwrap();
+
+        std::fs::write(src.path().join("f"), b"old v1").unwrap();
+        let (id1, c1) = commit_dir(src.path(), &a, &dev, None, vec![], 1);
+        push_objects(&remote, &a, &m, &id1, None, &[1; 16])
+            .await
+            .unwrap();
+        let (h1, b1) = push_head(&remote, &m, &dev, "main", id1, 0, None, &[1; 16])
+            .await
+            .unwrap();
+        let tree1 = secsec_snapshot::load_tree(&c1.root_tree, &c1.root_salt, &m, &a).unwrap();
+        let Entry::File { chunks, .. } = &tree1.entries[0] else {
+            panic!("f is a file")
+        };
+        let old_chunk = chunks[0];
+
+        std::fs::write(src.path().join("f"), b"new version two").unwrap();
+        let (id2, c2) = commit_dir(src.path(), &a, &dev, Some(&c1), vec![id1], 2);
+        push_objects(&remote, &a, &m, &id2, Some(&id1), &[2; 16])
+            .await
+            .unwrap();
+        let (h2, b2) = push_head(
+            &remote,
+            &m,
+            &dev,
+            "main",
+            id2,
+            0,
+            Some((&h1, &b1)),
+            &[2; 16],
+        )
+        .await
+        .unwrap();
+
+        // A revert re-derives the old chunk: durable on the server, outside the head's tree.
+        std::fs::write(src.path().join("f"), b"old v1").unwrap();
+        let (id3, _) = commit_dir(src.path(), &a, &dev, Some(&c2), vec![id2], 3);
+        push_objects(&remote, &a, &m, &id3, Some(&id2), &[3; 16])
+            .await
+            .unwrap();
+        // A prune signed against the unmoved head drops it before our cas-head lands.
+        assert!(remote.store.prune_if(&[old_chunk], |_, _| true).unwrap());
         push_head(
             &remote,
             &m,
-            &dev_a,
+            &dev,
             "main",
-            c_a,
+            id3,
             0,
-            Some((&h_base, &b_base)),
-            &[0x11; 16],
+            Some((&h2, &b2)),
+            &[3; 16],
         )
         .await
         .unwrap();
-
-        // B edits "shared" DIFFERENTLY → c_B (b, v1), divergent, NOT pushed.
-        let b_wt = tempfile::tempdir().unwrap();
-        write_dir(b_wt.path(), &[("keep", b"k0"), ("shared", b"sB")]);
-        let (bt2, bs2, _) =
-            secsec_snapshot::snapshot_tree(b_wt.path(), &m, &b_store, Some((&bt, &bs))).unwrap();
-        let c_b = seal_commit(&b_store, &m, &dev_b, bt2, bs2, vec![c_base], 1, c_base);
-
-        // B syncs: fetch A's head, rollback-gated merge with c_B, push the merge + advance the ref.
-        let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
-        let rep_b = sync_ref(
-            &remote,
-            &b_store,
-            &m,
-            &members,
-            &SyncFrontier::default(),
-            "main",
-            &c_b,
-            CommitAuthor {
-                device: &dev_b,
-                version: 2,
-                roster_seq: 0,
-                ts: 0,
-            },
-            &[0x12; 16],
-            &seal,
-        )
-        .await
-        .unwrap();
-        let SyncAction::Merged {
-            commit_id: merge_id,
-            conflicts,
-        } = rep_b.action
-        else {
-            panic!("B must perform a real merge")
-        };
-        assert_eq!(conflicts.len(), 1, "shared was edited on both sides");
-        assert_eq!(conflicts[0].path, "shared");
-        // the frontier observed A's head_version (A advanced the ref to v2 before B synced).
-        assert_eq!(
-            rep_b
-                .frontier
-                .head_version_hwm
-                .get(&dev_a.device_id().unwrap()),
-            Some(&2)
-        );
-
-        // The remote head now points at B's merge and is signed by B.
-        let (rh, rsig, _) = fetch_head(&remote, &m, "main").await.unwrap().unwrap();
-        assert_eq!(rh.commit_id, merge_id);
-        assert_eq!(
-            SiblingHead::verified(&members, &rh, &rsig).map(|s| s.device_id),
-            Some(dev_b.device_id().unwrap())
-        );
-
-        // B's restored tree: shared kept-both, keep unchanged.
-        let (mc, _) = secsec_snapshot::open_signed_commit(&merge_id, &m, &b_store).unwrap();
-        let b_out = tempfile::tempdir().unwrap();
-        secsec_snapshot::restore_commit_tree(&mc, &m, &b_store, b_out.path()).unwrap();
-        let bf: BTreeMap<String, Vec<u8>> = read_tree(b_out.path()).into_iter().collect();
-        assert_eq!(bf.get("keep").unwrap(), b"k0");
-        assert_eq!(bf.get("shared").unwrap(), b"sB"); // ours (B) keeps the name
-        assert!(
-            bf.keys().any(|k| k.starts_with("shared.conflict-")),
-            "A's divergent shared kept-both"
-        );
-
-        // A re-syncs: the remote merge descends from c_A → fast-forward, no new commit.
-        let rep_a = sync_ref(
-            &remote,
-            &a_store,
-            &m,
-            &members,
-            &SyncFrontier::default(),
-            "main",
-            &c_a,
-            CommitAuthor {
-                device: &dev_a,
-                version: 3,
-                roster_seq: 0,
-                ts: 0,
-            },
-            &[0x13; 16],
-            &seal,
-        )
-        .await
-        .unwrap();
-        assert!(
-            matches!(rep_a.action, SyncAction::FastForward { commit_id } if commit_id == merge_id)
-        );
-        assert!(rep_a.wrote.is_none());
-
-        // A restores the same merged tree B produced.
-        let (mca, _) = secsec_snapshot::open_signed_commit(&merge_id, &m, &a_store).unwrap();
-        let a_out = tempfile::tempdir().unwrap();
-        secsec_snapshot::restore_commit_tree(&mca, &m, &a_store, a_out.path()).unwrap();
-        assert_eq!(read_tree(a_out.path()), read_tree(b_out.path()));
+        assert!(remote.store.get(&old_chunk).unwrap().is_some());
     }
 
     #[test]
-    fn frontier_persists_across_restart_and_detects_loss() {
+    fn frontier_persists_detects_loss_and_migrates_v1() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("frontier.state");
+        let path = dir.path().join("frontier");
         let device = DeviceKey::generate().unwrap();
-
-        // missing file on a fresh repo → Absent (not yet a loss).
+        let id = device.device_id().unwrap();
         assert!(matches!(
             load_frontier(&path, &device).unwrap(),
             FrontierLoad::Absent
@@ -951,31 +877,41 @@ mod tests {
 
         let f = SyncFrontier {
             roster_seq: 12,
-            head_version_hwm: BTreeMap::from([(device.device_id().unwrap(), 5)]),
-            commit_version_hwm: BTreeMap::from([(device.device_id().unwrap(), 9)]),
+            head_version_hwm: BTreeMap::from([(id, 5)]),
+            commit_version_hwm: BTreeMap::from([(id, 9)]),
         };
         save_frontier(&path, &f, &device).unwrap();
-
-        // "restart": re-load → identical frontier (rollback gates survive a process restart).
         let FrontierLoad::Loaded(got) = load_frontier(&path, &device).unwrap() else {
             panic!("expected a loaded frontier")
         };
         assert_eq!(got, f);
-
-        // a different device cannot open it → lost-frontier event (the device_id AD binds it).
-        let other = DeviceKey::generate().unwrap();
         assert!(matches!(
-            load_frontier(&path, &other),
+            load_frontier(&path, &DeviceKey::generate().unwrap()),
             Err(ClientError::FrontierLost(_))
         ));
 
-        // a corrupted file is a lost-frontier event, not a silent reset.
-        let mut blob = std::fs::read(&path).unwrap();
+        // A legacy v1 seal opens once and is rewritten under v2.
+        let v1 = seal_frontier(&f, &device.local_seal_key_v1().unwrap(), &id).unwrap();
+        std::fs::write(&path, &v1).unwrap();
+        let FrontierLoad::Loaded(got) = load_frontier(&path, &device).unwrap() else {
+            panic!("v1 frontier must migrate")
+        };
+        assert_eq!(got, f);
+        let resealed = std::fs::read(&path).unwrap();
+        assert!(open_frontier(&device.local_seal_key().unwrap(), &id, &resealed).is_ok());
+
+        let mut blob = resealed;
         *blob.last_mut().unwrap() ^= 1;
         std::fs::write(&path, &blob).unwrap();
         assert!(matches!(
             load_frontier(&path, &device),
             Err(ClientError::FrontierLost(_))
         ));
+        // No temp file survives the atomic writes.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["frontier".to_string()]);
     }
 }

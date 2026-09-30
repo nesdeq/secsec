@@ -13,8 +13,9 @@ workspace = true
 secsec-kdf = { path = "../secsec-kdf" }
 secsec-frame = { path = "../secsec-frame" }
 secsec-aead = { path = "../secsec-aead" }
-blake3 = "1"
+blake3 = { version = "1", features = ["zeroize"] }
 subtle = "2"
+zeroize = "1"
 
 [dev-dependencies]
 secsec-chunk = { path = "../secsec-chunk" }

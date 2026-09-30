@@ -1,9 +1,4 @@
-//! `secsec-sync` — the sync plane (`secsec-Design.md` §10). This module: the **Head**, the per-ref
-//! mutable pointer at `/refs/<H>` — **signed** (`NS_HEAD`, §9.6) and **encrypted** (§9.8
-//! fresh-nonce AEAD under `head_key_g`, AD = `FRAME ‖ H`), with `H = keyed_hash(ref_name_key,
-//! ref_name)` hiding the ref name (§13). Head rollback/replay is caught by the §8.5 frontier, not
-//! the AEAD. Submodules: [`dag`] (ancestry), [`merge`] (three-way merge), [`rollback`] (merge
-//! gates + fork detection). Orchestration lives in `secsec-client`.
+//! The sync plane (`secsec-Design.md` §10): the signed and encrypted per-ref Head at `/refs/<H>` (§9.8, §13), plus [`dag`], [`merge`], [`rollback`].
 
 #![forbid(unsafe_code)]
 
@@ -14,7 +9,7 @@ pub mod rollback;
 use secsec_canon::{verify_reencode, CanonError, Reader, Writer};
 use secsec_frame::{Frame, FrameError, ObjType, FRAME_LEN, MAX_BLOB_SIZE};
 use secsec_kdf::{MasterKey, MasterKeys};
-use secsec_sig::{DeviceKey, DevicePublic, NS_HEAD};
+use secsec_sig::{DeviceKey, DevicePublic, MAX_SIG_LEN, NS_HEAD};
 
 /// A 256-bit content address (commit / prev-head id).
 pub type Id = [u8; 32];
@@ -22,54 +17,52 @@ pub type Id = [u8; 32];
 /// The keyed-hash ref-name path component `H` (§13).
 pub type RefHash = [u8; 32];
 
-/// Head-blob AEAD nonce length (§9.8): 96-bit.
+/// Head-blob AEAD nonce length (§9.8).
 pub const HEAD_NONCE_LEN: usize = 12;
 /// Poly1305 tag length stored in the head blob (§9.8).
 pub(crate) const HEAD_TAG_LEN: usize = 16;
 /// Maximum ref-name length, in bytes (decoder bound).
 pub(crate) const MAX_REF_NAME: usize = 4096;
-/// Maximum stored head-signature length, in bytes (decoder bound; an SSHSIG PEM is far smaller).
-pub(crate) const MAX_HEAD_SIG: usize = 4096;
 
-/// The sentinel `prev_head` for a ref's first head (no predecessor).
+/// The `prev_head` of a ref's first head.
 pub const NO_PREV_HEAD: Id = [0u8; 32];
 
-/// A per-ref head pointer (§6). The signature over its [`Head::signed_message`] is carried
-/// alongside it (inside the encrypted blob); this struct is the plaintext payload.
+/// A per-ref head pointer (§6); its signature travels beside it inside the encrypted blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Head {
-    /// The ref name (e.g. `"main"`). Hidden from the server via [`ref_hash`].
+    /// The ref name (e.g. `"main"`), hidden from the server via [`ref_hash`].
     pub ref_name: String,
     /// The commit this head points at.
     pub commit_id: Id,
-    /// Per-ref strictly-increasing version (§8.5); the anti-rollback counter for this ref.
+    /// Per-ref strictly-increasing version (§8.5).
     pub head_version: u64,
     /// The roster sequence this head was written under (§8.5).
     pub roster_seq: u64,
-    /// The previous head's id, or [`NO_PREV_HEAD`] for the first.
+    /// The previous head's id, or [`NO_PREV_HEAD`].
     pub prev_head: Id,
 }
 
 /// Errors from the head layer.
 #[derive(Debug)]
 pub enum HeadError {
-    /// Blob exceeded the §19 maximum object size, or was too short for FRAME+nonce+tag.
+    /// Blob over the §19 cap or too short for FRAME+nonce+tag.
     BadBlobSize,
-    /// FRAME malformed or did not match the expected `(gen, type=Head)` (§18).
+    /// FRAME malformed or not `(gen, Head)` (§18).
     Frame(FrameError),
-    /// The §9.8 AEAD failed to open (wrong key/generation/ref, or tampered blob).
+    /// The §9.8 AEAD failed to open.
     Aead,
-    /// The head's authenticated `FRAME.gen` had no master key in the resolver — the caller lacks that
-    /// generation's key (peel the §8.2 key history), or a newer device rotated past it. Refold + retry.
+    /// No key for the head's `FRAME.gen`: peel the key history, or refold and retry.
     UnknownGeneration(u32),
-    /// Strict canonical decode failed (truncation, over-long field, trailing bytes, non-canonical).
+    /// Strict canonical decode failed.
     Canon(CanonError),
-    /// A head field was not valid UTF-8 (ref name).
+    /// The ref name was not UTF-8.
     NonUtf8,
-    /// The decrypted head's ref name did not match the requested ref (§13 slot binding).
+    /// The decrypted ref name did not match the requested ref (§13 slot binding).
     RefMismatch,
-    /// The head signature did not verify against the given key (§9.6).
+    /// The head signature did not verify (§9.6).
     BadSignature,
+    /// `head_version` cannot advance past `u64::MAX`.
+    VersionExhausted,
     /// Signing/key error.
     Sig(secsec_sig::SigError),
 }
@@ -92,6 +85,7 @@ impl core::fmt::Display for HeadError {
                 f.write_str("decrypted head ref does not match requested ref")
             }
             HeadError::BadSignature => f.write_str("head signature invalid"),
+            HeadError::VersionExhausted => f.write_str("head_version exhausted"),
             HeadError::Sig(e) => write!(f, "sig: {e}"),
         }
     }
@@ -114,8 +108,7 @@ impl From<secsec_sig::SigError> for HeadError {
     }
 }
 
-/// `H = BLAKE3::keyed_hash(ref_name_key, ref_name)` (§13): the opaque storage-path component for a
-/// ref, so the server never learns the ref name.
+/// `H = BLAKE3::keyed_hash(ref_name_key, ref_name)` (§13).
 #[must_use]
 pub fn ref_hash(ref_name_key: &[u8; 32], ref_name: &str) -> RefHash {
     let mut h = blake3::Hasher::new_keyed(ref_name_key);
@@ -124,8 +117,7 @@ pub fn ref_hash(ref_name_key: &[u8; 32], ref_name: &str) -> RefHash {
 }
 
 impl Head {
-    /// The §9.6 signed message: `ref ‖ commit_id ‖ head_version ‖ roster_seq ‖ prev_head`,
-    /// canonically encoded (length-prefixed ref name, fixed-width remainder).
+    /// The §9.6 signed message `ref ‖ commit_id ‖ head_version ‖ roster_seq ‖ prev_head`.
     #[must_use]
     pub(crate) fn signed_message(&self) -> Vec<u8> {
         let mut w = Writer::new();
@@ -138,45 +130,48 @@ impl Head {
     }
 }
 
-/// Sign a head under `NS_HEAD` (§9.6). The signature is stored inside the encrypted head blob and
-/// verified against the roster on read.
+/// Sign a head under `NS_HEAD` (§9.6).
 pub fn sign_head(device: &DeviceKey, head: &Head) -> Result<Vec<u8>, HeadError> {
     Ok(device.sign(NS_HEAD, &head.signed_message())?)
 }
 
-/// Verify a head signature against `pubkey` (which the caller resolves from the folded roster).
+/// Verify a head signature against `pubkey`.
 pub fn verify_head(pubkey: &DevicePublic, head: &Head, sig: &[u8]) -> Result<(), HeadError> {
     pubkey
         .verify(NS_HEAD, &head.signed_message(), sig)
         .map_err(|_| HeadError::BadSignature)
 }
 
-/// Deterministic head identity: `BLAKE3` of the canonical signed content (§6) — chains heads via
-/// `prev_head` (the stored blob is nonce-randomized, so it cannot serve as the id).
+/// Deterministic head identity `BLAKE3(signed message)`, which `prev_head` chains on.
 #[must_use]
 pub fn head_id(head: &Head) -> Id {
     *blake3::hash(&head.signed_message()).as_bytes()
 }
 
-/// Build the next head for a ref (§10): version `+1`, `prev_head` = id of `prev` (or
-/// [`NO_PREV_HEAD`]). The caller signs, seals, and CASes it (§12).
-#[must_use]
+/// The next head for a ref: version `prev + 1` (checked), `prev_head = head_id(prev)`.
 pub fn build_head(
     ref_name: impl Into<String>,
     commit_id: Id,
     roster_seq: u64,
     prev: Option<&Head>,
-) -> Head {
-    Head {
+) -> Result<Head, HeadError> {
+    let head_version = match prev {
+        Some(p) => p
+            .head_version
+            .checked_add(1)
+            .ok_or(HeadError::VersionExhausted)?,
+        None => 1,
+    };
+    Ok(Head {
         ref_name: ref_name.into(),
         commit_id,
-        head_version: prev.map_or(1, |p| p.head_version + 1),
+        head_version,
         roster_seq,
         prev_head: prev.map_or(NO_PREV_HEAD, head_id),
-    }
+    })
 }
 
-/// The encrypted plaintext: the head fields followed by its signature, canonically encoded.
+/// The encrypted plaintext: head fields then its signature, canonically encoded.
 fn encode_head(head: &Head, sig: &[u8]) -> Vec<u8> {
     let mut w = Writer::new();
     w.bytes(head.ref_name.as_bytes())
@@ -194,8 +189,7 @@ fn read32(r: &mut Reader<'_>) -> Result<[u8; 32], CanonError> {
     Ok(out)
 }
 
-/// Strictly decode the head plaintext (inverse of [`encode_head`]) into `(head, sig)`, with the §9.3
-/// re-encode malleability guard.
+/// Strictly decode the head plaintext into `(head, sig)`, with the §9.3 re-encode guard.
 fn decode_head(bytes: &[u8]) -> Result<(Head, Vec<u8>), HeadError> {
     let mut r = Reader::new(bytes);
     let ref_name =
@@ -204,7 +198,7 @@ fn decode_head(bytes: &[u8]) -> Result<(Head, Vec<u8>), HeadError> {
     let head_version = r.u64()?;
     let roster_seq = r.u64()?;
     let prev_head = read32(&mut r)?;
-    let sig = r.bytes(MAX_HEAD_SIG)?.to_vec();
+    let sig = r.bytes(MAX_SIG_LEN)?.to_vec();
     r.finish()?;
     let head = Head {
         ref_name,
@@ -219,8 +213,7 @@ fn decode_head(bytes: &[u8]) -> Result<(Head, Vec<u8>), HeadError> {
     Ok((head, sig))
 }
 
-/// `AD_head = FRAME ‖ H` (§9.8): binds the ciphertext to its generation, the `Head` object type, and
-/// its ref slot.
+/// `AD_head = FRAME ‖ H` (§9.8): binds generation, type, and ref slot.
 fn head_ad(frame: &Frame, ref_hash: &RefHash) -> [u8; FRAME_LEN + 32] {
     let mut ad = [0u8; FRAME_LEN + 32];
     ad[..FRAME_LEN].copy_from_slice(&frame.encode());
@@ -228,8 +221,7 @@ fn head_ad(frame: &Frame, ref_hash: &RefHash) -> [u8; FRAME_LEN + 32] {
     ad
 }
 
-/// Seal a signed head into its stored blob `FRAME ‖ nonce ‖ tag ‖ ct` (§9.8) under `mk`'s
-/// `head_key_g`. `nonce` MUST be fresh per write ([`random_nonce`]).
+/// Seal a signed head as `FRAME ‖ nonce ‖ tag ‖ ct` under `mk`'s `head_key_g`; `nonce` MUST be fresh ([`random_nonce`]).
 #[must_use]
 pub fn seal_head(
     mk: &MasterKey,
@@ -257,10 +249,7 @@ pub fn seal_head(
     out
 }
 
-/// Open a stored head blob for `ref_name`: resolve its `FRAME.gen` against `keys` (peel across
-/// rotations, §9.8), AEAD-open under that generation's `head_key_g`, strictly decode, and check the
-/// decrypted ref name. Returns `(head, sig)`. The caller MUST still [`verify_head`] against the
-/// roster and check the §8.5 frontier — this layer gives confidentiality + slot binding only.
+/// Open a head blob for `ref_name` (confidentiality + slot binding only); callers still verify the signature and frontier.
 pub fn open_head<K: MasterKeys>(
     keys: &K,
     ref_name_key: &[u8; 32],
@@ -298,7 +287,7 @@ pub fn open_head<K: MasterKeys>(
     Ok((head, sig))
 }
 
-/// A fresh 96-bit nonce for [`seal_head`] (OS CSPRNG). Each head write MUST use a new one (§9.8).
+/// A fresh 96-bit head nonce from the OS CSPRNG.
 pub fn random_nonce() -> Result<[u8; HEAD_NONCE_LEN], HeadError> {
     let mut n = [0u8; HEAD_NONCE_LEN];
     getrandom::fill(&mut n).map_err(|_| HeadError::Aead)?;
@@ -332,11 +321,9 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
-    /// Across a rotation the ref path must stay fixed (genesis-derived [`MasterKeys::ref_name_key`])
-    /// and `open_head` must peel the key ring to read an older-generation head.
+    /// Across a rotation the ref path stays fixed and `open_head` peels the key ring.
     #[test]
     fn head_survives_a_rotation_via_stable_path_and_peel() {
-        // Independent key bytes per generation, as a real Rotate mints (mk(gen) above reuses bytes).
         let g1 = MasterKey::new(1, [0x11; 32]);
         let g2 = MasterKey::new(2, [0x22; 32]);
         let ring: BTreeMap<u32, MasterKey> = [
@@ -346,30 +333,24 @@ mod tests {
         .into_iter()
         .collect();
 
-        // The per-generation key (the *bug*) moves the path; the stable key ring keeps it fixed.
         assert_ne!(
             ref_hash(&g1.ref_name_key(), "main"),
             ref_hash(&g2.ref_name_key(), "main"),
-            "the per-generation ref key moves the path — must not be used for the ref slot"
+            "a per-generation ref key would move the path"
         );
         assert_eq!(
             ref_hash(&MasterKeys::ref_name_key(&ring), "main"),
             ref_hash(&g1.ref_name_key(), "main"),
-            "the stable ref key is the genesis generation's, independent of the current generation"
         );
 
-        // Seal a head under gen 1 at the stable path.
         let dev = DeviceKey::generate().unwrap();
         let head = sample_head();
         let sig = sign_head(&dev, &head).unwrap();
         let rnk = MasterKeys::ref_name_key(&ring);
         let blob = seal_head(&g1, &rnk, &head, &sig, &[0x07; 12]);
 
-        // A member at gen 2 holding the key ring peels back and reads the gen-1 head (the fix).
         let (got, _) = open_head(&ring, &rnk, "main", &blob).unwrap();
         assert_eq!(got, head);
-
-        // A bare gen-2 key (no gen-1 in its resolver) genuinely cannot read it.
         assert!(matches!(
             open_head(&g2, &rnk, "main", &blob),
             Err(HeadError::UnknownGeneration(1))
@@ -383,32 +364,15 @@ mod tests {
         let dev = DeviceKey::generate().unwrap();
         let head = sample_head();
         let sig = sign_head(&dev, &head).unwrap();
-
         let blob = seal_head(&m, &rnk, &head, &sig, &[0x07; 12]);
         let (got, got_sig) = open_head(&m, &rnk, "main", &blob).unwrap();
         assert_eq!(got, head);
         assert_eq!(got_sig, sig);
-        // signature verifies against the authoring device's public key.
         assert!(verify_head(&dev.public(), &got, &got_sig).is_ok());
     }
 
     #[test]
-    fn blob_hides_plaintext_and_is_well_formed() {
-        let m = mk(1);
-        let rnk = rnk(&m);
-        let dev = DeviceKey::generate().unwrap();
-        let head = sample_head();
-        let sig = sign_head(&dev, &head).unwrap();
-        let blob = seal_head(&m, &rnk, &head, &sig, &[0x07; 12]);
-        // FRAME ‖ nonce ‖ tag ‖ ct
-        assert!(blob.len() > FRAME_LEN + HEAD_NONCE_LEN + HEAD_TAG_LEN);
-        // the ref name "main" must not appear in the ciphertext region
-        let ct = &blob[FRAME_LEN + HEAD_NONCE_LEN + HEAD_TAG_LEN..];
-        assert!(!ct.windows(4).any(|w| w == b"main"));
-    }
-
-    #[test]
-    fn fresh_nonce_changes_blob_both_open() {
+    fn blob_hides_plaintext_and_fresh_nonce_changes_it() {
         let m = mk(1);
         let rnk = rnk(&m);
         let dev = DeviceKey::generate().unwrap();
@@ -416,8 +380,9 @@ mod tests {
         let sig = sign_head(&dev, &head).unwrap();
         let b1 = seal_head(&m, &rnk, &head, &sig, &[1u8; 12]);
         let b2 = seal_head(&m, &rnk, &head, &sig, &[2u8; 12]);
-        assert_ne!(b1, b2, "a fresh nonce must change the blob");
-        assert_eq!(open_head(&m, &rnk, "main", &b1).unwrap().0, head);
+        let ct = &b1[FRAME_LEN + HEAD_NONCE_LEN + HEAD_TAG_LEN..];
+        assert!(!ct.windows(4).any(|w| w == b"main"));
+        assert_ne!(b1, b2);
         assert_eq!(open_head(&m, &rnk, "main", &b2).unwrap().0, head);
     }
 
@@ -430,29 +395,20 @@ mod tests {
         let sig = sign_head(&dev, &head).unwrap();
         let blob = seal_head(&m, &rnk, &head, &sig, &[0x07; 12]);
 
-        // tamper the last ciphertext byte
         let mut bad = blob.clone();
         *bad.last_mut().unwrap() ^= 0x01;
         assert!(matches!(
             open_head(&m, &rnk, "main", &bad),
             Err(HeadError::Aead)
         ));
-
-        // wrong ref name -> different H in the AD -> AEAD open fails
         assert!(matches!(
             open_head(&m, &rnk, "other", &blob),
             Err(HeadError::Aead)
         ));
-
-        // a resolver that lacks the head's generation cannot open it (no key to peel to) — the head
-        // was written under gen 1, and a bare gen-2 key holds no gen-1 key.
-        let m2 = mk(2);
         assert!(matches!(
-            open_head(&m2, &rnk, "main", &blob),
+            open_head(&mk(2), &rnk, "main", &blob),
             Err(HeadError::UnknownGeneration(1))
         ));
-
-        // too-short blob
         assert!(matches!(
             open_head(&m, &rnk, "main", &blob[..FRAME_LEN + 4]),
             Err(HeadError::BadBlobSize)
@@ -465,12 +421,10 @@ mod tests {
         let attacker = DeviceKey::generate().unwrap();
         let head = sample_head();
         let sig = sign_head(&dev, &head).unwrap();
-        // a different key must not verify the head (authenticity rests on the signature, §9.8).
         assert!(matches!(
             verify_head(&attacker.public(), &head, &sig),
             Err(HeadError::BadSignature)
         ));
-        // tampering a field after signing also fails.
         let mut tampered = head.clone();
         tampered.commit_id[0] ^= 0x01;
         assert!(matches!(
@@ -489,34 +443,31 @@ mod tests {
             decode_head(&extended),
             Err(HeadError::Canon(CanonError::TrailingBytes { .. }))
         ));
-        // and the clean bytes decode fine
         let (h, s) = decode_head(&bytes).unwrap();
         assert_eq!(h, head);
         assert_eq!(s, b"sig-bytes");
     }
 
     #[test]
-    fn build_head_chains_and_addresses() {
-        // first head: version 1, no predecessor.
-        let h1 = build_head("main", [0xC1; 32], 4, None);
+    fn build_head_chains_and_refuses_overflow() {
+        let h1 = build_head("main", [0xC1; 32], 4, None).unwrap();
         assert_eq!(h1.head_version, 1);
         assert_eq!(h1.prev_head, NO_PREV_HEAD);
-
-        // next head: version 2, prev_head = id(h1).
-        let h2 = build_head("main", [0xC2; 32], 5, Some(&h1));
+        let h2 = build_head("main", [0xC2; 32], 5, Some(&h1)).unwrap();
         assert_eq!(h2.head_version, 2);
         assert_eq!(h2.prev_head, head_id(&h1));
-
-        // head_id is content-deterministic and distinguishes versions.
-        assert_eq!(
-            head_id(&h1),
-            head_id(&build_head("main", [0xC1; 32], 4, None))
-        );
         assert_ne!(head_id(&h1), head_id(&h2));
+        let top = Head {
+            head_version: u64::MAX,
+            ..h2
+        };
+        assert!(matches!(
+            build_head("main", [0; 32], 0, Some(&top)),
+            Err(HeadError::VersionExhausted)
+        ));
     }
 
-    /// Frozen KATs, mirrored in `vectors/secsec-kat-v1.txt [head]` (fixed nonce + dummy sig pin the
-    /// §9.8 wire format deterministically).
+    /// Frozen KATs mirrored in `vectors/secsec-kat-v1.txt [head]`.
     #[test]
     fn head_kat() {
         let m = mk(1);
@@ -531,7 +482,6 @@ mod tests {
             hx(&blob),
             "737365630101010000000307070707070707070707070732606c8303716a667b303fd332a3e95f60a85422ed82a4d278642d1d35301852bf4992736077b620823945e522d418cf6d06d04a394f84084274abd6e7e4a3ab17594fff0cf359b5065e4d15ca901501023755da139ab87cf0f0bb0dac3c1397c683ba9c3d36eabbc92789c8d8075b9c7e0e5de5e0"
         );
-        // round-trips with the dummy signature
         let (got, sig) = open_head(&m, &rnk, "main", &blob).unwrap();
         assert_eq!(got, head);
         assert_eq!(sig, b"dummy-sig");

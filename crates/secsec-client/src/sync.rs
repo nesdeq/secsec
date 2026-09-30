@@ -1,83 +1,83 @@
-//! One-shot bidirectional sync of a working directory against a remote ref (`secsec-Design.md` §10).
-//! [`sync_once`] tracks a **base** (the last-synced commit) so a fresh client never publishes its
-//! empty dir as a deletion of everyone's files. Cases: no base + remote head → clone if the folder
-//! is empty, else join-merge (parentless commit, three-way merge with an empty ancestor — union +
-//! keep-both, nothing lost); no base + no head → first publish; base + no local change →
-//! fast-forward pull or no-op; base + local change → commit on the base and [`crate::sync_ref`] it.
-//! The returned base is persisted by the caller (§8.5); versions come from the frontier's
-//! per-device high-water.
+//! One bidirectional sync of a working folder against a ref (`secsec-Design.md` §8.5, §10).
 
 use crate::{
-    fetch_closure, fetch_head, push_head, push_objects, sync_ref, ClientError, CommitAuthor,
-    Remote, SyncAction,
+    fetch_closure, fetch_tree, fetch_verified_head, push_head, push_objects, ClientError, Remote,
+    RemoteHead, Walk,
 };
-use secsec_engine::MergeError;
+use secsec_engine::{
+    accept_sibling, load_commit_dag, merge_accepted, merge_base, CommitAuthor, SyncAction,
+};
 use secsec_kdf::MasterKeys;
-use secsec_object::Id;
+use secsec_object::{Id, PathSalt};
 use secsec_proto::PUSH_ID_LEN;
-use secsec_sig::{DeviceId, DeviceKey, DevicePublic};
+use secsec_roster::State;
+use secsec_sig::{DeviceId, DeviceKey};
 use secsec_snapshot::{
-    open_signed_commit, restore_commit_tree, seal_signed_commit, snapshot_tree, verify_commit,
-    Commit,
+    open_signed_commit, restore_commit_tree, seal_signed_commit, snapshot_tree, Commit, Prior,
+    RestoreReport, SnapshotMemo,
 };
 use secsec_store::Store;
-use secsec_sync::rollback::{
-    evaluate_merge, MergeDecision, MergeReject, SiblingHead, SyncFrontier,
-};
-use secsec_sync::{Head, NO_PREV_HEAD};
-use std::collections::BTreeMap;
+use secsec_sync::rollback::{MergeDecision, SyncFrontier};
+use secsec_sync::NO_PREV_HEAD;
 use std::path::Path;
 
-/// What [`sync_once`] did this run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What [`sync_once`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncKind {
-    /// Already in sync; nothing transferred.
+    /// Nothing to do.
     UpToDate,
-    /// First writer: published our directory as the initial commit.
+    /// First writer: our folder became the ref's first head.
     Published,
-    /// Fresh client: cloned the existing repo and restored it to the working dir.
+    /// A fresh link to an existing repo, nothing tracked locally: the head was restored.
     Cloned,
-    /// No local changes; fast-forwarded to a newer remote head and restored it.
+    /// The remote moved ahead of us and was restored.
     Pulled,
-    /// Local changes published on top of the base (the remote had nothing newer).
+    /// Our commit was published on top of the remote head.
     Pushed,
-    /// Local changes reconciled with a divergent remote head via three-way merge.
+    /// A divergent remote head was three-way merged, published, and restored.
     Merged,
 }
 
-/// The result of [`sync_once`].
+/// The result of [`sync_once`]; the caller persists `base`, then `frontier` (§8.5).
 #[derive(Debug, Clone)]
 pub struct SyncOutcome {
     /// What happened.
     pub kind: SyncKind,
-    /// The new last-synced commit (the **base** to persist and feed back next sync). `None` only when
-    /// the repo has no head at all and we did not publish (cannot happen — first publish sets it).
+    /// The new last-synced commit.
     pub base: Option<Id>,
-    /// The frontier advanced by this sync (§8.5: persist before the next sync).
+    /// The advanced frontier.
     pub frontier: SyncFrontier,
-    /// Keep-both conflict paths produced by a three-way merge this sync (§10), so the caller can
-    /// surface them to the user. Empty unless `kind == Merged` with genuine conflicts; the conflicting
-    /// content is preserved on disk as `name.conflict-<device>-<id>.ext` (no data is lost).
+    /// Paths kept both ways: merge conflicts, and local edits made while the sync ran.
     pub conflicts: Vec<String>,
-    /// Working-folder paths the §19 bounds make unsyncable (a file needing more chunks than a tree
-    /// can encode). Already-synced paths freeze at their last version rather than being deleted, but
-    /// the user must be told — a file that silently stops syncing looks exactly like one that works.
+    /// Paths this device could not sync (too large, unreadable, or not creatable here).
     pub skipped: Vec<String>,
+    /// The merge ran against an empty base because the common ancestor's tree is gone.
+    pub base_missing: bool,
 }
 
-/// Resolve a commit's author key from the folded roster (a commit by a non-member is rejected).
-fn author_key<'a>(
-    members: &'a BTreeMap<DeviceId, DevicePublic>,
-    commit: &Commit,
-) -> Result<&'a DevicePublic, ClientError> {
-    members
-        .get(&commit.device_id)
-        .ok_or(ClientError::HeadNotMember)
+/// Everything one sync reads besides the remote, the frontier, and the base.
+pub struct SyncInput<'a, K: MasterKeys> {
+    /// The local object cache.
+    pub store: &'a Store,
+    /// The working folder.
+    pub dir: &'a Path,
+    /// The peeled key ring.
+    pub keys: &'a K,
+    /// This device's key.
+    pub device: &'a DeviceKey,
+    /// The folded roster.
+    pub roster: &'a State,
+    /// The ref this folder syncs.
+    pub ref_name: &'a str,
+    /// Advisory timestamp for new commits.
+    pub ts: u64,
+    /// This attempt's push id (§15).
+    pub push_id: &'a [u8; PUSH_ID_LEN],
+    /// Persists the frontier; runs before any ref-advancing push, and a failure aborts it (§8.5).
+    pub seal: &'a dyn Fn(&SyncFrontier) -> Result<(), ClientError>,
 }
 
-/// Whether `dir` contains anything a snapshot would track (a regular file or a real directory).
-/// Symlinks and special files don't count — they are never synced, so a folder holding only those is
-/// "empty" for clone purposes. A missing `dir` is empty.
+/// Whether `dir` holds anything a snapshot would track.
 fn has_tracked_entries(dir: &Path) -> Result<bool, ClientError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -85,869 +85,780 @@ fn has_tracked_entries(dir: &Path) -> Result<bool, ClientError> {
         Err(e) => return Err(ClientError::Io(e)),
     };
     for ent in entries {
-        let ft = ent?.file_type()?;
-        if ft.is_file() || ft.is_dir() {
+        let ent = ent?;
+        let ft = ent.file_type()?;
+        let tracked = ent
+            .file_name()
+            .to_str()
+            .is_some_and(secsec_snapshot::is_materializable);
+        if tracked && (ft.is_file() || ft.is_dir()) {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-/// Pull a verified head into the working dir: resolve+verify the head signer, fetch its closure,
-/// verify the commit against its author, restore, and observe the head into the frontier.
-#[allow(clippy::too_many_arguments)]
-async fn pull_to<R: Remote, K: MasterKeys>(
-    remote: &R,
-    store: &Store,
-    keys: &K,
+/// This device's highest commit version: the frontier's, else the highest in the known history (a fresh or lost frontier).
+fn own_high<K: MasterKeys>(
+    s: &SyncInput<'_, K>,
     frontier: &SyncFrontier,
-    members: &BTreeMap<DeviceId, DevicePublic>,
-    head: &Head,
-    head_sig: &[u8],
-    dir: &Path,
-) -> Result<SyncFrontier, ClientError> {
-    let sibling =
-        SiblingHead::verified(members, head, head_sig).ok_or(ClientError::HeadNotMember)?;
-    let signer = sibling.device_id;
-
-    // §8.5/§10 anti-rollback on the PULL path (the merge path runs these gates inside
-    // `merge_heads`): without them a malicious server could replay an older member-signed head and
-    // silently roll this device's working dir back. A fresh clone (empty frontier) passes; only a
-    // head whose counters regress below the persisted frontier is rejected (alarm).
-    if head.roster_seq < frontier.roster_seq {
-        return Err(ClientError::Merge(MergeError::Rollback(
-            MergeReject::RosterRollback {
-                sibling: head.roster_seq,
-                frontier: frontier.roster_seq,
-            },
-        )));
+    device_id: &DeviceId,
+    heads: &[Id],
+) -> Result<u64, ClientError> {
+    if let Some(v) = frontier.commit_version_hwm.get(device_id) {
+        return Ok(*v);
     }
-    let head_hwm = frontier.head_version_hwm.get(&signer).copied().unwrap_or(0);
-    if head.head_version < head_hwm {
-        return Err(ClientError::Merge(MergeError::Rollback(
-            MergeReject::HeadRollback {
-                device: signer,
-                head_version: head.head_version,
-                hwm: head_hwm,
-            },
-        )));
-    }
-
-    fetch_closure(remote, store, keys, &head.commit_id).await?;
-    let (commit, csig) = open_signed_commit(&head.commit_id, keys, store)?;
-    verify_commit(author_key(members, &commit)?, &commit, &csig)?;
-    restore_commit_tree(&commit, keys, store, dir)?;
-
-    // Observe the head into the frontier so later syncs gate against it (§8.5/§10).
-    let (parents, meta) = secsec_engine::load_commit_dag(&[head.commit_id], keys, store)?;
-    let mut f = frontier.clone();
-    f.observe(&sibling, &parents, &meta);
-    Ok(f)
+    let (_, meta) = load_commit_dag(heads, s.keys, s.store)?;
+    Ok(meta
+        .values()
+        .filter(|m| m.device_id == *device_id)
+        .map(|m| m.version)
+        .max()
+        .unwrap_or(0))
 }
 
-/// Reconcile `dir` with `/refs/<ref_name>` once (§10; cases in the module docs). `base` is the
-/// last-synced commit (`None` on a fresh client); `seal` persists the advanced frontier and runs
-/// **before** any ref-advancing push (§8.5) — a failure aborts the publish. Returns the action, the
-/// new base, and the advanced frontier (the caller persists both after the call).
-#[allow(clippy::too_many_arguments)]
+fn next_version(v: u64) -> Result<u64, ClientError> {
+    v.checked_add(1).ok_or(ClientError::VersionExhausted)
+}
+
+fn raise(frontier: &mut SyncFrontier, device_id: DeviceId, version: u64) {
+    let e = frontier.commit_version_hwm.entry(device_id).or_insert(0);
+    *e = (*e).max(version);
+}
+
+/// Restore `commit_id` into the folder against `ours`, this device's snapshot of it.
+fn restore<K: MasterKeys>(
+    s: &SyncInput<'_, K>,
+    commit_id: &Id,
+    ours: Option<&(Id, PathSalt)>,
+) -> Result<RestoreReport, ClientError> {
+    let (commit, _) = open_signed_commit(commit_id, s.keys, s.store)?;
+    Ok(restore_commit_tree(
+        &commit,
+        commit_id,
+        ours.map(|(t, salt)| (t, salt)),
+        s.keys,
+        s.store,
+        s.dir,
+    )?)
+}
+
+/// Reconcile the folder with the ref once; the caller persists the returned base, then the frontier.
 pub async fn sync_once<R: Remote, K: MasterKeys>(
     remote: &R,
-    store: &Store,
-    dir: &Path,
-    keys: &K,
-    device: &DeviceKey,
-    members: &BTreeMap<DeviceId, DevicePublic>,
+    s: &SyncInput<'_, K>,
     frontier: &SyncFrontier,
-    ref_name: &str,
-    roster_seq: u64,
     base: Option<Id>,
-    ts: u64,
-    push_id: &[u8; PUSH_ID_LEN],
-    seal: &dyn Fn(&SyncFrontier) -> Result<(), ClientError>,
+    memo: &mut SnapshotMemo,
 ) -> Result<SyncOutcome, ClientError> {
-    // Writes (snapshot, commit, head) use the current generation; reads (closures, old commits) route
-    // through `keys`, which resolves any past generation after a rotation (§8.2).
-    let device_id = device.device_id()?;
-    let head = fetch_head(remote, keys, ref_name).await?;
-
-    // Fresh client with an existing repo: an EMPTY folder clones (never commit an empty dir — that
-    // publishes a deletion of everything). A NON-EMPTY folder must NOT clone (materializing the head
-    // would delete/overwrite its local files); it falls through to become a parentless commit that
-    // the three-way merge (empty ancestor) unions with the head — keep-both on same-name divergence,
-    // nothing lost. Also the reinstall / re-link / server-rebuild re-join path (§14).
-    if base.is_none() {
-        if let Some((h, sig, _)) = &head {
-            if !has_tracked_entries(dir)? {
-                let frontier = pull_to(remote, store, keys, frontier, members, h, sig, dir).await?;
-                return Ok(SyncOutcome {
-                    kind: SyncKind::Cloned,
-                    base: Some(h.commit_id),
-                    frontier,
-                    conflicts: Vec::new(),
-                    skipped: Vec::new(),
-                });
-            }
+    let device_id = s.device.device_id()?;
+    let head = fetch_verified_head(remote, s.keys, &s.roster.members, s.ref_name).await?;
+    if let Some(rh) = &head {
+        if Some(rh.head.commit_id) != base {
+            fetch_closure(remote, s.store, s.keys, &rh.head.commit_id).await?;
         }
     }
 
-    // Snapshot the working dir incrementally on the base's tree (so salts/ids are stable, §9.7).
-    let prev = match base {
-        Some(b) => {
-            let (c, _) = open_signed_commit(&b, keys, store)?;
-            Some((c.root_tree, c.root_salt))
+    // A fresh link to an existing repo with nothing tracked here clones; a non-empty folder merges instead.
+    if let (None, Some(rh)) = (base, &head) {
+        if !has_tracked_entries(s.dir)? {
+            let accepted = accept_sibling(
+                frontier,
+                None,
+                &rh.sibling,
+                &device_id,
+                &s.roster.ever_members,
+                s.keys,
+                s.store,
+            )?;
+            let report = restore(s, &rh.head.commit_id, None)?;
+            return Ok(SyncOutcome {
+                kind: SyncKind::Cloned,
+                base: Some(rh.head.commit_id),
+                frontier: accepted.frontier,
+                conflicts: report.conflicts,
+                skipped: report.skipped,
+                base_missing: false,
+            });
         }
+    }
+
+    let base_commit = match base {
+        Some(b) => Some(open_signed_commit(&b, s.keys, s.store)?.0),
         None => None,
     };
-    // Read through the whole key ring so the previous tree is legible across a rotation; new objects
-    // still seal under the current generation inside `snapshot_tree`.
-    let (our_tree, our_salt, skipped) =
-        snapshot_tree(dir, keys, store, prev.as_ref().map(|(t, s)| (t, s)))?;
-    let unchanged = prev.as_ref().is_some_and(|(t, _)| *t == our_tree);
+    // With no base the server's head seeds per-path salts, so identical files get identical ids; its mtimes are not ours.
+    let seed = match (&base_commit, &head) {
+        (None, Some(rh)) => Some(open_signed_commit(&rh.head.commit_id, s.keys, s.store)?.0),
+        _ => None,
+    };
+    let prior = match (&base_commit, &seed) {
+        (Some(c), _) => Some(Prior {
+            root: &c.root_tree,
+            salt: &c.root_salt,
+            fast_path: true,
+        }),
+        (None, Some(c)) => Some(Prior {
+            root: &c.root_tree,
+            salt: &c.root_salt,
+            fast_path: false,
+        }),
+        (None, None) => None,
+    };
+    let snap = snapshot_tree(s.dir, s.keys, s.store, prior, memo)?;
+    let ours = (snap.root, snap.salt);
 
-    // No local changes: reconcile a differing remote head, or we are already up to date.
-    if unchanged {
-        let Some((h, sig, _blob)) = &head else {
-            return Ok(SyncOutcome {
-                kind: SyncKind::UpToDate,
-                base,
-                frontier: frontier.clone(),
-                conflicts: Vec::new(),
-                skipped,
-            });
-        };
-        if Some(h.commit_id) == base {
-            return Ok(SyncOutcome {
-                kind: SyncKind::UpToDate,
-                base,
-                frontier: frontier.clone(),
-                conflicts: Vec::new(),
-                skipped,
-            });
-        }
-        // The remote head differs from our base and we have no local changes. Classify it against
-        // base with the SAME rollback-gated DAG decision the merge path uses (§10): only a genuine
-        // fast-forward is restored. A replayed ancestor head — or a cas-unreachable incomparable fork
-        // — is NOT restored, so a malicious server cannot silently roll the working dir back (the §10
-        // "ancestor sibling is a no-op before the gates" rule).
-        let sibling = SiblingHead::verified(members, h, sig).ok_or(ClientError::HeadNotMember)?;
-        fetch_closure(remote, store, keys, &h.commit_id).await?;
-        let our = base.expect("the no-base clone path is handled above");
-        let (parents, meta) = secsec_engine::load_commit_dag(&[our, h.commit_id], keys, store)?;
-        return match evaluate_merge(frontier, &our, &sibling, &device_id, &parents, &meta) {
-            Ok(MergeDecision::FastForward) => {
-                let (commit, csig) = open_signed_commit(&h.commit_id, keys, store)?;
-                verify_commit(author_key(members, &commit)?, &commit, &csig)?;
-                restore_commit_tree(&commit, keys, store, dir)?;
+    if let (Some(base_id), Some(bc)) = (base, &base_commit) {
+        if bc.root_tree == snap.root {
+            let Some(rh) = head else {
+                return Ok(SyncOutcome {
+                    kind: SyncKind::UpToDate,
+                    base,
+                    frontier: frontier.clone(),
+                    conflicts: Vec::new(),
+                    skipped: snap.skipped,
+                    base_missing: false,
+                });
+            };
+            if rh.head.commit_id == base_id {
                 let mut f = frontier.clone();
-                f.observe(&sibling, &parents, &meta);
-                Ok(SyncOutcome {
-                    kind: SyncKind::Pulled,
-                    base: Some(h.commit_id),
+                f.observe_head(&rh.sibling);
+                return Ok(SyncOutcome {
+                    kind: SyncKind::UpToDate,
+                    base,
                     frontier: f,
                     conflicts: Vec::new(),
-                    skipped,
-                })
+                    skipped: snap.skipped,
+                    base_missing: false,
+                });
             }
-            // Ancestor of our base (replayed) or a cas-unreachable incomparable fork: do not restore.
-            // A genuine fork reconciles keep-both on this device's next local change (the merge path).
-            Ok(MergeDecision::AlreadyHave | MergeDecision::Merge) => Ok(SyncOutcome {
-                kind: SyncKind::UpToDate,
-                base,
-                frontier: frontier.clone(),
-                conflicts: Vec::new(),
-                skipped,
-            }),
-            Err(reject) => Err(ClientError::Merge(MergeError::Rollback(reject))),
-        };
-    }
-
-    // Local changes: author a commit on the base. The version continues strictly after BOTH the
-    // persisted high-water AND our own commits already in the head's history — after a re-link /
-    // reinstall the head can contain them, and re-using a version trips every peer's replay gate
-    // (2a) forever.
-    let mut own_high = frontier
-        .commit_version_hwm
-        .get(&device_id)
-        .copied()
-        .unwrap_or(0);
-    if base.is_none() {
-        if let Some((h, _, _)) = &head {
-            // First contact with an existing head (the non-empty join): bring its history local
-            // (idempotent; the merge needs it anyway) and continue after our own highest version in it.
-            fetch_closure(remote, store, keys, &h.commit_id).await?;
-            let (_, meta) = secsec_engine::load_commit_dag(&[h.commit_id], keys, store)?;
-            own_high = own_high.max(
-                meta.values()
-                    .filter(|m| m.device_id == device_id)
-                    .map(|m| m.version)
-                    .max()
-                    .unwrap_or(0),
-            );
+            // The remote moved, or was replayed: converge through the same accept, merge, and push path.
+            let own = own_high(s, frontier, &device_id, &[base_id, rh.head.commit_id])?;
+            let (action, f) = reconcile(
+                remote,
+                s,
+                frontier,
+                &base_id,
+                &rh,
+                &device_id,
+                next_version(own)?,
+            )
+            .await?;
+            return finish(s, action, f, base_id, &ours, snap.skipped);
         }
     }
-    let version = own_high + 1;
-    let parents = base.map(|b| vec![b]).unwrap_or_default();
-    let last_seen = head.as_ref().map_or(NO_PREV_HEAD, |(h, _, _)| h.commit_id);
+
+    // A local change (or a first snapshot): a commit on the base, versioned after all of this device's history.
+    let heads: Vec<Id> = base
+        .into_iter()
+        .chain(head.as_ref().map(|rh| rh.head.commit_id))
+        .collect();
+    let version = next_version(own_high(s, frontier, &device_id, &heads)?)?;
     let commit = Commit {
-        root_tree: our_tree,
-        root_salt: our_salt,
-        parents,
+        root_tree: snap.root,
+        root_salt: snap.salt,
+        parents: base.into_iter().collect(),
         device_id,
         version,
-        roster_seq,
-        last_seen_head: last_seen,
-        ts,
+        roster_seq: s.roster.tip_seq,
+        last_seen_head: head.as_ref().map_or(NO_PREV_HEAD, |rh| rh.head.commit_id),
+        ts: s.ts,
     };
-    let our_commit = seal_signed_commit(keys.current(), store, device, &commit)?;
+    let our_commit = seal_signed_commit(s.keys.current(), s.store, s.device, &commit)?;
     let mut f = frontier.clone();
-    f.commit_version_hwm.insert(device_id, version);
+    raise(&mut f, device_id, version);
 
-    match head {
-        // First publish: no remote head yet.
-        None => {
-            // §8.5: seal the frontier (carrying our commit's version) before the ref-advancing push.
-            seal(&f)?;
-            push_objects(remote, store, keys, &our_commit, push_id).await?;
-            push_head(
-                remote, keys, device, ref_name, our_commit, roster_seq, None, push_id,
-            )
-            .await?;
-            Ok(SyncOutcome {
-                kind: SyncKind::Published,
-                base: Some(our_commit),
-                frontier: f,
-                conflicts: Vec::new(),
-                skipped,
-            })
-        }
-        // Reconcile our commit against the remote head (push if we're ahead, else merge).
-        Some(_) => {
-            // The merge commit, if any, is the next version after ours.
-            let author = CommitAuthor {
-                device,
-                version: version + 1,
-                roster_seq,
-                ts,
-            };
-            let report = sync_ref(
+    let Some(rh) = head else {
+        (s.seal)(&f)?;
+        push_objects(remote, s.store, s.keys, &our_commit, None, s.push_id).await?;
+        push_head(
+            remote,
+            s.keys,
+            s.device,
+            s.ref_name,
+            our_commit,
+            s.roster.tip_seq,
+            None,
+            s.push_id,
+        )
+        .await?;
+        return Ok(SyncOutcome {
+            kind: SyncKind::Published,
+            base: Some(our_commit),
+            frontier: f,
+            conflicts: Vec::new(),
+            skipped: snap.skipped,
+            base_missing: false,
+        });
+    };
+    let (action, f) = reconcile(
+        remote,
+        s,
+        &f,
+        &our_commit,
+        &rh,
+        &device_id,
+        next_version(version)?,
+    )
+    .await?;
+    finish(s, action, f, our_commit, &ours, snap.skipped)
+}
+
+/// Accept `rh` against `our_commit`, merge when incomparable, and publish whatever we are ahead with (§8.5 seal first).
+async fn reconcile<R: Remote, K: MasterKeys>(
+    remote: &R,
+    s: &SyncInput<'_, K>,
+    frontier: &SyncFrontier,
+    our_commit: &Id,
+    rh: &RemoteHead,
+    device_id: &DeviceId,
+    merge_version: u64,
+) -> Result<(SyncAction, SyncFrontier), ClientError> {
+    let accepted = accept_sibling(
+        frontier,
+        Some(our_commit),
+        &rh.sibling,
+        device_id,
+        &s.roster.ever_members,
+        s.keys,
+        s.store,
+    )?;
+    if accepted.decision == MergeDecision::Merge {
+        // The merge base's trees come on demand; one the server no longer holds merges as a missing base.
+        if let Some(b) = merge_base(&accepted.parents, our_commit, &rh.head.commit_id) {
+            let (bc, _) = open_signed_commit(&b, s.keys, s.store)?;
+            match fetch_tree(
                 remote,
-                store,
-                keys,
-                members,
-                &f,
-                ref_name,
-                &our_commit,
-                author,
-                push_id,
-                seal,
+                s.store,
+                s.keys,
+                &bc.root_tree,
+                &bc.root_salt,
+                Walk::Trees,
             )
-            .await?;
-            let mut frontier = report.frontier;
-            let (kind, base, conflicts) = match report.action {
-                SyncAction::AlreadyHave => {
-                    frontier.commit_version_hwm.insert(device_id, version);
-                    (SyncKind::Pushed, our_commit, Vec::new())
-                }
-                SyncAction::Merged {
-                    commit_id,
-                    conflicts,
-                } => {
-                    frontier.commit_version_hwm.insert(device_id, version + 1);
-                    let (mc, _) = open_signed_commit(&commit_id, keys, store)?;
-                    restore_commit_tree(&mc, keys, store, dir)?;
-                    let paths = conflicts.into_iter().map(|c| c.path).collect();
-                    (SyncKind::Merged, commit_id, paths)
-                }
-                SyncAction::FastForward { commit_id } => {
-                    let (c, _) = open_signed_commit(&commit_id, keys, store)?;
-                    restore_commit_tree(&c, keys, store, dir)?;
-                    (SyncKind::Pulled, commit_id, Vec::new())
-                }
-            };
-            Ok(SyncOutcome {
-                kind,
-                base: Some(base),
-                frontier,
-                conflicts,
-                skipped,
-            })
+            .await
+            {
+                Ok(_) | Err(ClientError::MissingRemote(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
     }
+    let author = CommitAuthor {
+        device: s.device,
+        version: merge_version,
+        roster_seq: s.roster.tip_seq,
+        ts: s.ts,
+    };
+    let action = merge_accepted(&accepted, our_commit, &rh.sibling, author, s.keys, s.store)?;
+    let mut fin = accepted.frontier.clone();
+    let publish = match &action {
+        SyncAction::Merged { commit_id, .. } => {
+            raise(&mut fin, *device_id, merge_version);
+            Some(*commit_id)
+        }
+        SyncAction::AlreadyHave => Some(*our_commit),
+        SyncAction::FastForward { .. } => None,
+    };
+    if let Some(commit_id) = publish {
+        // The pre-push seal carries the observed heads and our versions, not the merged-in commits' until the base moves.
+        let own = fin.commit_version_hwm.get(device_id).copied().unwrap_or(0);
+        (s.seal)(&frontier.with_heads_of(&accepted.frontier, (*device_id, own)))?;
+        push_objects(
+            remote,
+            s.store,
+            s.keys,
+            &commit_id,
+            Some(&rh.head.commit_id),
+            s.push_id,
+        )
+        .await?;
+        push_head(
+            remote,
+            s.keys,
+            s.device,
+            s.ref_name,
+            commit_id,
+            s.roster.tip_seq,
+            Some((&rh.head, &rh.blob)),
+            s.push_id,
+        )
+        .await?;
+    }
+    Ok((action, fin))
+}
+
+/// Bring the folder to the reconciled commit, restoring against our snapshot so later local edits are kept.
+fn finish<K: MasterKeys>(
+    s: &SyncInput<'_, K>,
+    action: SyncAction,
+    frontier: SyncFrontier,
+    our_commit: Id,
+    ours: &(Id, PathSalt),
+    mut skipped: Vec<String>,
+) -> Result<SyncOutcome, ClientError> {
+    let (kind, base, mut conflicts, report, base_missing) = match action {
+        SyncAction::AlreadyHave => (
+            SyncKind::Pushed,
+            our_commit,
+            Vec::new(),
+            RestoreReport::default(),
+            false,
+        ),
+        SyncAction::FastForward { commit_id } => (
+            SyncKind::Pulled,
+            commit_id,
+            Vec::new(),
+            restore(s, &commit_id, Some(ours))?,
+            false,
+        ),
+        SyncAction::Merged {
+            commit_id,
+            conflicts,
+            base_missing,
+        } => (
+            SyncKind::Merged,
+            commit_id,
+            conflicts.into_iter().map(|c| c.path).collect(),
+            restore(s, &commit_id, Some(ours))?,
+            base_missing,
+        ),
+    };
+    conflicts.extend(report.conflicts);
+    skipped.extend(report.skipped);
+    Ok(SyncOutcome {
+        kind,
+        base: Some(base),
+        frontier,
+        conflicts,
+        skipped,
+        base_missing,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testmem::MemRemote;
+    use crate::fetch_head;
+    use crate::testmem::{roster_of, MemRemote};
+    use secsec_engine::MergeError;
     use secsec_kdf::MasterKey;
-    use secsec_store::Store;
+    use secsec_sync::rollback::MergeReject;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
 
-    fn read_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
-        let mut out = Vec::new();
-        for e in std::fs::read_dir(root).unwrap() {
-            let e = e.unwrap();
-            out.push((
-                e.file_name().to_str().unwrap().to_owned(),
-                std::fs::read(e.path()).unwrap(),
-            ));
-        }
-        out.sort();
-        out
+    fn mk() -> MasterKey {
+        MasterKey::new(1, [0x55; 32])
     }
 
-    /// First contact of a **non-empty** folder with an existing repo must MERGE, never
-    /// clone-restore: local-only files survive, same-name divergence is keep-both, the repo's files
-    /// land — nothing deleted or overwritten. The join / reinstall / re-link / server-rebuild path.
+    /// One device's view: its cache, folder, base, and frontier.
+    struct Side {
+        store: Store,
+        dir: tempfile::TempDir,
+        base: Option<Id>,
+        frontier: SyncFrontier,
+        memo: SnapshotMemo,
+    }
+
+    impl Side {
+        fn new(root: &Path, name: &str) -> Self {
+            Self {
+                store: Store::open(root.join(name)).unwrap(),
+                dir: tempfile::tempdir().unwrap(),
+                base: None,
+                frontier: SyncFrontier::default(),
+                memo: SnapshotMemo::default(),
+            }
+        }
+
+        fn write(&self, name: &str, data: &[u8]) {
+            std::fs::write(self.dir.path().join(name), data).unwrap();
+        }
+
+        fn read(&self, name: &str) -> Option<Vec<u8>> {
+            std::fs::read(self.dir.path().join(name)).ok()
+        }
+
+        fn names(&self) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(self.dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        }
+
+        /// Sync once, keeping base and frontier on success.
+        async fn sync(
+            &mut self,
+            r: &MemRemote,
+            dev: &DeviceKey,
+            roster: &State,
+            seal: &dyn Fn(&SyncFrontier) -> Result<(), ClientError>,
+        ) -> Result<SyncOutcome, ClientError> {
+            let m = mk();
+            let input = SyncInput {
+                store: &self.store,
+                dir: self.dir.path(),
+                keys: &m,
+                device: dev,
+                roster,
+                ref_name: "main",
+                ts: 0,
+                push_id: &[0x44; 16],
+                seal,
+            };
+            let out = sync_once(r, &input, &self.frontier, self.base, &mut self.memo).await?;
+            self.base = out.base;
+            self.frontier = out.frontier.clone();
+            Ok(out)
+        }
+    }
+
+    fn no_seal(_: &SyncFrontier) -> Result<(), ClientError> {
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_clone_edit_pull_and_idle() {
+        let root = tempfile::tempdir().unwrap();
+        let r = MemRemote::new(Store::open(root.path().join("r.redb")).unwrap());
+        let dev = DeviceKey::generate().unwrap();
+        let roster = roster_of(&[&dev]);
+        let mut a = Side::new(root.path(), "a.redb");
+        let mut b = Side::new(root.path(), "b.redb");
+
+        a.write("hello.txt", b"v1");
+        assert_eq!(
+            a.sync(&r, &dev, &roster, &no_seal).await.unwrap().kind,
+            SyncKind::Published
+        );
+        assert_eq!(
+            b.sync(&r, &dev, &roster, &no_seal).await.unwrap().kind,
+            SyncKind::Cloned
+        );
+        assert_eq!(b.read("hello.txt").unwrap(), b"v1");
+
+        a.write("hello.txt", b"v2-edited");
+        assert_eq!(
+            a.sync(&r, &dev, &roster, &no_seal).await.unwrap().kind,
+            SyncKind::Pushed
+        );
+        assert_eq!(
+            b.sync(&r, &dev, &roster, &no_seal).await.unwrap().kind,
+            SyncKind::Pulled
+        );
+        assert_eq!(b.read("hello.txt").unwrap(), b"v2-edited");
+        assert_eq!(
+            b.sync(&r, &dev, &roster, &no_seal).await.unwrap().kind,
+            SyncKind::UpToDate
+        );
+    }
+
+    /// A non-empty first link merges keep-both, identical files seed identical ids, and the version continues.
     #[tokio::test]
     async fn joining_a_nonempty_folder_merges_and_loses_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let m = MasterKey::new(1, [0x55; 32]);
-        let dev_a = DeviceKey::generate().unwrap();
-        let members: BTreeMap<DeviceId, DevicePublic> =
-            [(dev_a.device_id().unwrap(), dev_a.public())]
-                .into_iter()
-                .collect();
-        let remote = MemRemote::new(Store::open(dir.path().join("remote.redb")).unwrap());
-        let a_store = Store::open(dir.path().join("a.redb")).unwrap();
-        let b_store = Store::open(dir.path().join("b.redb")).unwrap();
-        let fr = SyncFrontier::default();
-        let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
-        let sync = |store, wdir, frontier, base| {
-            sync_once(
-                &remote,
-                store,
-                wdir,
-                &m,
-                &dev_a,
-                &members,
-                frontier,
-                "main",
-                0,
-                base,
-                0,
-                &[0x44; 16],
-                &seal,
-            )
-        };
+        let root = tempfile::tempdir().unwrap();
+        let r = MemRemote::new(Store::open(root.path().join("r.redb")).unwrap());
+        let dev = DeviceKey::generate().unwrap();
+        let roster = roster_of(&[&dev]);
+        let mut a = Side::new(root.path(), "a.redb");
+        let mut b = Side::new(root.path(), "b.redb");
 
-        // A publishes {shared.txt:"from-A", a-only.txt}.
-        let a_dir = tempfile::tempdir().unwrap();
-        std::fs::write(a_dir.path().join("shared.txt"), b"from-A").unwrap();
-        std::fs::write(a_dir.path().join("a-only.txt"), b"a").unwrap();
-        let ra = sync(&a_store, a_dir.path(), &fr, None).await.unwrap();
-        assert_eq!(ra.kind, SyncKind::Published);
+        a.write("shared.txt", b"from-A");
+        a.write("same.txt", b"identical");
+        a.write("a-only.txt", b"a");
+        a.sync(&r, &dev, &roster, &no_seal).await.unwrap();
 
-        // B's folder ALREADY holds {shared.txt:"from-B" (divergent), b-only.txt}, no link (base=None).
-        // (Same device key as A — also covering the re-link case, where the head's history contains
-        // this very device's commits and the version sequence must continue, not restart.)
-        let b_dir = tempfile::tempdir().unwrap();
-        std::fs::write(b_dir.path().join("shared.txt"), b"from-B").unwrap();
-        std::fs::write(b_dir.path().join("b-only.txt"), b"b").unwrap();
-        let rb = sync(&b_store, b_dir.path(), &fr, None).await.unwrap();
-
-        // It merged (did not clone-restore): everything survives.
+        b.write("shared.txt", b"from-B");
+        b.write("same.txt", b"identical");
+        b.write("b-only.txt", b"b");
+        let out = b.sync(&r, &dev, &roster, &no_seal).await.unwrap();
+        assert_eq!(out.kind, SyncKind::Merged);
+        assert_eq!(out.conflicts, vec!["shared.txt".to_string()]);
+        assert!(!out.base_missing);
+        assert_eq!(b.read("b-only.txt").unwrap(), b"b");
+        assert_eq!(b.read("a-only.txt").unwrap(), b"a");
+        assert_eq!(b.read("shared.txt").unwrap(), b"from-B");
+        let names = b.names();
+        assert!(names.iter().any(|n| n.starts_with("shared.conflict-")));
+        assert!(!names.iter().any(|n| n.starts_with("same.conflict-")));
+        // The re-linked device continued after its own history: version 2 commit, version 3 merge.
         assert_eq!(
-            rb.kind,
-            SyncKind::Merged,
-            "non-empty first contact must merge"
-        );
-        assert_eq!(
-            std::fs::read(b_dir.path().join("b-only.txt")).unwrap(),
-            b"b",
-            "local-only file must survive the join"
-        );
-        assert_eq!(
-            std::fs::read(b_dir.path().join("a-only.txt")).unwrap(),
-            b"a",
-            "the repo's files land"
-        );
-        assert_eq!(
-            std::fs::read(b_dir.path().join("shared.txt")).unwrap(),
-            b"from-B",
-            "ours keeps the name on a divergent same-name file"
-        );
-        assert!(
-            std::fs::read_dir(b_dir.path())
-                .unwrap()
-                .map(|e| e.unwrap().file_name().to_str().unwrap().to_owned())
-                .any(|n| n.starts_with("shared.conflict-")),
-            "divergent same-name content is kept-both"
-        );
-        assert_eq!(rb.conflicts, vec!["shared.txt".to_string()]);
-
-        // A pulls: B's local-only file and the conflict copy propagate; nothing of A's is gone.
-        let ra2 = sync(&a_store, a_dir.path(), &ra.frontier, ra.base)
-            .await
-            .unwrap();
-        assert_eq!(ra2.kind, SyncKind::Pulled);
-        assert_eq!(
-            std::fs::read(a_dir.path().join("b-only.txt")).unwrap(),
-            b"b"
-        );
-        assert_eq!(
-            std::fs::read(a_dir.path().join("a-only.txt")).unwrap(),
-            b"a"
+            out.frontier
+                .commit_version_hwm
+                .get(&dev.device_id().unwrap()),
+            Some(&3)
         );
 
-        // An EMPTY folder still takes the plain clone path.
-        let c_store = Store::open(dir.path().join("c.redb")).unwrap();
-        let c_dir = tempfile::tempdir().unwrap();
-        let rc = sync(&c_store, c_dir.path(), &fr, None).await.unwrap();
-        assert_eq!(rc.kind, SyncKind::Cloned, "empty folder clones");
+        assert_eq!(
+            a.sync(&r, &dev, &roster, &no_seal).await.unwrap().kind,
+            SyncKind::Pulled
+        );
+        assert_eq!(a.read("b-only.txt").unwrap(), b"b");
+
+        let mut c = Side::new(root.path(), "c.redb");
+        assert_eq!(
+            c.sync(&r, &dev, &roster, &no_seal).await.unwrap().kind,
+            SyncKind::Cloned
+        );
     }
 
-    /// A deletion on one device must propagate to the others (and must NOT resurrect): the working
-    /// directory is reconciled to the synced tree, so a file removed upstream is removed locally and
-    /// does not reappear on the next snapshot.
     #[tokio::test]
     async fn deletion_propagates_and_does_not_resurrect() {
-        let dir = tempfile::tempdir().unwrap();
-        let m = MasterKey::new(1, [0x55; 32]);
-        let dev_a = DeviceKey::generate().unwrap();
-        let members: BTreeMap<DeviceId, DevicePublic> =
-            [(dev_a.device_id().unwrap(), dev_a.public())]
-                .into_iter()
-                .collect();
-        let remote = MemRemote::new(Store::open(dir.path().join("remote.redb")).unwrap());
-        let a_store = Store::open(dir.path().join("a.redb")).unwrap();
-        let b_store = Store::open(dir.path().join("b.redb")).unwrap();
-        let fr = SyncFrontier::default();
-        let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
-        let sync = |store, wdir, frontier, base| {
-            sync_once(
-                &remote,
-                store,
-                wdir,
-                &m,
-                &dev_a,
-                &members,
-                frontier,
-                "main",
-                0,
-                base,
-                0,
-                &[0x44; 16],
-                &seal,
-            )
-        };
-
-        // A publishes {keep.txt, gone.txt}.
-        let a_dir = tempfile::tempdir().unwrap();
-        std::fs::write(a_dir.path().join("keep.txt"), b"k").unwrap();
-        std::fs::write(a_dir.path().join("gone.txt"), b"g").unwrap();
-        let ra = sync(&a_store, a_dir.path(), &fr, None).await.unwrap();
-        assert_eq!(ra.kind, SyncKind::Published);
-
-        // B clones → has both files.
-        let b_dir = tempfile::tempdir().unwrap();
-        let rb = sync(&b_store, b_dir.path(), &fr, None).await.unwrap();
-        assert_eq!(rb.kind, SyncKind::Cloned);
-        assert!(b_dir.path().join("gone.txt").exists());
-
-        // A deletes gone.txt and syncs.
-        std::fs::remove_file(a_dir.path().join("gone.txt")).unwrap();
-        let ra2 = sync(&a_store, a_dir.path(), &ra.frontier, ra.base)
-            .await
-            .unwrap();
-        assert_eq!(ra2.kind, SyncKind::Pushed);
-
-        // B pulls → the deletion must apply to B's working dir.
-        let rb2 = sync(&b_store, b_dir.path(), &rb.frontier, rb.base)
-            .await
-            .unwrap();
-        assert_eq!(rb2.kind, SyncKind::Pulled);
-        assert!(
-            !b_dir.path().join("gone.txt").exists(),
-            "a file deleted upstream must be removed on pull"
-        );
-        assert!(b_dir.path().join("keep.txt").exists());
-
-        // And it must not resurrect: B re-syncs with no local change → UpToDate, not a re-add push.
-        let rb3 = sync(&b_store, b_dir.path(), &rb2.frontier, rb2.base)
-            .await
-            .unwrap();
-        assert_eq!(
-            rb3.kind,
-            SyncKind::UpToDate,
-            "the deletion must not bounce back as a new commit"
-        );
-        assert!(!b_dir.path().join("gone.txt").exists());
-    }
-
-    #[tokio::test]
-    async fn two_clients_publish_clone_edit_pull() {
-        let dir = tempfile::tempdir().unwrap();
-        let m = MasterKey::new(1, [0x55; 32]);
-        let dev_a = DeviceKey::generate().unwrap();
-        let members: BTreeMap<DeviceId, DevicePublic> =
-            [(dev_a.device_id().unwrap(), dev_a.public())]
-                .into_iter()
-                .collect();
-        let remote = MemRemote::new(Store::open(dir.path().join("remote.redb")).unwrap());
-        let a_store = Store::open(dir.path().join("a.redb")).unwrap();
-        let b_store = Store::open(dir.path().join("b.redb")).unwrap();
-        let fr = SyncFrontier::default();
-        let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
-
-        // A publishes a folder.
-        let a_dir = tempfile::tempdir().unwrap();
-        std::fs::write(a_dir.path().join("hello.txt"), b"v1").unwrap();
-        let r1 = sync_once(
-            &remote,
-            &a_store,
-            a_dir.path(),
-            &m,
-            &dev_a,
-            &members,
-            &fr,
-            "main",
-            0,
-            None,
-            0,
-            &[0x44; 16],
-            &seal,
-        )
-        .await
-        .unwrap();
-        assert_eq!(r1.kind, SyncKind::Published);
-        let a_base = r1.base;
-
-        // B clones into an empty dir → gets A's file (B does NOT publish its empty dir).
-        let b_dir = tempfile::tempdir().unwrap();
-        let r2 = sync_once(
-            &remote,
-            &b_store,
-            b_dir.path(),
-            &m,
-            &dev_a,
-            &members,
-            &fr,
-            "main",
-            0,
-            None,
-            0,
-            &[0x44; 16],
-            &seal,
-        )
-        .await
-        .unwrap();
-        assert_eq!(r2.kind, SyncKind::Cloned);
-        assert_eq!(read_tree(b_dir.path()), read_tree(a_dir.path()));
-        let b_base = r2.base;
-
-        // A edits and syncs → pushes on top of its base (linear, no merge).
-        std::fs::write(a_dir.path().join("hello.txt"), b"v2-edited").unwrap();
-        let r3 = sync_once(
-            &remote,
-            &a_store,
-            a_dir.path(),
-            &m,
-            &dev_a,
-            &members,
-            &r1.frontier,
-            "main",
-            0,
-            a_base,
-            0,
-            &[0x44; 16],
-            &seal,
-        )
-        .await
-        .unwrap();
-        assert_eq!(r3.kind, SyncKind::Pushed);
-
-        // B syncs (no local change) → fast-forwards, restoring A's edit.
-        let r4 = sync_once(
-            &remote,
-            &b_store,
-            b_dir.path(),
-            &m,
-            &dev_a,
-            &members,
-            &r2.frontier,
-            "main",
-            0,
-            b_base,
-            0,
-            &[0x44; 16],
-            &seal,
-        )
-        .await
-        .unwrap();
-        assert_eq!(r4.kind, SyncKind::Pulled);
-        assert_eq!(
-            std::fs::read(b_dir.path().join("hello.txt")).unwrap(),
-            b"v2-edited"
-        );
-
-        // B re-syncs with nothing new → up to date.
-        let r5 = sync_once(
-            &remote,
-            &b_store,
-            b_dir.path(),
-            &m,
-            &dev_a,
-            &members,
-            &r4.frontier,
-            "main",
-            0,
-            r4.base,
-            0,
-            &[0x44; 16],
-            &seal,
-        )
-        .await
-        .unwrap();
-        assert_eq!(r5.kind, SyncKind::UpToDate);
-    }
-
-    /// §8.5: the frontier seal runs **before** the ref-advancing push, so a seal failure aborts the
-    /// publish — no head is written to the remote. (A crash post-push could otherwise leave a published
-    /// head uncovered by the persisted anti-rollback frontier.)
-    #[tokio::test]
-    async fn seal_failure_aborts_before_publishing() {
-        use secsec_sync::ref_hash;
-        let dir = tempfile::tempdir().unwrap();
-        let m = MasterKey::new(1, [0x55; 32]);
+        let root = tempfile::tempdir().unwrap();
+        let r = MemRemote::new(Store::open(root.path().join("r.redb")).unwrap());
         let dev = DeviceKey::generate().unwrap();
-        let members: BTreeMap<DeviceId, DevicePublic> = [(dev.device_id().unwrap(), dev.public())]
-            .into_iter()
-            .collect();
-        let remote = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
-        let store = Store::open(dir.path().join("c.redb")).unwrap();
-        let work = tempfile::tempdir().unwrap();
-        std::fs::write(work.path().join("f.txt"), b"v1").unwrap();
+        let roster = roster_of(&[&dev]);
+        let mut a = Side::new(root.path(), "a.redb");
+        let mut b = Side::new(root.path(), "b.redb");
+        a.write("keep.txt", b"k");
+        a.write("gone.txt", b"g");
+        a.sync(&r, &dev, &roster, &no_seal).await.unwrap();
+        b.sync(&r, &dev, &roster, &no_seal).await.unwrap();
+        assert!(b.read("gone.txt").is_some());
 
-        // A seal that always fails: the first publish must abort before advancing the ref.
-        let seal = |_: &SyncFrontier| {
-            Err(ClientError::Io(std::io::Error::other(
-                "seal failed on purpose",
-            )))
-        };
-        let res = sync_once(
-            &remote,
-            &store,
-            work.path(),
-            &m,
-            &dev,
-            &members,
-            &SyncFrontier::default(),
-            "main",
-            0,
-            None,
-            0,
-            &[0x44; 16],
-            &seal,
-        )
-        .await;
-        assert!(
-            matches!(res, Err(ClientError::Io(_))),
-            "a seal failure must abort the publish"
+        std::fs::remove_file(a.dir.path().join("gone.txt")).unwrap();
+        assert_eq!(
+            a.sync(&r, &dev, &roster, &no_seal).await.unwrap().kind,
+            SyncKind::Pushed
         );
-        // The ref was NOT advanced — the remote head is still absent.
-        let ref_h = ref_hash(&m.ref_name_key(), "main");
-        assert!(
-            remote.get_ref(&ref_h).await.unwrap().is_none(),
-            "no head must be published when the pre-push seal fails"
+        assert_eq!(
+            b.sync(&r, &dev, &roster, &no_seal).await.unwrap().kind,
+            SyncKind::Pulled
+        );
+        assert!(b.read("gone.txt").is_none());
+        assert!(b.read("keep.txt").is_some());
+        assert_eq!(
+            b.sync(&r, &dev, &roster, &no_seal).await.unwrap().kind,
+            SyncKind::UpToDate
         );
     }
 
-    /// §8.5/§10: the pull path must reject a replayed head whose `head_version` is below the
-    /// persisted per-device high-water — else a malicious server could roll a no-local-change
-    /// client's working dir back to an older member-signed head.
+    /// macOS's `Icon\r` never syncs, and a peer that never has it removes it only by deleting its folder.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn pull_to_rejects_head_below_frontier_high_water() {
-        use secsec_engine::MergeError;
-        use secsec_sync::rollback::MergeReject;
-        use secsec_sync::{build_head, sign_head};
-
-        let dir = tempfile::tempdir().unwrap();
-        let m = MasterKey::new(1, [0x55; 32]);
-        let dev = DeviceKey::generate().unwrap();
-        let signer = dev.device_id().unwrap();
-        let members: BTreeMap<DeviceId, DevicePublic> =
-            [(signer, dev.public())].into_iter().collect();
-        let remote = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
-        let store = Store::open(dir.path().join("c.redb")).unwrap();
-
-        // A validly-signed but OLD head (head_version 1).
-        let head = build_head("main", [0xC0; 32], 0, None);
-        let sig = sign_head(&dev, &head).unwrap();
-
-        // The client has already observed head_version 5 from this device.
-        let frontier = SyncFrontier {
-            head_version_hwm: BTreeMap::from([(signer, 5)]),
-            ..Default::default()
-        };
-        let work = tempfile::tempdir().unwrap();
-        let res = pull_to(
-            &remote,
-            &store,
-            &m,
-            &frontier,
-            &members,
-            &head,
-            &sig,
-            work.path(),
-        )
-        .await;
-        assert!(
-            matches!(
-                res,
-                Err(ClientError::Merge(MergeError::Rollback(
-                    MergeReject::HeadRollback {
-                        head_version: 1,
-                        hwm: 5,
-                        ..
-                    }
-                )))
-            ),
-            "a pulled head below the persisted head_version high-water must be a rollback alarm"
+    async fn a_macos_folder_icon_lives_exactly_as_long_as_its_folder() {
+        fn icons_intact(mac: &Side) {
+            assert_eq!(mac.read("Icon\r").unwrap(), b"root icon");
+            assert_eq!(mac.read("Photos/Icon\r").unwrap(), b"folder icon");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let r = MemRemote::new(Store::open(root.path().join("r.redb")).unwrap());
+        let dev_mac = DeviceKey::generate().unwrap();
+        let dev_linux = DeviceKey::generate().unwrap();
+        let roster = roster_of(&[&dev_mac, &dev_linux]);
+        let mut mac = Side::new(root.path(), "mac.redb");
+        let mut linux = Side::new(root.path(), "linux.redb");
+        std::fs::create_dir(mac.dir.path().join("Photos")).unwrap();
+        mac.write("Photos/a.jpg", b"a");
+        mac.write("Photos/b.jpg", b"b");
+        mac.write("Icon\r", b"root icon");
+        mac.write("Photos/Icon\r", b"folder icon");
+        mac.sync(&r, &dev_mac, &roster, &no_seal).await.unwrap();
+        assert_eq!(
+            linux
+                .sync(&r, &dev_linux, &roster, &no_seal)
+                .await
+                .unwrap()
+                .kind,
+            SyncKind::Cloned
         );
+        assert!(linux.read("Icon\r").is_none());
+        assert!(linux.read("Photos/Icon\r").is_none());
+        assert_eq!(linux.read("Photos/a.jpg").unwrap(), b"a");
+
+        linux.write("Photos/a.jpg", b"edited on linux");
+        std::fs::remove_file(linux.dir.path().join("Photos/b.jpg")).unwrap();
+        linux.write("Photos/c.jpg", b"c");
+        linux.sync(&r, &dev_linux, &roster, &no_seal).await.unwrap();
+        assert_eq!(
+            mac.sync(&r, &dev_mac, &roster, &no_seal)
+                .await
+                .unwrap()
+                .kind,
+            SyncKind::Pulled
+        );
+        assert_eq!(mac.read("Photos/a.jpg").unwrap(), b"edited on linux");
+        assert!(mac.read("Photos/b.jpg").is_none());
+        assert_eq!(mac.read("Photos/c.jpg").unwrap(), b"c");
+        icons_intact(&mac);
+
+        mac.write("from-mac.txt", b"m");
+        linux.write("from-linux.txt", b"l");
+        linux.sync(&r, &dev_linux, &roster, &no_seal).await.unwrap();
+        assert_eq!(
+            mac.sync(&r, &dev_mac, &roster, &no_seal)
+                .await
+                .unwrap()
+                .kind,
+            SyncKind::Merged
+        );
+        assert_eq!(mac.read("from-linux.txt").unwrap(), b"l");
+        icons_intact(&mac);
+        linux.sync(&r, &dev_linux, &roster, &no_seal).await.unwrap();
+        assert_eq!(linux.read("from-mac.txt").unwrap(), b"m");
+        assert!(linux.read("Icon\r").is_none());
+        assert!(linux.read("Photos/Icon\r").is_none());
+
+        std::fs::remove_dir_all(linux.dir.path().join("Photos")).unwrap();
+        linux.sync(&r, &dev_linux, &roster, &no_seal).await.unwrap();
+        assert_eq!(
+            mac.sync(&r, &dev_mac, &roster, &no_seal)
+                .await
+                .unwrap()
+                .kind,
+            SyncKind::Pulled
+        );
+        assert!(!mac.dir.path().join("Photos").exists());
+        assert_eq!(mac.read("Icon\r").unwrap(), b"root icon");
+        assert_eq!(
+            mac.sync(&r, &dev_mac, &roster, &no_seal)
+                .await
+                .unwrap()
+                .kind,
+            SyncKind::UpToDate
+        );
+        assert_eq!(
+            linux
+                .sync(&r, &dev_linux, &roster, &no_seal)
+                .await
+                .unwrap()
+                .kind,
+            SyncKind::UpToDate
+        );
+        assert!(!linux.dir.path().join("Photos").exists());
     }
 
-    /// §10/P8: with no local changes, a malicious server replaying an OLDER (ancestor) head must NOT
-    /// roll the working dir back — even when that head is signed by a device whose per-device
-    /// head_version high-water equals the replayed head's version (so gate 2b alone would pass). The
-    /// pull path must apply the "ancestor sibling is a no-op before the gates" rule.
+    /// A merge's pre-push seal carries the observed head but not the merged-in commits' versions.
     #[tokio::test]
-    async fn pull_path_refuses_ancestor_head_replay() {
-        use crate::{fetch_closure, fetch_head, push_head, push_objects};
-        use secsec_snapshot::{open_signed_commit, restore_commit_tree, seal_signed_commit};
-        use secsec_sync::ref_hash;
-
-        let dir = tempfile::tempdir().unwrap();
-        let m = MasterKey::new(1, [0x55; 32]);
+    async fn divergent_devices_merge_and_seal_only_what_the_base_vouches_for() {
+        let root = tempfile::tempdir().unwrap();
+        let r = MemRemote::new(Store::open(root.path().join("r.redb")).unwrap());
         let dev_a = DeviceKey::generate().unwrap();
         let dev_b = DeviceKey::generate().unwrap();
         let (ida, idb) = (dev_a.device_id().unwrap(), dev_b.device_id().unwrap());
-        let members: BTreeMap<DeviceId, DevicePublic> =
-            [(ida, dev_a.public()), (idb, dev_b.public())]
-                .into_iter()
-                .collect();
-        let remote = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
-        let auth = Store::open(dir.path().join("auth.redb")).unwrap();
+        let roster = roster_of(&[&dev_a, &dev_b]);
+        let mut a = Side::new(root.path(), "a.redb");
+        let mut b = Side::new(root.path(), "b.redb");
+        a.write("keep", b"k0");
+        a.write("shared", b"s0");
+        a.sync(&r, &dev_a, &roster, &no_seal).await.unwrap();
+        b.sync(&r, &dev_b, &roster, &no_seal).await.unwrap();
 
-        // B publishes C_b (head v1).
-        let wb = tempfile::tempdir().unwrap();
-        std::fs::write(wb.path().join("f"), b"vB").unwrap();
-        let (tb, sb, _) = snapshot_tree(wb.path(), &m, &auth, None).unwrap();
-        let c_b = seal_signed_commit(
-            &m,
-            &auth,
-            &dev_b,
-            &Commit {
-                root_tree: tb,
-                root_salt: sb,
-                parents: vec![],
-                device_id: idb,
-                version: 1,
-                roster_seq: 0,
-                last_seen_head: [0; 32],
-                ts: 0,
-            },
-        )
-        .unwrap();
-        push_objects(&remote, &auth, &m, &c_b, &[1; 16])
-            .await
-            .unwrap();
-        let (head_b, blob_b) = push_head(&remote, &m, &dev_b, "main", c_b, 0, None, &[1; 16])
-            .await
-            .unwrap();
-
-        // A advances to C_a (head v2, descends from C_b).
-        std::fs::write(wb.path().join("f"), b"vA").unwrap();
-        let (ta, sa, _) = snapshot_tree(wb.path(), &m, &auth, Some((&tb, &sb))).unwrap();
-        let c_a = seal_signed_commit(
-            &m,
-            &auth,
-            &dev_a,
-            &Commit {
-                root_tree: ta,
-                root_salt: sa,
-                parents: vec![c_b],
-                device_id: ida,
-                version: 1,
-                roster_seq: 0,
-                last_seen_head: c_b,
-                ts: 0,
-            },
-        )
-        .unwrap();
-        push_objects(&remote, &auth, &m, &c_a, &[2; 16])
-            .await
-            .unwrap();
-        let (_head_a, blob_a) = push_head(
-            &remote,
-            &m,
-            &dev_a,
-            "main",
-            c_a,
-            0,
-            Some((&head_b, blob_b.as_slice())),
-            &[2; 16],
-        )
-        .await
-        .unwrap();
-
-        // Our device: at base C_a, working dir == C_a, frontier observed both heads.
-        let c_store = Store::open(dir.path().join("c.redb")).unwrap();
-        fetch_closure(&remote, &c_store, &m, &c_a).await.unwrap();
-        let work = tempfile::tempdir().unwrap();
-        let (ca_commit, _) = open_signed_commit(&c_a, &m, &c_store).unwrap();
-        restore_commit_tree(&ca_commit, &m, &c_store, work.path()).unwrap();
-        let frontier = SyncFrontier {
-            roster_seq: 0,
-            head_version_hwm: BTreeMap::from([(ida, 2), (idb, 1)]),
-            commit_version_hwm: BTreeMap::from([(ida, 1), (idb, 1)]),
+        a.write("shared", b"from A");
+        a.sync(&r, &dev_a, &roster, &no_seal).await.unwrap();
+        b.write("shared", b"from B, longer");
+        let sealed = RefCell::new(Vec::new());
+        let capture = |f: &SyncFrontier| {
+            sealed.borrow_mut().push(f.clone());
+            Ok(())
         };
+        let out = b.sync(&r, &dev_b, &roster, &capture).await.unwrap();
+        assert_eq!(out.kind, SyncKind::Merged);
+        assert_eq!(out.conflicts, vec!["shared".to_string()]);
+        assert_eq!(b.read("shared").unwrap(), b"from B, longer");
+        let pre = sealed.borrow().last().cloned().unwrap();
+        assert_eq!(pre.head_version_hwm.get(&ida), Some(&2));
+        assert_eq!(
+            pre.commit_version_hwm.get(&ida),
+            Some(&1),
+            "A's v2 waits for the base"
+        );
+        assert_eq!(out.frontier.commit_version_hwm.get(&ida), Some(&2));
+        assert_eq!(pre.commit_version_hwm.get(&idb), Some(&2));
 
-        // Malicious server rolls /refs/main back to C_b's head.
-        let ref_h = ref_hash(&m.ref_name_key(), "main");
-        remote
-            .store
+        let rh = fetch_head(&r, &mk(), "main").await.unwrap().unwrap();
+        assert_eq!(Some(rh.0.commit_id), b.base);
+        assert_eq!(
+            a.sync(&r, &dev_a, &roster, &no_seal).await.unwrap().kind,
+            SyncKind::Pulled
+        );
+        assert_eq!(a.read("shared").unwrap(), b"from B, longer");
+        assert!(a.names().iter().any(|n| n.starts_with("shared.conflict-")));
+    }
+
+    /// §8.5: the seal runs before the ref-advancing push, so its failure publishes nothing.
+    #[tokio::test]
+    async fn seal_failure_aborts_before_publishing() {
+        let root = tempfile::tempdir().unwrap();
+        let r = MemRemote::new(Store::open(root.path().join("r.redb")).unwrap());
+        let dev = DeviceKey::generate().unwrap();
+        let roster = roster_of(&[&dev]);
+        let mut a = Side::new(root.path(), "a.redb");
+        a.write("f.txt", b"v1");
+        let failing = |_: &SyncFrontier| Err(ClientError::Io(std::io::Error::other("seal failed")));
+        assert!(matches!(
+            a.sync(&r, &dev, &roster, &failing).await,
+            Err(ClientError::Io(_))
+        ));
+        assert!(fetch_head(&r, &mk(), "main").await.unwrap().is_none());
+    }
+
+    /// A clone of a head below the persisted head high-water is a rollback alarm, not a restore.
+    #[tokio::test]
+    async fn clone_rejects_a_head_below_the_frontier() {
+        let root = tempfile::tempdir().unwrap();
+        let r = MemRemote::new(Store::open(root.path().join("r.redb")).unwrap());
+        let dev = DeviceKey::generate().unwrap();
+        let roster = roster_of(&[&dev]);
+        let mut a = Side::new(root.path(), "a.redb");
+        a.write("f", b"x");
+        a.sync(&r, &dev, &roster, &no_seal).await.unwrap();
+        let mut b = Side::new(root.path(), "b.redb");
+        b.frontier.head_version_hwm = BTreeMap::from([(dev.device_id().unwrap(), 5)]);
+        assert!(matches!(
+            b.sync(&r, &dev, &roster, &no_seal).await,
+            Err(ClientError::Merge(MergeError::Rollback(
+                MergeReject::HeadRollback {
+                    head_version: 1,
+                    hwm: 5,
+                    ..
+                }
+            )))
+        ));
+        assert!(b.names().is_empty());
+    }
+
+    /// §10/P8: a replayed ancestor head never rolls the folder back; the device converges by republishing its base.
+    #[tokio::test]
+    async fn an_ancestor_head_replay_is_repaired_not_restored() {
+        let root = tempfile::tempdir().unwrap();
+        let r = MemRemote::new(Store::open(root.path().join("r.redb")).unwrap());
+        let dev_a = DeviceKey::generate().unwrap();
+        let dev_b = DeviceKey::generate().unwrap();
+        let roster = roster_of(&[&dev_a, &dev_b]);
+        let m = mk();
+        let mut b = Side::new(root.path(), "b.redb");
+        b.write("f", b"vB");
+        b.sync(&r, &dev_b, &roster, &no_seal).await.unwrap();
+        let (_, _, blob_b) = fetch_head(&r, &m, "main").await.unwrap().unwrap();
+
+        let mut a = Side::new(root.path(), "a.redb");
+        a.sync(&r, &dev_a, &roster, &no_seal).await.unwrap();
+        a.write("f", b"vA");
+        assert_eq!(
+            a.sync(&r, &dev_a, &roster, &no_seal).await.unwrap().kind,
+            SyncKind::Pushed
+        );
+        let c_a = a.base.unwrap();
+        let (_, _, blob_a) = fetch_head(&r, &m, "main").await.unwrap().unwrap();
+
+        // The server rolls /refs/main back to B's older head.
+        let ref_h = secsec_sync::ref_hash(&secsec_kdf::MasterKeys::ref_name_key(&m), "main");
+        r.store
             .cas_ref(&ref_h, blake3::hash(&blob_a).as_bytes(), &blob_b, &[0; 16])
             .unwrap();
+        let out = a.sync(&r, &dev_a, &roster, &no_seal).await.unwrap();
+        assert_eq!(out.kind, SyncKind::Pushed);
+        assert_eq!(out.base, Some(c_a));
+        assert_eq!(a.read("f").unwrap(), b"vA");
         assert_eq!(
-            fetch_head(&remote, &m, "main")
+            fetch_head(&r, &m, "main")
                 .await
                 .unwrap()
                 .unwrap()
                 .0
                 .commit_id,
-            c_b,
-            "the server now serves the rolled-back head"
-        );
-
-        // Sync with no local change: must NOT roll the working dir back to C_b.
-        let seal = |_: &SyncFrontier| Ok::<(), ClientError>(());
-        let out = sync_once(
-            &remote,
-            &c_store,
-            work.path(),
-            &m,
-            &dev_a,
-            &members,
-            &frontier,
-            "main",
-            0,
-            Some(c_a),
-            0,
-            &[3; 16],
-            &seal,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            out.kind,
-            SyncKind::UpToDate,
-            "an ancestor-head replay must be a no-op, not a rollback"
-        );
-        assert_eq!(out.base, Some(c_a), "base must stay at C_a");
-        assert_eq!(
-            std::fs::read(work.path().join("f")).unwrap(),
-            b"vA",
-            "the working dir must not roll back to B's content"
+            c_a
         );
     }
 }

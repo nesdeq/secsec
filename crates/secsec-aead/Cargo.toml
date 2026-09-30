@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 chacha20 = { version = "0.9", features = ["zeroize"] }
 poly1305 = { version = "0.8", features = ["zeroize"] }
-blake3 = "1"
+blake3 = { version = "1", features = ["zeroize"] }
 subtle = "2"
 zeroize = "1"
 

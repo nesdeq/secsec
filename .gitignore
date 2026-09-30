@@ -2,10 +2,7 @@
 # `fuzz/` is its own workspace (libfuzzer-sys needs nightly), so it builds to its own target dir.
 /fuzz/target
 /fuzz/Cargo.lock
-**/*.rs.bk
+/fuzz/corpus
+/fuzz/artifacts
 .DS_Store
-
-# Local working docs (audit verdict, session state map, follow-up notes); never committed.
-/todo.md
-/state.md
-/continue.md
+claude.continue

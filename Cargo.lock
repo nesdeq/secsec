@@ -113,6 +113,9 @@ name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "autocfg"
@@ -202,6 +205,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -303,9 +307,9 @@ dependencies = [
 
 [[package]]
 name = "chacha20"
-version = "0.10.0"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -1553,7 +1557,7 @@ version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
 dependencies = [
- "chacha20 0.10.0",
+ "chacha20 0.10.2",
  "getrandom 0.4.2",
  "rand_core 0.10.1",
 ]
@@ -1758,9 +1762,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "log",
  "once_cell",
@@ -1783,9 +1787,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -1843,13 +1847,19 @@ dependencies = [
  "quinn",
  "rcgen",
  "rpassword",
+ "rustix",
  "secsec-client",
+ "secsec-engine",
+ "secsec-kdf",
  "secsec-proto",
+ "secsec-roster",
  "secsec-server",
  "secsec-sig",
+ "secsec-snapshot",
  "secsec-store",
  "secsec-sync",
  "secsec-transport",
+ "socket2",
  "tempfile",
  "tokio",
  "zeroize",
@@ -1880,6 +1890,7 @@ name = "secsec-chunk"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "zeroize",
 ]
 
 [[package]]
@@ -1939,9 +1950,11 @@ dependencies = [
 name = "secsec-fuzz"
 version = "0.0.0"
 dependencies = [
+ "secsec-client",
  "secsec-frame",
  "secsec-kdf",
  "secsec-object",
+ "secsec-pq",
  "secsec-proto",
  "secsec-roster",
  "secsec-snapshot",
@@ -1954,7 +1967,6 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "secsec-aead",
- "secsec-canon",
  "zeroize",
 ]
 
@@ -1968,6 +1980,7 @@ dependencies = [
  "secsec-frame",
  "secsec-kdf",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1999,6 +2012,7 @@ name = "secsec-roster"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "getrandom 0.3.4",
  "proptest",
  "secsec-aead",
  "secsec-canon",
@@ -2058,6 +2072,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "redb",
+ "secsec-frame",
  "tempfile",
 ]
 
@@ -2172,6 +2187,16 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
 
 [[package]]
 name = "signature"
@@ -2413,6 +2438,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -2946,7 +2972,10 @@ dependencies = [
 name = "xtask"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "secsec-aead",
+ "secsec-chunk",
+ "secsec-client",
  "secsec-frame",
  "secsec-kdf",
  "secsec-object",

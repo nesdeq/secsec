@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Build tooling: mechanical KAT vector generation + reproducible musl release (secsec-Design.md §3, §20)."
+description = "Build tooling: the KAT anti-drift check and the reproducible static release recipe (secsec-Implementation.md §3, secsec-Design.md §18)."
 
 [lints]
 workspace = true
@@ -14,6 +14,9 @@ secsec-kdf = { path = "../crates/secsec-kdf" }
 secsec-frame = { path = "../crates/secsec-frame" }
 secsec-aead = { path = "../crates/secsec-aead" }
 secsec-object = { path = "../crates/secsec-object" }
+secsec-chunk = { path = "../crates/secsec-chunk" }
 secsec-sync = { path = "../crates/secsec-sync" }
-secsec-roster = { path = "../crates/secsec-roster" }
+secsec-roster = { path = "../crates/secsec-roster", features = ["legacy-v1"] }
 secsec-transport = { path = "../crates/secsec-transport" }
+secsec-client = { path = "../crates/secsec-client" }
+blake3 = "1"

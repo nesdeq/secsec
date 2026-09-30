@@ -1,63 +1,62 @@
-//! `secsec-server` — the §12 per-op request handler over the content-addressed store
-//! (`secsec-Design.md` §12, §19). Pipeline: keyslot existence → per-op signature over the recomputed
-//! `args_hash` + session transcript (+ single-use `server_nonce` for writes) → §19 limits → execute.
-//! The server is **blind**: blobs are opaque (clients re-check content addresses on fetch, §9.2),
-//! a push stages objects and the winning `cas-head` atomically promotes them, and `prune` is a
-//! compare-and-swap against the server's head/roster state (§15). The handler is pure and
-//! clock-injected (`now`) — [`Server::handle`] unit-tests, no sockets.
+//! The §12 per-op request handler over the blind store (`secsec-Design.md` §12, §15, §19), pure and clock-injected.
 
 #![forbid(unsafe_code)]
 
 pub mod serve;
 
 use secsec_frame::MAX_BLOB_SIZE;
-use secsec_proto::server::{limits, Limits, NonceStore, StorageQuota, TokenBucket, WindowCounter};
+use secsec_proto::prune;
+use secsec_proto::server::{limits, Limits, StorageQuota, TokenBucket, WindowCounter};
 use secsec_proto::wire::{ErrorCode, Request, Response};
-use secsec_proto::{op, op_and_args, prune, ReadAuth, WriteAuth};
+use secsec_proto::{op_and_args, ReadAuth, WriteAuth};
 use secsec_sig::{DeviceId, DevicePublic};
-use secsec_store::Store;
+use secsec_store::{HeadSwap, KeyslotWrite, RosterBatch, Store, ABSENT_HEAD};
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
-/// Pairing-mailbox entry TTL (§7 invite onboarding): the agreed invite lifetime (~10 minutes). An
-/// unclaimed pairing slot is evicted after this; an invite is single-use and short-lived.
+/// Pairing-mailbox slot lifetime `PAIR_TTL` (§7, §19).
 const PAIR_TTL_SECS: u64 = 600;
-/// Anti-abuse cap on concurrent pairing-mailbox slots (each ≤ `MAX_ROSTER_ENTRY_SIZE`, TTL-evicted).
+/// Concurrent pairing slots, server-wide (§19).
 const MAX_PAIR_SLOTS: usize = 256;
 
-/// One authenticated per-op request, as resolved by the connection-auth + framing layers: the
-/// connection's authenticated public key, the operation, its per-op signature, the session
-/// transcript, and (for writes) the `server_nonce` the client signed.
+/// The per-stream challenge a write signs, with the time it was issued (§11, §19 TTL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IssuedNonce {
+    /// The OS-CSPRNG nonce sent on the stream.
+    pub nonce: [u8; 32],
+    /// Issue time, unix seconds.
+    pub issued_at: u64,
+}
+
+/// One authenticated request as the serve loop resolved it.
 pub struct Incoming<'a> {
-    /// The public key that completed connection auth on this connection.
+    /// The key that completed connection auth.
     pub pubkey: &'a DevicePublic,
-    /// The requested operation.
+    /// The operation.
     pub request: Request,
-    /// The per-op `secsec-write-v1` / `secsec-read-v1` signature.
+    /// The per-op signature.
     pub op_sig: Vec<u8>,
     /// The connection's session transcript (§11).
     pub session_transcript: [u8; 32],
-    /// The `server_nonce` the client signed (writes only; `None` for reads).
-    pub server_nonce: Option<[u8; 32]>,
+    /// This stream's challenge (every stream gets one; only writes sign it).
+    pub server_nonce: Option<IssuedNonce>,
 }
 
-/// The mutable rate-limit / replay state, behind a fast `std::sync::Mutex` locked only for counter
-/// updates (no I/O, no `await`); the redb store is transactional and accessed lock-free.
+/// Rate-limit and mailbox state behind one short-held mutex (no I/O under the lock).
 #[derive(Default)]
 struct ServerState {
-    nonces: NonceStore,
     write_buckets: HashMap<DeviceId, TokenBucket>,
     read_buckets: HashMap<DeviceId, TokenBucket>,
     quotas: HashMap<DeviceId, StorageQuota>,
-    /// Per-connection-identity sigchain-append counter (§8.1: ≤ 60 roster-appends per key per hour).
     sigchain_calls: HashMap<DeviceId, WindowCounter>,
-    /// §7 invite-onboarding mailbox: `slot → (blob, expiry)`. Transient, never persisted, TTL-evicted.
+    /// §7 mailbox `slot → (blob, expiry)`: in memory, TTL-evicted, taken on read.
     pairing: HashMap<[u8; 32], (Vec<u8>, u64)>,
-    /// Live concurrent connections per authenticated key (§19: ≤ `MAX_CONCURRENT_CONNS_PER_KEY`).
     conn_counts: HashMap<DeviceId, u32>,
+    /// Connections holding a server-wide [`Admission`].
+    open_conns: u64,
 }
 
 impl ServerState {
-    /// Post to a pairing slot (evicting expired entries first); `false` if the mailbox is full.
     fn pair_put(&mut self, slot: [u8; 32], blob: Vec<u8>, now: u64) -> bool {
         self.pairing.retain(|_, (_, exp)| *exp > now);
         if self.pairing.len() >= MAX_PAIR_SLOTS && !self.pairing.contains_key(&slot) {
@@ -67,10 +66,10 @@ impl ServerState {
         true
     }
 
-    /// Read a pairing slot (`None` if empty/expired), evicting expired entries.
-    fn pair_get(&mut self, slot: &[u8; 32], now: u64) -> Option<Vec<u8>> {
+    /// Take a slot: a pairing message is delivered once, then gone (§7 single use).
+    fn pair_take(&mut self, slot: &[u8; 32], now: u64) -> Option<Vec<u8>> {
         self.pairing.retain(|_, (_, exp)| *exp > now);
-        self.pairing.get(slot).map(|(b, _)| b.clone())
+        self.pairing.remove(slot).map(|(b, _)| b)
     }
 
     fn take_write(&mut self, d: DeviceId, n: u64, now: u64, rate: u64) -> bool {
@@ -80,9 +79,7 @@ impl ServerState {
             .try_take(n, now)
     }
 
-    /// Per-key read byte-rate (configurable; default 200 MB/s sustained). The burst reuses the §19
-    /// write-burst constant (1 GiB ≥ MAX_BLOB_SIZE) so a single object always fits and an initial
-    /// clone is never starved; only sustained egress is bounded.
+    /// Reads share the write burst (≥ the object cap, so one object always fits); only sustained egress is bounded.
     fn take_read(&mut self, d: DeviceId, n: u64, now: u64, rate: u64) -> bool {
         self.read_buckets
             .entry(d)
@@ -90,8 +87,7 @@ impl ServerState {
             .try_take(n, now)
     }
 
-    /// Record a roster-append for the per-connection-identity hourly cap (§8.1: ≤ 60/key/hour).
-    fn sigchain_record(&mut self, d: DeviceId, now: u64) -> bool {
+    fn sigchain_record(&mut self, d: DeviceId, n: u64, now: u64) -> bool {
         self.sigchain_calls
             .entry(d)
             .or_insert_with(|| {
@@ -100,20 +96,18 @@ impl ServerState {
                     limits::MAX_SIGCHAIN_ENTRIES_PER_CONN_PER_HOUR,
                 )
             })
-            .try_record(now)
+            .try_record_n(now, n)
     }
 
-    /// Refund a slot charged by [`sigchain_record`](Self::sigchain_record) when the append lost the
-    /// tip CAS — a benign racer must not burn one of its 60/hr slots (§8.1).
-    fn sigchain_refund(&mut self, d: DeviceId) {
+    fn sigchain_refund(&mut self, d: DeviceId, n: u64) {
         if let Some(w) = self.sigchain_calls.get_mut(&d) {
-            w.refund();
+            w.refund(n);
         }
     }
 
     fn add_quota(&mut self, d: DeviceId, n: u64, cap: u64) -> bool {
         if cap == 0 {
-            return true; // unlimited (the default, §15)
+            return true;
         }
         self.quotas
             .entry(d)
@@ -121,40 +115,36 @@ impl ServerState {
             .try_add(n)
     }
 
-    /// Return `n` reserved bytes to a key's cap — used when a charged `cas-head` then lost its CAS, so
-    /// a benign racer is not permanently charged for objects it never promoted.
     fn release_quota(&mut self, d: DeviceId, n: u64) {
         if let Some(q) = self.quotas.get_mut(&d) {
             q.release(n);
         }
     }
+
+    /// Forget idle per-key state (full buckets, empty windows) and expired mailbox slots; quotas persist for the session.
+    fn sweep_idle(&mut self, now: u64) {
+        self.write_buckets.retain(|_, b| !b.is_full(now));
+        self.read_buckets.retain(|_, b| !b.is_full(now));
+        self.sigchain_calls.retain(|_, w| w.count(now) > 0);
+        self.pairing.retain(|_, (_, exp)| *exp > now);
+    }
 }
 
-/// The server's per-op handler. Object ops hit the redb store lock-free (redb is transactional);
-/// only [`ServerState`] is mutex-guarded. `handle` takes `&self`, so the server is shared via
-/// `Arc<Server>` and serves requests concurrently.
-pub struct Server {
-    store: Store,
-    state: std::sync::Mutex<ServerState>,
-    /// Operator-tunable runtime limits (§19 `secsec.config`); default to the §19 normative values.
-    limits: Limits,
-    /// The **mandatory** connection allow-list (the operator's `authorized_keys`), re-read per
-    /// connection so adding a key needs no restart. Gates who can talk at all, including pairing
-    /// (§7); membership/decryption is the separate crypto roster + keyslots (§8).
-    authorized: Authorized,
-}
-
-/// The server's connection allow-list source (§11/§12).
+/// The connection allow-list source (§11).
 pub(crate) enum Authorized {
-    /// Allow any authenticated key to connect (tests / in-process backends only).
+    /// Any authenticated key (in-process tests only).
     Any,
-    /// Re-read `~/.ssh/authorized_keys` (the OpenSSH `authorized_keys` file) on every check, so the
-    /// operator can add/remove devices live. Unreadable ⇒ deny (fail closed).
-    File(std::path::PathBuf),
+    /// The operator's `authorized_keys`, re-parsed whenever its size or mtime changes; unreadable denies.
+    File {
+        path: std::path::PathBuf,
+        cache: std::sync::Mutex<Option<(AuthStamp, BTreeSet<DeviceId>)>>,
+    },
 }
 
-/// Parse an OpenSSH `authorized_keys` file body into the set of permitted Ed25519 device ids
-/// (`device_id = BLAKE3(canonical(pubkey))`). Comment/blank/non-Ed25519 lines are skipped.
+/// The `(mtime, len)` a parsed `authorized_keys` was read at.
+type AuthStamp = (Option<std::time::SystemTime>, u64);
+
+/// Parse an OpenSSH `authorized_keys` body into the permitted Ed25519 device ids; other lines are skipped.
 #[must_use]
 pub fn parse_authorized_keys(body: &str) -> BTreeSet<DeviceId> {
     let mut set = BTreeSet::new();
@@ -170,16 +160,16 @@ pub fn parse_authorized_keys(body: &str) -> BTreeSet<DeviceId> {
     set
 }
 
+/// The per-op handler; object ops hit the transactional store directly, only [`ServerState`] is locked.
+pub struct Server {
+    store: Store,
+    state: std::sync::Mutex<ServerState>,
+    limits: Limits,
+    authorized: Authorized,
+}
+
 impl Server {
-    /// Build a handler over `store` with default limits and an open allow-list (tighten with
-    /// [`with_limits`](Self::with_limits) / [`with_authorized_file`](Self::with_authorized_file)).
-    ///
-    /// # Safety
-    /// The default allow-list is [`Authorized::Any`] — **every** authenticated key may open a session
-    /// (the connection gate is off). Any networked deployment MUST call
-    /// [`with_authorized_file`](Self::with_authorized_file) to enable the mandatory `authorized_keys`
-    /// gate (§11); `secsec serve` does this and refuses to start without a usable file. The open
-    /// default exists only for in-process/test backends.
+    /// A handler with default limits and an OPEN allow-list; networked use MUST call [`Self::with_authorized_file`].
     #[must_use]
     pub fn new(store: Store) -> Self {
         Self {
@@ -190,140 +180,129 @@ impl Server {
         }
     }
 
-    /// Apply operator-tuned runtime limits (§19 `secsec.config`); unset values keep their §19 defaults.
+    /// Apply operator-tuned runtime limits (§19).
     #[must_use]
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self
     }
 
-    /// The configured per-source-IP new-connection rate (the serve accept loop enforces it, §19).
+    /// The per-source-IP new-connection rate the accept loop enforces (§19).
     #[must_use]
     pub fn conn_rate_per_sec(&self) -> u64 {
         self.limits.conn_rate_per_sec
     }
 
-    /// Gate connections on the operator's `authorized_keys` **file**, re-read per connection so adding
-    /// a device takes effect with no restart. This is the mandatory `secsec serve` configuration.
+    /// Gate connections on the operator's `authorized_keys` file (the mandatory `serve` configuration, §11).
     #[must_use]
     pub fn with_authorized_file(mut self, path: std::path::PathBuf) -> Self {
-        self.authorized = Authorized::File(path);
+        self.authorized = Authorized::File {
+            path,
+            cache: std::sync::Mutex::new(None),
+        };
         self
     }
 
-    /// Whether `device_id` is permitted to connect. `File` is re-read on each call (unreadable ⇒ deny).
+    /// Whether `device_id` may connect; the file is re-parsed when it changes and denies when unreadable.
     #[must_use]
-    pub(crate) fn is_authorized(&self, device_id: &DeviceId) -> bool {
+    pub fn is_authorized(&self, device_id: &DeviceId) -> bool {
         match &self.authorized {
             Authorized::Any => true,
-            Authorized::File(path) => std::fs::read_to_string(path)
-                .map(|body| parse_authorized_keys(&body).contains(device_id))
-                .unwrap_or(false),
+            Authorized::File { path, cache } => {
+                let Ok(meta) = std::fs::metadata(path) else {
+                    return false;
+                };
+                let stamp = (meta.modified().ok(), meta.len());
+                let mut cache = cache.lock().expect("authorized cache");
+                if cache.as_ref().map(|(s, _)| *s) != Some(stamp) {
+                    let Ok(body) = std::fs::read_to_string(path) else {
+                        *cache = None;
+                        return false;
+                    };
+                    *cache = Some((stamp, parse_authorized_keys(&body)));
+                }
+                cache
+                    .as_ref()
+                    .is_some_and(|(_, set)| set.contains(device_id))
+            }
         }
     }
 
-    /// Borrow the underlying object + keyslot store (e.g. for enrollment writes by the orchestration
-    /// layer, or `keyslot_exists` queries).
+    /// Borrow the store (tests).
     #[cfg(test)]
     #[must_use]
     pub fn store(&self) -> &Store {
         &self.store
     }
 
-    /// Reclaim in-flight pushes idle past `ttl_secs` (§15). The serve loop drives this on a background
-    /// interval so abandoned staging cannot accumulate on a server that no client is actively pushing
-    /// to. Returns the number of pushes reclaimed.
-    pub fn reclaim_staging(
-        &self,
-        now: u64,
-        ttl_secs: u64,
-    ) -> Result<u64, secsec_store::StoreError> {
+    /// Whether `device_id` owns a keyslot; a store error is `Err`, never "enrolled" (§12).
+    pub fn is_enrolled(&self, device_id: &DeviceId) -> Result<bool, secsec_store::StoreError> {
+        self.store.keyslot_exists(device_id)
+    }
+
+    /// Reclaim pushes idle past `ttl_secs` (§15) and forget idle rate-limit state; driven by the serve loop's timer.
+    pub fn reclaim(&self, now: u64, ttl_secs: u64) -> Result<u64, secsec_store::StoreError> {
+        self.state.lock().expect("server state").sweep_idle(now);
         self.store.reclaim_staging(now, ttl_secs)
     }
 
-    /// Issue a fresh `server_nonce` challenge (the caller draws it from the OS CSPRNG and sends it to
-    /// the client). It is honoured once, within the §19 TTL.
-    pub(crate) fn issue_nonce(&self, nonce: [u8; 32], now: u64) {
-        self.state
-            .lock()
-            .expect("server state")
-            .nonces
-            .issue(nonce, now);
-    }
-
-    fn consume_nonce(&self, nonce: &[u8; 32], now: u64) -> bool {
-        self.state
-            .lock()
-            .expect("server state")
-            .nonces
-            .consume(nonce, now)
+    fn with_state<T>(&self, f: impl FnOnce(&mut ServerState) -> T) -> T {
+        f(&mut self.state.lock().expect("server state"))
     }
 
     fn take_write(&self, d: DeviceId, n: u64, now: u64) -> bool {
-        self.state
-            .lock()
-            .expect("server state")
-            .take_write(d, n, now, self.limits.write_rate)
-    }
-
-    fn add_quota(&self, d: DeviceId, n: u64) -> bool {
-        self.state
-            .lock()
-            .expect("server state")
-            .add_quota(d, n, self.limits.storage_cap)
-    }
-
-    fn release_quota(&self, d: DeviceId, n: u64) {
-        self.state.lock().expect("server state").release_quota(d, n);
+        let rate = self.limits.write_rate;
+        self.with_state(|s| s.take_write(d, n, now, rate))
     }
 
     fn take_read(&self, d: DeviceId, n: u64, now: u64) -> bool {
-        self.state
-            .lock()
-            .expect("server state")
-            .take_read(d, n, now, self.limits.read_rate)
+        let rate = self.limits.read_rate;
+        self.with_state(|s| s.take_read(d, n, now, rate))
     }
 
-    fn sigchain_allow(&self, d: DeviceId, now: u64) -> bool {
-        self.state
-            .lock()
-            .expect("server state")
-            .sigchain_record(d, now)
-    }
-
-    fn sigchain_refund(&self, d: DeviceId) {
-        self.state.lock().expect("server state").sigchain_refund(d);
-    }
-
-    /// Reserve a concurrent-connection slot for `d` (§19: ≤ `MAX_CONCURRENT_CONNS_PER_KEY` per
-    /// authenticated key). Returns `true` if reserved (the caller MUST [`release_conn`](Self::release_conn)
-    /// on disconnect, e.g. via [`ConnGuard`]); `false` if the key is already at its cap.
+    /// Reserve a concurrent-connection slot for `d` (§19); release it via [`Self::release_conn`].
     #[must_use]
     pub(crate) fn acquire_conn(&self, d: DeviceId) -> bool {
         let max = self.limits.max_conns_per_key;
-        let mut st = self.state.lock().expect("server state");
-        let n = st.conn_counts.entry(d).or_insert(0);
-        if u64::from(*n) >= max {
-            false
-        } else {
-            *n += 1;
-            true
-        }
-    }
-
-    /// Release a slot reserved by [`acquire_conn`](Self::acquire_conn).
-    pub(crate) fn release_conn(&self, d: DeviceId) {
-        let mut st = self.state.lock().expect("server state");
-        if let Some(n) = st.conn_counts.get_mut(&d) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                st.conn_counts.remove(&d);
+        self.with_state(|st| {
+            let n = st.conn_counts.entry(d).or_insert(0);
+            if u64::from(*n) >= max {
+                false
+            } else {
+                *n += 1;
+                true
             }
-        }
+        })
     }
 
-    /// Charge a read against the §19 per-key read byte-rate; `RateLimit` when the bucket is
-    /// exhausted.
+    /// Release a slot from [`Self::acquire_conn`].
+    pub(crate) fn release_conn(&self, d: DeviceId) {
+        self.with_state(|st| {
+            if let Some(n) = st.conn_counts.get_mut(&d) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    st.conn_counts.remove(&d);
+                }
+            }
+        });
+    }
+
+    /// Admit one connection under the server-wide cap (§19), taken before its handshake; `None` when full.
+    #[must_use]
+    pub fn admit(self: &Arc<Self>) -> Option<Admission> {
+        let max = self.limits.max_connections;
+        let admitted = self.with_state(|st| {
+            if st.open_conns >= max {
+                false
+            } else {
+                st.open_conns += 1;
+                true
+            }
+        });
+        admitted.then(|| Admission(Arc::clone(self)))
+    }
+
+    /// Serve a read, charged against the per-key read rate.
     fn read_charged(
         &self,
         d: DeviceId,
@@ -342,125 +321,107 @@ impl Server {
         }
     }
 
-    fn pair_put(&self, slot: [u8; 32], blob: Vec<u8>, now: u64) -> bool {
-        self.state
-            .lock()
-            .expect("server state")
-            .pair_put(slot, blob, now)
-    }
-
-    fn pair_get(&self, slot: &[u8; 32], now: u64) -> Option<Vec<u8>> {
-        self.state.lock().expect("server state").pair_get(slot, now)
-    }
-
-    /// §7 pairing mailbox, dispatched **pre-enrollment** (a joiner owns no keyslot yet). Read-auth
-    /// proves the connecting key; the payload is MAC'd under the invite code end to end and slot ids
-    /// are `BLAKE3::derive_key(label, code)`, so the blind server only relays + TTLs.
-    fn handle_pair(&self, inc: Incoming<'_>, now: u64) -> Response {
-        let (op_label, args_hash, _) = op_and_args(&inc.request);
-        let ra = ReadAuth {
-            op: op_label,
-            args_hash,
-            session_transcript: inc.session_transcript,
+    /// Verify the per-op signature over the recomputed `args_hash`; a write must also be inside its nonce's TTL.
+    fn authorize(&self, inc: &Incoming<'_>, now: u64) -> Result<(), ErrorCode> {
+        let (op_label, args_hash, is_write) = op_and_args(&inc.request);
+        let ok = if is_write {
+            let Some(n) = inc.server_nonce else {
+                return Err(ErrorCode::BadAuth);
+            };
+            if now < n.issued_at || now.saturating_sub(n.issued_at) >= limits::SERVER_NONCE_TTL_SECS
+            {
+                return Err(ErrorCode::BadAuth);
+            }
+            WriteAuth {
+                op: op_label,
+                args_hash,
+                session_transcript: inc.session_transcript,
+                server_nonce: n.nonce,
+            }
+            .verify(inc.pubkey, &inc.op_sig)
+            .is_ok()
+        } else {
+            ReadAuth {
+                op: op_label,
+                args_hash,
+                session_transcript: inc.session_transcript,
+            }
+            .verify(inc.pubkey, &inc.op_sig)
+            .is_ok()
         };
-        if ra.verify(inc.pubkey, &inc.op_sig).is_err() {
-            return Response::Err(ErrorCode::BadAuth);
+        if ok {
+            Ok(())
+        } else {
+            Err(ErrorCode::BadAuth)
         }
+    }
+
+    /// The genesis exception (§7, §12): an unenrolled key may send exactly the genesis batch, only onto an empty roster.
+    fn is_genesis_batch(&self, req: &Request, device_id: &DeviceId) -> Result<bool, ErrorCode> {
+        let Request::RosterBatch {
+            old_tip,
+            entries,
+            keyslots,
+            keyhist,
+            roster_keyhist,
+            revoke,
+            head,
+        } = req
+        else {
+            return Ok(false);
+        };
+        let shape = *old_tip == ABSENT_HEAD
+            && entries.len() == 1
+            && keyslots.len() == 1
+            && keyslots[0].device_id == *device_id
+            && keyhist.is_none()
+            && roster_keyhist.is_none()
+            && revoke.is_empty()
+            && head.is_none();
+        if !shape {
+            return Ok(false);
+        }
+        self.store
+            .roster_len()
+            .map(|n| n == 0)
+            .map_err(|_| ErrorCode::Internal)
+    }
+
+    /// Run the §12 pipeline for one request.
+    pub(crate) fn handle(&self, inc: Incoming<'_>, now: u64) -> Response {
         let device_id = match inc.pubkey.device_id() {
             Ok(d) => d,
             Err(_) => return Response::Err(ErrorCode::BadRequest),
         };
-        match inc.request {
-            Request::PairPut { slot, blob } => {
-                // Rate-limit posts via the connecting key's write bucket (anti-mailbox-flood).
-                if !self.take_write(device_id, blob.len() as u64, now) {
-                    return Response::Err(ErrorCode::RateLimit);
-                }
-                if self.pair_put(slot, blob, now) {
-                    Response::Ok
-                } else {
-                    Response::Err(ErrorCode::RateLimit)
-                }
-            }
-            Request::PairGet { slot } => Response::Blob(self.pair_get(&slot, now)),
-            _ => Response::Err(ErrorCode::Internal),
-        }
-    }
-
-    /// Run the §12 pipeline for one request and return the response.
-    pub(crate) fn handle(&self, inc: Incoming<'_>, now: u64) -> Response {
-        // (0) Pairing mailbox (§7 invite onboarding): allowed PRE-enrollment (a joining device owns no
-        // keyslot yet), so dispatch it before the keyslot-existence check.
+        // (0) The pairing mailbox runs before enrollment: a joiner owns no keyslot yet (§7).
         if matches!(
             inc.request,
             Request::PairPut { .. } | Request::PairGet { .. }
         ) {
-            return self.handle_pair(inc, now);
+            if let Err(c) = self.authorize(&inc, now) {
+                return Response::Err(c);
+            }
+            return self.handle_pair(inc.request, device_id, now);
         }
 
-        // (1) keyslot existence: the connecting key must be rostered, with the genesis-bootstrap
-        // exception below. (Connection-level access via authorized_keys is enforced up in `serve`.)
-        let device_id = match inc.pubkey.device_id() {
-            Ok(d) => d,
-            Err(_) => return Response::Err(ErrorCode::BadRequest),
-        };
-        // keyslot presence only (no decryption) — a store error fails closed.
-        if !self.store.keyslot_exists(&device_id).unwrap_or(false) {
-            // Genesis exception (§7/§12): while the roster is empty, the first device may write the
-            // genesis sigchain entry and ITS OWN keyslot only — `owner == device_id` stops an
-            // unenrolled key squatting a keyslot for an arbitrary device_id.
-            let genesis_bootstrap = self.store.roster_len().map(|n| n == 0).unwrap_or(false)
-                && match &inc.request {
-                    Request::RosterAppend { .. } => true,
-                    Request::PutKeyslot {
-                        device_id: owner, ..
-                    } => *owner == device_id,
-                    _ => false,
-                };
-            if !genesis_bootstrap {
-                return Response::Err(ErrorCode::NotEnrolled);
-            }
+        // (1) Keyslot existence, fail closed, with the bounded genesis exception.
+        match self.store.keyslot_exists(&device_id) {
+            Ok(true) => {}
+            Ok(false) => match self.is_genesis_batch(&inc.request, &device_id) {
+                Ok(true) => {}
+                Ok(false) => return Response::Err(ErrorCode::NotEnrolled),
+                Err(c) => return Response::Err(c),
+            },
+            Err(_) => return Response::Err(ErrorCode::Internal),
         }
 
-        // prune has a state-dependent args_hash (§15 compare-and-swap), so it is authorized separately
-        // from the generic op_and_args path below.
-        if matches!(inc.request, Request::Prune { .. }) {
-            return self.handle_prune(inc, now);
+        // (2) Per-op authorization.
+        if let Err(c) = self.authorize(&inc, now) {
+            return Response::Err(c);
         }
 
-        // (2) per-op authorization: recompute args_hash from the request and verify the signature.
-        let (op_label, args_hash, is_write) = op_and_args(&inc.request);
-        if is_write {
-            let Some(nonce) = inc.server_nonce else {
-                return Response::Err(ErrorCode::BadAuth);
-            };
-            let wa = WriteAuth {
-                op: op_label,
-                args_hash,
-                session_transcript: inc.session_transcript,
-                server_nonce: nonce,
-            };
-            if wa.verify(inc.pubkey, &inc.op_sig).is_err() {
-                return Response::Err(ErrorCode::BadAuth);
-            }
-            // (3) nonce freshness: consume exactly once (after verifying the sig binds it).
-            if !self.consume_nonce(&nonce, now) {
-                return Response::Err(ErrorCode::BadAuth);
-            }
-        } else {
-            let ra = ReadAuth {
-                op: op_label,
-                args_hash,
-                session_transcript: inc.session_transcript,
-            };
-            if ra.verify(inc.pubkey, &inc.op_sig).is_err() {
-                return Response::Err(ErrorCode::BadAuth);
-            }
-        }
-
-        // (4 + 5) limits + execute.
+        // (3) Limits, then execute.
         match inc.request {
-            // Reads are charged against the §19 per-key read byte-rate (200 MB/s sustained).
             Request::Get { id } => self.read_charged(device_id, self.store.get(&id), now),
             Request::GetRef { ref_h } => {
                 self.read_charged(device_id, self.store.get_ref(&ref_h), now)
@@ -496,20 +457,12 @@ impl Server {
                 push_id,
                 blob,
             } => {
-                // §11/§12 normative: MUST reject declared_size > 16 MiB outright (the wire decoder
-                // already caps the actual blob).
-                if declared_size as usize > MAX_BLOB_SIZE {
+                if declared_size as usize > MAX_BLOB_SIZE || blob.len() != declared_size as usize {
                     return Response::Err(ErrorCode::BadRequest);
                 }
-                if blob.len() != declared_size as usize {
-                    return Response::Err(ErrorCode::BadRequest);
-                }
-                // write byte-rate limit (§19: 100 MB/s sustained, 1 GiB burst). The per-key storage
-                // cap is charged at promote (cas-head), so abandoned staging is never charged.
                 if !self.take_write(device_id, blob.len() as u64, now) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
-                // Stage the object under this push; a winning cas-head promotes it durably (§15).
                 match self.store.stage(&push_id, &id, &blob, now) {
                     Ok(()) => Response::Ok,
                     Err(_) => Response::Err(ErrorCode::Internal),
@@ -521,167 +474,179 @@ impl Server {
                 new_head,
                 promote,
                 new_blob,
+            } => self.handle_cas(
+                device_id, ref_h, old_head, new_head, promote, &new_blob, now,
+            ),
+            Request::RosterBatch {
+                old_tip,
+                entries,
+                keyslots,
+                keyhist,
+                roster_keyhist,
+                revoke,
+                head,
             } => {
-                // The attached new head blob must hash to the signed new_head (§12 cas-head semantics).
-                if *blake3::hash(&new_blob).as_bytes() != new_head {
+                if entries.is_empty() {
                     return Response::Err(ErrorCode::BadRequest);
                 }
-                if !self.take_write(device_id, new_blob.len() as u64, now) {
+                let bytes: usize = entries.iter().map(Vec::len).sum::<usize>()
+                    + keyslots.iter().map(|k| k.blob.len()).sum::<usize>()
+                    + head.as_ref().map_or(0, |h| h.new_blob.len());
+                if !self.take_write(device_id, bytes as u64, now) {
                     return Response::Err(ErrorCode::RateLimit);
                 }
-                // Charge the per-key cap (§15) on the bytes this push would make durable, BEFORE
-                // promoting, so an over-cap promote is rejected rather than committed. A lost CAS
-                // promotes nothing, so its reservation is refunded.
-                let promote_bytes = self.store.staged_bytes(&promote).unwrap_or(0);
-                if promote_bytes > 0 && !self.add_quota(device_id, promote_bytes) {
-                    return Response::Err(ErrorCode::RateLimit);
-                }
-                // Atomic compare-and-swap on the server-visible blob hash, promoting this push's staged
-                // objects in the same transaction (blind server, §15/§12).
-                match self.store.cas_ref(&ref_h, &old_head, &new_blob, &promote) {
-                    Ok(outcome) if outcome.swapped => Response::Ok,
-                    Ok(_) => {
-                        self.release_quota(device_id, promote_bytes);
-                        Response::Err(ErrorCode::CasConflict)
-                    }
-                    Err(_) => {
-                        self.release_quota(device_id, promote_bytes);
-                        Response::Err(ErrorCode::Internal)
-                    }
-                }
-            }
-            Request::RosterAppend { old_tip, entry } => {
-                if !self.take_write(device_id, entry.len() as u64, now) {
-                    return Response::Err(ErrorCode::RateLimit);
-                }
-                // §8.1 server-enforced volume limits: ≤ 60 appends/key/hour + a total chain cap.
-                if !self.sigchain_allow(device_id, now) {
-                    return Response::Err(ErrorCode::RateLimit);
-                }
+                let n = entries.len() as u64;
                 match self.store.roster_len() {
-                    Ok(n) if n >= limits::MAX_TOTAL_SIGCHAIN => {
+                    Ok(len) if len.saturating_add(n) > limits::MAX_TOTAL_SIGCHAIN => {
                         return Response::Err(ErrorCode::RateLimit);
                     }
                     Ok(_) => {}
                     Err(_) => return Response::Err(ErrorCode::Internal),
                 }
-                // Append CAS-guarded by the /roster-head tip (§8.1): a racing append loses.
-                match self.store.append_roster(&old_tip, &entry) {
-                    Ok(Some(_seq)) => Response::Ok,
-                    // A CAS loss didn't grow the chain — refund so a benign race can't exhaust the
-                    // hourly budget and block a retried revocation (§8.1).
+                if !self.with_state(|s| s.sigchain_record(device_id, n, now)) {
+                    return Response::Err(ErrorCode::RateLimit);
+                }
+                let ks: Vec<KeyslotWrite<'_>> = keyslots
+                    .iter()
+                    .map(|k| KeyslotWrite {
+                        device_id: k.device_id,
+                        gen: k.gen,
+                        blob: &k.blob,
+                    })
+                    .collect();
+                let batch = RosterBatch {
+                    expected_tip: old_tip,
+                    entries: &entries,
+                    keyslots: &ks,
+                    keyhist: keyhist.as_ref().map(|(g, b)| (*g, b.as_slice())),
+                    roster_keyhist: roster_keyhist.as_ref().map(|(g, b)| (*g, b.as_slice())),
+                    revoke: &revoke,
+                    head: head.as_ref().map(|h| HeadSwap {
+                        ref_h: h.ref_h,
+                        expected_old: h.old_head,
+                        new_blob: &h.new_blob,
+                    }),
+                };
+                match self.store.roster_batch(&batch) {
+                    Ok(Some(_)) => Response::Ok,
+                    // A lost CAS grew nothing: refund, so a benign race never exhausts a retried revocation's budget.
                     Ok(None) => {
-                        self.sigchain_refund(device_id);
+                        self.with_state(|s| s.sigchain_refund(device_id, n));
                         Response::Err(ErrorCode::CasConflict)
                     }
-                    Err(_) => Response::Err(ErrorCode::Internal),
+                    Err(_) => {
+                        self.with_state(|s| s.sigchain_refund(device_id, n));
+                        Response::Err(ErrorCode::Internal)
+                    }
                 }
             }
-            // Enrollment write (§7/§8.4): opaque blob; authenticity is the recipient's `mk_commit`
-            // check, not the server's.
-            Request::PutKeyslot {
-                device_id: owner_id,
-                gen,
-                blob,
+            Request::Prune {
+                dead,
+                all_heads_hash,
+                roster_len,
             } => {
-                if !self.take_write(device_id, blob.len() as u64, now) {
-                    return Response::Err(ErrorCode::RateLimit);
+                if dead.len() > limits::MAX_HAS_IDS {
+                    return Response::Err(ErrorCode::TooManyIds);
                 }
-                match self.store.put_keyslot(&owner_id, gen, &blob) {
-                    Ok(()) => Response::Ok,
+                // The signed claim is honoured only if it still describes the store, inside the delete's own txn (§15).
+                match self.store.prune_if(&dead, |refs, len| {
+                    prune::all_heads_hash(refs) == all_heads_hash && len == roster_len
+                }) {
+                    Ok(true) => Response::Ok,
+                    Ok(false) => Response::Err(ErrorCode::CasConflict),
                     Err(_) => Response::Err(ErrorCode::Internal),
                 }
             }
-            // The network half of rotation (§8.2/§8.4): an enrolled member writes the key-history wraps
-            // and deletes revoked keyslots. All opaque; authenticity rests on the roster fold.
-            Request::PutKeyhist { gen, blob } => {
-                if !self.take_write(device_id, blob.len() as u64, now) {
-                    return Response::Err(ErrorCode::RateLimit);
-                }
-                match self.store.put_keyhist(gen, &blob) {
-                    Ok(()) => Response::Ok,
-                    Err(_) => Response::Err(ErrorCode::Internal),
-                }
-            }
-            Request::PutRosterKeyhist { gen, blob } => {
-                if !self.take_write(device_id, blob.len() as u64, now) {
-                    return Response::Err(ErrorCode::RateLimit);
-                }
-                match self.store.put_roster_keyhist(gen, &blob) {
-                    Ok(()) => Response::Ok,
-                    Err(_) => Response::Err(ErrorCode::Internal),
-                }
-            }
-            Request::DeleteKeyslot {
-                device_id: owner_id,
-                gen,
-            } => match self.store.delete_keyslot(&owner_id, gen) {
-                Ok(_) => Response::Ok,
-                Err(_) => Response::Err(ErrorCode::Internal),
-            },
-            // prune is dispatched before this match (state-dependent auth, §15); never reached here.
-            Request::Prune { .. } => Response::Err(ErrorCode::Internal),
-            // Pairing ops are dispatched at the top of `handle` (pre-enrollment); never reached here.
             Request::PairPut { .. } | Request::PairGet { .. } => Response::Err(ErrorCode::Internal),
         }
     }
 
-    /// §15 `prune`: `args_hash` is recomputed from the **server's** current head/roster state
-    /// (`all_heads_hash` / `roster_seq`), so verifying the client's signature over it **is** the
-    /// head-binding compare-and-swap — a concurrent `cas-head`/`roster-append` changes the recomputed
-    /// message and the prune aborts (`BadAuth`) instead of deleting an object a reverted head now
-    /// references. On success the `dead` set is removed from durable storage.
-    fn handle_prune(&self, inc: Incoming<'_>, now: u64) -> Response {
-        let Request::Prune { dead, .. } = &inc.request else {
+    /// `cas-head` (§12, §15): charge the per-key cap on what would become durable, refund what did not.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_cas(
+        &self,
+        device_id: DeviceId,
+        ref_h: [u8; 32],
+        old_head: [u8; 32],
+        new_head: [u8; 32],
+        promote: [u8; 16],
+        new_blob: &[u8],
+        now: u64,
+    ) -> Response {
+        if *blake3::hash(new_blob).as_bytes() != new_head {
+            return Response::Err(ErrorCode::BadRequest);
+        }
+        if !self.take_write(device_id, new_blob.len() as u64, now) {
+            return Response::Err(ErrorCode::RateLimit);
+        }
+        let Ok(staged) = self.store.staged_bytes(&promote) else {
             return Response::Err(ErrorCode::Internal);
         };
-        if dead.len() > limits::MAX_HAS_IDS {
-            return Response::Err(ErrorCode::TooManyIds);
+        let cap = self.limits.storage_cap;
+        if staged > 0 && !self.with_state(|s| s.add_quota(device_id, staged, cap)) {
+            return Response::Err(ErrorCode::RateLimit);
         }
-        let Some(nonce) = inc.server_nonce else {
-            return Response::Err(ErrorCode::BadAuth);
-        };
+        match self.store.cas_ref(&ref_h, &old_head, new_blob, &promote) {
+            Ok(outcome) if outcome.swapped => {
+                let unused = staged.saturating_sub(outcome.promoted_bytes);
+                self.with_state(|s| s.release_quota(device_id, unused));
+                Response::Ok
+            }
+            Ok(_) => {
+                self.with_state(|s| s.release_quota(device_id, staged));
+                Response::Err(ErrorCode::CasConflict)
+            }
+            Err(_) => {
+                self.with_state(|s| s.release_quota(device_id, staged));
+                Response::Err(ErrorCode::Internal)
+            }
+        }
+    }
 
-        // Compare (§15 CAS): recompute the CAS inputs; the client's signature verifies only if its view matches.
-        let (refs, roster_len) = match (self.store.ref_blob_hashes(), self.store.roster_len()) {
-            (Ok(r), Ok(n)) => (r, n),
-            _ => return Response::Err(ErrorCode::Internal),
-        };
-        let roster_seq = roster_len.saturating_sub(1);
-        let expected_ahh = prune::all_heads_hash(&refs);
-        let args_hash = prune::args_prune(&prune::dead_set_hash(dead), &expected_ahh, roster_seq);
+    /// The §7 mailbox: posts charge the write rate, takes the read rate; the server only relays and TTLs.
+    fn handle_pair(&self, request: Request, device_id: DeviceId, now: u64) -> Response {
+        match request {
+            Request::PairPut { slot, blob } => {
+                if !self.take_write(device_id, (32 + blob.len()) as u64, now) {
+                    return Response::Err(ErrorCode::RateLimit);
+                }
+                if self.with_state(|s| s.pair_put(slot, blob, now)) {
+                    Response::Ok
+                } else {
+                    Response::Err(ErrorCode::RateLimit)
+                }
+            }
+            Request::PairGet { slot } => {
+                let got = self.with_state(|s| s.pair_take(&slot, now));
+                let n = 32 + got.as_ref().map_or(0, Vec::len) as u64;
+                if !self.take_read(device_id, n, now) {
+                    // Put it back: a rate-limited read must not destroy the message.
+                    if let Some(b) = got {
+                        self.with_state(|s| s.pair_put(slot, b, now));
+                    }
+                    return Response::Err(ErrorCode::RateLimit);
+                }
+                Response::Blob(got)
+            }
+            _ => Response::Err(ErrorCode::Internal),
+        }
+    }
+}
 
-        let wa = WriteAuth {
-            op: op::PRUNE,
-            args_hash,
-            session_transcript: inc.session_transcript,
-            server_nonce: nonce,
-        };
-        if wa.verify(inc.pubkey, &inc.op_sig).is_err() {
-            // Bad signature OR a stale client view of the bound state — the §15 CAS failed.
-            return Response::Err(ErrorCode::BadAuth);
-        }
-        if !self.consume_nonce(&nonce, now) {
-            return Response::Err(ErrorCode::BadAuth);
-        }
+/// A server-wide connection slot from [`Server::admit`], freed when dropped.
+pub struct Admission(Arc<Server>);
 
-        // Act under the same CAS, atomically: prune_if re-checks the inputs inside the delete's own txn,
-        // so a cas_head/roster_append racing between compare and delete aborts it (§15.2).
-        match self.store.prune_if(dead, |cur_refs, cur_roster_len| {
-            prune::all_heads_hash(cur_refs) == expected_ahh
-                && cur_roster_len.saturating_sub(1) == roster_seq
-        }) {
-            Ok(true) => Response::Ok,
-            // CAS lost (head/roster moved): same BadAuth as a stale-view prune; the client re-pulls and retries.
-            Ok(false) => Response::Err(ErrorCode::BadAuth),
-            Err(_) => Response::Err(ErrorCode::Internal),
-        }
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.0
+            .with_state(|st| st.open_conns = st.open_conns.saturating_sub(1));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secsec_proto::wire::{HeadPut, KeyslotPut};
     use secsec_sig::DeviceKey;
 
     fn server() -> (Server, tempfile::TempDir) {
@@ -690,81 +655,99 @@ mod tests {
         (Server::new(store), dir)
     }
 
-    /// Enroll `dev` by writing it a keyslot (the §12 keyslot-existence backing).
     fn enroll(s: &Server, dev: &DeviceKey) {
         s.store()
             .put_keyslot(&dev.device_id().unwrap(), 1, b"keyslot")
             .unwrap();
     }
 
-    /// Sign a read request as `dev` would.
-    fn read_req(dev: &DeviceKey, request: Request, transcript: [u8; 32]) -> Incoming<'_> {
+    const T: [u8; 32] = [0x7a; 32];
+    const NOW: u64 = 1_000;
+
+    fn read_req(dev: &DeviceKey, request: Request) -> Incoming<'static> {
         let (op_label, args_hash, _) = op_and_args(&request);
-        let ra = ReadAuth {
+        let sig = ReadAuth {
             op: op_label,
             args_hash,
-            session_transcript: transcript,
-        };
-        let sig = ra.sign(dev).unwrap();
+            session_transcript: T,
+        }
+        .sign(dev)
+        .unwrap();
         Incoming {
             pubkey: Box::leak(Box::new(dev.public())),
             request,
             op_sig: sig,
-            session_transcript: transcript,
+            session_transcript: T,
             server_nonce: None,
         }
     }
 
-    /// Sign a write request as `dev` would, with `nonce`.
-    fn write_req(
-        dev: &DeviceKey,
-        request: Request,
-        transcript: [u8; 32],
-        nonce: [u8; 32],
-    ) -> Incoming<'_> {
+    fn write_req_at(dev: &DeviceKey, request: Request, issued_at: u64) -> Incoming<'static> {
+        let nonce = [0x5e; 32];
         let (op_label, args_hash, _) = op_and_args(&request);
-        let wa = WriteAuth {
+        let sig = WriteAuth {
             op: op_label,
             args_hash,
-            session_transcript: transcript,
+            session_transcript: T,
             server_nonce: nonce,
-        };
-        let sig = wa.sign(dev).unwrap();
+        }
+        .sign(dev)
+        .unwrap();
         Incoming {
             pubkey: Box::leak(Box::new(dev.public())),
             request,
             op_sig: sig,
-            session_transcript: transcript,
-            server_nonce: Some(nonce),
+            session_transcript: T,
+            server_nonce: Some(IssuedNonce { nonce, issued_at }),
         }
     }
 
-    const T: [u8; 32] = [0x7a; 32];
+    fn write_req(dev: &DeviceKey, request: Request) -> Incoming<'static> {
+        write_req_at(dev, request, NOW)
+    }
 
-    /// Promote the objects staged under `push` to durable storage by advancing a throwaway ref under
-    /// it (each push gets a unique ref so the expect-absent swap always wins).
+    fn put(id: [u8; 32], blob: &[u8], push: [u8; 16]) -> Request {
+        Request::Put {
+            id,
+            declared_size: blob.len() as u32,
+            push_id: push,
+            blob: blob.to_vec(),
+        }
+    }
+
+    /// Promote `push`'s staging by advancing a throwaway ref under it.
     fn promote(s: &Server, dev: &DeviceKey, push: [u8; 16]) {
-        let ref_h = *blake3::hash(&push).as_bytes();
         let blob = b"head".to_vec();
-        let new_head = *blake3::hash(&blob).as_bytes();
-        let nonce = [0xfe; 32];
-        s.issue_nonce(nonce, 0);
         let cas = Request::CasHead {
-            ref_h,
+            ref_h: *blake3::hash(&push).as_bytes(),
             old_head: [0u8; 32],
-            new_head,
+            new_head: *blake3::hash(&blob).as_bytes(),
             promote: push,
             new_blob: blob,
         };
-        assert_eq!(s.handle(write_req(dev, cas, T, nonce), 0), Response::Ok);
+        assert_eq!(s.handle(write_req(dev, cas), NOW), Response::Ok);
+    }
+
+    fn batch(old_tip: [u8; 32], entries: &[&[u8]], keyslots: Vec<KeyslotPut>) -> Request {
+        Request::RosterBatch {
+            old_tip,
+            entries: entries.iter().map(|e| e.to_vec()).collect(),
+            keyslots,
+            keyhist: None,
+            roster_keyhist: None,
+            revoke: vec![],
+            head: None,
+        }
     }
 
     #[test]
     fn unenrolled_key_is_rejected() {
         let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
-        let resp = s.handle(read_req(&dev, Request::Get { id: [1; 32] }, T), 0);
-        assert_eq!(resp, Response::Err(ErrorCode::NotEnrolled));
+        assert_eq!(
+            s.handle(read_req(&dev, Request::Get { id: [1; 32] }), NOW),
+            Response::Err(ErrorCode::NotEnrolled)
+        );
     }
 
     #[test]
@@ -773,166 +756,120 @@ mod tests {
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
         let id = [0x22; 32];
-        let blob = b"object-bytes".to_vec();
-
-        // put (needs a freshly-issued nonce).
-        let nonce = [0x01; 32];
-        s.issue_nonce(nonce, 0);
-        let put = Request::Put {
-            id,
-            declared_size: blob.len() as u32,
-            push_id: [0xaa; 16],
-            blob: blob.clone(),
-        };
-        assert_eq!(s.handle(write_req(&dev, put, T, nonce), 0), Response::Ok);
-        // promote the staged object durable by advancing a ref under the same push.
-        promote(&s, &dev, [0xaa; 16]);
-
-        // get it back.
-        let got = s.handle(read_req(&dev, Request::Get { id }, T), 0);
-        assert_eq!(got, Response::Blob(Some(blob)));
-        // absent id -> None.
         assert_eq!(
-            s.handle(read_req(&dev, Request::Get { id: [0x99; 32] }, T), 0),
+            s.handle(write_req(&dev, put(id, b"object-bytes", [0xaa; 16])), NOW),
+            Response::Ok
+        );
+        promote(&s, &dev, [0xaa; 16]);
+        assert_eq!(
+            s.handle(read_req(&dev, Request::Get { id }), NOW),
+            Response::Blob(Some(b"object-bytes".to_vec()))
+        );
+        assert_eq!(
+            s.handle(read_req(&dev, Request::Get { id: [0x99; 32] }), NOW),
             Response::Blob(None)
         );
     }
 
     #[test]
-    fn bad_signature_is_rejected() {
+    fn bad_or_forged_signatures_are_rejected() {
         let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
-        // tamper the signature.
-        let mut inc = read_req(&dev, Request::Get { id: [1; 32] }, T);
+        let mut inc = read_req(&dev, Request::Get { id: [1; 32] });
         *inc.op_sig.last_mut().unwrap() ^= 0x01;
-        assert_eq!(s.handle(inc, 0), Response::Err(ErrorCode::BadAuth));
-    }
-
-    #[test]
-    fn forged_args_are_rejected() {
-        // a request whose fields differ from what was signed must fail (server recomputes args_hash).
-        let (s, _d) = server();
-        let dev = DeviceKey::generate().unwrap();
-        enroll(&s, &dev);
-        let mut inc = read_req(&dev, Request::Get { id: [1; 32] }, T);
-        // swap the requested id after signing.
+        assert_eq!(s.handle(inc, NOW), Response::Err(ErrorCode::BadAuth));
+        let mut inc = read_req(&dev, Request::Get { id: [1; 32] });
         inc.request = Request::Get { id: [2; 32] };
-        assert_eq!(s.handle(inc, 0), Response::Err(ErrorCode::BadAuth));
+        assert_eq!(s.handle(inc, NOW), Response::Err(ErrorCode::BadAuth));
     }
 
+    /// A write outside its stream challenge's TTL, or without one, is refused (§19).
     #[test]
-    fn write_nonce_is_single_use() {
+    fn write_nonce_must_be_fresh() {
         let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
-        let nonce = [0x05; 32];
-        s.issue_nonce(nonce, 0);
-        let put = Request::Put {
-            id: [3; 32],
-            declared_size: 1,
-            push_id: [0xbb; 16],
-            blob: vec![0u8],
-        };
-        // first use ok.
-        assert_eq!(
-            s.handle(write_req(&dev, put.clone(), T, nonce), 0),
-            Response::Ok
-        );
-        // replay with the same nonce -> rejected (single-use).
-        assert_eq!(
-            s.handle(write_req(&dev, put, T, nonce), 0),
-            Response::Err(ErrorCode::BadAuth)
-        );
+        let stale = write_req_at(&dev, put([3; 32], &[0], [0xbb; 16]), NOW - 60);
+        assert_eq!(s.handle(stale, NOW), Response::Err(ErrorCode::BadAuth));
+        let future = write_req_at(&dev, put([3; 32], &[0], [0xbb; 16]), NOW + 1);
+        assert_eq!(s.handle(future, NOW), Response::Err(ErrorCode::BadAuth));
+        let mut none = write_req(&dev, put([3; 32], &[0], [0xbb; 16]));
+        none.server_nonce = None;
+        assert_eq!(s.handle(none, NOW), Response::Err(ErrorCode::BadAuth));
+        let fresh = write_req_at(&dev, put([3; 32], &[0], [0xbb; 16]), NOW - 59);
+        assert_eq!(s.handle(fresh, NOW), Response::Ok);
     }
 
     #[test]
-    fn write_without_issued_nonce_is_rejected() {
+    fn put_size_rules() {
         let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
-        // never issued -> consume fails.
-        let put = Request::Put {
-            id: [4; 32],
-            declared_size: 1,
-            push_id: [0; 16],
-            blob: vec![0u8],
-        };
-        assert_eq!(
-            s.handle(write_req(&dev, put, T, [0xAA; 32]), 0),
-            Response::Err(ErrorCode::BadAuth)
-        );
-    }
-
-    #[test]
-    fn put_declared_size_mismatch_is_bad_request() {
-        let (s, _d) = server();
-        let dev = DeviceKey::generate().unwrap();
-        enroll(&s, &dev);
-        let nonce = [0x06; 32];
-        s.issue_nonce(nonce, 0);
-        let put = Request::Put {
+        let lie = Request::Put {
             id: [5; 32],
-            declared_size: 99, // lies about the size
+            declared_size: 99,
             push_id: [0; 16],
             blob: vec![0u8; 3],
         };
         assert_eq!(
-            s.handle(write_req(&dev, put, T, nonce), 0),
+            s.handle(write_req(&dev, lie), NOW),
             Response::Err(ErrorCode::BadRequest)
         );
-    }
-
-    #[test]
-    fn put_declared_size_over_max_is_rejected() {
-        // §11/§12: a `declared_size` over 16 MiB is rejected outright, before the size-match check.
-        let (s, _d) = server();
-        let dev = DeviceKey::generate().unwrap();
-        enroll(&s, &dev);
-        let nonce = [0x07; 32];
-        s.issue_nonce(nonce, 0);
-        let put = Request::Put {
+        let huge = Request::Put {
             id: [6; 32],
-            declared_size: u32::MAX, // > 16 MiB
+            declared_size: u32::MAX,
             push_id: [0; 16],
             blob: vec![0u8; 8],
         };
         assert_eq!(
-            s.handle(write_req(&dev, put, T, nonce), 0),
+            s.handle(write_req(&dev, huge), NOW),
             Response::Err(ErrorCode::BadRequest)
         );
     }
 
+    /// §7/§12: the genesis exception admits exactly the genesis batch, with the key's own keyslot, onto an empty roster.
     #[test]
-    fn genesis_putkeyslot_must_target_own_device() {
-        // On an empty repo, the genesis exception lets an unenrolled key write only ITS OWN keyslot —
-        // not squat one for an arbitrary device_id.
+    fn genesis_exception_is_exact() {
         let (s, _d) = server();
-        let dev = DeviceKey::generate().unwrap(); // unenrolled; roster empty
-        let other = [0x55; 32];
-
-        let n1 = [0x40; 32];
-        s.issue_nonce(n1, 0);
-        let put_other = Request::PutKeyslot {
-            device_id: other,
+        let dev = DeviceKey::generate().unwrap();
+        let me = dev.device_id().unwrap();
+        let ks = |d: [u8; 32]| KeyslotPut {
+            device_id: d,
             gen: 1,
             blob: b"ks".to_vec(),
         };
+        for bad in [
+            batch(ABSENT_HEAD, &[b"g"], vec![ks([0x55; 32])]),
+            batch(ABSENT_HEAD, &[b"g", b"x"], vec![ks(me)]),
+            batch(ABSENT_HEAD, &[b"g"], vec![ks(me), ks([0x56; 32])]),
+            batch([1; 32], &[b"g"], vec![ks(me)]),
+            Request::Get { id: [1; 32] },
+        ] {
+            let inc = if matches!(bad, Request::Get { .. }) {
+                read_req(&dev, bad)
+            } else {
+                write_req(&dev, bad)
+            };
+            assert_eq!(s.handle(inc, NOW), Response::Err(ErrorCode::NotEnrolled));
+        }
         assert_eq!(
-            s.handle(write_req(&dev, put_other, T, n1), 0),
-            Response::Err(ErrorCode::NotEnrolled),
-            "genesis exception must not let an unenrolled key write another device's keyslot"
+            s.handle(
+                write_req(&dev, batch(ABSENT_HEAD, &[b"g"], vec![ks(me)])),
+                NOW
+            ),
+            Response::Ok
         );
-
-        // Its OWN keyslot during genesis is permitted.
-        let n2 = [0x41; 32];
-        s.issue_nonce(n2, 0);
-        let put_own = Request::PutKeyslot {
-            device_id: dev.device_id().unwrap(),
-            gen: 1,
-            blob: b"ks".to_vec(),
-        };
-        assert_eq!(s.handle(write_req(&dev, put_own, T, n2), 0), Response::Ok);
+        // With a repository in place, a second key's genesis attempt is no exception.
+        let other = DeviceKey::generate().unwrap();
+        let oid = other.device_id().unwrap();
+        assert_eq!(
+            s.handle(
+                write_req(&other, batch(ABSENT_HEAD, &[b"g2"], vec![ks(oid)])),
+                NOW
+            ),
+            Response::Err(ErrorCode::NotEnrolled)
+        );
     }
 
     #[test]
@@ -942,7 +879,7 @@ mod tests {
         enroll(&s, &dev);
         let ids = vec![[0u8; 32]; limits::MAX_HAS_IDS + 1];
         assert_eq!(
-            s.handle(read_req(&dev, Request::Has { ids }, T), 0),
+            s.handle(read_req(&dev, Request::Has { ids }), NOW),
             Response::Err(ErrorCode::TooManyIds)
         );
     }
@@ -952,148 +889,112 @@ mod tests {
         let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
-        let ref_h = [0x33; 32];
-        let blob = b"head-blob-v1".to_vec();
-        let new_head = *blake3::hash(&blob).as_bytes();
         let cas = |old: [u8; 32], nh: [u8; 32], b: Vec<u8>| Request::CasHead {
-            ref_h,
+            ref_h: [0x33; 32],
             old_head: old,
             new_head: nh,
             promote: [0u8; 16],
             new_blob: b,
         };
-
-        // first write (expect-absent) succeeds.
-        let n1 = [0x10; 32];
-        s.issue_nonce(n1, 0);
+        let blob = b"head-blob-v1".to_vec();
+        let h1 = *blake3::hash(&blob).as_bytes();
         assert_eq!(
-            s.handle(
-                write_req(&dev, cas([0; 32], new_head, blob.clone()), T, n1),
-                0
-            ),
+            s.handle(write_req(&dev, cas([0; 32], h1, blob.clone())), NOW),
             Response::Ok
         );
-
-        // a second expect-absent now loses the CAS.
-        let n2 = [0x11; 32];
-        s.issue_nonce(n2, 0);
         assert_eq!(
-            s.handle(
-                write_req(&dev, cas([0; 32], new_head, blob.clone()), T, n2),
-                0
-            ),
+            s.handle(write_req(&dev, cas([0; 32], h1, blob)), NOW),
             Response::Err(ErrorCode::CasConflict)
         );
-
-        // a swap to the correct expected-old (= BLAKE3 of the stored blob) succeeds.
-        let n3 = [0x12; 32];
-        s.issue_nonce(n3, 0);
         let v2 = b"head-blob-v2".to_vec();
-        let v2_head = *blake3::hash(&v2).as_bytes();
+        let h2 = *blake3::hash(&v2).as_bytes();
         assert_eq!(
-            s.handle(write_req(&dev, cas(new_head, v2_head, v2), T, n3), 0),
+            s.handle(write_req(&dev, cas(h1, h2, v2)), NOW),
             Response::Ok
         );
-
-        // attached blob not matching the signed new_head -> BadRequest.
-        let n4 = [0x13; 32];
-        s.issue_nonce(n4, 0);
         assert_eq!(
             s.handle(
-                write_req(&dev, cas([0; 32], [0xAB; 32], b"x".to_vec()), T, n4),
-                0
+                write_req(&dev, cas([0; 32], [0xAB; 32], b"x".to_vec())),
+                NOW
             ),
             Response::Err(ErrorCode::BadRequest)
         );
     }
 
-    /// Sign a §15 prune the way the client driver does: over the **state-bound** `args_prune`, not the
-    /// placeholder binding `op_and_args` returns for this op.
+    /// A finite cap is charged only for what a promote actually made durable.
+    #[test]
+    fn quota_charges_only_promoted_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Server::new(Store::open(dir.path().join("q.redb")).unwrap()).with_limits(Limits {
+            storage_cap: 10,
+            ..Limits::default()
+        });
+        let dev = DeviceKey::generate().unwrap();
+        enroll(&s, &dev);
+        let d = dev.device_id().unwrap();
+        s.store()
+            .stage(&[7; 16], &[1; 32], b"eight!!!", NOW)
+            .unwrap();
+        s.store().stage(&[7; 16], &[2; 32], b"two", NOW).unwrap();
+        // Another push makes one staged object durable first; it is never charged twice.
+        s.store().put(&[1; 32], b"eight!!!").unwrap();
+        let blob = b"h".to_vec();
+        let cas = Request::CasHead {
+            ref_h: [9; 32],
+            old_head: [0; 32],
+            new_head: *blake3::hash(&blob).as_bytes(),
+            promote: [7; 16],
+            new_blob: blob,
+        };
+        assert_eq!(s.handle(write_req(&dev, cas), NOW), Response::Ok);
+        let used = s.with_state(|st| st.quotas.get(&d).map(StorageQuota::used));
+        assert_eq!(used, Some(3), "only the 3 newly durable bytes are charged");
+    }
+
     fn prune_req(
         dev: &DeviceKey,
         dead: Vec<[u8; 32]>,
-        all_heads_hash: [u8; 32],
-        roster_seq: u64,
-        nonce: [u8; 32],
-    ) -> Incoming<'_> {
-        let args_hash =
-            prune::args_prune(&prune::dead_set_hash(&dead), &all_heads_hash, roster_seq);
-        let wa = WriteAuth {
-            op: op::PRUNE,
-            args_hash,
-            session_transcript: T,
-            server_nonce: nonce,
-        };
-        let sig = wa.sign(dev).unwrap();
-        Incoming {
-            pubkey: Box::leak(Box::new(dev.public())),
-            request: Request::Prune {
+        ahh: [u8; 32],
+        roster_len: u64,
+    ) -> Incoming<'static> {
+        write_req(
+            dev,
+            Request::Prune {
                 dead,
-                all_heads_hash,
-                roster_seq,
+                all_heads_hash: ahh,
+                roster_len,
             },
-            op_sig: sig,
-            session_transcript: T,
-            server_nonce: Some(nonce),
-        }
+        )
     }
 
-    /// The §15 head-binding compare-and-swap: because the server recomputes `all_heads_hash` and
-    /// `roster_seq` from its own state, verifying the client's signature over them **is** the CAS. A
-    /// prune carrying a stale view must delete nothing — this is what closes the
-    /// resurrection-via-dedup race, where a reverted head starts referencing an id already in flight
-    /// to be deleted.
+    /// §15: a prune signed over a stale view is a typed CasConflict and deletes nothing.
     #[test]
     fn prune_is_bound_to_the_servers_own_head_and_roster_state() {
         let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
         enroll(&s, &dev);
-
-        // One durable object under a ref, so there is something to prune and a head to bind against.
         let id = [0x70; 32];
-        let push = [0xcc; 16];
-        let n1 = [0x50; 32];
-        s.issue_nonce(n1, 0);
-        let put = Request::Put {
-            id,
-            declared_size: 4,
-            push_id: push,
-            blob: b"data".to_vec(),
-        };
-        assert_eq!(s.handle(write_req(&dev, put, T, n1), 0), Response::Ok);
-        promote(&s, &dev, push);
         assert_eq!(
-            s.handle(read_req(&dev, Request::Get { id }, T), 0),
-            Response::Blob(Some(b"data".to_vec()))
-        );
-
-        // A prune against a head state the server does not have deletes nothing.
-        let n2 = [0x51; 32];
-        s.issue_nonce(n2, 0);
-        assert_eq!(
-            s.handle(prune_req(&dev, vec![id], [0xAB; 32], 0, n2), 0),
-            Response::Err(ErrorCode::BadAuth)
-        );
-        assert_eq!(
-            s.handle(read_req(&dev, Request::Get { id }, T), 0),
-            Response::Blob(Some(b"data".to_vec())),
-            "a stale-view prune must never delete live data"
-        );
-
-        // The same delete-set against the server's actual state is honoured.
-        let refs = s.store().ref_blob_hashes().unwrap();
-        let ahh = prune::all_heads_hash(&refs);
-        let roster_seq = s.store().roster_len().unwrap().saturating_sub(1);
-        let n3 = [0x52; 32];
-        s.issue_nonce(n3, 0);
-        assert_eq!(
-            s.handle(prune_req(&dev, vec![id], ahh, roster_seq, n3), 0),
+            s.handle(write_req(&dev, put(id, b"data", [0xcc; 16])), NOW),
             Response::Ok
         );
+        promote(&s, &dev, [0xcc; 16]);
         assert_eq!(
-            s.handle(read_req(&dev, Request::Get { id }, T), 0),
-            Response::Blob(None)
+            s.handle(prune_req(&dev, vec![id], [0xAB; 32], 0), NOW),
+            Response::Err(ErrorCode::CasConflict)
         );
+        assert!(s.store().get(&id).unwrap().is_some());
+        let ahh = prune::all_heads_hash(&s.store().ref_blob_hashes().unwrap());
+        assert_eq!(
+            s.handle(prune_req(&dev, vec![id], ahh, 1), NOW),
+            Response::Err(ErrorCode::CasConflict),
+            "an empty roster is length 0, never 1"
+        );
+        assert_eq!(
+            s.handle(prune_req(&dev, vec![id], ahh, 0), NOW),
+            Response::Ok
+        );
+        assert!(s.store().get(&id).unwrap().is_none());
     }
 
     #[test]
@@ -1101,61 +1002,195 @@ mod tests {
         let (s, _d) = server();
         let d = DeviceKey::generate().unwrap().device_id().unwrap();
         let max = limits::MAX_CONCURRENT_CONNS_PER_KEY;
-        // up to the cap acquire; the next is refused.
         for _ in 0..max {
             assert!(s.acquire_conn(d));
         }
-        assert!(!s.acquire_conn(d), "over the per-key concurrency cap");
-        // releasing one frees a slot.
+        assert!(!s.acquire_conn(d));
         s.release_conn(d);
         assert!(s.acquire_conn(d));
-        // a different key is independent.
         let d2 = DeviceKey::generate().unwrap().device_id().unwrap();
         assert!(s.acquire_conn(d2));
-        // releasing back to zero is clean (no underflow, entry removed).
         for _ in 0..max {
             s.release_conn(d);
         }
-        s.release_conn(d); // extra release is a harmless no-op
+        s.release_conn(d);
         assert!(s.acquire_conn(d));
     }
 
+    /// The server-wide cap holds a slot per admission until its guard drops, and defaults to the §19 value.
     #[test]
-    fn roster_append_chains_and_rejects_race() {
+    fn server_wide_connection_cap() {
+        let (s, _d) = server();
+        assert_eq!(s.limits.max_connections, limits::MAX_CONNECTIONS);
+        let s = Arc::new(s.with_limits(Limits {
+            max_connections: 2,
+            ..Limits::default()
+        }));
+        let a = s.admit().unwrap();
+        let b = s.admit().unwrap();
+        assert!(s.admit().is_none());
+        drop(a);
+        let c = s.admit().unwrap();
+        assert!(s.admit().is_none());
+        drop((b, c));
+        assert_eq!(s.with_state(|st| st.open_conns), 0);
+        assert!(s.admit().is_some());
+    }
+
+    /// Batches chain on the tip, a stale tip conflicts, and a conflict refunds the hourly budget.
+    #[test]
+    fn roster_batch_chains_rejects_races_and_refunds() {
         let (s, _d) = server();
         let dev = DeviceKey::generate().unwrap();
-        enroll(&s, &dev);
-        let append = |old_tip: [u8; 32], entry: Vec<u8>| Request::RosterAppend { old_tip, entry };
-
-        // genesis append (expect-absent).
-        let n1 = [0x20; 32];
-        s.issue_nonce(n1, 0);
-        assert_eq!(
-            s.handle(
-                write_req(&dev, append([0; 32], b"genesis".to_vec()), T, n1),
-                0
-            ),
-            Response::Ok
+        let me = dev.device_id().unwrap();
+        let genesis = batch(
+            ABSENT_HEAD,
+            &[b"genesis"],
+            vec![KeyslotPut {
+                device_id: me,
+                gen: 1,
+                blob: b"ks".to_vec(),
+            }],
         );
-
-        // a racing genesis (still expect-absent) loses the CAS.
-        let n2 = [0x21; 32];
-        s.issue_nonce(n2, 0);
-        assert_eq!(
-            s.handle(
-                write_req(&dev, append([0; 32], b"genesis2".to_vec()), T, n2),
-                0
-            ),
-            Response::Err(ErrorCode::CasConflict)
-        );
-
-        // append seq 1 on the correct tip succeeds.
+        assert_eq!(s.handle(write_req(&dev, genesis), NOW), Response::Ok);
         let tip0 = *blake3::hash(b"genesis").as_bytes();
-        let n3 = [0x22; 32];
-        s.issue_nonce(n3, 0);
         assert_eq!(
-            s.handle(write_req(&dev, append(tip0, b"entry1".to_vec()), T, n3), 0),
+            s.handle(write_req(&dev, batch(tip0, &[b"e1", b"e2"], vec![])), NOW),
             Response::Ok
         );
+        let used = s.with_state(|st| st.sigchain_calls.get_mut(&me).unwrap().count(NOW));
+        for _ in 0..3 {
+            assert_eq!(
+                s.handle(write_req(&dev, batch(tip0, &[b"racer"], vec![])), NOW),
+                Response::Err(ErrorCode::CasConflict)
+            );
+        }
+        let after = s.with_state(|st| st.sigchain_calls.get_mut(&me).unwrap().count(NOW));
+        assert_eq!(used, after, "lost CASes cost no sigchain budget");
+        assert_eq!(
+            s.handle(write_req(&dev, batch(tip0, &[], vec![])), NOW),
+            Response::Err(ErrorCode::BadRequest)
+        );
+    }
+
+    /// §8.4: a revoke batch deletes every generation's keyslot of the revoked device and re-signs the head atomically.
+    #[test]
+    fn revoke_batch_unenrolls_every_generation() {
+        let (s, _d) = server();
+        let dev = DeviceKey::generate().unwrap();
+        let victim = DeviceKey::generate().unwrap();
+        let vid = victim.device_id().unwrap();
+        let genesis = RosterBatch {
+            expected_tip: ABSENT_HEAD,
+            entries: &[b"g".to_vec()],
+            keyslots: &[],
+            keyhist: None,
+            roster_keyhist: None,
+            revoke: &[],
+            head: None,
+        };
+        assert_eq!(s.store().roster_batch(&genesis).unwrap(), Some(0));
+        enroll(&s, &dev);
+        s.store().put_keyslot(&vid, 1, b"v1").unwrap();
+        s.store().put_keyslot(&vid, 2, b"v2").unwrap();
+        s.store()
+            .cas_ref(&[4; 32], &ABSENT_HEAD, b"old-head", &[0; 16])
+            .unwrap();
+        let req = Request::RosterBatch {
+            old_tip: *blake3::hash(b"g").as_bytes(),
+            entries: vec![b"revoke".to_vec(), b"rotate".to_vec()],
+            keyslots: vec![],
+            keyhist: Some((1, b"kh".to_vec())),
+            roster_keyhist: Some((1, b"rkh".to_vec())),
+            revoke: vec![vid],
+            head: Some(HeadPut {
+                ref_h: [4; 32],
+                old_head: *blake3::hash(b"old-head").as_bytes(),
+                new_blob: b"resigned".to_vec(),
+            }),
+        };
+        assert_eq!(s.handle(write_req(&dev, req), NOW), Response::Ok);
+        assert!(!s.store().keyslot_exists(&vid).unwrap());
+        assert_eq!(
+            s.handle(read_req(&victim, Request::Get { id: [1; 32] }), NOW),
+            Response::Err(ErrorCode::NotEnrolled)
+        );
+        assert_eq!(
+            s.store().get_ref(&[4; 32]).unwrap().as_deref(),
+            Some(&b"resigned"[..])
+        );
+    }
+
+    /// §7: a mailbox slot is delivered once; a second take finds it empty.
+    #[test]
+    fn pairing_slot_is_single_use() {
+        let (s, _d) = server();
+        let joiner = DeviceKey::generate().unwrap();
+        let host = DeviceKey::generate().unwrap();
+        assert_eq!(
+            s.handle(
+                read_req(
+                    &joiner,
+                    Request::PairPut {
+                        slot: [1; 32],
+                        blob: b"msg".to_vec()
+                    }
+                ),
+                NOW
+            ),
+            Response::Ok
+        );
+        assert_eq!(
+            s.handle(read_req(&host, Request::PairGet { slot: [1; 32] }), NOW),
+            Response::Blob(Some(b"msg".to_vec()))
+        );
+        assert_eq!(
+            s.handle(read_req(&host, Request::PairGet { slot: [1; 32] }), NOW),
+            Response::Blob(None)
+        );
+    }
+
+    /// The allow-list follows file edits without a restart and denies when the file is unreadable.
+    #[test]
+    fn authorized_file_is_reread_on_change_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authorized_keys");
+        let a = DeviceKey::generate().unwrap();
+        let b = DeviceKey::generate().unwrap();
+        let line = |d: &DeviceKey| format!("{}\n", ssh_line(d));
+        std::fs::write(&path, line(&a)).unwrap();
+        let s = Server::new(Store::open(dir.path().join("s.redb")).unwrap())
+            .with_authorized_file(path.clone());
+        assert!(s.is_authorized(&a.device_id().unwrap()));
+        assert!(!s.is_authorized(&b.device_id().unwrap()));
+        std::fs::write(&path, format!("{}{}", line(&a), line(&b))).unwrap();
+        assert!(s.is_authorized(&b.device_id().unwrap()));
+        std::fs::remove_file(&path).unwrap();
+        assert!(!s.is_authorized(&a.device_id().unwrap()));
+    }
+
+    /// An OpenSSH public-key line for `d`.
+    fn ssh_line(d: &DeviceKey) -> String {
+        let canon = d.public().to_canonical().unwrap();
+        let b64 = base64_encode(&canon);
+        format!("ssh-ed25519 {b64} test")
+    }
+
+    fn base64_encode(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let n = (u32::from(c[0]) << 16)
+                | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*c.get(2).unwrap_or(&0));
+            for i in 0..4 {
+                if i <= c.len() {
+                    out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
     }
 }

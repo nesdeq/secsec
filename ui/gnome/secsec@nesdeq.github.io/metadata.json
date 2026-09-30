@@ -1,7 +1,8 @@
 {
   "uuid": "secsec@nesdeq.github.io",
   "name": "secsec",
-  "description": "Menu-bar control for secsec. Prompts for your SSH-key passphrase at login, runs `secsec sync` in the background (passphrase fed over a pipe — never the command line), and shows its live status. The folder to sync is read from ~/.config/secsec/ui.conf.",
+  "description": "Panel control for secsec. Prompts for your SSH-key passphrase at login, runs `secsec sync` in the background (the passphrase travels over a pipe, never the command line), and shows its status. The sync keeps running while the screen is locked; the panel UI is hidden there. The folder to sync is read from secsec/ui.conf in your config directory (~/.config by default).",
   "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "session-modes": ["user", "unlock-dialog"],
   "url": "https://github.com/nesdeq/secsec"
 }

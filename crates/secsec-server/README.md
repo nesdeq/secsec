@@ -1,40 +1,50 @@
 # secsec-server
 
-The server request handler (`secsec-Design.md` §11, §12, §19). Two gates protect the store — a coarse
-connection allow-list and the fine per-op crypto check:
+The blind server (`secsec-Design.md` §11, §12, §19). Two gates protect the store: a coarse connection
+allow-list and the fine per-op cryptographic check.
 
-0. **connection gate (§11)** — `serve_connection` rejects any key absent from the operator's
-   `~/.ssh/authorized_keys` (`Authorized::File`, re-read per connection, fail-closed;
-   `parse_authorized_keys`). `secsec serve` refuses to start without a usable key. Necessary, not
-   sufficient.
+0. **Connection gate (§11).** Before any handshake, the accept loop takes a server-wide slot
+   (`Server::admit`, 256 concurrent by default, held until the connection ends) or refuses the
+   connection. `serve_connection` then rejects any key absent from the operator's
+   `~/.ssh/authorized_keys` (`with_authorized_file`; `parse_authorized_keys` takes each bare
+   `ssh-ed25519` line). The file is re-parsed whenever its size or mtime changes, an unreadable file
+   denies, and an open connection re-checks it on its first request after 60 s, closing if the key is
+   gone. Then the per-key concurrent-connection cap applies. `secsec serve` refuses to start without a
+   usable key. Necessary, not sufficient.
 
-Then the §12 per-op pipeline (`Server::handle`) runs for every request over the content-addressed
-object store ([`secsec_store::Store`]):
+Each request then travels on its own stream: the server answers the stream's opening with a fresh
+32-byte challenge (`IssuedNonce`), caps the request frame by enrollment (the full request size, or just
+the genesis batch and pairing messages for a key without a keyslot), and runs the §12 pipeline
+(`Server::handle`) over the content-addressed store:
 
-1. **keyslot existence** — the connecting key must own a keyslot (be rostered); else `not-enrolled`.
-   Two bounded exceptions: the §7 `pair-put`/`pair-get` invite mailbox is dispatched *pre*-enrollment
-   (read-auth only, TTL'd, rate-limited), and the **genesis-bootstrap** exception lets the first
-   device write its genesis roster entry + keyslot while `roster_len == 0`;
-2. **per-op authorization** — verify the `secsec-write-v1` / `secsec-read-v1` signature over the op's
-   `args_hash` + the session transcript (+ `server_nonce` for writes), recomputing `args_hash` from
-   the request so the client can't lie about what it signed;
-3. **nonce freshness** — consume the `server_nonce` exactly once (writes), defeating replay;
-4. **limits** — per-key write byte-rate + burst and storage quota (§19), the `has` id cap;
-5. **execute** — against the blob store.
+1. **Pairing mailbox first.** `pair-put` / `pair-get` are dispatched *before* the enrollment check (a
+   joiner owns no keyslot yet), authorized by their read signature alone; the mailbox holds at most
+   256 slots for 600 s, a take removes the message, a post charges the write rate and a take the read
+   rate.
+2. **Keyslot existence.** The key must own a keyslot at any generation; else `NotEnrolled`, with one
+   exception: the exact genesis batch (one entry, one keyslot owned by the signer, nothing else) onto
+   an empty roster.
+3. **Per-op authorization.** The `secsec-write-v1` / `secsec-read-v1` signature over the recomputed
+   `args_hash` and the session transcript (plus, for a write, the stream's challenge, which must be
+   under 60 s old).
+4. **Limits, then execute.** Size rules, the per-key byte rates (a 1 GiB burst), the id caps, the
+   sigchain limits (60 entries per key per hour, refunded on a lost CAS; 10,000 in total), and the
+   per-session write cap charged on the bytes a promote makes durable.
 
-The server is **blind**: it stores opaque blobs by id and never reads or verifies their content
-(content-addressing is re-checked by *clients* on fetch, §9.2). The mutable ops CAS on a `BLAKE3` of
-the stored (encrypted) tip blob. The handler is pure and clock-injected (`now`), so the whole §12
-pipeline is unit-testable by calling `Server::handle` directly — no sockets.
+The server is **blind**: it stores opaque blobs and never reads or verifies their content (clients
+re-check content addressing on fetch, §9.2). `cas-head` compares `BLAKE3` of the stored head blob and
+promotes the push's staging in the same transaction; `roster-batch` compares the tip entry blob's hash;
+`prune` deletes only if its signed `all_heads_hash` and `roster_len` still describe the store. The
+handler is clock-injected, so the whole pipeline is unit-tested without sockets.
 
 ## Public API
 
-- `Server` — `new(store)`, `with_limits(Limits)` (operator-tunable runtime limits, §15/§19),
-  `with_authorized_file(path)` (the §11 connection gate), `conn_rate_per_sec`, `reclaim_staging`. It
-  stages objects on `put`, promotes them on `cas-head` (charging the per-key cap on promoted bytes),
-  executes `prune` under a head-binding CAS, and runs a background `reclaim_staging` sweep over idle
-  pushes. The per-op pipeline `handle(request, now)` is crate-internal (driven by `serve_connection`
-  and the in-crate unit tests) — clock-injected so it needs no sockets.
-- `parse_authorized_keys` (the allow-list `Any` / `File` source is crate-internal).
-- `serve` — `serve_connection` (the QUIC serve loop over `secsec-transport`; enforces the gate).
-- `Incoming`, `ServeError`.
+- `Server`: `new(store)`, `with_limits(Limits)` (the operator-tunable limits of `secsec.config`),
+  `with_authorized_file(path)`, `is_authorized(device_id)`, `is_enrolled(device_id)`,
+  `conn_rate_per_sec()`, `admit()` (on an `Arc<Server>`: a server-wide connection slot, or `None` at
+  the cap), and `reclaim(now, ttl)`, which drops pushes idle past the TTL and forgets idle rate-limit
+  state (the serve loop calls it on a timer). `handle(incoming, now)` is crate-internal.
+- `Admission` (the slot `admit` returns, freed when dropped), `parse_authorized_keys`, `IssuedNonce`,
+  `Incoming`.
+- `serve`: `serve_connection(conn, server, host_id, handshake_deadline, now)` (the handshake under the
+  deadline, the gate, then one request per stream until the connection closes), `ServeError`.

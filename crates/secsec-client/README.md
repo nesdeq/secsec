@@ -1,40 +1,47 @@
 # secsec-client
 
-Client orchestration over a [`Remote`] (`secsec-Design.md` §10, §12, §15). The top of the
-library stack — it plumbs the proven cores into the end-to-end flows the `secsec` binary drives.
+Client orchestration over a [`Remote`] (`secsec-Design.md` §7, §8, §10, §12, §15): the top of the
+library stack, plumbing the proven cores into the end-to-end flows the `secsec` binary drives.
 
-It pushes the reachable **object closure** of a commit, advances the per-ref **head** via the
-blind-server compare-and-swap (§12), and on the read side fetches a head, fetches a commit's closure
-**verifying every object on arrival** (§9.2), and restores it. The remote is abstracted as the
-[`Remote`] trait, so the orchestration is exercised against the real blind-CAS semantics in-process;
-the QUIC adapter (`quic.rs`, over `secsec-transport`) is a thin layer on top.
+The remote is the [`Remote`] trait, the §12 server surface; `quic::QuicRemote` implements it over a
+handshaken connection, and a test-only in-process implementation runs the same flows against a real
+store with the server's CAS, batch, prune, and mailbox semantics. Every object fetched is verified
+before it is stored (§9.2).
 
 ## Modules / public API
 
-- **`repo`** — repository lifecycle over the wire, the path the CLI drives: `init_repo_remote`
-  (first-device genesis), `open_repo_remote` (§8.1 cold-start fold, carrying the `RosterAnchor`
-  anti-rollback anchor), `rotate_repo_remote` (also the engine of `revoke`), `data_keyring_remote`
-  (§8.2 key ring); `RepoError`.
-- **`pair`** (§7) — **invite-code pairing**, the shipped enrollment flow: `new_invite` /
-  `decode_code`, `run_host` (`secsec invite`) and `run_join` (`secsec sync --invite`) —
-  MAC-under-code through the server's transient mailbox; `PairError`.
-- **`sync`** — `sync_once` (clone / publish / pull / merge in one call), `SyncKind`, `SyncOutcome`
-  (which carries the merge `conflicts` and the §19 `skipped` paths for the caller to surface).
-- **`history`** (§10/§15) — the read side of `secsec log` / `secsec restore`: `fetch_history`,
-  `repo_log`, `path_history`, `commit_ids`, `restore`; `LogEntry`, `PathVersion`.
-- **`prune`** (§15) — `local_sweep` (drops cache orphans unreachable from the head) and
-  `prune_history` (count-based retention: keep the last N versions per file, delete the rest under the
-  head-CAS). (Driven automatically from the `sync` loop — no `prune` command.)
-- **`quic`** — `QuicRemote`, the `Remote` implementation over a handshaken connection.
-- **`watcher`** — `notify`-driven debounced change ticks for live sync; `watch_dir`, `WatchError`.
-- Crate root: the `Remote` trait and `RemoteError`, `fetch_head`, frontier persistence
-  `load_frontier` / `save_frontier` + `FrontierLoad` (§8.5), `SyncReport`, `ClientError`.
+- **`repo`**: the repository lifecycle over the wire. `init_repo_remote` (one genesis batch: the
+  entry and this device's keyslot), `open_repo_remote` (the §8.1 cold start against the persisted
+  `RosterAnchor`), `roster_grew` (the cheap per-tick probe), `data_keyring_remote` (the §8.2 key
+  ring), `rotate_repo_remote` (one atomic batch, optionally with a `Revoke`, re-signing the head when
+  its signer goes; retries only while the tip or the head moves), `revoke_preview`, `Rotation`,
+  `RepoError`.
+- **`pair`** (§7): invite-code pairing through the server's mailbox. `new_invite`, `decode_code`,
+  `run_host` (`secsec invite`: await the joiner, grant it, send the RFP and host pin) and `run_join`
+  (`secsec sync --invite`: post the keys, check the vouched pin against the connected server);
+  `PairError`.
+- **`sync`**: `sync_once` (clone, publish, push, pull, or merge in one call), `SyncInput` (its
+  `seal` callback persists the frontier before any ref-advancing push), `SyncKind`, `SyncOutcome` (the
+  new base and frontier for the caller to persist in that order, the keep-both `conflicts`, the
+  `skipped` paths, and `base_missing`).
+- **`history`** (§15): the read side of `secsec log` and `secsec restore`. `fetch_history` (commits
+  signature-checked against `ever_members`, trees as held), `repo_log`, `path_history`, `commit_ids`,
+  `restore` (fetching only the chunks the path needs); `LogEntry`, `PathVersion`.
+- **`prune`** (§15): `local_sweep` (drops cache objects the head does not reach) and `prune_history`
+  (keep each file's last `keep` versions, delete other chunks locally and on the server under the
+  head-binding CAS; `Ok(false)` means retry later). Driven by the `sync` loop; there is no `prune`
+  command.
+- **`quic`**: `QuicRemote`.
+- **`watcher`**: `watch_dir` turns a burst of filesystem events into one callback after a quiet
+  interval or a maximum delay; `WatchError`.
+- Crate root: `Remote`, `RemoteError`, `RosterWrite`, `fetch_head`, `fetch_verified_head` /
+  `RemoteHead` (a head only a current member signed), `load_frontier` / `save_frontier` /
+  `FrontierLoad` (the §8.5 sealed state, migrating a v1 seal), `write_private_atomic`, `ClientError`.
 
-The push/pull primitives `sync_once` composes — `push_objects` / `push_head`, `fetch_closure`,
-`sync_ref` — and the in-process `init_repo` / `open_repo` / `rotate_repo` / `data_keyring` variants
-that back the tests are crate-internal: driving them individually is how the §8.5 seal-before-publish
-ordering gets skipped.
+The primitives `sync_once` composes (`push_objects`, `push_head`, `fetch_commits`, `fetch_tree`,
+`fetch_closure`) and the grant `grant_device_remote` are crate-internal: driving them individually is
+how the §8.5 seal-before-publish ordering gets skipped.
 
-Fork detection is the **same-server DAG-incomparable check** in the merge path (a divergence is kept
-both-sides as a `name.conflict-*` copy and surfaced to the user); there is no multi-remote or gossip
-layer (single-host by design).
+A fork (a DAG-incomparable head) is reconciled by the three-way merge, with divergent paths kept both
+ways as `name.conflict-*` copies and surfaced to the user; there is no multi-remote or gossip layer
+(single-host by design).

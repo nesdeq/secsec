@@ -4,12 +4,13 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Server-side content-addressed blob store over redb (secsec-Design.md §13)."
+description = "Content-addressed blob store over redb: the server repository and the client object cache (secsec-Design.md §13, §15)."
 
 [lints]
 workspace = true
 
 [dependencies]
+secsec-frame = { path = "../secsec-frame" }
 redb = "2"
 blake3 = "1"
 

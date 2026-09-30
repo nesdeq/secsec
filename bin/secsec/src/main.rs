@@ -1,46 +1,72 @@
-//! `secsec` — the CLI binary (`secsec-Design.md` §11, §12): `serve` (the blind server, gated on the
-//! operator's `authorized_keys`), `sync` (link a folder and keep it in continuous two-way sync; one
-//! repo = one tree under the ref `main`), `invite` / `devices` / `revoke` (enrollment lifecycle,
-//! §7/§8.4), `hostpin` (§11 TOFU verification), `log` / `restore` (history), and `reset` (wipe local
-//! secsec state). Usage: README.md.
+//! `secsec`, the single binary: the blind server and every client command (`secsec-Design.md` §7, §10, §11, §12). Usage: README.md.
 
-#![allow(missing_docs)] // a binary crate exports no public API
+#![allow(missing_docs)] // a binary crate has no public API
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use secsec_client::history::{LogEntry, PathVersion};
 use secsec_client::pair;
 use secsec_client::quic::QuicRemote;
 use secsec_client::repo::{
-    data_keyring_remote, init_repo_remote, open_repo_remote, RepoError, RosterAnchor,
+    data_keyring_remote, init_repo_remote, open_repo_remote, revoke_preview, roster_grew,
+    rotate_repo_remote, RepoError, Revoke, RosterAnchor,
 };
-use secsec_client::sync::sync_once;
-use secsec_client::{load_frontier, save_frontier, FrontierLoad};
+use secsec_client::sync::{sync_once, SyncInput, SyncKind, SyncOutcome};
+use secsec_client::{
+    fetch_head, fetch_verified_head, load_frontier, save_frontier, write_private_atomic,
+    ClientError, FrontierLoad,
+};
+use secsec_engine::MergeError;
+use secsec_kdf::MasterKey;
 use secsec_proto::server::{Limits, WindowCounter};
+use secsec_roster::State;
 use secsec_server::{serve::serve_connection, Server};
-use secsec_sig::DeviceKey;
+use secsec_sig::{DeviceKey, SigError};
+use secsec_snapshot::SnapshotMemo;
 use secsec_store::Store;
 use secsec_sync::rollback::SyncFrontier;
-use secsec_transport::handshake::{client_handshake, ClientSession};
+use secsec_sync::HeadError;
+use secsec_transport::handshake::client_handshake;
 use secsec_transport::quic::{
     client_config_tofu, client_config_tuned, server_config_tuned, Tuning,
 };
 use secsec_transport::HostPin;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::path::{Path, PathBuf};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::path::{Component, Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::UnboundedReceiver;
 use zeroize::Zeroizing;
 
-/// Default listen port a client assumes for a bare `host` (§19: udp/8899). The server's actual listen
-/// port, the staging TTL, the reclaim cadence, and history retention are set in `secsec.config` (§19).
+type CliResult<T> = Result<T, Box<dyn Error>>;
+
+/// The data key ring a cold start peels (§8.2).
+type Keyring = BTreeMap<u32, MasterKey>;
+
+/// The port a bare `host` means (§19, udp/8899), and the default listen port.
 const DEFAULT_PORT: u16 = 8899;
-/// How long `invite` waits for a device to pair, and `sync --invite` waits for the host, in 500 ms
-/// pairing-poll rounds (§7): the host waits up to the ~10-minute invite lifetime; the joiner ~2 min.
+/// Pairing-mailbox polls (500 ms apart) the inviting device waits: the invite's lifetime.
 const PAIR_HOST_ROUNDS: u32 = 1200;
+/// Pairing-mailbox polls the joining device waits.
 const PAIR_JOIN_ROUNDS: u32 = 240;
+/// Pause between reconnect attempts after the connection drops.
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+/// Interactive passphrase attempts.
+const MAX_PASSPHRASE_TRIES: usize = 3;
+/// The one ref every folder syncs (one repository holds one tree).
+const REF: &str = "main";
+/// What `--version` prints: the release tag a release build is stamped with (`SECSEC_RELEASE`), else the crate version.
+const RELEASE: &str = match option_env!("SECSEC_RELEASE") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 #[derive(Parser)]
 #[command(
     name = "secsec",
+    version = RELEASE,
     about = "Zero-knowledge end-to-end-encrypted file sync"
 )]
 struct Cli {
@@ -48,111 +74,108 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[derive(Args)]
+struct KeyArgs {
+    /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
+    #[arg(long, value_name = "FILE")]
+    key: Option<PathBuf>,
+    /// Read the key passphrase from stdin (a pipe, never argv) instead of prompting.
+    #[arg(long)]
+    passphrase_stdin: bool,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run the blind sync server. Reads `~/.ssh/authorized_keys` as a mandatory connection gate.
+    /// Run the blind sync server; every connection is gated on ~/.ssh/authorized_keys.
     Serve {
-        /// Directory to store the encrypted repo + host key (default: current directory).
+        /// Directory for the encrypted repository and the host key (default: current directory).
         dir: Option<PathBuf>,
-        /// UDP port to listen on (default: 8899).
+        /// UDP port to listen on (default: listen_port in secsec.config).
+        #[arg(long)]
         port: Option<u16>,
     },
-    /// Sync a folder with a repo, continuously. Name the server once; then just `secsec sync <dir>`.
+    /// Keep a folder in continuous two-way sync with its repository.
     Sync {
         /// The folder to sync (default: current directory).
         dir: Option<PathBuf>,
-        /// Server `host[:port]` — required the first time a folder is linked.
+        /// Server host[:port], needed the first time a folder is linked.
         #[arg(long)]
         server: Option<String>,
-        /// A one-time invite code from an enrolled device (to join an existing repo).
-        #[arg(long)]
+        /// The server's host pin (`secsec hostpin --serve <dir>` there); without it the first connection trusts on first use.
+        #[arg(long, value_name = "HOST_PIN")]
+        pin: Option<String>,
+        /// Join an existing repository with a one-time invite code; without a value, prompt for it.
+        #[arg(long, value_name = "CODE", num_args = 0..=1, default_missing_value = "")]
         invite: Option<String>,
-        /// Sync once and exit (default is to keep running and watch for changes).
+        /// Sync once and exit instead of watching for changes.
         #[arg(long)]
         once: bool,
-        /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
-        #[arg(long, value_name = "FILE")]
-        key: Option<PathBuf>,
-        /// Read the key passphrase from stdin instead of prompting — for headless/GUI launchers.
-        /// The passphrase travels over a pipe, never argv, so it is not visible to `ps`/`top`.
-        #[arg(long)]
-        passphrase_stdin: bool,
+        #[command(flatten)]
+        key: KeyArgs,
     },
-    /// On an enrolled device, print a one-time invite code and pair a new device over the wire.
+    /// Stop the sync running for a folder (default: the synced folder you are in).
+    Stop {
+        /// A synced folder, or a path inside one.
+        dir: Option<PathBuf>,
+    },
+    /// Show whether a folder's sync is running and how it last went, as key=value lines.
+    Status {
+        /// A synced folder, or a path inside one.
+        dir: Option<PathBuf>,
+    },
+    /// On an enrolled device: print a one-time invite code and pair a new device over the wire.
     Invite {
-        /// A folder already linked to the repo (default: current directory).
+        /// A synced folder, or a path inside one.
         dir: Option<PathBuf>,
-        /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
-        #[arg(long, value_name = "FILE")]
-        key: Option<PathBuf>,
-        /// Read the key passphrase from stdin instead of prompting — for headless/GUI launchers.
-        /// The passphrase travels over a pipe, never argv, so it is not visible to `ps`/`top`.
-        #[arg(long)]
-        passphrase_stdin: bool,
+        #[command(flatten)]
+        key: KeyArgs,
     },
-    /// List the devices enrolled in a linked folder's repo (with their SSH key fingerprints).
+    /// List the devices enrolled in the repository, with their SSH key fingerprints.
     Devices {
-        /// A folder already linked to the repo (default: current directory).
+        /// A synced folder, or a path inside one.
         dir: Option<PathBuf>,
-        /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
-        #[arg(long, value_name = "FILE")]
-        key: Option<PathBuf>,
-        /// Read the key passphrase from stdin instead of prompting — for headless/GUI launchers.
-        /// The passphrase travels over a pipe, never argv, so it is not visible to `ps`/`top`.
-        #[arg(long)]
-        passphrase_stdin: bool,
+        #[command(flatten)]
+        key: KeyArgs,
     },
-    /// Show the pinned server host fingerprint for a folder, to compare out-of-band against the
-    /// `host pin` the server prints on startup (TOFU first-contact verification).
+    /// Print a server host pin: the one a folder pinned, or with --serve the server's own.
     Hostpin {
-        /// A folder already linked to the repo (default: current directory).
+        /// A synced folder, or a path inside one.
         dir: Option<PathBuf>,
+        /// A serve directory: print its host pin, creating the host key if it does not exist yet.
+        #[arg(long, value_name = "DIR", conflicts_with = "dir")]
+        serve: Option<PathBuf>,
     },
-    /// Show the change log of the synced folder you're in; with a path, that file/folder's history.
+    /// Show the repository's change log; with a path, that file or folder's versions.
     Log {
-        /// A file or folder within the repo (relative to the synced folder root). Omit for the whole repo.
+        /// A file or folder, relative to the current directory inside the synced folder.
         path: Option<String>,
-        /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
-        #[arg(long, value_name = "FILE")]
-        key: Option<PathBuf>,
-        /// Read the key passphrase from stdin instead of prompting — for headless/GUI launchers.
-        /// The passphrase travels over a pipe, never argv, so it is not visible to `ps`/`top`.
-        #[arg(long)]
-        passphrase_stdin: bool,
+        #[command(flatten)]
+        key: KeyArgs,
     },
-    /// Restore a historic version of a file/folder into the working folder; the next sync propagates it
-    /// to other devices (like copying the old file over the current one). Run inside the synced folder.
+    /// Write an earlier version of a file or folder into the synced folder; the running sync propagates it.
     Restore {
-        /// The file or folder within the repo to restore (relative to the synced folder root).
+        /// A file or folder, relative to the current directory inside the synced folder.
         path: String,
-        /// The version: a commit-id prefix from `secsec log <path>`. Omit for the previous version.
+        /// A commit-id prefix from `secsec log <path>`; omit for the previous version.
         version: Option<String>,
-        /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
-        #[arg(long, value_name = "FILE")]
-        key: Option<PathBuf>,
-        /// Read the key passphrase from stdin instead of prompting — for headless/GUI launchers.
-        /// The passphrase travels over a pipe, never argv, so it is not visible to `ps`/`top`.
-        #[arg(long)]
-        passphrase_stdin: bool,
+        #[command(flatten)]
+        key: KeyArgs,
     },
-    /// Revoke a device (e.g. a stolen one): rotate the key away from it so it can't read new data.
+    /// Revoke a device and the devices it granted since this one last checked, rotating the key away from them.
     Revoke {
-        /// The device id (a unique prefix is enough) — from `secsec devices`.
+        /// The device id, or a unique prefix of it, from `secsec devices`.
         device: String,
-        /// A folder already linked to the repo (default: current directory).
+        /// A synced folder, or a path inside one.
         dir: Option<PathBuf>,
-        /// SSH private key to use as this device's identity (default: ~/.ssh/id_ed25519).
-        #[arg(long, value_name = "FILE")]
-        key: Option<PathBuf>,
-        /// Read the key passphrase from stdin instead of prompting — for headless/GUI launchers.
-        /// The passphrase travels over a pipe, never argv, so it is not visible to `ps`/`top`.
-        #[arg(long)]
-        passphrase_stdin: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        #[command(flatten)]
+        key: KeyArgs,
     },
-    /// Wipe secsec's local state at a location (client link/cache and/or server repo + host key) and
-    /// start over — your files and your `~/.ssh` key are left untouched. Stop a running sync/serve first.
+    /// Remove secsec's own state for a folder and/or serve directory; your files and SSH keys stay.
     Reset {
-        /// The synced folder and/or serve dir to reset (default: current directory).
+        /// The synced folder and/or serve directory (default: current directory).
         dir: Option<PathBuf>,
         /// Skip the confirmation prompt.
         #[arg(long, short = 'y')]
@@ -166,164 +189,38 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn parse_hex(s: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-    if s.len() % 2 != 0 {
-        return Err("invalid hex (odd length)".into());
+fn parse_hex32(s: &str) -> CliResult<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 || !s.is_ascii() {
+        return Err("expected 64 hex characters".into());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(s.get(i..i + 2).unwrap_or("zz"), 16))
-        .collect::<Result<_, _>>()
-        .map_err(|_| "invalid hex".into())
-}
-
-fn parse_hex32(s: &str) -> Result<[u8; 32], Box<dyn Error>> {
-    parse_hex(s.trim())?
-        .try_into()
-        .map_err(|_| "expected 32 bytes (64 hex chars)".into())
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|_| "invalid hex")?;
+    }
+    Ok(out)
 }
 
 fn unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
-fn rand32() -> Result<[u8; 32], Box<dyn Error>> {
-    let mut n = [0u8; 32];
-    getrandom::fill(&mut n)?;
-    Ok(n)
+fn random<const N: usize>() -> CliResult<[u8; N]> {
+    let mut b = [0u8; N];
+    getrandom::fill(&mut b)?;
+    Ok(b)
 }
 
-/// A fresh 16-byte per-attempt push id (§15).
-fn rand16() -> Result<[u8; 16], Box<dyn Error>> {
-    let mut n = [0u8; 16];
-    getrandom::fill(&mut n)?;
-    Ok(n)
+fn home() -> CliResult<PathBuf> {
+    std::env::home_dir()
+        .filter(|p| p.is_absolute())
+        .ok_or_else(|| "cannot determine the home directory".into())
 }
 
-/// Create `dir` and its parents owner-only (0700 on unix). Everything under the client root is either
-/// a trust anchor (the link's pinned `host_id`/RFP/rollback anchor) or the sealed frontier, and the
-/// serve dir holds the TLS host key; no other user has business reading them.
-fn create_dir_private(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-    }
-    #[cfg(not(unix))]
-    std::fs::create_dir_all(dir)
-}
-
-/// Write `contents` to `path` owner-only (0600 on unix), created with the mode already set so the
-/// bytes are never briefly world-readable. The mode is re-applied for a pre-existing file, so an
-/// install that predates this also gets tightened.
-fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(contents)
-    }
-    #[cfg(not(unix))]
-    std::fs::write(path, contents)
-}
-
-fn home() -> Result<PathBuf, Box<dyn Error>> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "HOME is not set".into())
-}
-
-/// Load this device's SSH key — the `--key <file>` override if given, else the default
-/// `~/.ssh/id_ed25519` (current behaviour when the flag is absent) — decrypting a
-/// passphrase-protected key in memory; the on-disk key stays encrypted. When `passphrase_stdin` is
-/// set the passphrase is read from stdin (for headless/GUI launchers); otherwise we prompt
-/// interactively with no echo.
-fn load_device(
-    key_path: Option<PathBuf>,
-    passphrase_stdin: bool,
-) -> Result<DeviceKey, Box<dyn Error>> {
-    let path = match key_path {
-        Some(p) => p,
-        None => home()?.join(".ssh/id_ed25519"),
-    };
-    let pem = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read device key {}: {e}", path.display()))?;
-    match DeviceKey::from_openssh(&pem) {
-        Ok(device) => Ok(device),
-        Err(secsec_sig::SigError::Encrypted) if passphrase_stdin => decrypt_device_stdin(&pem),
-        Err(secsec_sig::SigError::Encrypted) => decrypt_device(&pem, &path),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Prompt for the passphrase (up to 3 attempts, no echo) and decrypt the key in RAM; the typed
-/// passphrase is zeroized after each try and the on-disk key is never modified.
-fn decrypt_device(pem: &str, path: &Path) -> Result<DeviceKey, Box<dyn Error>> {
-    const MAX_TRIES: usize = 3;
-    for attempt in 1..=MAX_TRIES {
-        let passphrase = Zeroizing::new(rpassword::prompt_password(format!(
-            "passphrase for {}: ",
-            path.display()
-        ))?);
-        match DeviceKey::from_openssh_passphrase(pem, &passphrase) {
-            Ok(device) => return Ok(device),
-            // Wrong passphrase: re-prompt unless that was the last allowed attempt.
-            Err(secsec_sig::SigError::BadPassphrase) => {
-                if attempt < MAX_TRIES {
-                    eprintln!("wrong passphrase — try again");
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Err("could not decrypt the device key: wrong passphrase".into())
-}
-
-/// Decrypt a passphrase-protected key using a passphrase read from **stdin** (the headless / GUI
-/// path). A parent process writes the passphrase to this child's stdin and closes it — so the secret
-/// travels over a pipe and never appears in argv (invisible to `ps`/`top`/`/proc/<pid>/cmdline`),
-/// unlike a `--passphrase <value>` flag would. One attempt only: stdin carries a single passphrase.
-fn decrypt_device_stdin(pem: &str) -> Result<DeviceKey, Box<dyn Error>> {
-    let passphrase = read_passphrase_stdin()?;
-    match DeviceKey::from_openssh_passphrase(pem, &passphrase) {
-        Ok(device) => Ok(device),
-        Err(secsec_sig::SigError::BadPassphrase) => {
-            Err("wrong passphrase (read from stdin)".into())
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Read a passphrase from stdin: take the first line, strip its trailing newline (CRLF tolerated),
-/// and keep it [`Zeroizing`]. Other whitespace is preserved (it may be part of the passphrase); EOF
-/// with no trailing newline is fine — the parent may close the pipe without one.
-fn read_passphrase_stdin() -> Result<Zeroizing<String>, Box<dyn Error>> {
-    use std::io::BufRead;
-    let mut line = Zeroizing::new(String::new());
-    std::io::stdin().lock().read_line(&mut line)?;
-    Ok(Zeroizing::new(
-        line.trim_end_matches(['\r', '\n']).to_string(),
-    ))
-}
-
-/// The secsec client root: `$XDG_CONFIG_HOME/secsec` if that var is an absolute path, else
-/// `~/.config/secsec`. Everything client-side (per-folder state, the UI's `ui.conf`/log, the systemd
-/// env files) lives under this one root — no scatter across the home dir (§13). Resolves to the same
-/// dir the GNOME/macOS UIs use via the XDG config dir.
-fn config_root() -> Result<PathBuf, Box<dyn Error>> {
+/// The client root: `$XDG_CONFIG_HOME/secsec` when that is absolute, else `~/.config/secsec`; the desktop UIs use the same.
+fn config_root() -> CliResult<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(v) if Path::new(&v).is_absolute() => PathBuf::from(v),
         _ => home()?.join(".config"),
@@ -331,25 +228,86 @@ fn config_root() -> Result<PathBuf, Box<dyn Error>> {
     Ok(base.join("secsec"))
 }
 
+/// Create `dir` and its parents, and make `dir` owner-only (0700 on unix).
+fn create_dir_private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+}
+
+fn not_found(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+}
+
+/// Ask a yes/no question on the terminal; anything but yes is no.
+fn confirm(question: &str) -> CliResult<bool> {
+    use std::io::Write;
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
+}
+
+/// Resolves on Ctrl-C (or never, where signals are unavailable).
+async fn ctrl_c() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Resolves on Ctrl-C, or SIGTERM on unix.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                () = ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    ctrl_c().await;
+}
+
+/// Sleep until `deadline`; `None` (beyond the clock's range) never wakes.
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn deadline_after(d: Duration) -> Option<tokio::time::Instant> {
+    tokio::time::Instant::now().checked_add(d)
+}
+
 // ---- secsec.config (§19) ----
 
-/// Operator-tunable settings, loaded from `<config_root>/secsec.config` (written with defaults on
-/// first use). Only settings that are safe to change live here; content-addressing, the wire format,
-/// and cryptographic parameters are compiled in. Out-of-range values are clamped on load.
+/// Operator-tunable settings from `<config root>/secsec.config`; out-of-range values are clamped on load.
 struct Config {
-    // [client]
     retention_keep_versions: usize,
     watch_debounce_ms: u64,
     poll_interval_secs: u64,
     quic_idle_secs: u64,
     quic_keepalive_secs: u64,
-    // [server]
     listen_port: u16,
     storage_cap_gib: u64,
     write_rate_mb_s: u64,
     read_rate_mb_s: u64,
     conn_rate_per_ip: u64,
     max_conns_per_key: u64,
+    max_connections: u64,
     staging_ttl_hours: u64,
     reclaim_tick_minutes: u64,
 }
@@ -368,55 +326,56 @@ impl Default for Config {
             read_rate_mb_s: 200,
             conn_rate_per_ip: 10,
             max_conns_per_key: 3,
+            max_connections: 256,
             staging_ttl_hours: 24,
             reclaim_tick_minutes: 60,
         }
     }
 }
 
-/// The default `secsec.config`, written verbatim on first use. Comments document each setting's range.
+/// The default `secsec.config`, written on first use when none exists.
 const CONFIG_TEMPLATE: &str = "\
-# secsec.config — operator-tunable settings. Out-of-range values are clamped on load.
-# Only settings that are safe to change are here; content-addressing, the wire format, and
-# cryptographic parameters are compiled in and cannot be set from this file.
+# secsec.config: operator-tunable settings, clamped to their ranges on load; everything else is compiled in.
 
 [client]
-retention_keep_versions = 8     # versions kept per file (0 = keep every version forever)
-watch_debounce_ms       = 1000  # coalesce a burst of edits into one sync (min 100)
-poll_interval_secs      = 15    # periodic re-sync to pick up newly-enrolled devices (min 5)
-quic_idle_secs          = 30    # connection idle timeout (min 5)
-quic_keepalive_secs     = 10    # keepalive interval (min 1, forced below quic_idle_secs)
+retention_keep_versions = 8     # versions kept per file (0 = keep every version)
+watch_debounce_ms       = 1000  # quiet time that ends a burst of edits (min 100)
+poll_interval_secs      = 15    # periodic re-sync, and the longest a burst of edits waits (min 5)
+quic_idle_secs          = 30    # connection idle timeout, also the server's handshake deadline (min 5)
+quic_keepalive_secs     = 10    # keepalive interval (min 1, kept below quic_idle_secs)
 
 [server]
-listen_port          = 8899  # UDP port to listen on (1-65535)
-storage_cap_gib      = 0     # per-key cumulative new-write cap, GiB (0 = unlimited)
+listen_port          = 8899  # UDP port (1-65535)
+storage_cap_gib      = 0     # per-key new-write cap per server run, GiB (0 = unlimited)
 write_rate_mb_s      = 100   # per-key sustained write rate, MB/s (min 1)
 read_rate_mb_s       = 200   # per-key sustained read rate, MB/s (min 1)
 conn_rate_per_ip     = 10    # new connections per second per source IP (min 1)
 max_conns_per_key    = 3     # concurrent connections per device key (min 1)
+max_connections      = 256   # concurrent connections server-wide, handshakes in flight included (min 1)
 staging_ttl_hours    = 24    # idle hours before an abandoned upload's staging is reclaimed (min 1)
 reclaim_tick_minutes = 60    # how often the server sweeps idle staging (min 1)
 ";
 
 impl Config {
-    /// Load the config, writing the default template on first use; values are range-clamped (§19).
-    fn load() -> Result<Config, Box<dyn Error>> {
+    /// Load the config; only a missing file is replaced by the template, any other read error is reported.
+    fn load() -> CliResult<Config> {
         let path = config_root()?.join("secsec.config");
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
-            Err(_) => {
+            Err(e) if not_found(&e) => {
                 if let Some(parent) = path.parent() {
                     create_dir_private(parent)?;
                 }
-                std::fs::write(&path, CONFIG_TEMPLATE)?;
+                write_private_atomic(&path, CONFIG_TEMPLATE.as_bytes())?;
                 CONFIG_TEMPLATE.to_string()
             }
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display()).into()),
         };
         let mut cfg = Config::default();
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() || line.starts_with('[') {
-                continue; // blank, comment, or section header
+                continue;
             }
             if let Some((k, v)) = line.split_once('=') {
                 cfg.apply(k.trim(), v.trim());
@@ -426,8 +385,7 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Set one field from a `key = value` line; an unknown key or an unparseable value is ignored so
-    /// the compiled-in default stands.
+    /// Set one field; an unknown key or an unparseable value leaves the default.
     fn apply(&mut self, key: &str, val: &str) {
         match key {
             "retention_keep_versions" => set(&mut self.retention_keep_versions, val),
@@ -441,18 +399,18 @@ impl Config {
             "read_rate_mb_s" => set(&mut self.read_rate_mb_s, val),
             "conn_rate_per_ip" => set(&mut self.conn_rate_per_ip, val),
             "max_conns_per_key" => set(&mut self.max_conns_per_key, val),
+            "max_connections" => set(&mut self.max_connections, val),
             "staging_ttl_hours" => set(&mut self.staging_ttl_hours, val),
             "reclaim_tick_minutes" => set(&mut self.reclaim_tick_minutes, val),
             _ => {}
         }
     }
 
-    /// Clamp every field to its safe range (§19). `retention_keep_versions == 0` (keep everything) and
-    /// `storage_cap_gib == 0` (unlimited) are valid and left as-is.
+    /// Clamp to the documented minimums; the idle timeout also stays within what QUIC can express.
     fn clamp(&mut self) {
         self.watch_debounce_ms = self.watch_debounce_ms.max(100);
         self.poll_interval_secs = self.poll_interval_secs.max(5);
-        self.quic_idle_secs = self.quic_idle_secs.max(5);
+        self.quic_idle_secs = self.quic_idle_secs.clamp(5, Tuning::MAX_IDLE_SECS);
         self.quic_keepalive_secs = self
             .quic_keepalive_secs
             .clamp(1, self.quic_idle_secs.saturating_sub(1).max(1));
@@ -463,11 +421,11 @@ impl Config {
         self.read_rate_mb_s = self.read_rate_mb_s.max(1);
         self.conn_rate_per_ip = self.conn_rate_per_ip.max(1);
         self.max_conns_per_key = self.max_conns_per_key.max(1);
+        self.max_connections = self.max_connections.max(1);
         self.staging_ttl_hours = self.staging_ttl_hours.max(1);
         self.reclaim_tick_minutes = self.reclaim_tick_minutes.max(1);
     }
 
-    /// The transport idle/keepalive tuning derived from this config.
     fn tuning(&self) -> Tuning {
         Tuning {
             idle_secs: self.quic_idle_secs,
@@ -475,107 +433,156 @@ impl Config {
         }
     }
 
-    /// The server runtime limits derived from this config: rates decimal-MB/s → bytes/s, cap GiB →
-    /// bytes (0 = unlimited). Saturating so a huge value cannot overflow.
+    fn idle(&self) -> Duration {
+        Duration::from_secs(self.quic_idle_secs)
+    }
+
+    /// Server limits: rates in decimal MB/s to bytes/s, the cap in GiB to bytes (0 = unlimited).
     fn limits(&self) -> Limits {
         Limits {
             write_rate: self.write_rate_mb_s.saturating_mul(1_000_000),
             read_rate: self.read_rate_mb_s.saturating_mul(1_000_000),
             conn_rate_per_sec: self.conn_rate_per_ip,
             max_conns_per_key: self.max_conns_per_key,
+            max_connections: self.max_connections,
             storage_cap: self.storage_cap_gib.saturating_mul(1024 * 1024 * 1024),
         }
     }
 }
 
-/// Parse `val` into `field` via `FromStr`, leaving the existing value on a parse error.
 fn set<T: std::str::FromStr>(field: &mut T, val: &str) {
     if let Ok(v) = val.parse() {
         *field = v;
     }
 }
 
-/// The out-of-tree state directory for a synced folder: `<config_root>/folders/<hash(abspath)>/`
-/// (created if absent). Holds the per-folder link, the sealed cursor, the in-flight push id, and the
-/// object cache — so the synced folder itself stays nothing but the user's files.
-fn state_dir_for(dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
-    let abs = std::fs::canonicalize(dir)?;
-    let name = hex(blake3::hash(abs.to_string_lossy().as_bytes()).as_bytes());
-    let sdir = config_root()?.join("folders").join(&name);
-    create_dir_private(&sdir)?;
-    Ok(sdir)
-}
+// ---- device key ----
 
-/// Resolve `host[:port]` (default port 8899) to a socket address.
-fn resolve_server(s: &str) -> Result<SocketAddr, Box<dyn Error>> {
-    let with_port = if s
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse::<u16>().ok())
-        .is_some()
-        && s.contains(':')
+/// Refuse a private key that other users can read, as ssh does.
+fn check_key_permissions(path: &Path) -> CliResult<()> {
+    #[cfg(unix)]
     {
-        s.to_string()
-    } else {
-        format!("{s}:{DEFAULT_PORT}")
-    };
-    with_port
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| format!("cannot resolve server address '{s}'").into())
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| format!("cannot read device key {}: {e}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "permissions {:o} on {} are too open: the private key must be accessible by its owner only (chmod 600)",
+                mode & 0o777,
+                path.display()
+            )
+            .into());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
-/// A folder's link to its repo (the git-remote analogue): server address, pinned host id, RFP, ref
-/// name, and the §8.1 anti-rollback anchor (P7). Stored at `<state>/link` — client-side, so a
-/// malicious **server** cannot roll the roster back.
+/// Load this device's SSH key, decrypting a passphrase-protected one in memory only.
+fn load_device(k: &KeyArgs) -> CliResult<DeviceKey> {
+    let path = match &k.key {
+        Some(p) => p.clone(),
+        None => home()?.join(".ssh").join("id_ed25519"),
+    };
+    check_key_permissions(&path)?;
+    let pem = Zeroizing::new(
+        std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read device key {}: {e}", path.display()))?,
+    );
+    match DeviceKey::from_openssh(&pem) {
+        Ok(device) => Ok(device),
+        Err(SigError::Encrypted) if k.passphrase_stdin => decrypt_stdin(&pem),
+        Err(SigError::Encrypted) => decrypt_prompt(&pem, &path),
+        Err(e) => Err(format!("cannot load device key {}: {e}", path.display()).into()),
+    }
+}
+
+/// Prompt for the passphrase without echo; each typed passphrase is zeroized after its try.
+fn decrypt_prompt(pem: &str, path: &Path) -> CliResult<DeviceKey> {
+    for attempt in 1..=MAX_PASSPHRASE_TRIES {
+        let passphrase = Zeroizing::new(rpassword::prompt_password(format!(
+            "passphrase for {}: ",
+            path.display()
+        ))?);
+        match DeviceKey::from_openssh_passphrase(pem, &passphrase) {
+            Ok(device) => return Ok(device),
+            Err(SigError::BadPassphrase) if attempt < MAX_PASSPHRASE_TRIES => {
+                eprintln!("wrong passphrase, try again");
+            }
+            Err(SigError::BadPassphrase) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err("could not decrypt the device key: wrong passphrase".into())
+}
+
+/// Decrypt with one passphrase read from stdin, the first line without its line ending.
+fn decrypt_stdin(pem: &str) -> CliResult<DeviceKey> {
+    use std::io::BufRead;
+    let mut line = Zeroizing::new(String::new());
+    std::io::stdin().lock().read_line(&mut line)?;
+    let passphrase = Zeroizing::new(line.trim_end_matches(['\r', '\n']).to_string());
+    match DeviceKey::from_openssh_passphrase(pem, &passphrase) {
+        Ok(device) => Ok(device),
+        Err(SigError::BadPassphrase) => Err("wrong passphrase (read from stdin)".into()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+// ---- folder state ----
+
+/// A folder's out-of-tree state directory, named by `BLAKE3` of its canonical path.
+fn state_path(canonical: &Path) -> CliResult<PathBuf> {
+    let name = hex(blake3::hash(canonical.to_string_lossy().as_bytes()).as_bytes());
+    Ok(config_root()?.join("folders").join(name))
+}
+
+/// A folder's link to its repository: server, pinned host id, RFP, and the §8.1 anti-rollback anchor.
 struct Link {
     server: String,
     host_id: [u8; 32],
     rfp: [u8; 32],
-    ref_name: String,
     anchor: Option<RosterAnchor>,
 }
 
-fn read_link(sdir: &Path) -> Option<Link> {
-    let s = std::fs::read_to_string(sdir.join("link")).ok()?;
-    let (mut server, mut host_id, mut rfp, mut ref_name) = (None, None, None, None);
-    let (mut rseq, mut rtip) = (None, None);
-    for line in s.lines() {
-        if let Some(v) = line.strip_prefix("server=") {
-            server = Some(v.to_string());
-        } else if let Some(v) = line.strip_prefix("host_id=") {
-            host_id = parse_hex32(v).ok();
-        } else if let Some(v) = line.strip_prefix("rfp=") {
-            rfp = parse_hex32(v).ok();
-        } else if let Some(v) = line.strip_prefix("ref=") {
-            ref_name = Some(v.to_string());
-        } else if let Some(v) = line.strip_prefix("roster_seq=") {
-            rseq = v.parse::<u64>().ok();
-        } else if let Some(v) = line.strip_prefix("roster_tip=") {
-            rtip = parse_hex32(v).ok();
-        }
-    }
-    // None until the first successful cold-start records one — the create/join establishes it.
-    let anchor = match (rseq, rtip) {
-        (Some(max_seq), Some(tip_hash)) => Some(RosterAnchor { max_seq, tip_hash }),
+fn read_link(sdir: &Path) -> CliResult<Option<Link>> {
+    let path = sdir.join("link");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if not_found(&e) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let fields: BTreeMap<&str, &str> = text.lines().filter_map(|l| l.split_once('=')).collect();
+    let field = |k: &str| {
+        fields
+            .get(k)
+            .copied()
+            .ok_or_else(|| format!("{} lacks `{k}`", path.display()))
+    };
+    let anchor = match (fields.get("roster_seq"), fields.get("roster_tip")) {
+        (Some(seq), Some(tip)) => Some(RosterAnchor {
+            max_seq: seq.parse()?,
+            tip_hash: parse_hex32(tip)?,
+        }),
         _ => None,
     };
-    Some(Link {
-        server: server?,
-        host_id: host_id?,
-        rfp: rfp?,
-        ref_name: ref_name?,
+    Ok(Some(Link {
+        server: field("server")?.to_string(),
+        host_id: parse_hex32(field("host_id")?)?,
+        rfp: parse_hex32(field("rfp")?)?,
         anchor,
-    })
+    }))
 }
 
-fn write_link(sdir: &Path, l: &Link) -> Result<(), Box<dyn Error>> {
+fn write_link(sdir: &Path, l: &Link) -> CliResult<()> {
     let mut body = format!(
-        "server={}\nhost_id={}\nrfp={}\nref={}\n",
+        "server={}\nhost_id={}\nrfp={}\n",
         l.server,
         hex(&l.host_id),
-        hex(&l.rfp),
-        l.ref_name
+        hex(&l.rfp)
     );
     if let Some(a) = &l.anchor {
         body.push_str(&format!(
@@ -584,170 +591,400 @@ fn write_link(sdir: &Path, l: &Link) -> Result<(), Box<dyn Error>> {
             hex(&a.tip_hash)
         ));
     }
-    write_private(&sdir.join("link"), body.as_bytes())?;
+    write_private_atomic(&sdir.join("link"), body.as_bytes())?;
     Ok(())
 }
 
-/// Connect to `addr`, pinning a known `host_id` or capturing it on first use (TOFU). Returns the
-/// endpoint, connection, and the pinned/captured `host_id`.
+/// Take a blocking exclusive lock on `path` (created if absent), released when the handle drops.
+fn lock_file(path: &Path) -> CliResult<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    f.lock()?;
+    Ok(f)
+}
+
+/// Record a newer anchor in the link of `rfp`'s folder; the stored anchor never moves backwards (§8.1).
+fn persist_anchor(sdir: &Path, rfp: &[u8; 32], anchor: RosterAnchor) -> CliResult<()> {
+    let _guard = lock_file(&sdir.join("link.lock"))?;
+    let Some(mut link) = read_link(sdir)? else {
+        return Ok(());
+    };
+    if link.rfp != *rfp || link.anchor.is_some_and(|a| a.max_seq >= anchor.max_seq) {
+        return Ok(());
+    }
+    link.anchor = Some(anchor);
+    write_link(sdir, &link)
+}
+
+/// Find the synced folder containing `start`: its canonical root, state directory, and link.
+fn find_linked(start: &Path) -> CliResult<(PathBuf, PathBuf, Link)> {
+    let canonical = std::fs::canonicalize(start)
+        .map_err(|e| format!("cannot resolve {}: {e}", start.display()))?;
+    for dir in canonical.ancestors() {
+        let sdir = state_path(dir)?;
+        if let Some(link) = read_link(&sdir)? {
+            return Ok((dir.to_path_buf(), sdir, link));
+        }
+    }
+    Err(format!(
+        "{} is not inside a synced folder (link one with `secsec sync <folder> --server <host>`)",
+        canonical.display()
+    )
+    .into())
+}
+
+fn read_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// A folder's sync lock, held for the sync's lifetime and naming its pid.
+struct FolderLock(#[allow(dead_code)] std::fs::File);
+
+impl FolderLock {
+    fn acquire(sdir: &Path, dir: &Path) -> CliResult<Self> {
+        use std::io::Write;
+        let path = sdir.join("lock");
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        match f.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let who = read_pid(&path).map_or_else(String::new, |p| format!(" (pid {p})"));
+                return Err(format!(
+                    "{} is already being synced{who}; stop it with `secsec stop {}`",
+                    dir.display(),
+                    dir.display()
+                )
+                .into());
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        f.set_len(0)?;
+        writeln!(f, "{}", std::process::id())?;
+        f.sync_all()?;
+        Ok(Self(f))
+    }
+}
+
+/// `Some(pid)` while a sync holds the folder's lock (the pid when readable), `None` when none does.
+fn lock_holder(sdir: &Path) -> CliResult<Option<Option<u32>>> {
+    let path = sdir.join("lock");
+    let f = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) if not_found(&e) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    match f.try_lock() {
+        Ok(()) => Ok(None),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(Some(read_pid(&path))),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// What a running sync last reported, for `secsec status` and the desktop UIs.
+#[derive(Default)]
+struct Status {
+    state: &'static str,
+    last_sync: u64,
+    result: &'static str,
+    conflicts: usize,
+    skipped: usize,
+    message: String,
+}
+
+impl Status {
+    fn write(&self, sdir: &Path) {
+        let message: String = self
+            .message
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let body = format!(
+            "pid={}\nstate={}\nlast_sync={}\nlast_result={}\nconflicts={}\nskipped={}\nmessage={message}\n",
+            std::process::id(),
+            self.state,
+            self.last_sync,
+            self.result,
+            self.conflicts,
+            self.skipped
+        );
+        if let Err(e) = write_private_atomic(&sdir.join("status"), body.as_bytes()) {
+            eprintln!("warning: cannot write the status file: {e}");
+        }
+    }
+
+    fn set(&mut self, sdir: &Path, state: &'static str, message: impl Into<String>) {
+        self.state = state;
+        self.message = message.into();
+        self.write(sdir);
+    }
+}
+
+fn kind_word(kind: SyncKind) -> &'static str {
+    match kind {
+        SyncKind::UpToDate => "uptodate",
+        SyncKind::Published => "published",
+        SyncKind::Cloned => "cloned",
+        SyncKind::Pulled => "pulled",
+        SyncKind::Pushed => "pushed",
+        SyncKind::Merged => "merged",
+    }
+}
+
+// ---- connections ----
+
+/// Resolve `host[:port]`, IPv6 literals included (`[::1]:8899`, `::1`, `[::1]`); the port defaults to 8899.
+fn resolve_server(s: &str) -> CliResult<SocketAddr> {
+    let s = s.trim();
+    if let Ok(a) = s.parse::<SocketAddr>() {
+        return Ok(a);
+    }
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return Ok((ip, DEFAULT_PORT).into());
+    }
+    if let Some(ip) = s
+        .strip_prefix('[')
+        .and_then(|r| r.strip_suffix(']'))
+        .and_then(|b| b.parse::<IpAddr>().ok())
+    {
+        return Ok((ip, DEFAULT_PORT).into());
+    }
+    let (host, port) = match s.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => (
+            h,
+            p.parse::<u16>()
+                .map_err(|_| format!("invalid port in '{s}'"))?,
+        ),
+        _ => (s, DEFAULT_PORT),
+    };
+    (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| format!("cannot resolve server address '{s}'").into())
+}
+
+/// Connect to `addr`, pinning `pinned` or capturing the host id on first contact (TOFU, §11).
 async fn connect(
     addr: SocketAddr,
     pinned: Option<[u8; 32]>,
     tuning: Tuning,
-) -> Result<(quinn::Endpoint, quinn::Connection, [u8; 32]), Box<dyn Error>> {
-    let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    let captured = match pinned {
+) -> CliResult<(quinn::Endpoint, quinn::Connection, [u8; 32])> {
+    let bind: SocketAddr = if addr.is_ipv6() {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let mut ep = quinn::Endpoint::client(bind)?;
+    match pinned {
         Some(h) => {
             ep.set_default_client_config(client_config_tuned(HostPin::from_host_id(h), tuning)?);
-            None
+            let conn = ep.connect(addr, "secsec.invalid")?.await?;
+            Ok((ep, conn, h))
         }
         None => {
-            let (cfg, cap) = client_config_tofu()?;
+            let (cfg, captured) = client_config_tofu(tuning)?;
             ep.set_default_client_config(cfg);
-            Some(cap)
+            let conn = ep.connect(addr, "secsec.invalid")?.await?;
+            let host_id = (*captured.lock().map_err(|_| "TOFU capture poisoned")?)
+                .ok_or("the server presented no host key")?;
+            Ok((ep, conn, host_id))
         }
-    };
-    let conn = ep.connect(addr, "secsec.invalid")?.await?;
-    let host_id = match (pinned, captured) {
-        (Some(h), _) => h,
-        (None, Some(cap)) => {
-            (*cap.lock().expect("tofu cell")).ok_or("server presented no host key during TOFU")?
-        }
-        _ => unreachable!(),
-    };
-    Ok((ep, conn, host_id))
+    }
 }
 
-/// Connect to an already-linked folder's server (pinned `host_id`, default tuning) and run the
-/// §11 handshake. Returns the endpoint, connection, and post-handshake session.
+/// Connect to a linked folder's pinned server and run the §11 handshake; returns the session transcript.
 async fn connect_linked(
     link: &Link,
     device: &DeviceKey,
-) -> Result<(quinn::Endpoint, quinn::Connection, ClientSession), Box<dyn Error>> {
+    tuning: Tuning,
+) -> CliResult<(quinn::Endpoint, quinn::Connection, [u8; 32])> {
     let addr = resolve_server(&link.server)?;
-    let (endpoint, conn, host_id) = connect(addr, Some(link.host_id), Tuning::default()).await?;
-    let sess = client_handshake(&conn, device, host_id, rand32()?).await?;
-    Ok((endpoint, conn, sess))
+    let (ep, conn, host_id) = connect(addr, Some(link.host_id), tuning).await?;
+    let t = client_handshake(&conn, device, host_id, random()?)
+        .await?
+        .transcript;
+    Ok((ep, conn, t))
 }
 
-// ---- host key (server) ----
+// ---- server ----
 
-fn load_or_generate_hostkey(dir: &Path) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
+/// Load the host key from `dir`, or create it; a half-present pair is an error, never silently replaced.
+fn load_or_generate_hostkey(dir: &Path) -> CliResult<(Vec<u8>, Vec<u8>)> {
     let cert_path = dir.join("hostkey.crt");
     let key_path = dir.join("hostkey.key");
-    if cert_path.exists() && key_path.exists() {
-        // Tighten a key left world-readable by an older build before handing it out; idempotent.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+    match (cert_path.exists(), key_path.exists()) {
+        (true, true) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            Ok((std::fs::read(cert_path)?, std::fs::read(key_path)?))
         }
-        return Ok((std::fs::read(cert_path)?, std::fs::read(key_path)?));
+        (false, false) => {
+            let ck = rcgen::generate_simple_self_signed(vec!["secsec.invalid".to_string()])?;
+            let (cert, key) = (
+                ck.cert.der().to_vec(),
+                Zeroizing::new(ck.key_pair.serialize_der()),
+            );
+            create_dir_private(dir)?;
+            write_private_atomic(&key_path, &key)?;
+            write_private_atomic(&cert_path, &cert)?;
+            Ok((cert, key.to_vec()))
+        }
+        _ => Err(format!(
+            "{} holds only half of the host key; restore the missing file or run `secsec reset`",
+            dir.display()
+        )
+        .into()),
     }
-    let ck = rcgen::generate_simple_self_signed(vec!["secsec.invalid".to_string()])?;
-    let (cert, key) = (ck.cert.der().to_vec(), ck.key_pair.serialize_der());
-    create_dir_private(dir)?;
-    std::fs::write(&cert_path, &cert)?;
-    write_private(&key_path, &key)?;
-    Ok((cert, key))
 }
 
-// ---- serve ----
+/// A UDP socket on `port`: dual-stack `[::]` where IPv6 exists, else IPv4 only.
+fn bind_udp(port: u16) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    let v6 = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).and_then(|s| {
+        s.set_only_v6(false)?;
+        s.bind(&SockAddr::from(SocketAddr::from((
+            Ipv6Addr::UNSPECIFIED,
+            port,
+        ))))?;
+        Ok(s)
+    });
+    let socket = match v6 {
+        Ok(s) => s,
+        Err(_) => {
+            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+            s.bind(&SockAddr::from(SocketAddr::from((
+                Ipv4Addr::UNSPECIFIED,
+                port,
+            ))))?;
+            s
+        }
+    };
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
 
-async fn run_serve(dir: PathBuf, port: Option<u16>) -> Result<(), Box<dyn Error>> {
+async fn run_serve(dir: PathBuf, port: Option<u16>) -> CliResult<()> {
     let cfg = Config::load()?;
     let port = port.unwrap_or(cfg.listen_port);
-    std::fs::create_dir_all(&dir)?;
-    let store_path = dir.join("repo.secsec");
-    let hostkey_dir = dir.join("hostkey");
-    let auth_path = home()?.join(".ssh/authorized_keys");
-
-    // authorized_keys is MANDATORY (the connection gate for all comms). Refuse to start without it.
+    create_dir_private(&dir)?;
+    let auth_path = home()?.join(".ssh").join("authorized_keys");
     let body = std::fs::read_to_string(&auth_path).map_err(|e| {
-        format!("authorized_keys is required: cannot read {} ({e}). secsec serve gates every connection on it.", auth_path.display())
+        format!(
+            "{} is required: secsec serve admits only its keys ({e})",
+            auth_path.display()
+        )
     })?;
     let authorized = secsec_server::parse_authorized_keys(&body);
     if authorized.is_empty() {
         return Err(format!(
-            "{} has no usable Ed25519 keys — add at least your own device's public key",
+            "{} has no Ed25519 keys; add each device's public key (its ~/.ssh/id_ed25519.pub)",
             auth_path.display()
         )
         .into());
     }
 
-    let (cert, key) = load_or_generate_hostkey(&hostkey_dir)?;
+    let (cert, key) = load_or_generate_hostkey(&dir.join("hostkey"))?;
     let host_id = HostPin::from_cert(&cert)?.host_id();
-    let mut store = Store::open(&store_path)?;
-    // Compact at startup — the one moment the store is unshared and the endpoint isn't accepting — so
-    // prune/promote deletes that only free redb pages actually shrink the file (§15). Best-effort.
-    let before = std::fs::metadata(&store_path).map(|m| m.len()).unwrap_or(0);
+    let store_path = dir.join("repo.secsec");
+    let mut store = Store::open(&store_path).map_err(|e| {
+        format!(
+            "cannot open {} ({e}); is another secsec serve using it?",
+            store_path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    // Compact while nothing else holds the store, so pruned pages shrink the file (§15).
+    let before = std::fs::metadata(&store_path).map_or(0, |m| m.len());
     match store.compact() {
         Ok(true) => {
-            let after = std::fs::metadata(&store_path)
-                .map(|m| m.len())
-                .unwrap_or(before);
+            let after = std::fs::metadata(&store_path).map_or(before, |m| m.len());
             println!(
-                "compacted {} ({before} → {after} bytes)",
+                "compacted {} ({before} to {after} bytes)",
                 store_path.display()
             );
         }
         Ok(false) => {}
-        Err(e) => eprintln!("repo compaction skipped: {e}"),
+        Err(e) => eprintln!("repository compaction skipped: {e}"),
     }
-    let server = std::sync::Arc::new(
+    let server = Arc::new(
         Server::new(store)
             .with_limits(cfg.limits())
-            .with_authorized_file(auth_path.clone()), // re-read per connection
+            .with_authorized_file(auth_path.clone()),
     );
 
-    // Background reclaimer: drop in-flight pushes idle past the staging TTL (§15), so abandoned staging
-    // cannot accumulate on a server no client is actively pushing to (the accept loop never fires when
-    // idle, so the sweep needs its own timer).
+    // Abandoned staging and idle rate-limit state are reclaimed on a timer, since an idle accept loop never runs.
     {
         let server = server.clone();
-        let staging_ttl_secs = cfg.staging_ttl_hours.saturating_mul(3600);
-        let reclaim_tick_secs = cfg.reclaim_tick_minutes.saturating_mul(60);
+        let ttl = cfg.staging_ttl_hours.saturating_mul(3600);
+        let tick = Duration::from_secs(cfg.reclaim_tick_minutes.saturating_mul(60));
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(reclaim_tick_secs));
             loop {
-                tick.tick().await;
-                if let Err(e) = server.reclaim_staging(unix_secs(), staging_ttl_secs) {
+                sleep_until(deadline_after(tick)).await;
+                if let Err(e) = server.reclaim(unix_secs(), ttl) {
                     eprintln!("staging reclaim failed: {e}");
                 }
             }
         });
     }
 
-    let listen: SocketAddr = (Ipv4Addr::UNSPECIFIED, port).into();
-    let endpoint =
-        quinn::Endpoint::server(server_config_tuned(&cert, &key, cfg.tuning())?, listen)?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config_tuned(&cert, &key, cfg.tuning())?),
+        bind_udp(port)?,
+        Arc::new(quinn::TokioRuntime),
+    )?;
     println!(
-        "secsec serve — store {} · host pin {}",
+        "secsec serve: store {}, host pin {}",
         store_path.display(),
         hex(&host_id)
     );
     println!(
-        "authorized_keys: {} ({} key(s)) · listening on {}",
+        "authorized_keys: {} ({} key(s)), listening on udp {}",
         auth_path.display(),
         authorized.len(),
         endpoint.local_addr()?
     );
-    // Per-source-IP new-connection rate limit (configurable, §19). The accept loop is a single
-    // task, so this map needs no lock; it is pruned at most once per window so idle source IPs cannot
-    // accumulate.
+
+    // Per-source-IP new-connection rate (§19); pruned at most once per window so idle IPs do not accumulate.
     let conn_rate = server.conn_rate_per_sec();
-    let mut ip_rate: std::collections::HashMap<std::net::IpAddr, WindowCounter> =
-        std::collections::HashMap::new();
+    let mut ip_rate: HashMap<IpAddr, WindowCounter> = HashMap::new();
     let mut last_prune = 0u64;
-    while let Some(incoming) = endpoint.accept().await {
-        let now = unix_secs();
-        // §11 DoS hardening: validate the source address with a stateless QUIC Retry before
-        // allocating connection state — anti-amplification, and a spoofed IP cannot exhaust
-        // another's per-IP rate budget.
+    let idle = cfg.idle();
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        let incoming = tokio::select! {
+            i = endpoint.accept() => match i {
+                Some(i) => i,
+                None => break,
+            },
+            () = &mut shutdown => break,
+        };
+        // A stateless Retry validates the source address first: anti-amplification, and no spoofed rate budget.
         if !incoming.remote_address_validated() {
             let _ = incoming.retry();
             continue;
         }
+        let now = unix_secs();
         let ip = incoming.remote_address().ip();
         if now.saturating_sub(last_prune) >= 1 {
             ip_rate.retain(|_, c| c.count(now) > 0);
@@ -761,11 +998,18 @@ async fn run_serve(dir: PathBuf, port: Option<u16>) -> Result<(), Box<dyn Error>
             incoming.refuse();
             continue;
         }
+        // The server-wide cap (§19) holds this slot from before the handshake until the task ends.
+        let Some(admission) = server.admit() else {
+            incoming.refuse();
+            continue;
+        };
         let server = server.clone();
         tokio::spawn(async move {
+            let _admission = admission;
             match incoming.await {
                 Ok(conn) => {
-                    if let Err(e) = serve_connection(&conn, &server, host_id, unix_secs).await {
+                    if let Err(e) = serve_connection(&conn, server, host_id, idle, unix_secs).await
+                    {
                         eprintln!("connection closed: {e}");
                     }
                 }
@@ -773,500 +1017,759 @@ async fn run_serve(dir: PathBuf, port: Option<u16>) -> Result<(), Box<dyn Error>
             }
         });
     }
+    println!("shutting down");
+    endpoint.close(0u32.into(), b"server shutting down");
+    endpoint.wait_idle().await;
     Ok(())
 }
 
 // ---- sync ----
 
-async fn run_sync(
-    dir: PathBuf,
-    server_opt: Option<String>,
-    invite_opt: Option<String>,
-    once: bool,
-    key: Option<PathBuf>,
-    passphrase_stdin: bool,
-) -> Result<(), Box<dyn Error>> {
-    std::fs::create_dir_all(&dir)?;
-    let sdir = state_dir_for(&dir)?;
-    let device = load_device(key, passphrase_stdin)?;
-    let link = read_link(&sdir);
-    let cfg = Config::load()?;
+/// Where one folder's sync keeps its state files.
+struct Paths {
+    frontier: PathBuf,
+    base: PathBuf,
+    push_id: PathBuf,
+    objects: PathBuf,
+}
 
+impl Paths {
+    fn new(sdir: &Path) -> Self {
+        Self {
+            frontier: sdir.join("frontier"),
+            base: sdir.join("base"),
+            push_id: sdir.join("push_id"),
+            objects: sdir.join("objects.secsec"),
+        }
+    }
+}
+
+fn read_base(path: &Path) -> CliResult<Option<[u8; 32]>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(parse_hex32(&s)?)),
+        Err(e) if not_found(&e) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Refuse a folder that contains secsec's own state directory: it would sync itself.
+fn refuse_state_inside(dir: &Path) -> CliResult<()> {
+    let root = config_root()?;
+    create_dir_private(&root)?;
+    let root = std::fs::canonicalize(&root)?;
+    if root.starts_with(dir) {
+        return Err(format!(
+            "{} contains secsec's state directory {}; sync another folder, or set XDG_CONFIG_HOME outside it",
+            dir.display(),
+            root.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// What `secsec sync` was asked to do.
+struct SyncArgs {
+    server: Option<String>,
+    pin: Option<String>,
+    invite: Option<String>,
+    once: bool,
+    key: KeyArgs,
+}
+
+async fn run_sync(dir: PathBuf, args: SyncArgs) -> CliResult<()> {
+    std::fs::create_dir_all(&dir)?;
+    let dir = std::fs::canonicalize(&dir)?;
+    refuse_state_inside(&dir)?;
+    let sdir = state_path(&dir)?;
+    create_dir_private(&sdir)?;
+    let _lock = FolderLock::acquire(&sdir, &dir)?;
+    let mut status = Status::default();
+    status.set(&sdir, "starting", "starting");
+    let result = sync_session(&dir, &sdir, args, &mut status).await;
+    match &result {
+        Ok(()) => status.set(&sdir, "stopped", "stopped"),
+        Err(e) => status.set(&sdir, "stopped", e.to_string()),
+    }
+    result
+}
+
+/// Open the repository after a roster change: refold against `anchor` and re-peel the key ring; the caller records the new anchor.
+async fn refold(
+    rem: &QuicRemote<'_>,
+    device: &DeviceKey,
+    rfp: &[u8; 32],
+    anchor: RosterAnchor,
+) -> Result<(State, RosterAnchor, Keyring), RepoError> {
+    let (mk, st, a) = open_repo_remote(rem, device, rfp, Some(anchor)).await?;
+    let keyring = data_keyring_remote(rem, &mk, &st).await?;
+    Ok((st, a, keyring))
+}
+
+/// Print what a sync did and update the status the UIs read.
+fn report(out: &SyncOutcome, first: bool, last_skipped: &mut Vec<String>, status: &mut Status) {
+    if first || out.kind != SyncKind::UpToDate {
+        println!("sync: {}", kind_word(out.kind));
+    }
+    if !out.conflicts.is_empty() {
+        eprintln!(
+            "{} path(s) changed on both sides; both versions are kept (the other as a .conflict- copy):",
+            out.conflicts.len()
+        );
+        for p in &out.conflicts {
+            eprintln!("  {p}");
+        }
+    }
+    if out.base_missing {
+        eprintln!(
+            "warning: the merge base is no longer on the server, so files deleted on one side may reappear"
+        );
+    }
+    if out.skipped != *last_skipped && !out.skipped.is_empty() {
+        eprintln!(
+            "warning: {} path(s) cannot sync here and keep their last synced version:",
+            out.skipped.len()
+        );
+        for p in &out.skipped {
+            eprintln!("  {p}");
+        }
+    }
+    last_skipped.clone_from(&out.skipped);
+    status.last_sync = unix_secs();
+    status.result = kind_word(out.kind);
+    status.conflicts = out.conflicts.len();
+    status.skipped = out.skipped.len();
+}
+
+/// Wait for the next watcher event; a closed watcher leaves only the poll timer.
+async fn next_change(rx: &mut Option<UnboundedReceiver<()>>) {
+    if let Some(r) = rx.as_mut() {
+        if r.recv().await.is_some() {
+            while r.try_recv().is_ok() {}
+            return;
+        }
+        *rx = None;
+    }
+    std::future::pending::<()>().await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn sync_session(
+    dir: &Path,
+    sdir: &Path,
+    args: SyncArgs,
+    status: &mut Status,
+) -> CliResult<()> {
+    let SyncArgs {
+        server: server_opt,
+        pin,
+        invite: invite_opt,
+        once,
+        key,
+    } = args;
+    let device = load_device(&key)?;
+    let cfg = Config::load()?;
+    let link = read_link(sdir)?;
     let server_str = server_opt
         .or_else(|| link.as_ref().map(|l| l.server.clone()))
-        .ok_or("no server for this folder — pass --server host[:port] the first time")?;
+        .ok_or("no server for this folder: pass --server host[:port] the first time")?;
     let addr = resolve_server(&server_str)?;
-    // One repo holds exactly one synced tree under the ref `main`, so devices converge with zero
-    // flags regardless of their local folder names. (Independent trees use independent repos.)
-    let ref_name = "main".to_string();
-
-    // Connect: pin the saved host key, or TOFU on first contact.
-    let pinned = link.as_ref().map(|l| l.host_id);
-    let (mut endpoint, mut conn, host_id) = connect(addr, pinned, cfg.tuning()).await?;
-    let sess = client_handshake(&conn, &device, host_id, rand32()?).await?;
-    let mut transcript = sess.transcript;
-    let rem = QuicRemote::new(&conn, transcript, &device);
-
-    // Establish the RFP: join via invite, reuse the link, or create the repo (first device).
-    let rfp = if let Some(code_str) = invite_opt {
-        let code = pair::decode_code(&code_str)?;
-        println!("pairing with an enrolled device…");
-        pair::run_join(&rem, &device, &code, &host_id, PAIR_JOIN_ROUNDS).await?
-    } else if let Some(l) = &link {
-        l.rfp
-    } else {
-        // First device: attempt to create the repo. Genesis is permitted only while the roster is
-        // empty, so if the repo already exists this fails and the device must join with an invite.
-        // (No pre-probe: reads require enrollment, which we don't have yet.)
-        if pinned.is_none() {
-            println!(
-                "server host fingerprint (verify out-of-band): {}",
-                hex(&host_id)
-            );
+    let expected = pin.as_deref().map(parse_hex32).transpose()?;
+    let pinned = match (link.as_ref().map(|l| l.host_id), expected) {
+        (Some(have), Some(want)) if have != want => {
+            return Err(format!(
+                "{} is pinned to host {}, not the --pin given; `secsec reset` it to re-pin",
+                dir.display(),
+                hex(&have)
+            )
+            .into())
         }
-        match init_repo_remote(&rem, &device, unix_secs()).await {
-            Ok(rfp) => {
-                println!("created new repository");
-                rfp
+        (have, want) => have.or(want),
+    };
+    status.set(sdir, "connecting", format!("connecting to {server_str}"));
+    let (mut endpoint, mut conn, host_id) = connect(addr, pinned, cfg.tuning()).await?;
+    if pinned.is_none() {
+        println!(
+            "server host pin (compare with `secsec hostpin --serve <dir>` on the server): {}",
+            hex(&host_id)
+        );
+    }
+    let mut transcript = client_handshake(&conn, &device, host_id, random()?)
+        .await?
+        .transcript;
+
+    let rfp = {
+        let rem = QuicRemote::new(&conn, transcript, &device);
+        match invite_opt {
+            Some(code) => {
+                let code = if code.is_empty() {
+                    Zeroizing::new(rpassword::prompt_password("invite code: ")?)
+                } else {
+                    Zeroizing::new(code)
+                };
+                let code = pair::decode_code(&code)?;
+                println!("pairing with an enrolled device...");
+                pair::run_join(&rem, &device, &code, &host_id, PAIR_JOIN_ROUNDS).await?
             }
-            // This device is already a member of the repo, but this folder isn't linked to it — so
-            // don't (and the library won't) re-run genesis over its live keyslot.
-            Err(RepoError::AlreadyEnrolled) => {
-                return Err(format!(
-                    "this device is already enrolled in the repo on {server_str}, but this folder isn't linked to it. \
-                     Sync the folder you first linked here, or re-establish this one: run `secsec invite` on an enrolled \
-                     device and `secsec sync {} --server {server_str} --invite <code>` here.",
-                    dir.display()
-                )
-                .into());
-            }
-            Err(e) => {
-                return Err(format!(
-                    "could not create the repository (it likely already exists) — to join it, get an invite from an enrolled device and pass --invite <code>. ({e})"
-                )
-                .into());
-            }
+            None => match &link {
+                Some(l) => l.rfp,
+                None => match init_repo_remote(&rem, &device, unix_secs()).await {
+                    Ok(rfp) => {
+                        println!("created a new repository");
+                        rfp
+                    }
+                    Err(RepoError::AlreadyEnrolled) => {
+                        return Err(format!(
+                            "this device is already enrolled in the repository on {server_str}, but {} is not linked to it: \
+                             sync the folder you linked first, or link this one with an invite \
+                             (`secsec invite` on an enrolled device, then `secsec sync {} --server {server_str} --invite`)",
+                            dir.display(),
+                            dir.display()
+                        )
+                        .into())
+                    }
+                    Err(RepoError::AlreadyInitialized) => {
+                        return Err(format!(
+                            "a repository already exists on {server_str}: join it with an invite from an enrolled device \
+                             (`secsec invite` there, then `secsec sync {} --server {server_str} --invite`)",
+                            dir.display()
+                        )
+                        .into())
+                    }
+                    Err(e) => return Err(e.into()),
+                },
+            },
         }
     };
 
-    // Cold-start over the wire (P7 anti-rollback: the fetched chain must extend the persisted anchor).
-    let prev_anchor = link.as_ref().and_then(|l| l.anchor);
-    let was_linked = link.is_some();
-    let (mk, mut st, mut anchor) = open_repo_remote(&rem, &device, &rfp, prev_anchor).await?;
-    // Persist the link with the advanced anti-rollback anchor.
-    write_link(
-        &sdir,
-        &Link {
-            server: server_str.clone(),
-            host_id,
-            rfp,
-            ref_name: ref_name.clone(),
-            anchor: Some(anchor),
-        },
-    )?;
-    // The roster_seq stamped on commits/heads is the current sigchain tip (drives §10 gate 1).
-    let mut roster_seq = anchor.max_seq;
+    let paths = Paths::new(sdir);
+    let was_linked = link.as_ref().is_some_and(|l| l.rfp == rfp);
+    if link.is_some() && !was_linked {
+        for p in [&paths.base, &paths.frontier, &paths.push_id, &paths.objects] {
+            match std::fs::remove_file(p) {
+                Ok(()) => {}
+                Err(e) if not_found(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        eprintln!(
+            "this folder was linked to another repository; its local sync state starts fresh"
+        );
+    }
+    let prev = link
+        .as_ref()
+        .filter(|l| l.rfp == rfp)
+        .and_then(|l| l.anchor);
+    let (mk, mut st, mut anchor, mut keyring) = {
+        let rem = QuicRemote::new(&conn, transcript, &device);
+        let (mk, st, anchor) = open_repo_remote(&rem, &device, &rfp, prev).await?;
+        let keyring = data_keyring_remote(&rem, &mk, &st).await?;
+        (mk, st, anchor, keyring)
+    };
+    {
+        let _guard = lock_file(&sdir.join("link.lock"))?;
+        write_link(
+            sdir,
+            &Link {
+                server: server_str.clone(),
+                host_id,
+                rfp,
+                anchor: Some(anchor),
+            },
+        )?;
+    }
 
-    let mut keyring = data_keyring_remote(&rem, &mk).await?;
-    let mut store = Store::open(sdir.join("objects.secsec"))?;
-    let frontier_path = sdir.join("frontier");
-    let base_path = sdir.join("base");
-    // The per-attempt push id (§15): persisted before each push, removed after; a file left behind by a
-    // crash mid-push is reused on the next run so the resumed push re-sends only what is still missing.
-    let push_id_path = sdir.join("push_id");
-    let mut resume_push_id: Option<[u8; 16]> = std::fs::read(&push_id_path)
-        .ok()
-        .and_then(|b| <[u8; 16]>::try_from(b).ok());
-    let mut frontier = match load_frontier(&frontier_path, &device)? {
-        FrontierLoad::Loaded(f) => f,
-        FrontierLoad::Absent => {
-            // §8.5 lost-frontier event: a folder already linked to a repo whose sealed frontier is
-            // gone (disk loss, deletion) is a reinstall — authenticity still holds (RFP + mk_commit),
-            // but freshness/rollback gating does not until a peer reconfirms. Alarm prominently.
+    let mut store = Store::open(&paths.objects)?;
+    let mut frontier = match load_frontier(&paths.frontier, &device) {
+        Ok(FrontierLoad::Loaded(f)) => f,
+        Ok(FrontierLoad::Absent) => {
             if was_linked {
                 eprintln!(
-                    "warning: local sync state for this folder is missing — treating as a reinstall.\n\
-                     anti-rollback freshness is not guaranteed for this session until it reconverges (§8.5)."
+                    "warning: this folder's sync state is missing, so this run is treated as a reinstall; \
+                     rollback protection resumes once it reconverges (§8.5)"
                 );
             }
             SyncFrontier::default()
         }
+        Err(ClientError::FrontierLost(e)) => {
+            eprintln!(
+                "ALARM: this folder's sealed sync state does not open ({e}); treating this run as a reinstall (§8.5)"
+            );
+            SyncFrontier::default()
+        }
+        Err(e) => return Err(e.into()),
     };
-    let mut base = match std::fs::read_to_string(&base_path) {
-        Ok(s) => Some(parse_hex32(&s)?),
-        Err(_) => None,
-    };
+    let mut base = read_base(&paths.base)?;
+    let mut resume_push_id: Option<[u8; 16]> = std::fs::read(&paths.push_id)
+        .ok()
+        .and_then(|b| <[u8; 16]>::try_from(b).ok());
 
-    // Startup store hygiene, once per session: drop local objects unreachable from our last-synced
-    // head (orphans from cas-conflict retries / aborted pushes). Best-effort, never blocks syncing.
+    // Once per session, while nothing else reads the cache: drop orphans, then reclaim their pages.
     if let Some(b) = base {
         match secsec_client::prune::local_sweep(&keyring, &store, &b) {
             Ok(n) if n > 0 => eprintln!("local sweep: dropped {n} unreachable object(s)"),
-            _ => {}
+            Ok(_) => {}
+            Err(e) => eprintln!("local sweep skipped: {e}"),
         }
     }
-    // Reclaim the freed pages so the cache file shrinks after a sweep / retention prune rather than
-    // re-growing to its high-water mark. Startup is the only point with exclusive store access (before
-    // the sync loop opens transactions); best-effort, leaves the store usable on failure.
     if let Err(e) = store.compact() {
         eprintln!("cache compaction skipped: {e}");
     }
 
     println!(
-        "synced '{}' (generation {}, {} member(s)) ↔ {}",
-        ref_name,
+        "syncing {} (generation {}, {} member(s)) with {server_str}",
+        dir.display(),
         mk.generation(),
-        st.members.len(),
-        dir.display()
+        st.members.len()
     );
+    drop(mk);
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let poll = Duration::from_secs(cfg.poll_interval_secs);
+    let mut rx = None;
     if !once {
-        let wdir = dir.clone();
-        let debounce_ms = cfg.watch_debounce_ms;
+        let (tx, r) = tokio::sync::mpsc::unbounded_channel::<()>();
+        rx = Some(r);
+        let wdir = dir.to_path_buf();
+        let debounce = Duration::from_millis(cfg.watch_debounce_ms);
         std::thread::spawn(move || {
-            let _ = secsec_client::watcher::watch_dir(
-                &wdir,
-                Duration::from_millis(debounce_ms),
-                || tx.send(()).is_ok(),
-            );
+            let watched = secsec_client::watcher::watch_dir(&wdir, debounce, poll, |err| {
+                if let Some(e) = err {
+                    eprintln!("{e}; rescanning");
+                }
+                tx.send(()).is_ok()
+            });
+            if let Err(e) = watched {
+                eprintln!(
+                    "warning: cannot watch {} ({e}); syncing every {}s instead",
+                    wdir.display(),
+                    poll.as_secs()
+                );
+            }
         });
-        println!("watching {} — Ctrl-C to stop", dir.display());
+        println!("watching {} (Ctrl-C to stop)", dir.display());
     }
-    let mut poll = tokio::time::interval(Duration::from_secs(cfg.poll_interval_secs));
-    poll.tick().await;
 
-    let mut initial = true;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let mut stopping = false;
+    let mut next_poll = deadline_after(poll);
+    let mut memo = SnapshotMemo::default();
+    let mut first = true;
     let mut retry_now = false;
-    let mut want_refold = false;
+    let mut force_refold = false;
+    let mut refolded_for_head = false;
+    let mut prune_pending = cfg.retention_keep_versions > 0;
+    let mut last_skipped: Vec<String> = Vec::new();
+    let mut last_error: Option<String> = None;
+
     loop {
-        if !initial && !retry_now {
+        let mut tick = false;
+        if !first && !retry_now {
+            if status.state != "error" && status.state != "alarm" {
+                status.set(sdir, "idle", "up to date");
+            }
             tokio::select! {
-                ev = rx.recv() => { if ev.is_none() { break; } }
-                _ = poll.tick() => { want_refold = true; } // periodic: pick up newly-enrolled devices
+                () = next_change(&mut rx) => {}
+                () = sleep_until(next_poll) => {
+                    tick = true;
+                    next_poll = deadline_after(poll);
+                }
+                () = &mut shutdown, if !stopping => stopping = true,
+            }
+            if stopping {
+                break;
             }
         }
         retry_now = false;
 
-        // Self-heal a dropped connection: post-sleep the server has discarded ours, so a reconnect
-        // handshake succeeds but the link is stateless-reset on first use — verify it with a real
-        // round-trip before trusting it, and retry (paced) until it carries data.
+        // A dropped connection is replaced, and verified with a real round trip before it is trusted.
         if let Some(reason) = conn.close_reason() {
-            eprintln!("connection lost ({reason}) — reconnecting to {server_str}…");
-            match reconnect_session(addr, host_id, &device, cfg.tuning()).await {
+            status.set(sdir, "connecting", format!("reconnecting to {server_str}"));
+            eprintln!("connection lost ({reason}); reconnecting to {server_str}...");
+            let fresh = async {
+                let (ep, c, h) = connect(addr, Some(host_id), cfg.tuning()).await?;
+                let t = client_handshake(&c, &device, h, random()?)
+                    .await?
+                    .transcript;
+                fetch_head(&QuicRemote::new(&c, t, &device), &keyring, REF).await?;
+                Ok::<_, Box<dyn Error>>((ep, c, t))
+            };
+            match fresh.await {
                 Ok((ep, c, t)) => {
-                    // Probe with one round-trip; a reset path fails here despite a "good" handshake.
-                    let probe = QuicRemote::new(&c, t, &device);
-                    if let Err(e) = secsec_client::fetch_head(&probe, &keyring, &ref_name).await {
-                        eprintln!("reconnected but the link is still dead ({e}); retrying in 2s…");
-                        initial = false;
-                        retry_now = true;
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        continue;
-                    }
                     endpoint = ep;
                     conn = c;
                     transcript = t;
-                    want_refold = true;
+                    force_refold = true;
                 }
-                Err(err) => {
-                    eprintln!("reconnect failed: {err}; retrying in 2s…");
-                    initial = false;
+                Err(e) => {
+                    eprintln!("reconnect failed: {e}; retrying");
+                    first = false;
                     retry_now = true;
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::select! {
+                        () = tokio::time::sleep(RECONNECT_DELAY) => {}
+                        () = &mut shutdown, if !stopping => stopping = true,
+                    }
+                    if stopping {
+                        break;
+                    }
                     continue;
                 }
             }
         }
-
         let rem = QuicRemote::new(&conn, transcript, &device);
 
-        // Re-fold the roster so a device that enrolled AFTER this loop started is recognized (else its
-        // head reads as "signed by a non-member"), and keep `roster_seq` current. Done on the periodic
-        // tick and after a reconnect — not on every file-change event, to keep saves snappy.
-        let refolded = want_refold;
-        if want_refold {
-            want_refold = false;
-            match open_repo_remote(&rem, &device, &rfp, Some(anchor)).await {
-                Ok((m, s, a)) => {
-                    // Re-peel the data keyring FIRST so the roster update is all-or-nothing: never
-                    // advance the generation without its matching keyring (the head/objects would be
-                    // unreadable until the next tick). On a peel failure keep the last-known roster
-                    // and retry next cycle.
-                    match data_keyring_remote(&rem, &m).await {
-                        Ok(k) => {
-                            if a.max_seq != anchor.max_seq {
-                                let _ = write_link(
-                                    &sdir,
-                                    &Link {
-                                        server: server_str.clone(),
-                                        host_id,
-                                        rfp,
-                                        ref_name: ref_name.clone(),
-                                        anchor: Some(a),
-                                    },
-                                );
-                            }
-                            st = s;
-                            anchor = a;
-                            roster_seq = a.max_seq;
-                            keyring = k;
-                        }
-                        Err(e) => {
-                            if conn.close_reason().is_none() {
-                                eprintln!("roster refresh failed (using last known roster): {e}");
-                            }
+        // A cheap probe each tick; the full refold runs only when the sigchain moved.
+        if tick || force_refold || frontier.roster_seq > anchor.max_seq {
+            let grew = force_refold
+                || frontier.roster_seq > anchor.max_seq
+                || roster_grew(&rem, &anchor).await.unwrap_or(false);
+            force_refold = false;
+            if grew {
+                match refold(&rem, &device, &rfp, anchor).await {
+                    Ok((s, a, k)) => {
+                        st = s;
+                        anchor = a;
+                        keyring = k;
+                        if let Err(e) = persist_anchor(sdir, &rfp, a) {
+                            eprintln!("warning: cannot record the roster anchor: {e}");
                         }
                     }
-                }
-                // A genuine server rollback/reset (P7): only this is fatal; other fold errors are
-                // transient below — a glitchy fetch must not permanently stop syncing.
-                Err(RepoError::Rollback) => {
-                    eprintln!(
-                        "ALARM: the repo on {server_str} no longer extends this folder's anti-rollback \
-                         anchor (P7) — the server may have been reset or rolled back. Refusing to sync; \
-                         re-link with `--invite` if this is intended."
-                    );
-                    break;
-                }
-                Err(e) => {
-                    if conn.close_reason().is_none() {
-                        eprintln!("roster refresh failed (using last known roster): {e}");
+                    Err(RepoError::Rollback) => {
+                        let msg = format!(
+                            "ALARM: the repository on {server_str} no longer extends the sigchain this folder verified (§8.1): \
+                             the server may have been rolled back or replaced. Syncing stopped."
+                        );
+                        status.set(sdir, "alarm", msg.clone());
+                        return Err(msg.into());
+                    }
+                    Err(RepoError::NoKeyslot) => {
+                        let msg = "this device is no longer a member of the repository (revoked?); syncing stopped";
+                        status.set(sdir, "error", msg);
+                        return Err(msg.into());
+                    }
+                    Err(e) => {
+                        if conn.close_reason().is_none() {
+                            eprintln!("roster refresh failed, keeping the last known roster: {e}");
+                        }
                     }
                 }
             }
         }
 
-        // §8.5: seal the advanced frontier to disk BEFORE any ref-advancing head push — a crash
-        // post-push must not leave a published head uncovered by the persisted frontier.
-        // Mint (or resume) the per-attempt push id and persist it before the push (temp+rename), so a
-        // crash mid-push can resume it next run; it is removed once the attempt returns.
         let push_id = match resume_push_id.take() {
             Some(p) => p,
-            None => rand16()?,
+            None => random()?,
         };
-        {
-            let tmp = push_id_path.with_extension("tmp");
-            write_private(&tmp, &push_id)?;
-            std::fs::rename(&tmp, &push_id_path)?;
-        }
-        let seal = |fr: &SyncFrontier| save_frontier(&frontier_path, fr, &device);
-        let outcome = sync_once(
-            &rem,
-            &store,
-            &dir,
-            &keyring,
-            &device,
-            &st.members,
-            &frontier,
-            &ref_name,
-            roster_seq,
-            base,
-            unix_secs(),
-            &push_id,
-            &seal,
-        )
-        .await;
-        let _ = std::fs::remove_file(&push_id_path);
-        match outcome {
-            Ok(outcome) => {
-                // Persist the final frontier too — it additionally carries our own commit's high-water,
-                // which the pre-push seal (observations only) need not have included.
-                save_frontier(&frontier_path, &outcome.frontier, &device)?;
-                if let Some(b) = outcome.base {
-                    write_private(&base_path, hex(&b).as_bytes())?;
-                }
-                if initial || !matches!(outcome.kind, secsec_client::sync::SyncKind::UpToDate) {
-                    println!("sync: {:?}", outcome.kind);
-                }
-                // Surface keep-both merge conflicts (§10): the conflicting versions are preserved on
-                // disk as `name.conflict-<device>-<id>.ext` (no data lost), but the user must be told.
-                if !outcome.conflicts.is_empty() {
-                    eprintln!(
-                        "merge: {} file(s) conflicted and were kept on both sides — review:",
-                        outcome.conflicts.len()
-                    );
-                    for p in &outcome.conflicts {
-                        eprintln!("  {p}  →  see the name.conflict-* copy alongside it");
+        write_private_atomic(&paths.push_id, &push_id)?;
+        status.set(sdir, "syncing", "syncing");
+        let seal = |f: &SyncFrontier| save_frontier(&paths.frontier, f, &device);
+        let input = SyncInput {
+            store: &store,
+            dir,
+            keys: &keyring,
+            device: &device,
+            roster: &st,
+            ref_name: REF,
+            ts: unix_secs(),
+            push_id: &push_id,
+            seal: &seal,
+        };
+        // A shutdown request lets the running sync finish, so the folder is never left half-restored.
+        let result = {
+            let fut = sync_once(&rem, &input, &frontier, base, &mut memo);
+            tokio::pin!(fut);
+            loop {
+                tokio::select! {
+                    r = &mut fut => break r,
+                    () = &mut shutdown, if !stopping => {
+                        stopping = true;
+                        status.set(sdir, "stopping", "finishing the current sync");
                     }
                 }
-                // §19: a file too large to encode into a decodable tree is held at its last synced
-                // version rather than deleted — but a file that has silently stopped moving is
-                // indistinguishable from one that works, so say so every sync.
-                if !outcome.skipped.is_empty() {
-                    eprintln!(
-                        "warning: {} path(s) are too large to sync and are frozen at their last synced version:",
-                        outcome.skipped.len()
-                    );
-                    for p in &outcome.skipped {
-                        eprintln!("  {p}");
-                    }
-                }
-                frontier = outcome.frontier;
-                base = outcome.base;
+            }
+        };
+        let _ = std::fs::remove_file(&paths.push_id);
 
-                // Bound history once per session (best-effort, §15): keep the last N versions per file,
-                // deleting superseded content under the head-binding CAS. Never blocks syncing.
-                if initial {
-                    if let Err(e) = secsec_client::prune::prune_history(
+        match result {
+            Ok(out) => {
+                // The base lands before the frontier: a frontier ahead of its base would reject its own history.
+                if let Some(b) = out.base {
+                    write_private_atomic(&paths.base, hex(&b).as_bytes())?;
+                }
+                save_frontier(&paths.frontier, &out.frontier, &device)?;
+                report(&out, first, &mut last_skipped, status);
+                status.set(sdir, "idle", format!("last sync: {}", kind_word(out.kind)));
+                frontier = out.frontier;
+                base = out.base;
+                refolded_for_head = false;
+                last_error = None;
+                if prune_pending && (first || tick) {
+                    match secsec_client::prune::prune_history(
                         &rem,
                         &store,
                         &keyring,
-                        &ref_name,
+                        &st,
+                        REF,
                         cfg.retention_keep_versions,
-                        roster_seq,
                     )
                     .await
                     {
-                        eprintln!("history prune skipped: {e}");
+                        Ok(true) => prune_pending = false,
+                        Ok(false) => {}
+                        Err(e) => {
+                            eprintln!("history prune skipped: {e}");
+                            prune_pending = false;
+                        }
                     }
                 }
             }
-            // A cas-head conflict is a normal concurrent-write race (another device advanced the ref
-            // while we were pushing), not an error — re-sync immediately to fetch its head and merge.
-            Err(secsec_client::ClientError::CasConflict) => {
+            // A concurrent writer won the ref: fetch its head and merge right away.
+            Err(ClientError::CasConflict) => retry_now = true,
+            // An unknown signer or generation means our roster is stale: refold once and retry.
+            Err(
+                ClientError::HeadNotMember | ClientError::Head(HeadError::UnknownGeneration(_)),
+            ) if !refolded_for_head => {
+                refolded_for_head = true;
+                force_refold = true;
                 retry_now = true;
             }
-            // A head from a device we don't know: our roster may be stale. Refresh once and retry; if
-            // it still fails right after a refresh, it is a genuine non-member (forged/revoked) head.
-            Err(secsec_client::ClientError::HeadNotMember) => {
-                if refolded {
-                    eprintln!(
-                        "sync error: fetched head signed by a non-member (after roster refresh)"
-                    );
-                } else {
-                    want_refold = true;
-                    retry_now = true;
-                }
+            Err(ClientError::Merge(MergeError::Rollback(r))) => {
+                let msg = format!(
+                    "ALARM: the server offered history older than this folder already accepted ({r:?}); nothing was applied"
+                );
+                eprintln!("{msg}");
+                status.set(sdir, "alarm", msg.clone());
+                last_error = Some(msg);
             }
-            // A dead connection is healed by the reconnect at the top of the next iteration — don't
-            // surface it as a sync error.
             Err(e) => {
                 if conn.close_reason().is_none() {
                     eprintln!("sync error: {e}");
+                    status.set(sdir, "error", e.to_string());
                 }
+                last_error = Some(e.to_string());
             }
         }
-        initial = false;
-        if once && !retry_now {
+        first = false;
+        if stopping || (once && !retry_now) {
             break;
         }
     }
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
+    match last_error {
+        Some(e) if once => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+// ---- stop / status ----
+
+#[cfg(unix)]
+fn send_signal(pid: u32, kill: bool) -> CliResult<()> {
+    use rustix::process::{kill_process, Pid, Signal};
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or("the lock file names an invalid pid")?;
+    match kill_process(pid, if kill { Signal::KILL } else { Signal::TERM }) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn send_signal(_pid: u32, _kill: bool) -> CliResult<()> {
+    Err("`secsec stop` needs a unix signal; end the process from the task manager instead".into())
+}
+
+/// Wait until the folder lock is free: `true` once it is, `false` if `limit` passes first.
+fn wait_unlocked(sdir: &Path, limit: Option<Duration>) -> CliResult<bool> {
+    let path = sdir.join("lock");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(lock_file(&path).map(drop).map_err(|e| e.to_string()));
+    });
+    let got = match limit {
+        Some(d) => match rx.recv_timeout(d) {
+            Ok(r) => r,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(false),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("lock waiter died".into())
+            }
+        },
+        None => rx.recv().map_err(|_| "lock waiter died")?,
+    };
+    got.map(|()| true).map_err(Into::into)
+}
+
+fn run_stop(start: PathBuf) -> CliResult<()> {
+    let (root, sdir, _) = find_linked(&start)?;
+    let Some(pid) = lock_holder(&sdir)? else {
+        println!("no sync is running for {}", root.display());
+        return Ok(());
+    };
+    let pid = pid.ok_or("a sync holds this folder's lock, but its pid is unreadable")?;
+    send_signal(pid, false)?;
+    // A clean stop finishes its current sync; one that outlives the idle timeout is stuck.
+    let cfg = Config::load()?;
+    if !wait_unlocked(&sdir, Some(cfg.idle()))? {
+        eprintln!(
+            "the sync (pid {pid}) did not stop within {}s; killing it",
+            cfg.quic_idle_secs
+        );
+        send_signal(pid, true)?;
+        wait_unlocked(&sdir, None)?;
+    }
+    println!("stopped the sync of {} (pid {pid})", root.display());
     Ok(())
 }
 
-/// Re-establish a session after a dropped connection: dial the (already-pinned) server again and
-/// redo the §11 handshake, returning the fresh endpoint + connection + session transcript.
-async fn reconnect_session(
-    addr: SocketAddr,
-    host_id: [u8; 32],
-    device: &DeviceKey,
-    tuning: Tuning,
-) -> Result<(quinn::Endpoint, quinn::Connection, [u8; 32]), Box<dyn Error>> {
-    let (endpoint, conn, _host_id) = connect(addr, Some(host_id), tuning).await?;
-    let sess = client_handshake(&conn, device, host_id, rand32()?).await?;
-    Ok((endpoint, conn, sess.transcript))
+fn run_status(start: PathBuf) -> CliResult<()> {
+    let (root, sdir, link) = find_linked(&start)?;
+    let running = lock_holder(&sdir)?;
+    println!("folder={}", root.display());
+    println!("server={}", link.server);
+    println!("running={}", if running.is_some() { "yes" } else { "no" });
+    let text = match std::fs::read_to_string(sdir.join("status")) {
+        Ok(t) => t,
+        Err(e) if not_found(&e) => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let mut state_seen = false;
+    for line in text.lines() {
+        if line.starts_with("pid=") && running.is_none() {
+            continue;
+        }
+        if line.starts_with("state=") {
+            state_seen = true;
+            if running.is_none() {
+                println!("state=stopped");
+                continue;
+            }
+        }
+        println!("{line}");
+    }
+    if !state_seen {
+        println!(
+            "state={}",
+            if running.is_some() {
+                "starting"
+            } else {
+                "stopped"
+            }
+        );
+    }
+    Ok(())
 }
 
-// ---- invite ----
+// ---- invite / devices / hostpin ----
 
-async fn run_invite(
-    dir: PathBuf,
-    key: Option<PathBuf>,
-    passphrase_stdin: bool,
-) -> Result<(), Box<dyn Error>> {
-    let sdir = state_dir_for(&dir)?;
-    let link = read_link(&sdir)
-        .ok_or("this folder isn't linked to a repo yet — run `secsec sync` on it first")?;
-    let device = load_device(key, passphrase_stdin)?;
-    let (endpoint, conn, sess) = connect_linked(&link, &device).await?;
-    let rem = QuicRemote::new(&conn, sess.transcript, &device);
-    let (mk, _st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
+async fn run_invite(start: PathBuf, key: KeyArgs) -> CliResult<()> {
+    let (_root, sdir, link) = find_linked(&start)?;
+    let device = load_device(&key)?;
+    let cfg = Config::load()?;
+    let (endpoint, conn, t) = connect_linked(&link, &device, cfg.tuning()).await?;
+    let rem = QuicRemote::new(&conn, t, &device);
+    let (_mk, _st, anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
+    persist_anchor(&sdir, &link.rfp, anchor)?;
 
-    let (code, disp) = pair::new_invite()?;
-    println!("INVITE CODE: {disp}");
+    let (code, display) = pair::new_invite()?;
+    println!("INVITE CODE: {display}");
     println!(
-        "on the new device (add its key to the server's authorized_keys first):\n  secsec sync <dir> --server {} --invite {disp}",
-        link.server
+        "on the new device (add its public key to the server's authorized_keys first):\n  secsec sync <dir> --server {} --pin {} --invite",
+        link.server,
+        hex(&link.host_id)
     );
-    println!("waiting for the device to pair — Ctrl-C to cancel…");
-    let enrolled = pair::run_host(
+    println!("waiting for the device to pair (Ctrl-C to cancel)...");
+    let (enrolled, anchor) = pair::run_host(
         &rem,
         &device,
-        &mk,
         &link.rfp,
+        Some(anchor),
         &link.host_id,
         &code,
         PAIR_HOST_ROUNDS,
         unix_secs(),
     )
     .await?;
+    persist_anchor(&sdir, &link.rfp, anchor)?;
     println!("paired device {}", hex(&enrolled));
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
     Ok(())
 }
 
-// ---- devices / revoke ----
-
-/// List the repo's enrolled devices: a short device id, the device's SSH key fingerprint (the
-/// `SHA256:…` string `ssh-keygen -lf` prints, so you can match it to a physical device), and a marker
-/// for the current device.
-async fn run_devices(
-    dir: PathBuf,
-    key: Option<PathBuf>,
-    passphrase_stdin: bool,
-) -> Result<(), Box<dyn Error>> {
-    let sdir = state_dir_for(&dir)?;
-    let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
-    let device = load_device(key, passphrase_stdin)?;
+async fn run_devices(start: PathBuf, key: KeyArgs) -> CliResult<()> {
+    let (_root, sdir, link) = find_linked(&start)?;
+    let device = load_device(&key)?;
     let me = device.device_id()?;
-    let (endpoint, conn, sess) = connect_linked(&link, &device).await?;
-    let rem = QuicRemote::new(&conn, sess.transcript, &device);
-    let (_mk, st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
-    println!("{} device(s) in this repo:", st.members.len());
+    let cfg = Config::load()?;
+    let (endpoint, conn, t) = connect_linked(&link, &device, cfg.tuning()).await?;
+    let rem = QuicRemote::new(&conn, t, &device);
+    let (_mk, st, anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
+    persist_anchor(&sdir, &link.rfp, anchor)?;
+    println!("{} device(s) in this repository:", st.members.len());
     for (id, pubkey) in &st.members {
         let fp = pubkey
             .ssh_fingerprint()
             .unwrap_or_else(|_| "<unknown>".to_string());
-        let mark = if *id == me { "  ← this device" } else { "" };
-        println!("  {}  {}{}", &hex(id)[..12], fp, mark);
+        let mark = if *id == me { "  (this device)" } else { "" };
+        println!("  {}  {fp}{mark}", &hex(id)[..12]);
     }
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
     Ok(())
 }
 
-/// Print the server host fingerprint this folder pinned (TOFU, §11) — the same `host pin` the
-/// server prints on startup, for **out-of-band** comparison. Offline: reads the local link only.
-fn run_hostpin(dir: PathBuf) -> Result<(), Box<dyn Error>> {
-    let sdir = state_dir_for(&dir)?;
-    let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
+fn run_hostpin(start: PathBuf, serve: Option<PathBuf>) -> CliResult<()> {
+    if let Some(dir) = serve {
+        create_dir_private(&dir)?;
+        let (cert, _) = load_or_generate_hostkey(&dir.join("hostkey"))?;
+        println!("{}", hex(&HostPin::from_cert(&cert)?.host_id()));
+        return Ok(());
+    }
+    let (root, _sdir, link) = find_linked(&start)?;
+    println!("folder:   {}", root.display());
     println!("server:   {}", link.server);
     println!("host pin: {}", hex(&link.host_id));
-    println!(
-        "compare this to the `host pin` printed by `secsec serve` on the server (out-of-band)."
-    );
+    println!("compare it out-of-band with `secsec hostpin --serve <dir>` on the server.");
     Ok(())
 }
 
-// ---- log / restore (history) ----
+// ---- log / restore ----
 
-/// A repo-relative path: drop empty / `.` segments and reject `..` (no escaping the synced folder).
-fn normalize_repo_path(p: &str) -> Result<String, Box<dyn Error>> {
-    let comps: Vec<&str> = p
-        .split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .collect();
-    if comps.contains(&"..") {
-        return Err("path must be inside the synced folder (no '..')".into());
+/// `arg` as a repository path: taken relative to `cwd`, which must lie inside the synced `root`.
+fn repo_path(root: &Path, cwd: &Path, arg: &str) -> CliResult<String> {
+    let arg = Path::new(arg);
+    let joined = if arg.is_absolute() {
+        arg.to_path_buf()
+    } else {
+        cwd.join(arg)
+    };
+    let rel = joined.strip_prefix(root).map_err(|_| {
+        format!(
+            "{} is outside the synced folder {}",
+            joined.display(),
+            root.display()
+        )
+    })?;
+    let mut parts: Vec<&str> = Vec::new();
+    for c in rel.components() {
+        match c {
+            Component::Normal(p) => parts.push(p.to_str().ok_or("the path is not valid UTF-8")?),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop().ok_or("the path leaves the synced folder")?;
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("the path leaves the synced folder".into())
+            }
+        }
     }
-    Ok(comps.join("/"))
+    Ok(parts.join("/"))
 }
 
-/// Human-friendly age of an advisory commit timestamp (§10: `ts` is a hint, not trusted for security).
+/// Human-friendly age of an advisory commit timestamp (§10: `ts` is a hint).
 fn rel_time(ts: u64, now: u64) -> String {
     if ts == 0 {
         return "unknown".into();
@@ -1286,7 +1789,7 @@ fn rel_time(ts: u64, now: u64) -> String {
     }
 }
 
-fn print_log_entry(e: &secsec_client::history::LogEntry, now: u64) {
+fn print_log_entry(e: &LogEntry, now: u64) {
     let merge = if e.parents.len() > 1 { " merge" } else { "" };
     let changed = if e.changed.is_empty() {
         "(no content change)".to_string()
@@ -1300,16 +1803,14 @@ fn print_log_entry(e: &secsec_client::history::LogEntry, now: u64) {
         )
     };
     println!(
-        "{}  {:<9}  dev {}{}  {}",
+        "{}  {:<9}  dev {}{merge}  {changed}",
         &hex(&e.commit_id)[..12],
         rel_time(e.ts, now),
-        &hex(&e.device_id)[..8],
-        merge,
-        changed
+        &hex(&e.device_id)[..8]
     );
 }
 
-fn print_path_version(v: &secsec_client::history::PathVersion, now: u64) {
+fn print_path_version(v: &PathVersion, now: u64) {
     let what = if !v.present {
         "deleted"
     } else if v.is_dir {
@@ -1325,137 +1826,126 @@ fn print_path_version(v: &secsec_client::history::PathVersion, now: u64) {
     );
 }
 
-/// `secsec log [path]` — the repo's change history, or one file/folder's version history. Run inside
-/// the synced folder. Reads history over the wire into a throwaway store (the shared object cache may
-/// be held by a running `sync`), so it works alongside a live sync.
-async fn run_log(
-    path: Option<String>,
-    key: Option<PathBuf>,
-    passphrase_stdin: bool,
-) -> Result<(), Box<dyn Error>> {
-    let dir = std::env::current_dir()?;
-    let sdir = state_dir_for(&dir)?;
-    let link = read_link(&sdir).ok_or(
-        "not inside a synced folder — run `secsec log` in a folder you've `secsec sync`-ed",
-    )?;
-    let path = path.map(|p| normalize_repo_path(&p)).transpose()?;
+/// Open a linked folder's repository for reading history into a throwaway store; returns what history commands need.
+async fn open_history(
+    rem: &QuicRemote<'_>,
+    device: &DeviceKey,
+    sdir: &Path,
+    link: &Link,
+    store: &Store,
+) -> CliResult<Option<(Keyring, [u8; 32])>> {
+    let (mk, st, anchor) = open_repo_remote(rem, device, &link.rfp, link.anchor).await?;
+    persist_anchor(sdir, &link.rfp, anchor)?;
+    let keyring = data_keyring_remote(rem, &mk, &st).await?;
+    let Some(rh) = fetch_verified_head(rem, &keyring, &st.members, REF).await? else {
+        return Ok(None);
+    };
+    secsec_client::history::fetch_history(
+        rem,
+        store,
+        &keyring,
+        &st.ever_members,
+        &rh.head.commit_id,
+    )
+    .await?;
+    Ok(Some((keyring, rh.head.commit_id)))
+}
 
-    let device = load_device(key, passphrase_stdin)?;
-    let (endpoint, conn, sess) = connect_linked(&link, &device).await?;
-    let rem = QuicRemote::new(&conn, sess.transcript, &device);
-    let (mk, _st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
-    let keyring = data_keyring_remote(&rem, &mk).await?;
-
+async fn run_log(path: Option<String>, key: KeyArgs) -> CliResult<()> {
+    let cwd = std::fs::canonicalize(std::env::current_dir()?)?;
+    let (root, sdir, link) = find_linked(&cwd)?;
+    // The synced root itself means the whole repository.
+    let path = path
+        .map(|p| repo_path(&root, &cwd, &p))
+        .transpose()?
+        .filter(|p| !p.is_empty());
+    let device = load_device(&key)?;
+    let cfg = Config::load()?;
+    let (endpoint, conn, t) = connect_linked(&link, &device, cfg.tuning()).await?;
+    let rem = QuicRemote::new(&conn, t, &device);
+    // A throwaway store: the folder's cache belongs to its running sync.
     let tmp = tempfile::tempdir()?;
     let store = Store::open(tmp.path().join("history.redb"))?;
     let now = unix_secs();
-    match secsec_client::fetch_head(&rem, &keyring, &link.ref_name).await? {
-        None => println!(
-            "no history yet — nothing has been synced to '{}'.",
-            link.ref_name
-        ),
-        Some((head, _sig, _blob)) => {
-            secsec_client::history::fetch_history(&rem, &store, &keyring, &head.commit_id).await?;
-            match &path {
-                None => {
-                    let log = secsec_client::history::repo_log(&keyring, &store, &head.commit_id)?;
-                    for e in &log {
-                        print_log_entry(e, now);
-                    }
-                    println!("{} commit(s).", log.len());
+    match open_history(&rem, &device, &sdir, &link, &store).await? {
+        None => println!("no history yet: nothing has been synced."),
+        Some((keyring, head)) => match &path {
+            None => {
+                let log = secsec_client::history::repo_log(&keyring, &store, &head)?;
+                for e in &log {
+                    print_log_entry(e, now);
                 }
-                Some(p) => {
-                    let hist =
-                        secsec_client::history::path_history(&keyring, &store, &head.commit_id, p)?;
-                    if hist.is_empty() {
-                        println!("no history for '{p}' (it may not exist in the repo).");
-                    } else {
-                        for v in &hist {
-                            print_path_version(v, now);
-                        }
-                        println!("{} version(s) of '{p}'.", hist.len());
+                println!("{} commit(s).", log.len());
+            }
+            Some(p) => {
+                let hist = secsec_client::history::path_history(&keyring, &store, &head, p)?;
+                if hist.is_empty() {
+                    println!("no history for '{p}' (it may never have been synced).");
+                } else {
+                    for v in &hist {
+                        print_path_version(v, now);
                     }
+                    println!("{} version(s) of '{p}'.", hist.len());
                 }
             }
-        }
+        },
     }
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
     Ok(())
 }
 
-/// `secsec restore <path> [version]` — write a historic version of a file/folder into the working
-/// folder. With no version, restores the *previous* version of that path. The change then propagates
-/// via the normal sync (a running `secsec sync` picks it up), exactly like copying an old file over.
-async fn run_restore(
-    path: String,
-    version: Option<String>,
-    key: Option<PathBuf>,
-    passphrase_stdin: bool,
-) -> Result<(), Box<dyn Error>> {
-    let dir = std::env::current_dir()?;
-    let sdir = state_dir_for(&dir)?;
-    let link = read_link(&sdir).ok_or(
-        "not inside a synced folder — run `secsec restore` in a folder you've `secsec sync`-ed",
-    )?;
-    let path = normalize_repo_path(&path)?;
+async fn run_restore(path: String, version: Option<String>, key: KeyArgs) -> CliResult<()> {
+    let cwd = std::fs::canonicalize(std::env::current_dir()?)?;
+    let (root, sdir, link) = find_linked(&cwd)?;
+    let path = repo_path(&root, &cwd, &path)?;
     if path.is_empty() {
-        return Err("specify a file or folder to restore".into());
+        return Err("name a file or folder inside the synced folder to restore".into());
     }
-
-    let device = load_device(key, passphrase_stdin)?;
-    let (endpoint, conn, sess) = connect_linked(&link, &device).await?;
-    let rem = QuicRemote::new(&conn, sess.transcript, &device);
-    let (mk, _st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
-    let keyring = data_keyring_remote(&rem, &mk).await?;
-
+    let device = load_device(&key)?;
+    let cfg = Config::load()?;
+    let (endpoint, conn, t) = connect_linked(&link, &device, cfg.tuning()).await?;
+    let rem = QuicRemote::new(&conn, t, &device);
     let tmp = tempfile::tempdir()?;
     let store = Store::open(tmp.path().join("history.redb"))?;
-    let head = secsec_client::fetch_head(&rem, &keyring, &link.ref_name)
+    let (keyring, head) = open_history(&rem, &device, &sdir, &link, &store)
         .await?
-        .ok_or("no history yet — nothing to restore")?
-        .0;
-    secsec_client::history::fetch_history(&rem, &store, &keyring, &head.commit_id).await?;
+        .ok_or("no history yet: nothing to restore")?;
 
     let target = match version {
         Some(prefix) => {
             let prefix = prefix.to_lowercase();
-            let ids = secsec_client::history::commit_ids(&keyring, &store, &head.commit_id)?;
+            let ids = secsec_client::history::commit_ids(&keyring, &store, &head)?;
             let matches: Vec<[u8; 32]> = ids
                 .into_iter()
                 .filter(|c| hex(c).starts_with(&prefix))
                 .collect();
             match matches.as_slice() {
                 [c] => *c,
-                [] => return Err(format!("no commit matches '{prefix}' — see `secsec log`").into()),
+                [] => return Err(format!("no commit matches '{prefix}' (see `secsec log`)").into()),
                 _ => {
                     return Err(format!(
-                        "'{prefix}' matches more than one commit — use a longer prefix"
+                        "'{prefix}' matches more than one commit; use a longer prefix"
                     )
                     .into())
                 }
             }
         }
         None => {
-            let hist =
-                secsec_client::history::path_history(&keyring, &store, &head.commit_id, &path)?;
-            // Path gone from disk → bring back the most recent version where it existed
-            // (undo-delete). Still present → "previous" = the one before the current content:
-            // hist[0] is the current commit, hist[1] the version before it.
-            let chosen = if dir.join(&path).exists() {
-                hist.get(1).map(|v| v.commit_id)
-            } else {
-                hist.iter().find(|v| v.present).map(|v| v.commit_id)
-            };
-            chosen.ok_or_else(|| {
-                format!("'{path}' has no earlier version in the history to restore.")
-            })?
+            // Present on disk: the version before the current one; gone: the latest that existed. Deletions never count.
+            let hist = secsec_client::history::path_history(&keyring, &store, &head, &path)?;
+            let on_disk = std::fs::symlink_metadata(root.join(&path)).is_ok();
+            hist.iter()
+                .skip(usize::from(on_disk))
+                .find(|v| v.present)
+                .map(|v| v.commit_id)
+                .ok_or_else(|| format!("'{path}' has no earlier version to restore"))?
         }
     };
 
-    secsec_client::history::restore(&rem, &store, &keyring, &target, &path, &dir).await?;
+    secsec_client::history::restore(&rem, &store, &keyring, &target, &path, &root).await?;
     println!(
-        "restored '{path}' from commit {} — your running `secsec sync` will propagate it (or run `secsec sync`).",
+        "restored '{path}' from commit {}; the running sync propagates it (or run `secsec sync`).",
         &hex(&target)[..12]
     );
     conn.close(0u32.into(), b"done");
@@ -1463,60 +1953,72 @@ async fn run_restore(
     Ok(())
 }
 
-/// Revoke a device by a (prefix of its) device id: rotate the master key away from it (and its
-/// add-by closure) over the wire, so it can't decrypt anything written afterward. Also reminds the
-/// operator to remove its key from the server's `authorized_keys`.
-async fn run_revoke(
-    device_prefix: String,
-    dir: PathBuf,
-    key: Option<PathBuf>,
-    passphrase_stdin: bool,
-) -> Result<(), Box<dyn Error>> {
-    let sdir = state_dir_for(&dir)?;
-    let link = read_link(&sdir).ok_or("this folder isn't linked to a repo yet")?;
-    let device = load_device(key, passphrase_stdin)?;
-    let (endpoint, conn, sess) = connect_linked(&link, &device).await?;
-    let rem = QuicRemote::new(&conn, sess.transcript, &device);
-    let (mk, st, _anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
+// ---- revoke ----
 
-    // Resolve the device-id prefix against the roster (must be unique).
-    let prefix = device_prefix.to_lowercase();
-    let matches: Vec<_> = st
+async fn run_revoke(prefix: String, start: PathBuf, yes: bool, key: KeyArgs) -> CliResult<()> {
+    let (_root, sdir, link) = find_linked(&start)?;
+    let device = load_device(&key)?;
+    let me = device.device_id()?;
+    let cfg = Config::load()?;
+    let (endpoint, conn, t) = connect_linked(&link, &device, cfg.tuning()).await?;
+    let rem = QuicRemote::new(&conn, t, &device);
+    let (_mk, st, anchor) = open_repo_remote(&rem, &device, &link.rfp, link.anchor).await?;
+
+    let wanted = prefix.to_lowercase();
+    let matches: Vec<[u8; 32]> = st
         .members
         .keys()
-        .filter(|id| hex(&id[..]).starts_with(&prefix))
+        .filter(|id| hex(&id[..]).starts_with(&wanted))
+        .copied()
         .collect();
     let target = match matches.as_slice() {
-        [id] => **id,
-        [] => return Err(format!("no enrolled device matches '{device_prefix}'").into()),
+        [id] => *id,
+        [] => return Err(format!("no enrolled device matches '{prefix}'").into()),
         _ => {
-            return Err(format!(
-                "'{device_prefix}' matches more than one device — use a longer prefix"
+            return Err(
+                format!("'{prefix}' matches more than one device; use a longer prefix").into(),
             )
-            .into())
         }
     };
-    if target == device.device_id()? {
-        return Err("refusing to revoke the device you're running this from".into());
+    if target == me {
+        return Err("refusing to revoke the device you are running this from".into());
     }
-
-    secsec_client::repo::rotate_repo_remote(
+    // Grants this device has not yet verified are suspect: they go with the target (§8.1).
+    let revoke = Revoke {
+        device: target,
+        after_seq: link.anchor.map_or(0, |a| a.max_seq.saturating_add(1)),
+    };
+    let doomed = revoke_preview(&st, &revoke, &me);
+    println!("this revokes {} device(s):", doomed.len());
+    for id in &doomed {
+        let fp = st
+            .members
+            .get(id)
+            .and_then(|p| p.ssh_fingerprint().ok())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        println!("  {}  {fp}", &hex(id)[..12]);
+    }
+    if !yes && !confirm("revoke them and rotate the repository key?")? {
+        println!("aborted: nothing changed.");
+        return Ok(());
+    }
+    let rot = rotate_repo_remote(
         &rem,
         &device,
-        &mk,
-        &st,
         &link.rfp,
-        Some(target),
+        Some(anchor),
+        Some(revoke),
+        REF,
         unix_secs(),
     )
     .await?;
+    persist_anchor(&sdir, &link.rfp, rot.anchor)?;
     println!(
-        "revoked device {} — rotated to a new key generation",
-        hex(&target)
+        "revoked {} device(s); the repository key rotated to generation {}",
+        rot.revoked.len(),
+        rot.mk.generation()
     );
-    println!(
-        "now remove its public key from the server's ~/.ssh/authorized_keys so it can't reconnect."
-    );
+    println!("now remove their public keys from the server's ~/.ssh/authorized_keys so they cannot reconnect.");
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
     Ok(())
@@ -1524,138 +2026,235 @@ async fn run_revoke(
 
 // ---- reset ----
 
-/// `secsec reset [dir]` — remove all secsec-owned state at a location, **without** touching your
-/// files or your `~/.ssh` key: the folder's out-of-tree client sync state, and/or a serve dir's
-/// `repo.secsec` + `hostkey/`. Prompts with the exact paths before deleting (`--yes` skips). The
-/// next `sync` re-clones as a fresh device; the next `serve` mints a new host key (clients re-TOFU).
-fn run_reset(dir: PathBuf, yes: bool) -> Result<(), Box<dyn Error>> {
-    // (path, what-it-is, is_dir) for each piece of secsec state that actually exists at `dir`.
-    let mut targets: Vec<(PathBuf, &str, bool)> = Vec::new();
-
-    // Client state: keyed by the folder's canonical path (must match `state_dir_for`).
+fn run_reset(dir: PathBuf, yes: bool) -> CliResult<()> {
+    let mut targets: Vec<(PathBuf, &str)> = Vec::new();
     if let Ok(abs) = std::fs::canonicalize(&dir) {
-        let name = hex(blake3::hash(abs.to_string_lossy().as_bytes()).as_bytes());
-        let cdir = config_root()?.join("folders").join(&name);
-        if cdir.exists() {
+        let sdir = state_path(&abs)?;
+        if sdir.exists() {
+            if let Some(pid) = lock_holder(&sdir)? {
+                let who = pid.map_or_else(String::new, |p| format!(" (pid {p})"));
+                return Err(format!(
+                    "{} is being synced{who}; stop it first with `secsec stop {}`",
+                    abs.display(),
+                    abs.display()
+                )
+                .into());
+            }
             targets.push((
-                cdir,
-                "client sync state — link, object cache, rollback cursor",
-                true,
+                sdir,
+                "client sync state: link, object cache, rollback anchor, frontier",
             ));
         }
     }
-    // Server state: lives directly in the serve dir (which holds nothing but these).
     let repo = dir.join("repo.secsec");
     if repo.is_file() {
-        targets.push((
-            repo,
-            "server repository — the ENTIRE encrypted store (all devices' data)",
-            false,
-        ));
+        drop(Store::open(&repo).map_err(|e| {
+            format!(
+                "{} is in use ({e}); stop `secsec serve` first",
+                repo.display()
+            )
+        })?);
+        targets.push((repo, "server repository: every device's encrypted data"));
     }
     let hostkey = dir.join("hostkey");
-    if hostkey.is_dir() {
-        targets.push((
-            hostkey,
-            "server host key — clients will have to re-verify the pin",
-            true,
-        ));
-    }
-
-    if targets.is_empty() {
-        println!(
-            "nothing to reset — no secsec state found at {}",
-            dir.display()
-        );
-        return Ok(());
-    }
-
-    println!("This will permanently remove:");
-    for (path, what, _) in &targets {
-        println!("  {}\n      {what}", path.display());
-    }
-    println!("Your files and your ~/.ssh key are left untouched.");
-
-    if !yes {
-        use std::io::Write;
-        eprint!("Proceed? [y/N] ");
-        std::io::stderr().flush().ok();
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        if !matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES") {
-            println!("aborted — nothing removed.");
-            return Ok(());
+    for name in ["hostkey.crt", "hostkey.key"] {
+        let p = hostkey.join(name);
+        if p.is_file() {
+            targets.push((p, "server host key: clients must verify a new pin"));
         }
     }
-
-    for (path, _, is_dir) in &targets {
-        if *is_dir {
+    if targets.is_empty() {
+        println!("nothing to reset: no secsec state at {}", dir.display());
+        return Ok(());
+    }
+    println!("this permanently removes:");
+    for (path, what) in &targets {
+        println!("  {}\n      {what}", path.display());
+    }
+    println!("your files and your ~/.ssh keys stay.");
+    if !yes && !confirm("proceed?")? {
+        println!("aborted: nothing removed.");
+        return Ok(());
+    }
+    for (path, _) in &targets {
+        if path.is_dir() {
             std::fs::remove_dir_all(path)?;
         } else {
             std::fs::remove_file(path)?;
         }
         println!("removed {}", path.display());
     }
+    // The host-key directory goes only once nothing else is left in it.
+    let _ = std::fs::remove_dir(&hostkey);
     println!("reset complete.");
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let cli = Cli::parse();
+// ---- main ----
+
+fn run(cli: Cli) -> CliResult<()> {
     let rt = || tokio::runtime::Runtime::new();
-    let cwd = || PathBuf::from(".");
+    let here = || PathBuf::from(".");
     match cli.cmd {
-        Cmd::Serve { dir, port } => rt()?.block_on(run_serve(dir.unwrap_or_else(cwd), port)),
+        Cmd::Serve { dir, port } => rt()?.block_on(run_serve(dir.unwrap_or_else(here), port)),
         Cmd::Sync {
             dir,
             server,
+            pin,
             invite,
             once,
             key,
-            passphrase_stdin,
         } => rt()?.block_on(run_sync(
-            dir.unwrap_or_else(cwd),
-            server,
-            invite,
-            once,
-            key,
-            passphrase_stdin,
+            dir.unwrap_or_else(here),
+            SyncArgs {
+                server,
+                pin,
+                invite,
+                once,
+                key,
+            },
         )),
-        Cmd::Invite {
-            dir,
-            key,
-            passphrase_stdin,
-        } => rt()?.block_on(run_invite(dir.unwrap_or_else(cwd), key, passphrase_stdin)),
-        Cmd::Devices {
-            dir,
-            key,
-            passphrase_stdin,
-        } => rt()?.block_on(run_devices(dir.unwrap_or_else(cwd), key, passphrase_stdin)),
-        // hostpin is offline (reads the local link), so it needs no tokio runtime.
-        Cmd::Hostpin { dir } => run_hostpin(dir.unwrap_or_else(cwd)),
-        Cmd::Log {
-            path,
-            key,
-            passphrase_stdin,
-        } => rt()?.block_on(run_log(path, key, passphrase_stdin)),
-        Cmd::Restore {
-            path,
-            version,
-            key,
-            passphrase_stdin,
-        } => rt()?.block_on(run_restore(path, version, key, passphrase_stdin)),
+        Cmd::Stop { dir } => run_stop(dir.unwrap_or_else(here)),
+        Cmd::Status { dir } => run_status(dir.unwrap_or_else(here)),
+        Cmd::Invite { dir, key } => rt()?.block_on(run_invite(dir.unwrap_or_else(here), key)),
+        Cmd::Devices { dir, key } => rt()?.block_on(run_devices(dir.unwrap_or_else(here), key)),
+        Cmd::Hostpin { dir, serve } => run_hostpin(dir.unwrap_or_else(here), serve),
+        Cmd::Log { path, key } => rt()?.block_on(run_log(path, key)),
+        Cmd::Restore { path, version, key } => rt()?.block_on(run_restore(path, version, key)),
         Cmd::Revoke {
             device,
             dir,
+            yes,
             key,
-            passphrase_stdin,
-        } => rt()?.block_on(run_revoke(
-            device,
-            dir.unwrap_or_else(cwd),
-            key,
-            passphrase_stdin,
-        )),
-        // reset is pure filesystem cleanup (no network), so it needs no tokio runtime.
-        Cmd::Reset { dir, yes } => run_reset(dir.unwrap_or_else(cwd), yes),
+        } => rt()?.block_on(run_revoke(device, dir.unwrap_or_else(here), yes, key)),
+        Cmd::Reset { dir, yes } => run_reset(dir.unwrap_or_else(here), yes),
+    }
+}
+
+fn main() -> ExitCode {
+    match run(Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_addresses_parse_every_form() {
+        let v4: SocketAddr = "192.0.2.7:9000".parse().unwrap();
+        assert_eq!(resolve_server("192.0.2.7:9000").unwrap(), v4);
+        assert_eq!(resolve_server("192.0.2.7").unwrap().port(), DEFAULT_PORT);
+        assert_eq!(
+            resolve_server("[::1]:9000").unwrap(),
+            "[::1]:9000".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(resolve_server("::1").unwrap().port(), DEFAULT_PORT);
+        assert_eq!(resolve_server("[::1]").unwrap().port(), DEFAULT_PORT);
+        assert_eq!(resolve_server("localhost:9001").unwrap().port(), 9001);
+        assert!(resolve_server("localhost:notaport").is_err());
+    }
+
+    #[test]
+    fn repository_paths_are_relative_to_the_working_directory() {
+        let root = Path::new("/r");
+        assert_eq!(repo_path(root, Path::new("/r"), "a/b").unwrap(), "a/b");
+        assert_eq!(
+            repo_path(root, Path::new("/r/docs"), "x.md").unwrap(),
+            "docs/x.md"
+        );
+        assert_eq!(repo_path(root, Path::new("/r/docs"), "../y").unwrap(), "y");
+        assert_eq!(repo_path(root, Path::new("/r/docs"), "/r/z").unwrap(), "z");
+        assert!(repo_path(root, Path::new("/r"), "../escape").is_err());
+        assert!(repo_path(root, Path::new("/r"), "/elsewhere").is_err());
+        assert_eq!(repo_path(root, Path::new("/r/docs"), ".").unwrap(), "docs");
+    }
+
+    #[test]
+    fn config_clamps_to_its_documented_range() {
+        let mut c = Config::default();
+        c.apply("quic_idle_secs", "18446744073709551615");
+        c.apply("quic_keepalive_secs", "0");
+        c.apply("poll_interval_secs", "1");
+        c.apply("listen_port", "0");
+        c.apply("max_connections", "0");
+        c.clamp();
+        assert_eq!(c.quic_idle_secs, Tuning::MAX_IDLE_SECS);
+        assert_eq!(c.quic_keepalive_secs, 1);
+        assert_eq!(c.poll_interval_secs, 5);
+        assert_eq!(c.listen_port, DEFAULT_PORT);
+        assert_eq!(c.max_connections, 1);
+    }
+
+    #[test]
+    fn a_link_round_trips_and_its_anchor_only_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let rfp = [7; 32];
+        let link = Link {
+            server: "host:1".into(),
+            host_id: [1; 32],
+            rfp,
+            anchor: Some(RosterAnchor {
+                max_seq: 3,
+                tip_hash: [2; 32],
+            }),
+        };
+        write_link(dir.path(), &link).unwrap();
+        let older = RosterAnchor {
+            max_seq: 2,
+            tip_hash: [9; 32],
+        };
+        persist_anchor(dir.path(), &rfp, older).unwrap();
+        assert_eq!(
+            read_link(dir.path())
+                .unwrap()
+                .unwrap()
+                .anchor
+                .unwrap()
+                .max_seq,
+            3
+        );
+        let newer = RosterAnchor {
+            max_seq: 5,
+            tip_hash: [5; 32],
+        };
+        persist_anchor(dir.path(), &[8; 32], newer).unwrap();
+        assert_eq!(
+            read_link(dir.path())
+                .unwrap()
+                .unwrap()
+                .anchor
+                .unwrap()
+                .max_seq,
+            3
+        );
+        persist_anchor(dir.path(), &rfp, newer).unwrap();
+        let got = read_link(dir.path()).unwrap().unwrap();
+        assert_eq!(got.anchor, Some(newer));
+        assert_eq!(got.server, "host:1");
+    }
+
+    #[test]
+    fn the_folder_lock_is_exclusive_and_names_its_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(lock_holder(dir.path()).unwrap().is_none());
+        let held = FolderLock::acquire(dir.path(), dir.path()).unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            lock_holder(dir.path()).unwrap(),
+            Some(Some(std::process::id()))
+        );
+        // Windows locks the whole file against every other handle, so the holder's pid is unreadable there.
+        #[cfg(not(unix))]
+        assert!(lock_holder(dir.path()).unwrap().is_some());
+        assert!(FolderLock::acquire(dir.path(), dir.path()).is_err());
+        drop(held);
+        assert!(lock_holder(dir.path()).unwrap().is_none());
+        assert!(wait_unlocked(dir.path(), Some(Duration::from_secs(5))).unwrap());
     }
 }

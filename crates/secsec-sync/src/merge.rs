@@ -1,8 +1,6 @@
-//! Per-path three-way merge (`secsec-Design.md` §10), storage-free over in-memory [`Node`] trees.
-//! One-sided or identical change → take; genuine divergence → **keep-both conflict**
-//! (`name.conflict-<label>.ext`); divergent directories merge recursively. Equality is by content
-//! (chunk lists), never timestamps. The rollback gates live in [`crate::rollback`].
+//! Per-path three-way merge over in-memory [`Node`] trees (`secsec-Design.md` §10): content by chunk lists, modes merged three ways, divergence kept both.
 
+use secsec_frame::MAX_NAME_LEN;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A 256-bit chunk content-address (§9.2).
@@ -11,33 +9,49 @@ pub type Id = [u8; 32];
 /// A 16-byte per-path salt (§9.2/§9.7).
 pub type PathSalt = [u8; 16];
 
-/// An in-memory file-tree node. A directory maps child name → node.
+/// An in-memory file-tree node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
-    /// A regular file: its content is the ordered `chunks` (metadata is advisory, never trusted).
+    /// A regular file: content is the ordered `chunks`; mtime is advisory.
     File {
-        /// Unix mode bits.
+        /// Unix permission bits.
         mode: u32,
-        /// Modification time (advisory; not used for merge equality).
+        /// Modification time (advisory).
         mtime: u64,
         /// Plaintext size.
         size: u64,
-        /// The salt the `chunks` were sealed under (needed to re-verify on restore, §9.2); rides
-        /// along, never part of merge equality.
+        /// The salt `chunks` were sealed under (§9.2); rides along, never compared.
         path_salt: PathSalt,
-        /// Ordered chunk ids — the file's content identity.
+        /// Ordered chunk ids: the file's content identity.
         chunks: Vec<Id>,
     },
-    /// A directory. `mode`/`mtime` are advisory (preserved through merge so re-sealing keeps subdir
-    /// permissions; never compared for equality). Identity is the `children` map.
+    /// A directory whose identity is its `children`.
     Dir {
-        /// Unix mode bits.
+        /// Unix permission bits.
         mode: u32,
-        /// Modification time (advisory; not used for merge equality).
+        /// Modification time (advisory).
         mtime: u64,
+        /// The salt this directory's tree is sealed under, reused so a merge re-seals deterministically.
+        salt: PathSalt,
         /// Child name → child node.
         children: BTreeMap<String, Node>,
     },
+}
+
+impl Node {
+    fn mode(&self) -> u32 {
+        match self {
+            Node::File { mode, .. } | Node::Dir { mode, .. } => *mode,
+        }
+    }
+
+    fn with_mode(&self, mode: u32) -> Node {
+        let mut n = self.clone();
+        match &mut n {
+            Node::File { mode: m, .. } | Node::Dir { mode: m, .. } => *m = mode,
+        }
+        n
+    }
 }
 
 /// Why a path conflicted.
@@ -47,13 +61,13 @@ pub enum ConflictKind {
     ModifyModify,
     /// One side modified, the other deleted.
     ModifyDelete,
-    /// Both sides added the same name with different content (no base).
+    /// Both sides added the same name with different content.
     AddAdd,
-    /// The path is a file on one side and a directory on the other.
+    /// A file on one side and a directory on the other.
     TypeChange,
 }
 
-/// A reported conflict at `path` (slash-separated from the merge root).
+/// A conflict at a slash-separated `path` from the merge root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conflict {
     /// Slash-separated path from the merge root.
@@ -62,18 +76,16 @@ pub struct Conflict {
     pub kind: ConflictKind,
 }
 
-/// The result of a three-way merge: the merged directory and any conflicts (keep-both already
-/// applied to `tree`).
+/// A merged directory with keep-both already applied, plus the conflicts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Merge {
-    /// The merged directory (name → node).
+    /// The merged directory.
     pub tree: BTreeMap<String, Node>,
-    /// Conflicts encountered, in path order.
+    /// Conflicts, in path order.
     pub conflicts: Vec<Conflict>,
 }
 
-/// Content equality (§10: timestamps are hints, never trusted). Files are equal iff their chunk
-/// lists match; directories iff they have the same children, recursively equal by content.
+/// Content equality (§10): files by chunk list, directories by children, never by metadata.
 fn same_content(a: &Node, b: &Node) -> bool {
     match (a, b) {
         (Node::File { chunks: x, .. }, Node::File { chunks: y, .. }) => x == y,
@@ -94,21 +106,42 @@ fn same_opt(a: Option<&Node>, b: Option<&Node>) -> bool {
     }
 }
 
-/// Insert `.conflict-<label>` before the final extension: `notes.md` → `notes.conflict-<label>.md`;
-/// `LICENSE` → `LICENSE.conflict-<label>` (§10 keep-both naming; the uniqueness-bearing label is the
-/// caller's `<device>-<commit_id_hex12>`).
-fn conflict_name(name: &str, label: &str) -> String {
-    match name.rsplit_once('.') {
-        // Don't treat a leading dot (dotfile, empty stem) as an extension separator.
-        Some((stem, ext)) if !stem.is_empty() => format!("{stem}.conflict-{label}.{ext}"),
-        _ => format!("{name}.conflict-{label}"),
+/// Three-way pick: a one-sided change wins, a two-sided divergence keeps ours.
+fn pick3(base: Option<u32>, ours: u32, theirs: u32) -> u32 {
+    if ours == theirs || base != Some(ours) {
+        ours
+    } else {
+        theirs
     }
 }
 
-/// A keep-both name that collides with nothing — neither a name already in play on any side, nor one
-/// already written out. Without this a real entry literally named `a.conflict-<label>.txt` would be
-/// overwritten by the copy, which is the single outcome keep-both exists to prevent. Deterministic:
-/// the suffix walks upward from the same starting name on every device.
+/// `name.conflict-<label>.ext` (or `name.conflict-<label>`), the stem truncated so the name fits [`MAX_NAME_LEN`].
+fn conflict_name(name: &str, label: &str) -> String {
+    let (stem, ext) = match name.rsplit_once('.') {
+        // A leading dot (dotfile) is not an extension separator.
+        Some((stem, ext)) if !stem.is_empty() => (stem, Some(ext)),
+        _ => (name, None),
+    };
+    let suffix = match ext {
+        Some(ext) => format!(".conflict-{label}.{ext}"),
+        None => format!(".conflict-{label}"),
+    };
+    if stem.len() + suffix.len() <= MAX_NAME_LEN {
+        return format!("{stem}{suffix}");
+    }
+    let (base, suffix) = if suffix.len() < MAX_NAME_LEN {
+        (stem, suffix)
+    } else {
+        (name, format!(".conflict-{label}"))
+    };
+    let mut cut = MAX_NAME_LEN.saturating_sub(suffix.len()).min(base.len());
+    while !base.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{suffix}", &base[..cut])
+}
+
+/// A keep-both name colliding with nothing in play or already written; deterministic on every device.
 fn free_conflict_name(
     name: &str,
     label: &str,
@@ -132,9 +165,7 @@ fn join(prefix: &str, name: &str) -> String {
     }
 }
 
-/// Three-way merge of two directories against their common ancestor `base`. `their_label` is the
-/// keep-both suffix for the incoming side (`<device>-<commit_id_hex12>`, §10). The merge root path is
-/// empty; nested conflicts carry their full slash-path.
+/// Three-way merge of two directories against `base`; `their_label` (`<device>-<commit_id_hex12>`) names keep-both copies.
 #[must_use]
 pub fn three_way_merge(
     base: &BTreeMap<String, Node>,
@@ -158,7 +189,6 @@ fn merge_dir(
     their_label: &str,
     out: &mut Merge,
 ) {
-    // Union of names across all three sides, sorted.
     let mut names: BTreeSet<&str> = BTreeSet::new();
     for k in base.keys().chain(ours.keys()).chain(theirs.keys()) {
         names.insert(k.as_str());
@@ -167,36 +197,26 @@ fn merge_dir(
     for &name in &names {
         let path = join(prefix, name);
         let (b, o, t) = (base.get(name), ours.get(name), theirs.get(name));
+        let base_mode = b.map(Node::mode);
 
-        // Identical on both sides (incl. both absent), or one side unchanged: take, no conflict.
-        if same_opt(o, t) || same_opt(t, b) {
-            if let Some(node) = o {
-                out.tree.insert(name.to_string(), node.clone());
-            }
-            continue;
-        }
-        if same_opt(o, b) {
-            if let Some(node) = t {
-                out.tree.insert(name.to_string(), node.clone());
-            }
-            continue;
-        }
-
-        // Genuine divergence.
         match (o, t) {
-            // Two diverged directories merge recursively — never a conflict on the dir itself. The
-            // merged dir keeps ours's advisory mode/mtime (deterministic; metadata, not content).
+            // Two directories always merge recursively, so a change deep in either side survives.
             (
                 Some(Node::Dir {
                     mode: omode,
                     mtime: omtime,
+                    salt,
                     children: od,
                 }),
-                Some(Node::Dir { children: td, .. }),
+                Some(Node::Dir {
+                    mode: tmode,
+                    children: td,
+                    ..
+                }),
             ) => {
                 let bd = match b {
                     Some(Node::Dir { children, .. }) => children.clone(),
-                    _ => BTreeMap::new(), // base absent or a file: merge against empty
+                    _ => BTreeMap::new(),
                 };
                 let mut sub = Merge {
                     tree: BTreeMap::new(),
@@ -206,14 +226,27 @@ fn merge_dir(
                 out.tree.insert(
                     name.to_string(),
                     Node::Dir {
-                        mode: *omode,
+                        mode: pick3(base_mode, *omode, *tmode),
                         mtime: *omtime,
+                        salt: *salt,
                         children: sub.tree,
                     },
                 );
                 out.conflicts.extend(sub.conflicts);
             }
-            // Everything else diverging is a keep-both conflict (no data loss).
+            _ if same_opt(o, t) || same_opt(t, b) => {
+                if let Some(node) = o {
+                    let mode = t.map_or(node.mode(), |t| pick3(base_mode, node.mode(), t.mode()));
+                    out.tree.insert(name.to_string(), node.with_mode(mode));
+                }
+            }
+            _ if same_opt(o, b) => {
+                if let Some(node) = t {
+                    let mode = o.map_or(node.mode(), |o| pick3(base_mode, o.mode(), node.mode()));
+                    out.tree.insert(name.to_string(), node.with_mode(mode));
+                }
+            }
+            // Genuine divergence: keep both, ours under the name (no data loss).
             _ => {
                 let kind = classify(b, o, t);
                 if let Some(node) = o {
@@ -245,16 +278,18 @@ mod tests {
     use super::*;
 
     fn file(byte: u8) -> Node {
+        file_mode(byte, 0o644)
+    }
+    fn file_mode(byte: u8, mode: u32) -> Node {
         Node::File {
-            mode: 0o644,
+            mode,
             mtime: 0,
             size: 1,
             path_salt: [0u8; 16],
             chunks: vec![[byte; 32]],
         }
     }
-    /// Same content as `file(byte)` but a different mtime AND path_salt — must NOT be a conflict
-    /// (§10: equality is by chunk list alone; salt/mtime ride along but don't gate the merge).
+    /// Same content as `file(byte)`, different mtime and salt: never a conflict.
     fn file_touched(byte: u8) -> Node {
         Node::File {
             mode: 0o644,
@@ -265,9 +300,13 @@ mod tests {
         }
     }
     fn dir(entries: &[(&str, Node)]) -> Node {
+        dir_mode(entries, 0o755)
+    }
+    fn dir_mode(entries: &[(&str, Node)], mode: u32) -> Node {
         Node::Dir {
-            mode: 0o755,
+            mode,
             mtime: 0,
+            salt: [0x5A; 16],
             children: entries
                 .iter()
                 .map(|(n, v)| ((*n).to_string(), v.clone()))
@@ -283,7 +322,7 @@ mod tests {
 
     #[test]
     fn no_changes_is_identity() {
-        let b = map(&[("a", file(1))]);
+        let b = map(&[("a", file(1)), ("d", dir(&[("x", file(2))]))]);
         let m = three_way_merge(&b, &b, &b, "x");
         assert_eq!(m.tree, b);
         assert!(m.conflicts.is_empty());
@@ -292,8 +331,8 @@ mod tests {
     #[test]
     fn one_sided_add_and_modify_taken() {
         let base = map(&[("keep", file(1))]);
-        let ours = map(&[("keep", file(1)), ("new", file(2))]); // we added "new"
-        let theirs = map(&[("keep", file(9))]); // they modified "keep"
+        let ours = map(&[("keep", file(1)), ("new", file(2))]);
+        let theirs = map(&[("keep", file(9))]);
         let m = three_way_merge(&base, &ours, &theirs, "x");
         assert_eq!(m.conflicts, vec![]);
         assert_eq!(m.tree, map(&[("keep", file(9)), ("new", file(2))]));
@@ -312,13 +351,32 @@ mod tests {
     fn mtime_only_difference_is_not_a_conflict() {
         let base = map(&[("a", file(1))]);
         let ours = map(&[("a", file(5))]);
-        let theirs = map(&[("a", file_touched(5))]); // same chunks, different mtime
+        let theirs = map(&[("a", file_touched(5))]);
         let m = three_way_merge(&base, &ours, &theirs, "x");
-        assert!(
-            m.conflicts.is_empty(),
-            "content-equal files must not conflict"
-        );
+        assert!(m.conflicts.is_empty());
         assert_eq!(m.tree.get("a"), Some(&file(5)));
+    }
+
+    /// A one-sided chmod survives the merge, including one deep inside an otherwise unchanged directory.
+    #[test]
+    fn one_sided_mode_change_is_kept() {
+        let base = map(&[("a", file(1)), ("d", dir(&[("x", file(2))]))]);
+        let ours = map(&[("a", file(1)), ("d", dir(&[("x", file(2))]))]);
+        let theirs = map(&[
+            ("a", file_mode(1, 0o755)),
+            ("d", dir_mode(&[("x", file_mode(2, 0o600))], 0o700)),
+        ]);
+        let m = three_way_merge(&base, &ours, &theirs, "x");
+        assert!(m.conflicts.is_empty());
+        assert_eq!(m.tree.get("a"), Some(&file_mode(1, 0o755)));
+        assert_eq!(
+            m.tree.get("d"),
+            Some(&dir_mode(&[("x", file_mode(2, 0o600))], 0o700))
+        );
+        // Ours changed content while theirs changed only the mode: both apply.
+        let ours2 = map(&[("a", file(7)), ("d", dir(&[("x", file(2))]))]);
+        let m2 = three_way_merge(&base, &ours2, &theirs, "x");
+        assert_eq!(m2.tree.get("a"), Some(&file_mode(7, 0o755)));
     }
 
     #[test]
@@ -334,7 +392,6 @@ mod tests {
                 kind: ConflictKind::ModifyModify
             }]
         );
-        // ours keeps the name; theirs renamed; both retained (no data loss).
         assert_eq!(m.tree.get("a"), Some(&file(2)));
         assert_eq!(m.tree.get("a.conflict-devB-abc123"), Some(&file(3)));
     }
@@ -342,14 +399,24 @@ mod tests {
     #[test]
     fn modify_delete_keeps_modified_and_flags() {
         let base = map(&[("a", file(1))]);
-        let ours = map(&[("a", file(2))]); // modified
-        let theirs = map(&[]); // deleted
+        let ours = map(&[("a", file(2))]);
+        let theirs = map(&[]);
         let m = three_way_merge(&base, &ours, &theirs, "x");
         assert_eq!(
             m.conflicts.first().unwrap().kind,
             ConflictKind::ModifyDelete
         );
-        assert_eq!(m.tree.get("a"), Some(&file(2))); // modification preserved
+        assert_eq!(m.tree.get("a"), Some(&file(2)));
+    }
+
+    #[test]
+    fn deletion_against_a_real_base_applies() {
+        let base = map(&[("a", file(1)), ("d", dir(&[("x", file(2))]))]);
+        let ours = map(&[("a", file(1)), ("d", dir(&[("x", file(2))]))]);
+        let theirs = map(&[("d", dir(&[]))]);
+        let m = three_way_merge(&base, &ours, &theirs, "x");
+        assert!(m.conflicts.is_empty());
+        assert_eq!(m.tree, map(&[("d", dir(&[]))]));
     }
 
     #[test]
@@ -366,8 +433,8 @@ mod tests {
     #[test]
     fn type_change_is_conflict_keep_both() {
         let base = map(&[("a", file(1))]);
-        let ours = map(&[("a", file(2))]); // still a file, modified
-        let theirs = map(&[("a", dir(&[("inner", file(7))]))]); // became a dir
+        let ours = map(&[("a", file(2))]);
+        let theirs = map(&[("a", dir(&[("inner", file(7))]))]);
         let m = three_way_merge(&base, &ours, &theirs, "L");
         assert_eq!(m.conflicts.first().unwrap().kind, ConflictKind::TypeChange);
         assert_eq!(m.tree.get("a"), Some(&file(2)));
@@ -376,15 +443,11 @@ mod tests {
 
     #[test]
     fn divergent_directories_merge_recursively() {
-        // both sides changed *different* files inside dir "d" -> merge, no conflict.
-        let base = dir_map_base();
-        let ours = map(&[("d", dir(&[("x", file(2)), ("y", file(1))]))]); // changed x
-        let theirs = map(&[("d", dir(&[("x", file(1)), ("y", file(3))]))]); // changed y
+        let base = map(&[("d", dir(&[("x", file(1)), ("y", file(1))]))]);
+        let ours = map(&[("d", dir(&[("x", file(2)), ("y", file(1))]))]);
+        let theirs = map(&[("d", dir(&[("x", file(1)), ("y", file(3))]))]);
         let m = three_way_merge(&base, &ours, &theirs, "L");
-        assert!(
-            m.conflicts.is_empty(),
-            "non-overlapping dir edits must merge"
-        );
+        assert!(m.conflicts.is_empty());
         assert_eq!(
             m.tree.get("d"),
             Some(&dir(&[("x", file(2)), ("y", file(3))]))
@@ -393,9 +456,9 @@ mod tests {
 
     #[test]
     fn divergent_directories_surface_inner_conflict_with_full_path() {
-        let base = dir_map_base();
-        let ours = map(&[("d", dir(&[("x", file(2)), ("y", file(1))]))]); // x -> 2
-        let theirs = map(&[("d", dir(&[("x", file(8)), ("y", file(1))]))]); // x -> 8
+        let base = map(&[("d", dir(&[("x", file(1)), ("y", file(1))]))]);
+        let ours = map(&[("d", dir(&[("x", file(2)), ("y", file(1))]))]);
+        let theirs = map(&[("d", dir(&[("x", file(8)), ("y", file(1))]))]);
         let m = three_way_merge(&base, &ours, &theirs, "L");
         assert_eq!(
             m.conflicts,
@@ -411,13 +474,20 @@ mod tests {
         assert_eq!(d.get("x.conflict-L"), Some(&file(8)));
     }
 
-    fn dir_map_base() -> BTreeMap<String, Node> {
-        map(&[("d", dir(&[("x", file(1)), ("y", file(1))]))])
+    /// A merged directory keeps ours' salt, so two devices merging the same states seal the same tree.
+    #[test]
+    fn merged_directory_keeps_its_salt() {
+        let base = map(&[("d", dir(&[("x", file(1))]))]);
+        let ours = map(&[("d", dir(&[("x", file(2))]))]);
+        let theirs = map(&[("d", dir(&[("x", file(1)), ("y", file(3))]))]);
+        let m = three_way_merge(&base, &ours, &theirs, "L");
+        let Some(Node::Dir { salt, .. }) = m.tree.get("d") else {
+            panic!("d must be a dir")
+        };
+        assert_eq!(*salt, [0x5A; 16]);
     }
 
-    /// An entry that happens to be named exactly like the keep-both copy must not be overwritten by
-    /// it. Names are iterated in sorted order, so the real `a.conflict-L.txt` is placed first and the
-    /// copy for `a.txt` would land on top of it — the one outcome keep-both exists to prevent.
+    /// A real entry named like the keep-both copy is never overwritten by it.
     #[test]
     fn conflict_copy_never_overwrites_a_real_entry_of_that_name() {
         let base = map(&[("a.txt", file(1))]);
@@ -425,23 +495,28 @@ mod tests {
         let theirs = map(&[("a.txt", file(3))]);
         let m = three_way_merge(&base, &ours, &theirs, "L");
         assert_eq!(m.tree.get("a.txt"), Some(&file(2)));
-        assert_eq!(
-            m.tree.get("a.conflict-L.txt"),
-            Some(&file(8)),
-            "the user's own file keeps its name and content"
-        );
-        assert_eq!(
-            m.tree.get("a.conflict-L-2.txt"),
-            Some(&file(3)),
-            "the keep-both copy moves to the next free name"
-        );
+        assert_eq!(m.tree.get("a.conflict-L.txt"), Some(&file(8)));
+        assert_eq!(m.tree.get("a.conflict-L-2.txt"), Some(&file(3)));
     }
 
     #[test]
     fn conflict_name_extension_handling() {
         assert_eq!(conflict_name("notes.md", "L"), "notes.conflict-L.md");
         assert_eq!(conflict_name("LICENSE", "L"), "LICENSE.conflict-L");
-        assert_eq!(conflict_name(".bashrc", "L"), ".bashrc.conflict-L"); // dotfile, no stem
+        assert_eq!(conflict_name(".bashrc", "L"), ".bashrc.conflict-L");
         assert_eq!(conflict_name("a.tar.gz", "L"), "a.tar.conflict-L.gz");
+    }
+
+    /// A keep-both name never exceeds the decoder's name bound, even for a maximal or multibyte name.
+    #[test]
+    fn conflict_name_fits_the_name_bound() {
+        let long = format!("{}.txt", "é".repeat(MAX_NAME_LEN / 2));
+        let c = conflict_name(&long, "abcdef-123456789012");
+        assert!(c.len() <= MAX_NAME_LEN);
+        assert!(c.ends_with(".conflict-abcdef-123456789012.txt"));
+        let huge_ext = format!("a.{}", "x".repeat(MAX_NAME_LEN - 2));
+        let c2 = conflict_name(&huge_ext, "L");
+        assert!(c2.len() <= MAX_NAME_LEN);
+        assert!(c2.ends_with(".conflict-L"));
     }
 }

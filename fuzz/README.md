@@ -1,25 +1,29 @@
 # secsec fuzz targets
 
-`cargo-fuzz` targets — one per untrusted-input decoder (`secsec-Design.md` §3, §18). Each must be
-**total** on arbitrary input (never panic / OOM; the §19 pre-allocation bounds guard against
-alloc/recursion/decompression bombs).
+`cargo-fuzz` targets, one per decoder of untrusted bytes (`secsec-Design.md` §18). Each must be
+**total** on arbitrary input: never panic, never exhaust memory (the §19 bounds are checked before
+allocation).
 
-Targets: `frame`, `wire`, `roster_entry`, `object`, `head`, `tree`, `commit`.
+Targets: `frame`, `wire`, `roster_entry`, `keyhist`, `keyslot`, `object`, `head`, `frontier`, `tree`,
+`commit`, `pairing`.
 
-## Run (needs nightly + cargo-fuzz + LLVM)
+## Run (needs nightly and cargo-fuzz)
 
 ```sh
-cargo install cargo-fuzz
-cargo +nightly fuzz run frame        # or any target name above
-cargo +nightly fuzz run wire -- -max_total_time=60
+cargo install cargo-fuzz --locked
+cargo +nightly fuzz list
+cargo +nightly fuzz run frame                        # or any target above
+cargo +nightly fuzz run wire -- -max_total_time=60   # what CI runs for every target
 ```
 
-This crate is **not** a workspace member (libfuzzer needs nightly/sanitizers; it builds out-of-band).
+This package is **not** a workspace member (libFuzzer needs nightly and sanitizers; an empty
+`[workspace]` table keeps cargo from adopting it). CI's `fuzz` job runs every target for one minute.
 
-## Stable CI coverage (no fuzz toolchain needed)
+## Stable coverage (no fuzz toolchain needed)
 
-Each target is a thin wrapper over a `secsec_fuzz::fuzz_*` function. The same functions are hammered
-with a large deterministic corpus (zeros/ones/counters/huge-length-prefix/pseudo-random + single-byte
-mutations) by the `secsec-fuzz` crate's `every_decoder_survives_arbitrary_input` test, so the
-robustness property is checked in normal `cargo test` even without nightly. Deep, coverage-guided
-fuzzing via the targets above is the additional, toolchain-gated layer.
+Each target is a thin wrapper over a `secsec_fuzz::fuzz_*` function. The same functions run over a
+fixed-seed corpus (empty, all zeros, all `0xff`, counting bytes, huge length prefixes, pseudo-random
+buffers, single-byte flips) in the `secsec-fuzz` crate's `every_decoder_survives_arbitrary_input`
+test, so the robustness property is checked in every `cargo test`; `fuzz_manifest_lists_every_target`
+keeps this package's target list identical to the harness. Coverage-guided fuzzing here is the
+additional, toolchain-gated layer.

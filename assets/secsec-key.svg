@@ -2,6 +2,6 @@
   <title>secsec</title>
   <!-- rounded-square frame: the brand outline -->
   <rect x="8" y="8" width="48" height="48" rx="13" fill="none" stroke="#ffffff" stroke-width="4.5"/>
-  <!-- keyhole: the status fill — green when connected & syncing -->
+  <!-- keyhole: the status fill, green when connected & syncing -->
   <path d="M32 20 a6.5 6.5 0 0 1 4.2 11.5 L38 44 H26 L27.8 31.5 A6.5 6.5 0 0 1 32 20 Z" fill="#2aa85a"/>
 </svg>

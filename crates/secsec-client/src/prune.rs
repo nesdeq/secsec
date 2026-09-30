@@ -1,89 +1,67 @@
-//! Client cache hygiene (`secsec-Design.md` §15). [`local_sweep`] drops objects in the client's own
-//! object cache that are no longer reachable from the synced head — orphans left by cas-conflict
-//! retries or aborted pushes. (Bounded server-side history retention — `prune_history` — is added
-//! here in the retention layer.)
+//! Cache hygiene and bounded history (`secsec-Design.md` §15): retention drops chunks only; commits and trees are kept.
 
-use crate::{fetch_head, ClientError, Remote};
+use crate::{fetch_verified_head, ClientError, Remote};
 use secsec_kdf::MasterKeys;
 use secsec_object::Id;
 use secsec_proto::server::limits::MAX_HAS_IDS;
-use secsec_snapshot::{changed_paths, open_signed_commit, path_content, reachable_objects};
+use secsec_roster::State;
+use secsec_snapshot::{changed_paths, open_signed_commit, path_chunks, reachable_objects};
 use secsec_store::Store;
 use secsec_sync::ref_hash;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Keep-only-reachable sweep of the client's **own** object cache: delete every object unreachable
-/// from `head`. The cache serves only this device, so there is no grace window. **Fail-safe** — an
-/// unbuildable closure errors and deletes nothing. Returns the number of objects dropped.
+/// Drop every object of this device's own cache that `head` does not reach; fail-safe, returns the count dropped.
 pub fn local_sweep<K: MasterKeys>(keys: &K, store: &Store, head: &Id) -> Result<u64, ClientError> {
-    let keep = reachable_objects(keys, store, &[*head])?;
+    let keep = reachable_objects(keys, store, head)?;
     Ok(store.retain(&keep)?)
 }
 
-/// Bound history to the last `keep` versions per file (§15): keep the head's full current content plus,
-/// for each file, the content of its last `keep` changing-versions; delete everything else. The dead
-/// set is dropped from the local cache, then deleted on the server under a head-binding compare-and-swap
-/// (a concurrent `cas-head`/`roster-append` rejects the prune, so a reverted head's content is never
-/// deleted). `keep == 0` keeps everything. Commit objects are never pruned, so `secsec log` and the
-/// parent-graph walk always stay whole; only superseded tree/chunk content is dropped.
+/// Keep the head and each file's last `keep` versions, deleting other chunks here and on the server under the §15 CAS; `Ok(false)` retries later.
 pub async fn prune_history<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
     keys: &K,
+    roster: &State,
     ref_name: &str,
     keep: usize,
-    roster_seq: u64,
-) -> Result<(), ClientError> {
+) -> Result<bool, ClientError> {
     if keep == 0 {
-        return Ok(());
+        return Ok(true);
     }
-    let Some((head, _sig, head_blob)) = fetch_head(remote, keys, ref_name).await? else {
-        return Ok(());
+    let Some(rh) = fetch_verified_head(remote, keys, &roster.members, ref_name).await? else {
+        return Ok(true);
     };
-    // Bring all commits + trees local (chunk ids ride in the trees; chunk blobs are not fetched).
-    crate::history::fetch_history(remote, store, keys, &head.commit_id).await?;
+    let head = rh.head.commit_id;
+    crate::history::fetch_history(remote, store, keys, &roster.ever_members, &head).await?;
 
-    // KEEP = the head's full current closure ∪ each file's last `keep` changing-versions' content.
-    // ALL  = every tree/chunk reachable from any commit's tree. DEAD = ALL − KEEP (no commits, I4).
-    let (head_commit, _) = open_signed_commit(&head.commit_id, keys, store)?;
-    let mut keep_set: BTreeSet<Id> = path_content(
-        keys,
-        store,
-        &head_commit.root_tree,
-        &head_commit.root_salt,
-        "",
-    )?
-    .unwrap_or_default();
+    let (hc, _) = open_signed_commit(&head, keys, store)?;
+    let mut keep_set: BTreeSet<Id> =
+        path_chunks(keys, store, &hc.root_tree, &hc.root_salt, "")?.unwrap_or_default();
     let mut all: BTreeSet<Id> = keep_set.clone();
-    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-
-    for cid in crate::history::commit_ids(keys, store, &head.commit_id)? {
+    let mut kept: BTreeMap<String, usize> = BTreeMap::new();
+    for cid in crate::history::commit_ids(keys, store, &head)? {
         let (commit, _) = open_signed_commit(&cid, keys, store)?;
-        if let Some(content) = path_content(keys, store, &commit.root_tree, &commit.root_salt, "")?
-        {
-            all.extend(content);
+        if let Some(c) = path_chunks(keys, store, &commit.root_tree, &commit.root_salt, "")? {
+            all.extend(c);
         }
         let parent = match commit.parents.first() {
-            Some(p) => {
-                let (pc, _) = open_signed_commit(p, keys, store)?;
-                Some((pc.root_tree, pc.root_salt))
-            }
+            Some(p) => Some(open_signed_commit(p, keys, store)?.0),
             None => None,
         };
         let changed = changed_paths(
             keys,
             store,
-            parent.as_ref().map(|(t, s)| (t, s)),
+            parent.as_ref().map(|p| (&p.root_tree, &p.root_salt)),
             Some((&commit.root_tree, &commit.root_salt)),
         )?;
         for path in changed {
-            let count = seen.entry(path.clone()).or_insert(0);
-            if *count < keep {
-                *count += 1;
-                if let Some(content) =
-                    path_content(keys, store, &commit.root_tree, &commit.root_salt, &path)?
+            let n = kept.entry(path.clone()).or_insert(0);
+            if *n < keep {
+                *n += 1;
+                if let Some(c) =
+                    path_chunks(keys, store, &commit.root_tree, &commit.root_salt, &path)?
                 {
-                    keep_set.extend(content);
+                    keep_set.extend(c);
                 }
             }
         }
@@ -91,247 +69,175 @@ pub async fn prune_history<R: Remote, K: MasterKeys>(
 
     let dead: Vec<Id> = all.difference(&keep_set).copied().collect();
     if dead.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
-
-    // Drop locally first (symmetric), then delete on the server under the head-binding CAS.
+    // Local first: a chunk the head still needs is refetched on demand, so a lost server CAS costs nothing.
     store.delete_objects(&dead)?;
     let rnk = keys.ref_name_key();
-    let ref_h = ref_hash(&rnk, ref_name);
-    let ahh = secsec_proto::prune::all_heads_hash(&[(ref_h, *blake3::hash(&head_blob).as_bytes())]);
+    let ahh = secsec_proto::prune::all_heads_hash(&[(
+        ref_hash(&rnk, ref_name),
+        *blake3::hash(&rh.blob).as_bytes(),
+    )]);
+    let roster_len = roster.tip_seq.saturating_add(1);
     for batch in dead.chunks(MAX_HAS_IDS) {
-        if !remote.prune(batch, &ahh, roster_seq).await? {
-            // CAS conflict: the server's head/roster moved since we read it. Stop; a later prune
-            // re-reads and retries. The local delete self-heals — content a moved head now references
-            // is re-fetched on demand.
-            break;
+        if !remote.prune(batch, &ahh, roster_len).await? {
+            return Ok(false);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo::{init_repo_remote, open_repo_remote};
+    use crate::testmem::MemRemote;
+    use crate::{fetch_closure, fetch_head, push_head, push_objects};
     use secsec_kdf::MasterKey;
     use secsec_sig::DeviceKey;
-    use secsec_snapshot::{seal_signed_commit, snapshot_tree, Commit};
+    use secsec_snapshot::{seal_signed_commit, snapshot_tree, Commit, Prior, SnapshotMemo};
 
     #[test]
     fn local_sweep_keeps_reachable_and_drops_orphans() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(d.path().join("s.redb")).unwrap();
         let m = MasterKey::new(1, [0x55; 32]);
         let dev = DeviceKey::generate().unwrap();
-
-        // Commit a folder → the store holds exactly the head's reachable closure.
         let src = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("f"), b"data").unwrap();
-        let (rt, rs, _) = snapshot_tree(src.path(), &m, &store, None).unwrap();
+        let snap =
+            snapshot_tree(src.path(), &m, &store, None, &mut SnapshotMemo::default()).unwrap();
         let commit = Commit {
-            root_tree: rt,
-            root_salt: rs,
+            root_tree: snap.root,
+            root_salt: snap.salt,
             parents: vec![],
             device_id: dev.device_id().unwrap(),
             version: 1,
             roster_seq: 0,
-            last_seen_head: [0u8; 32],
+            last_seen_head: [0; 32],
             ts: 0,
         };
         let head = seal_signed_commit(&m, &store, &dev, &commit).unwrap();
         let reachable = store.object_count().unwrap();
-
-        // Inject an unreachable orphan, then sweep: only the orphan is dropped; the closure survives.
         store.put(&[0xee; 32], b"orphan").unwrap();
-        assert_eq!(store.object_count().unwrap(), reachable + 1);
         assert_eq!(local_sweep(&m, &store, &head).unwrap(), 1);
-        assert_eq!(store.get(&[0xee; 32]).unwrap(), None);
         assert_eq!(store.object_count().unwrap(), reachable);
-        assert!(secsec_snapshot::open_signed_commit(&head, &m, &store).is_ok());
     }
 
-    #[tokio::test]
-    async fn prune_history_keeps_last_n_versions_per_file() {
-        use crate::testmem::MemRemote;
-        use crate::{fetch_closure, fetch_head, push_head, push_objects};
-        use secsec_sync::Head;
-
-        let dir = tempfile::tempdir().unwrap();
-        let m = MasterKey::new(1, [0x55; 32]);
+    /// Publish `versions` fully distinct versions of one file into an initialized repo.
+    async fn history(
+        r: &MemRemote,
+        cache: &Store,
+        versions: u8,
+    ) -> (DeviceKey, MasterKey, State, Vec<Id>) {
         let dev = DeviceKey::generate().unwrap();
-        let remote = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
-        let store = Store::open(dir.path().join("c.redb")).unwrap();
-
-        // Three fully-distinct multi-chunk versions of one file (each version's chunks are unique).
+        let rfp = init_repo_remote(r, &dev, 0).await.unwrap();
+        let (m, st, _) = open_repo_remote(r, &dev, &rfp, None).await.unwrap();
         let work = tempfile::tempdir().unwrap();
-        let mut prev_tree: Option<(Id, [u8; 16])> = None;
-        let mut prev_head: Option<(Head, Vec<u8>)> = None;
-        let mut commits: Vec<Id> = Vec::new();
-        for v in 1..=3u8 {
+        let mut prev: Option<(Id, Commit)> = None;
+        let mut head: Option<(secsec_sync::Head, Vec<u8>)> = None;
+        let mut commits = Vec::new();
+        for v in 1..=versions {
             let mut data = vec![0u8; 200 * 1024];
             getrandom::fill(&mut data).unwrap();
             std::fs::write(work.path().join("f.bin"), &data).unwrap();
-            let (rt, rs, _) = snapshot_tree(
+            let snap = snapshot_tree(
                 work.path(),
                 &m,
-                &store,
-                prev_tree.as_ref().map(|(t, s)| (t, s)),
+                cache,
+                prev.as_ref().map(|(_, c)| Prior {
+                    root: &c.root_tree,
+                    salt: &c.root_salt,
+                    fast_path: false,
+                }),
+                &mut SnapshotMemo::default(),
             )
             .unwrap();
-            let parents = commits.last().copied().map(|c| vec![c]).unwrap_or_default();
-            let last_seen = prev_head
-                .as_ref()
-                .map(|(h, _)| secsec_sync::head_id(h))
-                .unwrap_or([0u8; 32]);
             let commit = Commit {
-                root_tree: rt,
-                root_salt: rs,
-                parents,
+                root_tree: snap.root,
+                root_salt: snap.salt,
+                parents: prev.iter().map(|(id, _)| *id).collect(),
                 device_id: dev.device_id().unwrap(),
                 version: u64::from(v),
                 roster_seq: 0,
-                last_seen_head: last_seen,
+                last_seen_head: [0; 32],
                 ts: u64::from(v),
             };
-            let cid = seal_signed_commit(&m, &store, &dev, &commit).unwrap();
-            let push = [v; 16];
-            push_objects(&remote, &store, &m, &cid, &push)
+            let id = seal_signed_commit(&m, cache, &dev, &commit).unwrap();
+            push_objects(r, cache, &m, &id, prev.as_ref().map(|(p, _)| p), &[v; 16])
                 .await
                 .unwrap();
-            let (h, b) = push_head(
-                &remote,
-                &m,
-                &dev,
-                "main",
-                cid,
-                0,
-                prev_head.as_ref().map(|(h, b)| (h, b.as_slice())),
-                &push,
-            )
-            .await
-            .unwrap();
-            prev_tree = Some((rt, rs));
-            prev_head = Some((h, b));
-            commits.push(cid);
+            head = Some(
+                push_head(
+                    r,
+                    &m,
+                    &dev,
+                    "main",
+                    id,
+                    0,
+                    head.as_ref().map(|(h, b)| (h, b.as_slice())),
+                    &[v; 16],
+                )
+                .await
+                .unwrap(),
+            );
+            prev = Some((id, commit));
+            commits.push(id);
         }
-        let before = remote.store.object_count().unwrap();
+        (dev, m, st, commits)
+    }
 
-        // Keep the last 2 versions per file: v1's unique content is pruned, v2/v3 + the head survive.
-        prune_history(&remote, &store, &m, "main", 2, 0)
-            .await
-            .unwrap();
-        let after = remote.store.object_count().unwrap();
+    /// Retention drops superseded chunks only; commits and trees stay, so a second prune and `log` walk the whole history.
+    #[tokio::test]
+    async fn prune_keeps_last_versions_and_every_commit_and_tree() {
+        let d = tempfile::tempdir().unwrap();
+        let r = MemRemote::new(Store::open(d.path().join("r.redb")).unwrap());
+        let cache = Store::open(d.path().join("c.redb")).unwrap();
+        let (_dev, m, st, commits) = history(&r, &cache, 4).await;
+        let before = r.store.object_count().unwrap();
+        assert!(prune_history(&r, &cache, &m, &st, "main", 2).await.unwrap());
+        let after = r.store.object_count().unwrap();
         assert!(
             after < before,
-            "v1's superseded content must be pruned ({before} -> {after})"
+            "superseded chunks are pruned ({before} -> {after})"
         );
-
-        // The head (v3) is still fully fetchable + restorable into a fresh clone after the prune.
-        let (h3, _, _) = fetch_head(&remote, &m, "main").await.unwrap().unwrap();
-        assert_eq!(h3.commit_id, *commits.last().unwrap());
-        let clone = Store::open(dir.path().join("clone.redb")).unwrap();
-        fetch_closure(&remote, &clone, &m, &h3.commit_id)
+        for c in &commits {
+            let (commit, _) = open_signed_commit(c, &m, &cache).unwrap();
+            assert!(r.store.get(c).unwrap().is_some(), "commits are kept");
+            assert!(
+                r.store.get(&commit.root_tree).unwrap().is_some(),
+                "trees are kept"
+            );
+        }
+        assert!(prune_history(&r, &cache, &m, &st, "main", 2).await.unwrap());
+        let (head, _, _) = fetch_head(&r, &m, "main").await.unwrap().unwrap();
+        let fresh = Store::open(d.path().join("fresh.redb")).unwrap();
+        fetch_closure(&r, &fresh, &m, &head.commit_id)
             .await
             .unwrap();
+        crate::history::fetch_history(&r, &fresh, &m, &st.ever_members, &head.commit_id)
+            .await
+            .unwrap();
+        let log = crate::history::repo_log(&m, &fresh, &head.commit_id).unwrap();
+        assert_eq!(log.len(), 4);
+        let hist = crate::history::path_history(&m, &fresh, &head.commit_id, "f.bin").unwrap();
+        assert_eq!(
+            hist.len(),
+            4,
+            "trees are kept, so every version stays listed"
+        );
     }
 
-    /// Regression: once retention prunes an old version's tree, a *second* `prune_history` (and a
-    /// `log`) must walk the kept commit skeleton over those pruned ancestors without erroring —
-    /// skip-missing on pruned content (§15/I5), not a fatal `MissingRemote`. Before the fetch_history
-    /// fix this failed every run with "required object absent on remote".
+    /// A prune signed over a stale roster length is refused by the server and deletes nothing there.
     #[tokio::test]
-    async fn prune_history_tolerates_already_pruned_ancestors() {
-        use crate::testmem::MemRemote;
-        use crate::{fetch_head, push_head, push_objects};
-        use secsec_sync::Head;
-
-        let dir = tempfile::tempdir().unwrap();
-        let m = MasterKey::new(1, [0x55; 32]);
-        let dev = DeviceKey::generate().unwrap();
-        let remote = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
-        let store = Store::open(dir.path().join("c.redb")).unwrap();
-
-        // Four fully-distinct versions of one file (each version's chunks are unique → prunable).
-        let work = tempfile::tempdir().unwrap();
-        let mut prev_tree: Option<(Id, [u8; 16])> = None;
-        let mut prev_head: Option<(Head, Vec<u8>)> = None;
-        let mut commits: Vec<Id> = Vec::new();
-        for v in 1..=4u8 {
-            let mut data = vec![0u8; 200 * 1024];
-            getrandom::fill(&mut data).unwrap();
-            std::fs::write(work.path().join("f.bin"), &data).unwrap();
-            let (rt, rs, _) = secsec_snapshot::snapshot_tree(
-                work.path(),
-                &m,
-                &store,
-                prev_tree.as_ref().map(|(t, s)| (t, s)),
-            )
-            .unwrap();
-            let parents = commits.last().copied().map(|c| vec![c]).unwrap_or_default();
-            let last_seen = prev_head
-                .as_ref()
-                .map(|(h, _)| secsec_sync::head_id(h))
-                .unwrap_or([0u8; 32]);
-            let commit = Commit {
-                root_tree: rt,
-                root_salt: rs,
-                parents,
-                device_id: dev.device_id().unwrap(),
-                version: u64::from(v),
-                roster_seq: 0,
-                last_seen_head: last_seen,
-                ts: u64::from(v),
-            };
-            let cid = seal_signed_commit(&m, &store, &dev, &commit).unwrap();
-            let push = [v; 16];
-            push_objects(&remote, &store, &m, &cid, &push)
-                .await
-                .unwrap();
-            let (h, b) = push_head(
-                &remote,
-                &m,
-                &dev,
-                "main",
-                cid,
-                0,
-                prev_head.as_ref().map(|(h, b)| (h, b.as_slice())),
-                &push,
-            )
-            .await
-            .unwrap();
-            prev_tree = Some((rt, rs));
-            prev_head = Some((h, b));
-            commits.push(cid);
-        }
-
-        // First prune keeps the last 2 versions → v1/v2 trees + chunks are pruned on both sides.
-        prune_history(&remote, &store, &m, "main", 2, 0)
-            .await
-            .unwrap();
-
-        // The regression: a second prune walks v1/v2's pruned trees without erroring, and `log` still
-        // lists every (kept) commit (I4).
-        prune_history(&remote, &store, &m, "main", 2, 0)
-            .await
-            .unwrap();
-        let (head, _, _) = fetch_head(&remote, &m, "main").await.unwrap().unwrap();
-        crate::history::fetch_history(&remote, &store, &m, &head.commit_id)
-            .await
-            .unwrap();
-        let log = crate::history::repo_log(&m, &store, &head.commit_id).unwrap();
-        assert_eq!(
-            log.len(),
-            4,
-            "every commit is kept past the retention window (I4)"
-        );
-
-        // `log <path>` over the same pruned history lists only resolvable versions, never errors, and
-        // never reports a pruned version as a deletion (no phantom-delete).
-        let hist = crate::history::path_history(&m, &store, &head.commit_id, "f.bin").unwrap();
-        assert!(!hist.is_empty(), "the kept versions of f.bin remain listed");
-        assert!(
-            hist.iter().all(|v| v.present),
-            "a pruned version must never surface as a deletion"
-        );
+    async fn prune_against_a_moved_roster_is_retried_later() {
+        let d = tempfile::tempdir().unwrap();
+        let r = MemRemote::new(Store::open(d.path().join("r.redb")).unwrap());
+        let cache = Store::open(d.path().join("c.redb")).unwrap();
+        let (_dev, m, mut st, _) = history(&r, &cache, 3).await;
+        let before = r.store.object_count().unwrap();
+        st.tip_seq += 1;
+        assert!(!prune_history(&r, &cache, &m, &st, "main", 1).await.unwrap());
+        assert_eq!(r.store.object_count().unwrap(), before);
     }
 }

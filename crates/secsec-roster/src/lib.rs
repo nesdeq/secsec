@@ -1,46 +1,42 @@
-//! `secsec-roster` — the roster sigchain, the real ACL (`secsec-Design.md` §8).
-//!
-//! An append-only, hash-chained, SSHSIG-signed log; genesis hashes to the RFP (§5). [`fold`]
-//! enforces **succession** (each entry's signer must be a current member of the prefix). Also here:
-//! the per-entry AEAD (§9.5), the never-trimmed key histories and their peels (§8.2), the
-//! cold-start bootstrap fold (§8.1), and the revoke⇒rotate op builder (§8.4). The anti-rollback
-//! anchor is enforced by the client cold-start.
+//! The roster sigchain: fold/succession, per-entry AEAD, key-history peels, cold start, and revoke⇒rotate ops (`secsec-Design.md` §8).
 
 #![forbid(unsafe_code)]
 
 use secsec_canon::{verify_reencode, CanonError, Reader, Writer};
 use secsec_frame::{
-    assemble_blob, parse_blob, Frame, FrameError, ObjType, CTX_TAG_LEN, FRAME_LEN,
+    parse_blob, parse_frame_prefix, Frame, FrameError, ObjType, CTX_TAG_LEN, FRAME_LEN,
     MAX_ROSTER_ENTRY_SIZE,
 };
-use secsec_kdf::{data_keyhist_key, roster_entry_key, roster_keyhist_key, MasterKey, SecretKey};
+use secsec_kdf::{
+    data_keyhist_key, roster_entry_key, roster_entry_key_v2, roster_keyhist_key, MasterKey,
+    SecretKey, ROSTER_ENTRY_SALT_LEN,
+};
 use secsec_sig::{DeviceId, DeviceKey, DevicePublic, NS_ROSTER};
 use std::collections::{BTreeMap, BTreeSet};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
-/// A 256-bit master-key generation commitment (`mk_commit_g`, recorded for verification elsewhere).
+/// A 256-bit master-key generation commitment `mk_commit_g`.
 pub type MkCommit = [u8; 32];
 
-/// A sigchain operation (§8.1). `params` are inlined per variant.
+/// A sigchain operation (§8.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
-    /// The trust root: device-1's canonical pubkey + generation-1 commitment. Self-signed at seq 0.
+    /// The trust root, self-signed at seq 0.
     Genesis {
         /// Canonical SSH encoding of device-1's public key.
         pubkey: Vec<u8>,
         /// `mk_commit_1`.
         mk_commit: MkCommit,
-        /// The device's **X-Wing public key** bytes (§8.3/§17), published so a granter can wrap the
-        /// keyslot to it. Opaque here — the keyslot layer interprets it.
+        /// Device-1's X-Wing public key (§8.3/§17).
         enroll_pub: Vec<u8>,
     },
-    /// Add a device: its canonical pubkey + the current generation's commitment.
+    /// Add a device at the current generation.
     AddDevice {
         /// Canonical SSH encoding of the new device's public key.
         pubkey: Vec<u8>,
-        /// `mk_commit_g` at the time of the grant.
+        /// `mk_commit_g` of the current generation; fold rejects any other value.
         mk_commit: MkCommit,
-        /// The new device's **X-Wing public key** bytes (§8.3/§17), as in [`Op::Genesis`].
+        /// The new device's X-Wing public key (§8.3/§17).
         enroll_pub: Vec<u8>,
     },
     /// Remove a device by id.
@@ -48,12 +44,12 @@ pub enum Op {
         /// The device being removed.
         device: DeviceId,
     },
-    /// Mint a new master-key generation; records the new generation's commitment.
+    /// Mint generation `g+1`.
     Rotate {
         /// `mk_commit_{g+1}`.
         mk_commit: MkCommit,
     },
-    /// Raise the repo-wide minimum algorithm id (§16 downgrade floor).
+    /// Raise the repo-wide keyslot algorithm floor (§16).
     SetMinAlgo {
         /// The new floor.
         min_algo: u8,
@@ -63,7 +59,7 @@ pub enum Op {
 /// A signed sigchain entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    /// Strictly increasing sequence number; genesis is 0.
+    /// Sequence number; genesis is 0.
     pub seq: u64,
     /// BLAKE3 of the full previous entry (`[0;32]` for genesis).
     pub prev: [u8; 32],
@@ -73,7 +69,7 @@ pub struct Entry {
     pub ts: u64,
     /// The signing device's id.
     pub signer: DeviceId,
-    /// SSHSIG (PEM bytes) over the signed portion, namespace `secsec-roster-v1`.
+    /// SSHSIG PEM over the signed portion (`secsec-roster-v1`).
     pub sig: Vec<u8>,
 }
 
@@ -82,35 +78,38 @@ pub struct Entry {
 pub enum RosterError {
     /// Empty chain.
     Empty,
-    /// Genesis entry malformed (wrong seq/prev/op, or not self-signed by device-1).
+    /// Genesis malformed or not self-signed by device-1.
     BadGenesis,
     /// Genesis hash did not equal the pinned RFP.
     RfpMismatch,
     /// A non-genesis entry had a `Genesis` op.
     DoubleGenesis,
-    /// Sequence numbers are not 0,1,2,….
+    /// Sequence numbers are not 0,1,2,… (or would overflow).
     BadSeq,
     /// An entry's `prev` did not equal the hash of its predecessor.
     ChainBreak,
-    /// An entry was signed by a key that is not a current member (succession violation).
+    /// An entry was signed by a non-member (succession violation).
     NotMember,
     /// An entry's signature did not verify.
     BadSignature,
-    /// An entry's encoded op carried an unknown tag.
+    /// Unknown op tag.
     BadOp,
-    /// Strict canonical decode failed (truncation, over-long field, trailing bytes, or
-    /// non-canonical re-encode).
+    /// An `AddDevice` recorded an `mk_commit` other than the current generation's.
+    BadCommit,
+    /// A device would revoke itself, which would leave its own later entries unsigned by a member.
+    SelfRevoke,
+    /// Strict canonical decode failed.
     Canon(CanonError),
-    /// The stored entry's FRAME was malformed or did not match the expected `(gen, type)` (§18).
+    /// FRAME malformed or not the expected `(version, gen, type)` (§18).
     Frame(FrameError),
-    /// The per-entry AEAD failed to open (wrong key/generation, or tampered ciphertext/commitment).
+    /// The per-entry AEAD failed to open.
     Aead,
-    /// Cold start: an entry's `FRAME.gen` had no peeled roster key (gen beyond `g_cur`, or a
-    /// tip/`g_cur` mismatch) — a forged or inconsistent chain.
+    /// An entry's generation has no peeled roster key (forged or inconsistent chain).
     BadGeneration,
-    /// Cold start: the keyslot-recovered candidate key failed `mk_commit_{g_cur}` from the
-    /// RFP-anchored chain (§7 step 3) — a forged keyslot / fake key.
+    /// The candidate master key failed `mk_commit_{g_cur}` (§7 step 3: forged keyslot / fake key).
     MkCommitMismatch,
+    /// OS RNG failure.
+    Rng,
     /// Signing/key error.
     Sig(secsec_sig::SigError),
 }
@@ -127,6 +126,10 @@ impl core::fmt::Display for RosterError {
             RosterError::NotMember => f.write_str("entry signed by a non-member (succession)"),
             RosterError::BadSignature => f.write_str("entry signature invalid"),
             RosterError::BadOp => f.write_str("unknown roster op tag"),
+            RosterError::BadCommit => {
+                f.write_str("AddDevice mk_commit differs from the current generation's")
+            }
+            RosterError::SelfRevoke => f.write_str("a device cannot revoke itself"),
             RosterError::Canon(e) => write!(f, "canon: {e}"),
             RosterError::Frame(e) => write!(f, "frame: {e}"),
             RosterError::Aead => f.write_str("roster entry AEAD open failed"),
@@ -134,6 +137,7 @@ impl core::fmt::Display for RosterError {
             RosterError::MkCommitMismatch => {
                 f.write_str("candidate key fails mk_commit from the RFP-anchored chain")
             }
+            RosterError::Rng => f.write_str("OS RNG failure"),
             RosterError::Sig(e) => write!(f, "sig: {e}"),
         }
     }
@@ -184,7 +188,7 @@ fn encode_op(w: &mut Writer, op: &Op) {
     }
 }
 
-/// The signed portion: `seq ‖ prev ‖ op ‖ ts ‖ signer` (§8.1).
+/// The signed portion `seq ‖ prev ‖ op ‖ ts ‖ signer` (§8.1).
 fn signed_bytes(seq: u64, prev: &[u8; 32], op: &Op, ts: u64, signer: &DeviceId) -> Vec<u8> {
     let mut w = Writer::new();
     w.u64(seq).raw(prev);
@@ -193,9 +197,7 @@ fn signed_bytes(seq: u64, prev: &[u8; 32], op: &Op, ts: u64, signer: &DeviceId) 
     w.finish()
 }
 
-/// The canonical wire encoding of a full entry (signed portion + signature). This is the byte
-/// string that is hashed for the chain (`prev`/RFP) and that the per-entry AEAD layer (§9.5)
-/// encrypts. Field order: `seq ‖ prev ‖ op ‖ ts ‖ signer ‖ sig`.
+/// The canonical entry `seq ‖ prev ‖ op ‖ ts ‖ signer ‖ sig`: hashed for `prev`/RFP and sealed by the AEAD.
 #[must_use]
 pub fn encode_entry(e: &Entry) -> Vec<u8> {
     let mut w = Writer::new();
@@ -209,7 +211,6 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, RosterError> {
     let tag = r.u8()?;
     Ok(match tag {
         0 => {
-            // Read in encode order: pubkey, mk_commit, enroll_pub.
             let pubkey = r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec();
             let mk_commit = read32(r)?;
             let enroll_pub = r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec();
@@ -244,12 +245,7 @@ fn read32(r: &mut Reader<'_>) -> Result<[u8; 32], RosterError> {
     Ok(out)
 }
 
-/// Strictly decode a full entry from its canonical wire bytes (inverse of [`encode_entry`]).
-///
-/// Rejects truncation, over-long length-prefixed fields (bounded by
-/// [`secsec_frame::MAX_ROSTER_ENTRY_SIZE`]), trailing bytes, and — via the §9.3 re-encode guard —
-/// any non-canonical encoding of an otherwise-valid entry. This is the malleability boundary: the
-/// bytes a signature/hash is computed over are the unique canonical encoding of the parsed value.
+/// Strictly decode a canonical entry: bounded fields, no trailing bytes, §9.3 re-encode guard.
 pub fn decode_entry(bytes: &[u8]) -> Result<Entry, RosterError> {
     let mut r = Reader::new(bytes);
     let seq = r.u64()?;
@@ -271,60 +267,129 @@ pub fn decode_entry(bytes: &[u8]) -> Result<Entry, RosterError> {
     Ok(entry)
 }
 
-/// BLAKE3 of the full entry — the chain link `prev` and the genesis RFP.
+/// BLAKE3 of the full entry: the chain link `prev` and the genesis RFP.
 #[must_use]
 pub(crate) fn entry_hash(e: &Entry) -> [u8; 32] {
     *blake3::hash(&encode_entry(e)).as_bytes()
 }
 
-// ---- per-entry AEAD (§9.5 "Roster entry AEAD") ----
+// ---- per-entry AEAD (§9.5) ----
 
-/// `AD_roster = FRAME_roster ‖ le64(seq)` (§9.5) — the FRAME binds type+gen, `seq` is appended.
-fn ad_roster(frame: &Frame, seq: u64) -> [u8; FRAME_LEN + 8] {
+/// v1 AD `FRAME ‖ le64(seq)`.
+fn ad_roster_v1(frame: &Frame, seq: u64) -> [u8; FRAME_LEN + 8] {
     let mut ad = [0u8; FRAME_LEN + 8];
     ad[..FRAME_LEN].copy_from_slice(&frame.encode());
     ad[FRAME_LEN..].copy_from_slice(&seq.to_le_bytes());
     ad
 }
 
-/// Seal a canonical entry plaintext at `(gen, seq)` under `roster_key_g` → stored blob
-/// `FRAME ‖ ctx_tag ‖ ct` (§9.5; the per-(key,seq) entry key makes the zero nonce safe).
-#[must_use]
-pub fn seal_entry(roster_key_g: &[u8; 32], gen: u32, seq: u64, entry_plaintext: &[u8]) -> Vec<u8> {
-    let k = roster_entry_key(roster_key_g, seq);
-    let frame = Frame::v1(gen, ObjType::RosterEntry);
-    let ad = ad_roster(&frame, seq);
-    let (ctx_tag, ct) = secsec_aead::seal(secsec_aead::UniqueKey::new(&k), &ad, entry_plaintext);
-    assemble_blob(&frame, &ctx_tag, &ct)
+/// v2 AD `FRAME ‖ le64(seq) ‖ salt`.
+fn ad_roster_v2(
+    frame: &Frame,
+    seq: u64,
+    salt: &[u8; ROSTER_ENTRY_SALT_LEN],
+) -> [u8; FRAME_LEN + 8 + ROSTER_ENTRY_SALT_LEN] {
+    let mut ad = [0u8; FRAME_LEN + 8 + ROSTER_ENTRY_SALT_LEN];
+    ad[..FRAME_LEN + 8].copy_from_slice(&ad_roster_v1(frame, seq));
+    ad[FRAME_LEN + 8..].copy_from_slice(salt);
+    ad
 }
 
-/// Open a stored roster entry blob at `(gen, seq)`: expected-FRAME check (§18) then AEAD open.
-/// The caller derives `roster_key_g` (peel, §8.2) and [`decode_entry`]s + chain-verifies the result.
+/// Seal a canonical entry at `(gen, seq)` as v2 `FRAME ‖ salt ‖ ctx_tag ‖ ct` under a fresh random salt (§9.5).
+pub fn seal_entry(
+    roster_key_g: &[u8; 32],
+    gen: u32,
+    seq: u64,
+    entry_plaintext: &[u8],
+) -> Result<Vec<u8>, RosterError> {
+    let mut salt = [0u8; ROSTER_ENTRY_SALT_LEN];
+    getrandom::fill(&mut salt).map_err(|_| RosterError::Rng)?;
+    Ok(seal_entry_with_salt(
+        roster_key_g,
+        gen,
+        seq,
+        &salt,
+        entry_plaintext,
+    ))
+}
+
+/// [`seal_entry`] with a caller-supplied salt, which MUST be fresh random per seal; fixed salts are for KATs only.
+#[must_use]
+pub fn seal_entry_with_salt(
+    roster_key_g: &[u8; 32],
+    gen: u32,
+    seq: u64,
+    salt: &[u8; ROSTER_ENTRY_SALT_LEN],
+    entry_plaintext: &[u8],
+) -> Vec<u8> {
+    let k = roster_entry_key_v2(roster_key_g, seq, salt);
+    let frame = Frame::v2(gen, ObjType::RosterEntry);
+    let ad = ad_roster_v2(&frame, seq, salt);
+    let (ctx_tag, ct) = secsec_aead::seal(secsec_aead::UniqueKey::new(&k), &ad, entry_plaintext);
+    let mut out = Vec::with_capacity(FRAME_LEN + ROSTER_ENTRY_SALT_LEN + CTX_TAG_LEN + ct.len());
+    out.extend_from_slice(&frame.encode());
+    out.extend_from_slice(salt);
+    out.extend_from_slice(&ctx_tag);
+    out.extend_from_slice(&ct);
+    out
+}
+
+/// Seal a legacy v1 entry (zero nonce, per-(key, seq) key); kept only so tests and KATs exercise the v1 reader.
+#[cfg(any(test, feature = "legacy-v1"))]
+#[must_use]
+pub fn seal_entry_v1(
+    roster_key_g: &[u8; 32],
+    gen: u32,
+    seq: u64,
+    entry_plaintext: &[u8],
+) -> Vec<u8> {
+    let k = roster_entry_key(roster_key_g, seq);
+    let frame = Frame::v1(gen, ObjType::RosterEntry);
+    let ad = ad_roster_v1(&frame, seq);
+    let (ctx_tag, ct) = secsec_aead::seal(secsec_aead::UniqueKey::new(&k), &ad, entry_plaintext);
+    secsec_frame::assemble_blob(&frame, &ctx_tag, &ct)
+}
+
+/// Open a stored entry at `(gen, seq)`, v2 or legacy v1 by its FRAME version (§18 check, then AEAD).
 pub fn open_entry(
     roster_key_g: &[u8; 32],
     gen: u32,
     seq: u64,
     stored: &[u8],
 ) -> Result<Vec<u8>, RosterError> {
-    let frame = Frame::v1(gen, ObjType::RosterEntry);
-    let (ctx_tag, ct) = parse_blob(stored, &frame)?;
-    let ad = ad_roster(&frame, seq);
-    let k = roster_entry_key(roster_key_g, seq);
-    secsec_aead::open(&k, &ad, ctx_tag, ct).map_err(|_| RosterError::Aead)
+    let frame_bytes = stored
+        .get(..FRAME_LEN)
+        .ok_or(RosterError::Frame(FrameError::ShortBlob))?;
+    if Frame::decode(frame_bytes)?.is_v2() {
+        let frame = Frame::v2(gen, ObjType::RosterEntry);
+        let rest = parse_frame_prefix(stored, &frame)?;
+        if rest.len() < ROSTER_ENTRY_SALT_LEN + CTX_TAG_LEN {
+            return Err(RosterError::Frame(FrameError::ShortBlob));
+        }
+        let (salt, rest) = rest.split_at(ROSTER_ENTRY_SALT_LEN);
+        let (tag, ct) = rest.split_at(CTX_TAG_LEN);
+        let salt: &[u8; ROSTER_ENTRY_SALT_LEN] = salt.try_into().expect("salt length");
+        let ctx_tag: &[u8; CTX_TAG_LEN] = tag.try_into().expect("tag length");
+        let k = roster_entry_key_v2(roster_key_g, seq, salt);
+        let ad = ad_roster_v2(&frame, seq, salt);
+        secsec_aead::open(&k, &ad, ctx_tag, ct).map_err(|_| RosterError::Aead)
+    } else {
+        let frame = Frame::v1(gen, ObjType::RosterEntry);
+        let (ctx_tag, ct) = parse_blob(stored, &frame)?;
+        let ad = ad_roster_v1(&frame, seq);
+        let k = roster_entry_key(roster_key_g, seq);
+        secsec_aead::open(&k, &ad, ctx_tag, ct).map_err(|_| RosterError::Aead)
+    }
 }
 
-// ---- roster-key history (§8.2; never trimmed — peels roster_key_current → roster_key_1) ----
+// ---- roster-key history (§8.2; never trimmed) ----
 
-/// A 256-bit roster key, the plaintext wrapped by the roster-key history.
+/// A roster key's length.
 const ROSTER_KEY_LEN: usize = 32;
-/// Stored size of one `roster_keyhist_g` wrap: `ctx_tag(32) ‖ ct(32)` (§8.2). No FRAME prefix —
-/// `g` comes from the storage path and the AD is reconstructed by the reader.
-pub(crate) const ROSTER_KEYHIST_LEN: usize = CTX_TAG_LEN + ROSTER_KEY_LEN;
+/// Stored size of one roster-key-history wrap `ctx_tag(32) ‖ ct(32)`; `g` comes from the storage path.
+pub const ROSTER_KEYHIST_LEN: usize = CTX_TAG_LEN + ROSTER_KEY_LEN;
 
-/// Wrap `roster_key_g` so it can be recovered by a holder of `roster_key_{g+1}` (the next
-/// generation). Keyed by `k_rkh_g = derive_key("secsec-roster-keyhist-v1", roster_key_{g+1} ‖
-/// le32(g))`, AD = `FRAME_rkh(type=roster-keyhist, gen=g)`. Returns the bare
-/// [`ROSTER_KEYHIST_LEN`]-byte `ctx_tag ‖ ct`.
+/// Wrap `roster_key_g` under `k_rkh_g` (from `roster_key_{g+1}`), AD `FRAME(roster-keyhist, g)` (§8.2).
 #[must_use]
 pub fn seal_roster_keyhist(
     roster_key_next: &[u8; 32],
@@ -340,36 +405,37 @@ pub fn seal_roster_keyhist(
     out
 }
 
-/// Recover `roster_key_g` from a `roster_keyhist_g` wrap using `roster_key_{g+1}`. Verifies the
-/// CMT-4 commitment before releasing the key. Returns the zeroizing-wrapped recovered key.
+/// Recover `roster_key_g` from its wrap with `roster_key_{g+1}`, CMT-4 checked first.
 pub(crate) fn open_roster_keyhist(
     roster_key_next: &[u8; 32],
     g: u32,
     stored: &[u8],
 ) -> Result<SecretKey, RosterError> {
-    if stored.len() != ROSTER_KEYHIST_LEN {
+    open_key_wrap(
+        &roster_keyhist_key(roster_key_next, g),
+        Frame::v1(g, ObjType::RosterKeyhist),
+        stored,
+    )
+}
+
+/// Open a 64-byte `ctx_tag ‖ ct` key wrap under `k` with AD `frame`, returning the zeroizing key.
+fn open_key_wrap(k: &[u8; 32], frame: Frame, stored: &[u8]) -> Result<SecretKey, RosterError> {
+    if stored.len() != CTX_TAG_LEN + ROSTER_KEY_LEN {
         return Err(RosterError::Aead);
     }
     let ctx_tag: &[u8; CTX_TAG_LEN] = stored[..CTX_TAG_LEN]
         .try_into()
         .expect("slice is exactly CTX_TAG_LEN");
     let ct = &stored[CTX_TAG_LEN..];
-    let ad = Frame::v1(g, ObjType::RosterKeyhist).encode();
-    let k = roster_keyhist_key(roster_key_next, g);
-    let mut pt = secsec_aead::open(&k, &ad, ctx_tag, ct).map_err(|_| RosterError::Aead)?;
-    if pt.len() != ROSTER_KEY_LEN {
-        pt.zeroize();
-        return Err(RosterError::Aead);
-    }
+    let pt = Zeroizing::new(
+        secsec_aead::open(k, &frame.encode(), ctx_tag, ct).map_err(|_| RosterError::Aead)?,
+    );
     let mut out = Zeroizing::new([0u8; ROSTER_KEY_LEN]);
     out.copy_from_slice(&pt);
-    pt.zeroize();
     Ok(out)
 }
 
-/// Peel the roster-key history downward from `roster_key_current`: returns `g → roster_key_g` for
-/// all `1..=current_gen`. `history` MUST hold a wrap for every `g` in `1..current_gen`; a missing
-/// or unopenable wrap aborts (a current member can always produce the never-trimmed chain).
+/// Peel `roster_key_current` down to `roster_key_1`; every wrap in `1..current_gen` must be present and open.
 pub(crate) fn peel_roster_keys(
     roster_key_current: &[u8; 32],
     current_gen: u32,
@@ -390,14 +456,12 @@ pub(crate) fn peel_roster_keys(
     Ok(keys)
 }
 
-// ---- DATA key-history (§8.2; peels master_key_current → master_key_1 for old-object reads) ----
+// ---- data key-history (§8.2) ----
 
-/// Stored size of one DATA `keyhist_g` wrap: `ctx_tag(32) ‖ ct(32)` (§8.2). Same layout as the
-/// roster-key history; no FRAME prefix (`g` comes from the storage path).
-pub(crate) const DATA_KEYHIST_LEN: usize = CTX_TAG_LEN + 32;
+/// Stored size of one data key-history wrap `ctx_tag(32) ‖ ct(32)`.
+pub const DATA_KEYHIST_LEN: usize = CTX_TAG_LEN + 32;
 
-/// Wrap `master_key_g` under `master_key_{g+1}` (§8.2): the CTX/CMT-4 seal with
-/// AD = `FRAME(type=keyhist, gen=g)`; returns the bare `ctx_tag ‖ ct`.
+/// Wrap `master_key_g` under `k_keyhist_g` (from `master_key_{g+1}`), AD `FRAME(keyhist, g)` (§8.2).
 #[must_use]
 pub fn seal_data_keyhist(
     master_key_next: &[u8; 32],
@@ -413,39 +477,26 @@ pub fn seal_data_keyhist(
     out
 }
 
-/// Recover `master_key_g` from a DATA `keyhist_g` wrap using `master_key_{g+1}` (§8.2). Verifies the
-/// CMT-4 commitment before releasing the key. Returns the generation-`g` [`MasterKey`].
+/// Recover `master_key_g` from its wrap with `master_key_{g+1}`, CMT-4 checked first.
 pub(crate) fn open_data_keyhist(
     master_key_next: &[u8; 32],
     g: u32,
     stored: &[u8],
 ) -> Result<MasterKey, RosterError> {
-    if stored.len() != DATA_KEYHIST_LEN {
-        return Err(RosterError::Aead);
-    }
-    let ctx_tag: &[u8; CTX_TAG_LEN] = stored[..CTX_TAG_LEN]
-        .try_into()
-        .expect("slice is exactly CTX_TAG_LEN");
-    let ct = &stored[CTX_TAG_LEN..];
-    let ad = Frame::v1(g, ObjType::Keyhist).encode();
-    let k = data_keyhist_key(master_key_next, g);
-    let mut pt = secsec_aead::open(&k, &ad, ctx_tag, ct).map_err(|_| RosterError::Aead)?;
-    if pt.len() != 32 {
-        pt.zeroize();
-        return Err(RosterError::Aead);
-    }
-    let mut key = Zeroizing::new([0u8; 32]);
-    key.copy_from_slice(&pt);
-    pt.zeroize();
+    let key = open_key_wrap(
+        &data_keyhist_key(master_key_next, g),
+        Frame::v1(g, ObjType::Keyhist),
+        stored,
+    )?;
     Ok(MasterKey::new(g, *key))
 }
 
-/// Peel the DATA key-history downward from `master_key_current`: returns `g → master_key_g` for
-/// all `1..=current_gen`. A missing or unopenable wrap aborts.
+/// Peel `master_key_current` down to `master_key_1`, each generation checked against `mk_commits` (§8.2).
 pub fn peel_data_keys(
     master_key_current: &[u8; 32],
     current_gen: u32,
     history: &BTreeMap<u32, Vec<u8>>,
+    mk_commits: &BTreeMap<u32, MkCommit>,
 ) -> Result<BTreeMap<u32, MasterKey>, RosterError> {
     let mut keys: BTreeMap<u32, MasterKey> = BTreeMap::new();
     keys.insert(
@@ -465,11 +516,15 @@ pub fn peel_data_keys(
         keys.insert(g - 1, prev);
         g -= 1;
     }
+    for (g, mk) in &keys {
+        if mk_commits.get(g) != Some(&mk.mk_commit()) {
+            return Err(RosterError::MkCommitMismatch);
+        }
+    }
     Ok(keys)
 }
 
-/// Create the genesis entry (seq 0, self-signed by device-1). Returns `(entry, rfp)`. `enroll_pub` is
-/// device-1's X-Wing public key bytes (§8.3/§17).
+/// Create the self-signed genesis entry (seq 0); returns `(entry, rfp)`.
 pub fn genesis(
     device: &DeviceKey,
     enroll_pub: Vec<u8>,
@@ -496,15 +551,14 @@ pub fn genesis(
     Ok((entry, rfp))
 }
 
-/// Append a new entry after `prev_entry`, signed by `signer` (who must be a current member for the
-/// resulting chain to fold). Computes `seq`/`prev` automatically.
+/// Append one entry after `prev_entry`, signed by `signer` (a current member for the chain to fold).
 pub fn append(
     prev_entry: &Entry,
     op: Op,
     signer: &DeviceKey,
     ts: u64,
 ) -> Result<Entry, RosterError> {
-    let seq = prev_entry.seq + 1;
+    let seq = prev_entry.seq.checked_add(1).ok_or(RosterError::BadSeq)?;
     let prev = entry_hash(prev_entry);
     let signer_id = signer.device_id()?;
     let sig = signer.sign(NS_ROSTER, &signed_bytes(seq, &prev, &op, ts, &signer_id))?;
@@ -518,9 +572,7 @@ pub fn append(
     })
 }
 
-/// Append a sequence of ops as a chain of signed entries after `prev_entry`, each linking to the
-/// one before it (so the whole batch is a valid hash-chain extension). Used to emit the multi-op
-/// `revoke⇒rotate` sequence from [`revoke_rotate_ops`] atomically in author order.
+/// Append `ops` as a chained run of signed entries after `prev_entry`.
 pub fn append_many(
     prev_entry: &Entry,
     ops: Vec<Op>,
@@ -537,26 +589,28 @@ pub fn append_many(
 
 /// The folded roster state (§8.1).
 pub struct State {
-    /// Current member device ids → their public keys.
+    /// Current members → public keys.
     pub members: BTreeMap<DeviceId, DevicePublic>,
+    /// Every device ever admitted (genesis or `AddDevice`), including revoked ones: verifies historical commits.
+    pub ever_members: BTreeMap<DeviceId, DevicePublic>,
     /// Current generation (`#Rotate + 1`).
     pub generation: u32,
-    /// Minimum algorithm id (max over `SetMinAlgo`).
+    /// Keyslot algorithm floor (max over `SetMinAlgo`).
     pub min_algo: u8,
-    /// Per-generation `mk_commit` recorded by genesis/rotate.
+    /// Per-generation `mk_commit` from genesis/rotate.
     pub mk_commits: BTreeMap<u32, MkCommit>,
-    /// For each current member added by an `AddDevice` (i.e. **not** genesis device-1), the device
-    /// that authored that grant. Drives the revoke-before-add closure (§8.1). Cleared on revoke.
+    /// For each current non-genesis member, the device that granted it (the §8.1 closure input).
     pub added_by: BTreeMap<DeviceId, DeviceId>,
-    /// For each member in [`added_by`], the `seq` of its (latest) `AddDevice` entry.
+    /// For each member in `added_by`, the seq of its latest `AddDevice`.
     pub added_at: BTreeMap<DeviceId, u64>,
-    /// Per current member, the **X-Wing public key** bytes it published at enrollment (§8.3/§17), so
-    /// a granter/rotation can wrap its keyslot to it. Cleared on revoke.
+    /// Per current member, its published X-Wing public key (§8.3/§17).
     pub enroll_pubs: BTreeMap<DeviceId, Vec<u8>>,
+    /// The tip seq this state was folded to.
+    pub tip_seq: u64,
 }
 
 impl State {
-    /// Whether `device` is a current member — the membership half of per-op auth (§9.6, §12).
+    /// Whether `device` is a current member.
     #[must_use]
     pub fn is_member(&self, device: &DeviceId) -> bool {
         self.members.contains_key(device)
@@ -573,9 +627,7 @@ fn verify_entry_sig(pubkey: &DevicePublic, e: &Entry) -> Result<(), RosterError>
         .map_err(|_| RosterError::BadSignature)
 }
 
-/// Fold and fully validate a sigchain against the pinned `rfp`. Enforces genesis = RFP,
-/// sequential seqs, the `prev` hash chain, per-entry signatures, and **succession** (each signer
-/// must be a current member of the prefix). Returns the resulting [`State`].
+/// Fold and validate a sigchain against `rfp`: genesis = RFP, seq order, `prev` chain, signatures, succession.
 pub(crate) fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterError> {
     let g = entries.first().ok_or(RosterError::Empty)?;
     if g.seq != 0 || g.prev != [0u8; 32] {
@@ -596,7 +648,6 @@ pub(crate) fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterErr
         ),
         _ => return Err(RosterError::BadGenesis),
     };
-    // Genesis must be self-signed by device-1 (signer id == the embedded pubkey's id).
     if g.signer != gpub.device_id()? {
         return Err(RosterError::BadGenesis);
     }
@@ -604,14 +655,17 @@ pub(crate) fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterErr
 
     let mut st = State {
         members: BTreeMap::new(),
+        ever_members: BTreeMap::new(),
         generation: 1,
         min_algo: secsec_frame::MIN_ALGO_ID,
         mk_commits: BTreeMap::new(),
         added_by: BTreeMap::new(),
         added_at: BTreeMap::new(),
         enroll_pubs: BTreeMap::new(),
+        tip_seq: 0,
     };
-    st.members.insert(g.signer, gpub);
+    st.members.insert(g.signer, gpub.clone());
+    st.ever_members.insert(g.signer, gpub);
     st.mk_commits.insert(1, gmk);
     if !g_enroll.is_empty() {
         st.enroll_pubs.insert(g.signer, g_enroll);
@@ -624,7 +678,6 @@ pub(crate) fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterErr
         if e.prev != entry_hash(&entries[i - 1]) {
             return Err(RosterError::ChainBreak);
         }
-        // Succession: the signer must be a current member of the state so far.
         let signer_pub = st.members.get(&e.signer).ok_or(RosterError::NotMember)?;
         verify_entry_sig(signer_pub, e)?;
 
@@ -632,14 +685,17 @@ pub(crate) fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterErr
             Op::Genesis { .. } => return Err(RosterError::DoubleGenesis),
             Op::AddDevice {
                 pubkey,
-                mk_commit: _,
+                mk_commit,
                 enroll_pub,
             } => {
+                if st.mk_commits.get(&st.generation) != Some(mk_commit) {
+                    return Err(RosterError::BadCommit);
+                }
                 let p = DevicePublic::from_canonical(pubkey)?;
                 let id = p.device_id()?;
-                st.members.insert(id, p);
-                // Record provenance for the revoke-before-add closure (§8.1). A re-add overwrites
-                // the prior grant, so the latest adder/seq wins.
+                st.members.insert(id, p.clone());
+                st.ever_members.insert(id, p);
+                // A re-add overwrites the prior grant: the latest adder/seq wins.
                 st.added_by.insert(id, e.signer);
                 st.added_at.insert(id, e.seq);
                 if enroll_pub.is_empty() {
@@ -655,25 +711,19 @@ pub(crate) fn fold(entries: &[Entry], rfp: &[u8; 32]) -> Result<State, RosterErr
                 st.enroll_pubs.remove(device);
             }
             Op::Rotate { mk_commit } => {
-                st.generation += 1;
+                st.generation = st.generation.checked_add(1).ok_or(RosterError::BadSeq)?;
                 st.mk_commits.insert(st.generation, *mk_commit);
             }
             Op::SetMinAlgo { min_algo } => {
-                if *min_algo > st.min_algo {
-                    st.min_algo = *min_algo;
-                }
+                st.min_algo = st.min_algo.max(*min_algo);
             }
         }
+        st.tip_seq = e.seq;
     }
     Ok(st)
 }
 
-/// The §8.1 cold-start fold for a device with no local state: peel the roster keys, decrypt +
-/// strictly decode every stored entry by its authenticated `FRAME.gen`, [`fold`] (RFP + chain +
-/// signatures + succession), then verify the keyslot-recovered candidate against `mk_commit_{g_cur}`
-/// (§7 step 3 — the forged-keyslot / fake-universe defense). Returns the folded [`State`] and the
-/// now-authenticated [`MasterKey`]. The caller unwraps the keyslot and reads `g_cur` from the tip's
-/// `FRAME.gen` first.
+/// §8.1 cold start: peel roster keys, open each entry by its FRAME.gen, fold, then check the candidate key's `mk_commit`.
 pub fn cold_start_fold(
     candidate_master_key: &[u8; 32],
     g_cur: u32,
@@ -683,35 +733,23 @@ pub fn cold_start_fold(
 ) -> Result<(State, MasterKey), RosterError> {
     let mk = MasterKey::new(g_cur, *candidate_master_key);
 
-    // §8.1 step 1 invariant: the tip's plaintext FRAME.gen is the current generation.
     let tip = stored_entries.last().ok_or(RosterError::Empty)?;
-    let tip_frame = tip
-        .get(..FRAME_LEN)
-        .ok_or(RosterError::Frame(FrameError::ShortBlob))?;
-    if Frame::decode(tip_frame)?.gen != g_cur {
+    if frame_gen(tip)? != g_cur {
         return Err(RosterError::BadGeneration);
     }
 
-    // (1) derive roster_key_{g_cur} and peel back to roster_key_1.
-    let roster_key_cur = mk.roster_key();
-    let roster_keys = peel_roster_keys(&roster_key_cur, g_cur, roster_keyhist)?;
+    let roster_keys = peel_roster_keys(&mk.roster_key(), g_cur, roster_keyhist)?;
 
-    // (2) decrypt + decode every entry, selecting the key by each blob's authenticated FRAME.gen.
     let mut entries = Vec::with_capacity(stored_entries.len());
     for (seq, blob) in stored_entries.iter().enumerate() {
-        let frame_bytes = blob
-            .get(..FRAME_LEN)
-            .ok_or(RosterError::Frame(FrameError::ShortBlob))?;
-        let gen = Frame::decode(frame_bytes)?.gen;
+        let gen = frame_gen(blob)?;
         let rk = roster_keys.get(&gen).ok_or(RosterError::BadGeneration)?;
         let plaintext = open_entry(rk, gen, seq as u64, blob)?;
         entries.push(decode_entry(&plaintext)?);
     }
 
-    // (3) fold: genesis = RFP, prev-chain, signatures, succession.
     let state = fold(&entries, rfp)?;
 
-    // (4) authenticity (§7 step 3): the candidate must match mk_commit_{g_cur} from the chain.
     let expected = *state
         .mk_commits
         .get(&g_cur)
@@ -722,9 +760,15 @@ pub fn cold_start_fold(
     Ok((state, mk))
 }
 
-/// One level of the revoke-before-add closure (§8.1, §8.4 step 1): current members `revoked`
-/// granted at/after `after_seq` (the revoker's last-authored-or-witnessed seq). Sorted, so the
-/// follow-on `RevokeDevice` entries are deterministic.
+/// The authenticated-by-AD `FRAME.gen` of a stored entry blob.
+pub fn frame_gen(blob: &[u8]) -> Result<u32, RosterError> {
+    let frame_bytes = blob
+        .get(..FRAME_LEN)
+        .ok_or(RosterError::Frame(FrameError::ShortBlob))?;
+    Ok(Frame::decode(frame_bytes)?.gen)
+}
+
+/// One closure level: current members `revoked` granted at seq ≥ `after_seq`, sorted.
 #[must_use]
 pub(crate) fn devices_added_by(state: &State, revoked: &DeviceId, after_seq: u64) -> Vec<DeviceId> {
     state
@@ -737,18 +781,18 @@ pub(crate) fn devices_added_by(state: &State, revoked: &DeviceId, after_seq: u64
         .collect()
 }
 
-/// The **transitive** revoke-before-add closure (§8.1, §8.4 step 1): every current member reachable
-/// from `revoked` through the add-by graph whose own grant is at/after `after_seq` (one level misses
-/// the nested sleeper, §8.1). The traversal walks the whole subtree — through pre-`after_seq`
-/// children — but collects only at/after-`after_seq` grants; filtering the *traversal* instead
-/// would let a pre-reference child shield its post-reference subtree. Excludes `revoked`; sorted.
+/// The transitive revoke-before-add closure of `revoked` (§8.1): every descendant granted at seq ≥ `after_seq`, walking through earlier children, never `revoker`.
 #[must_use]
-pub fn revoke_closure(state: &State, revoked: &DeviceId, after_seq: u64) -> Vec<DeviceId> {
+pub fn revoke_closure(
+    state: &State,
+    revoked: &DeviceId,
+    after_seq: u64,
+    revoker: &DeviceId,
+) -> Vec<DeviceId> {
     let mut result: BTreeSet<DeviceId> = BTreeSet::new();
-    let mut seen: BTreeSet<DeviceId> = BTreeSet::new();
+    let mut seen: BTreeSet<DeviceId> = [*revoked, *revoker].into_iter().collect();
     let mut work = vec![*revoked];
     while let Some(cur) = work.pop() {
-        // after_seq = 0 here: traverse everything, collect selectively below.
         for d in devices_added_by(state, &cur, 0) {
             if !seen.insert(d) {
                 continue;
@@ -762,25 +806,25 @@ pub fn revoke_closure(state: &State, revoked: &DeviceId, after_seq: u64) -> Vec<
     result.into_iter().collect()
 }
 
-/// The ordered `revoke⇒rotate` op sequence (§8.4): `RevokeDevice(revoked)`, the transitive
-/// [`revoke_closure`], then `Rotate(next_mk_commit)`. The caller signs these ([`append_many`]) and
-/// performs the keyslot re-wrap/deletion (§8.4 steps 2–4).
-#[must_use]
+/// The ordered revoke⇒rotate ops (§8.4): `RevokeDevice(revoked)`, the closure, then `Rotate(next_mk_commit)`.
 pub fn revoke_rotate_ops(
     state: &State,
     revoked: &DeviceId,
     after_seq: u64,
+    revoker: &DeviceId,
     next_mk_commit: MkCommit,
-) -> Vec<Op> {
-    let mut ops = Vec::new();
-    ops.push(Op::RevokeDevice { device: *revoked });
-    for d in revoke_closure(state, revoked, after_seq) {
+) -> Result<Vec<Op>, RosterError> {
+    if revoked == revoker {
+        return Err(RosterError::SelfRevoke);
+    }
+    let mut ops = vec![Op::RevokeDevice { device: *revoked }];
+    for d in revoke_closure(state, revoked, after_seq, revoker) {
         ops.push(Op::RevokeDevice { device: d });
     }
     ops.push(Op::Rotate {
         mk_commit: next_mk_commit,
     });
-    ops
+    Ok(ops)
 }
 
 #[cfg(test)]
@@ -802,7 +846,7 @@ mod tests {
         }
     }
 
-    /// device-1 genesis, then a list of appended ops, returns (entries, rfp).
+    /// device-1 genesis then `ops`; returns (entries, rfp).
     fn chain(d1: &DeviceKey, ops: Vec<(Op, &DeviceKey)>) -> (Vec<Entry>, [u8; 32]) {
         let (g, rfp) = genesis(d1, vec![], MK, 0).unwrap();
         let mut entries = vec![g];
@@ -822,6 +866,7 @@ mod tests {
         assert!(st.members.contains_key(&d1.device_id().unwrap()));
         assert_eq!(st.members.len(), 1);
         assert_eq!(st.mk_commits.get(&1), Some(&MK));
+        assert_eq!(st.tip_seq, 0);
     }
 
     #[test]
@@ -831,21 +876,14 @@ mod tests {
         let (entries, rfp) = chain(
             &d1,
             vec![
-                (
-                    Op::AddDevice {
-                        pubkey: pubkey_of(&d2),
-                        mk_commit: MK,
-                        enroll_pub: vec![],
-                    },
-                    &d1,
-                ),
+                (add(&d2), &d1),
                 (
                     Op::Rotate {
                         mk_commit: [0xBB; 32],
                     },
                     &d1,
                 ),
-                (Op::SetMinAlgo { min_algo: 2 }, &d2), // d2 is now a member, may sign
+                (Op::SetMinAlgo { min_algo: 2 }, &d2),
                 (
                     Op::RevokeDevice {
                         device: d2.device_id().unwrap(),
@@ -862,73 +900,79 @@ mod tests {
             !st.members.contains_key(&d2.device_id().unwrap()),
             "d2 revoked"
         );
+        assert!(
+            st.ever_members.contains_key(&d2.device_id().unwrap()),
+            "a revoked device stays in ever_members to verify its historical commits"
+        );
         assert_eq!(st.mk_commits.get(&2), Some(&[0xBB; 32]));
+        assert_eq!(st.tip_seq, 4);
+    }
+
+    /// An `AddDevice` must record the current generation's commitment (§7 step 3 relies on it).
+    #[test]
+    fn add_device_with_a_stale_commit_is_rejected() {
+        let d1 = DeviceKey::generate().unwrap();
+        let d2 = DeviceKey::generate().unwrap();
+        let (entries, rfp) = chain(
+            &d1,
+            vec![
+                (
+                    Op::Rotate {
+                        mk_commit: [0xBB; 32],
+                    },
+                    &d1,
+                ),
+                (add(&d2), &d1),
+            ],
+        );
+        assert!(matches!(fold(&entries, &rfp), Err(RosterError::BadCommit)));
     }
 
     #[test]
     fn state_tracks_provenance_and_membership() {
         let d1 = DeviceKey::generate().unwrap();
         let d2 = DeviceKey::generate().unwrap();
-        let (entries, rfp) = chain(
-            &d1,
-            vec![(
-                Op::AddDevice {
-                    pubkey: pubkey_of(&d2),
-                    mk_commit: MK,
-                    enroll_pub: vec![],
-                },
-                &d1,
-            )],
-        );
+        let (entries, rfp) = chain(&d1, vec![(add(&d2), &d1)]);
         let st = fold(&entries, &rfp).unwrap();
         let (id1, id2) = (d1.device_id().unwrap(), d2.device_id().unwrap());
-        // is_member predicate
         assert!(st.is_member(&id1));
         assert!(st.is_member(&id2));
         assert!(!st.is_member(&DeviceKey::generate().unwrap().device_id().unwrap()));
-        // genesis device-1 has no adder; d2 was added by d1 at seq 1
         assert!(!st.added_by.contains_key(&id1));
         assert_eq!(st.added_by.get(&id2), Some(&id1));
         assert_eq!(st.added_at.get(&id2), Some(&1));
     }
 
-    /// §8.1/§8.4 revoke-before-add closure: revoking B must also catch devices B granted at/after
-    /// the revoking device's reference seq, but not earlier grants or grants by other devices.
+    /// One closure level catches grants at/after the reference seq, never earlier ones or other adders'.
     #[test]
     fn revoke_before_add_closure() {
-        let d1 = DeviceKey::generate().unwrap(); // founder / revoker
-        let b = DeviceKey::generate().unwrap(); // to-be-revoked
-        let early = DeviceKey::generate().unwrap(); // B-added, before the reference point
-        let c = DeviceKey::generate().unwrap(); // B-added, after the reference point
-        let dd = DeviceKey::generate().unwrap(); // B-added, after the reference point
-        let other = DeviceKey::generate().unwrap(); // added by d1, must not be swept
+        let d1 = DeviceKey::generate().unwrap();
+        let b = DeviceKey::generate().unwrap();
+        let early = DeviceKey::generate().unwrap();
+        let c = DeviceKey::generate().unwrap();
+        let dd = DeviceKey::generate().unwrap();
+        let other = DeviceKey::generate().unwrap();
 
         let (entries, rfp) = chain(
             &d1,
             vec![
-                (add(&b), &d1),     // seq 1: d1 adds B
-                (add(&early), &b),  // seq 2: B adds `early`
-                (add(&other), &d1), // seq 3: d1 adds `other`
-                (add(&c), &b),      // seq 4: B adds C
-                (add(&dd), &b),     // seq 5: B adds D
+                (add(&b), &d1),     // seq 1
+                (add(&early), &b),  // seq 2
+                (add(&other), &d1), // seq 3
+                (add(&c), &b),      // seq 4
+                (add(&dd), &b),     // seq 5
             ],
         );
         let st = fold(&entries, &rfp).unwrap();
         let b_id = b.device_id().unwrap();
 
-        // Reference seq = 3 (d1's last-authored entry before deciding to revoke B): only C(4) and
-        // D(5) are at/after it; `early`(2) is excluded.
         let mut swept = devices_added_by(&st, &b_id, 3);
         swept.sort();
         let mut want = vec![c.device_id().unwrap(), dd.device_id().unwrap()];
         want.sort();
         assert_eq!(swept, want);
-
-        // `other` was added by d1, never swept regardless of seq.
         assert!(!devices_added_by(&st, &b_id, 0).contains(&other.device_id().unwrap()));
-        // With reference seq 0, the whole of B's still-present grants are caught (incl. `early`).
         assert_eq!(devices_added_by(&st, &b_id, 0).len(), 3);
-        // A device that is no longer a member is not reported: revoke `early`, re-fold.
         let revoke_early = append(
             entries.last().unwrap(),
             Op::RevokeDevice {
@@ -941,69 +985,81 @@ mod tests {
         let mut entries2 = entries.clone();
         entries2.push(revoke_early);
         let st2 = fold(&entries2, &rfp).unwrap();
-        assert_eq!(devices_added_by(&st2, &b_id, 0).len(), 2); // early gone, C+D remain
+        assert_eq!(devices_added_by(&st2, &b_id, 0).len(), 2);
     }
 
-    /// The transitive closure catches the two-hop sleeper that one level misses: B adds C, C adds E.
+    /// The transitive closure catches the two-hop sleeper: B adds C, C adds E.
     #[test]
     fn revoke_closure_is_transitive() {
         let d1 = DeviceKey::generate().unwrap();
         let b = DeviceKey::generate().unwrap();
         let c = DeviceKey::generate().unwrap();
         let e = DeviceKey::generate().unwrap();
-        let (entries, rfp) = chain(
-            &d1,
-            vec![
-                (add(&b), &d1), // seq 1: d1 adds B
-                (add(&c), &b),  // seq 2: B adds C
-                (add(&e), &c),  // seq 3: C adds E (the nested sleeper)
-            ],
-        );
+        let (entries, rfp) = chain(&d1, vec![(add(&b), &d1), (add(&c), &b), (add(&e), &c)]);
         let st = fold(&entries, &rfp).unwrap();
         let b_id = b.device_id().unwrap();
-
-        // one level sees only C ...
         assert_eq!(
             devices_added_by(&st, &b_id, 0),
             vec![c.device_id().unwrap()]
         );
-        // ... the transitive closure sweeps C and E both.
-        let mut closure = revoke_closure(&st, &b_id, 0);
+        let mut closure = revoke_closure(&st, &b_id, 0, &d1.device_id().unwrap());
         closure.sort();
         let mut want = vec![c.device_id().unwrap(), e.device_id().unwrap()];
         want.sort();
         assert_eq!(closure, want);
     }
 
-    /// `after_seq > 0`: a pre-reference child is retained (its grant was witnessed under prior trust),
-    /// but the traversal still reaches and sweeps its **post-reference** descendant — the nested-sleeper
-    /// guard must not be blocked by an out-of-scope intermediate.
+    /// A pre-reference child is retained but the walk still sweeps its post-reference descendant.
     #[test]
     fn revoke_closure_reaches_post_reference_descendant_of_pre_reference_child() {
         let d1 = DeviceKey::generate().unwrap();
         let b = DeviceKey::generate().unwrap();
         let c = DeviceKey::generate().unwrap();
         let e = DeviceKey::generate().unwrap();
-        let (entries, rfp) = chain(
-            &d1,
-            vec![
-                (add(&b), &d1), // seq 1
-                (add(&c), &b),  // seq 2: B adds C  (pre-reference grant)
-                (add(&e), &c),  // seq 3: C adds E  (post-reference grant)
-            ],
-        );
+        let (entries, rfp) = chain(&d1, vec![(add(&b), &d1), (add(&c), &b), (add(&e), &c)]);
         let st = fold(&entries, &rfp).unwrap();
-        let b_id = b.device_id().unwrap();
-
-        // Reference point seq = 3: C's grant (seq 2) is out of scope; E's grant (seq 3) is in scope.
-        // C is retained; E — the sleeper C added after the reference — is swept.
-        let closure = revoke_closure(&st, &b_id, 3);
+        let closure = revoke_closure(&st, &b.device_id().unwrap(), 3, &d1.device_id().unwrap());
         assert_eq!(closure, vec![e.device_id().unwrap()]);
         assert!(!closure.contains(&c.device_id().unwrap()));
     }
 
-    /// End-to-end: building revoke⇒rotate ops, appending them, and re-folding leaves none of the
-    /// suspect subtree as a member and bumps the generation.
+    /// A revoker re-added by the target is never swept, a re-add cycle lists the target once, and the ops still fold.
+    #[test]
+    fn revoke_closure_never_includes_the_revoker_or_the_target() {
+        let r = DeviceKey::generate().unwrap(); // founder, the revoker
+        let b = DeviceKey::generate().unwrap(); // target
+        let c = DeviceKey::generate().unwrap(); // granted by r after r's re-add
+        let e = DeviceKey::generate().unwrap(); // sleeper granted by b
+        let (r_id, b_id) = (r.device_id().unwrap(), b.device_id().unwrap());
+        let (mut entries, rfp) = chain(
+            &r,
+            vec![
+                (add(&b), &r), // seq 1: r adds b
+                (add(&r), &b), // seq 2: b re-adds r (a re-invite), so added_by[r] = b
+                (add(&b), &r), // seq 3: r re-adds b, a cycle b→r→b
+                (add(&c), &r), // seq 4
+                (add(&e), &b), // seq 5
+            ],
+        );
+        let st = fold(&entries, &rfp).unwrap();
+        let closure = revoke_closure(&st, &b_id, 0, &r_id);
+        assert_eq!(closure, vec![e.device_id().unwrap()]);
+
+        let ops = revoke_rotate_ops(&st, &b_id, 0, &r_id, [0xCC; 32]).unwrap();
+        let new = append_many(entries.last().unwrap(), ops, &r, 0).unwrap();
+        entries.extend(new);
+        let st2 = fold(&entries, &rfp).unwrap();
+        assert!(st2.is_member(&r_id), "the revoker stays a member");
+        assert!(st2.is_member(&c.device_id().unwrap()));
+        assert!(!st2.is_member(&b_id));
+        assert!(!st2.is_member(&e.device_id().unwrap()));
+        assert!(matches!(
+            revoke_rotate_ops(&st, &r_id, 0, &r_id, [0; 32]),
+            Err(RosterError::SelfRevoke)
+        ));
+    }
+
+    /// Appending revoke⇒rotate ops and refolding evicts the whole subtree and bumps the generation.
     #[test]
     fn revoke_rotate_ops_evicts_whole_subtree() {
         let d1 = DeviceKey::generate().unwrap();
@@ -1014,11 +1070,9 @@ mod tests {
         let st = fold(&entries, &rfp).unwrap();
         let b_id = b.device_id().unwrap();
 
-        // d1 builds and appends RevokeDevice(B), RevokeDevice(closure...), Rotate.
-        let ops = revoke_rotate_ops(&st, &b_id, 0, [0xCC; 32]);
-        // last op is the Rotate; the rest are revokes (B + its subtree = B, C, E -> 3 revokes).
+        let ops = revoke_rotate_ops(&st, &b_id, 0, &d1.device_id().unwrap(), [0xCC; 32]).unwrap();
         assert!(matches!(ops.last(), Some(Op::Rotate { .. })));
-        assert_eq!(ops.len(), 1 /*B*/ + 2 /*C,E*/ + 1 /*Rotate*/);
+        assert_eq!(ops.len(), 4);
 
         let new_entries = append_many(entries.last().unwrap(), ops, &d1, 0).unwrap();
         entries.extend(new_entries);
@@ -1038,7 +1092,7 @@ mod tests {
     #[test]
     fn non_member_cannot_sign() {
         let d1 = DeviceKey::generate().unwrap();
-        let d3 = DeviceKey::generate().unwrap(); // never added
+        let d3 = DeviceKey::generate().unwrap();
         let (entries, rfp) = chain(&d1, vec![(Op::SetMinAlgo { min_algo: 2 }, &d3)]);
         assert!(matches!(fold(&entries, &rfp), Err(RosterError::NotMember)));
     }
@@ -1050,21 +1104,14 @@ mod tests {
         let (entries, rfp) = chain(
             &d1,
             vec![
-                (
-                    Op::AddDevice {
-                        pubkey: pubkey_of(&d2),
-                        mk_commit: MK,
-                        enroll_pub: vec![],
-                    },
-                    &d1,
-                ),
+                (add(&d2), &d1),
                 (
                     Op::RevokeDevice {
                         device: d2.device_id().unwrap(),
                     },
                     &d1,
                 ),
-                (Op::SetMinAlgo { min_algo: 2 }, &d2), // d2 revoked -> must fail succession
+                (Op::SetMinAlgo { min_algo: 2 }, &d2),
             ],
         );
         assert!(matches!(fold(&entries, &rfp), Err(RosterError::NotMember)));
@@ -1084,17 +1131,7 @@ mod tests {
     fn chain_break_rejected() {
         let d1 = DeviceKey::generate().unwrap();
         let d2 = DeviceKey::generate().unwrap();
-        let (mut entries, rfp) = chain(
-            &d1,
-            vec![(
-                Op::AddDevice {
-                    pubkey: pubkey_of(&d2),
-                    mk_commit: MK,
-                    enroll_pub: vec![],
-                },
-                &d1,
-            )],
-        );
+        let (mut entries, rfp) = chain(&d1, vec![(add(&d2), &d1)]);
         entries[1].prev[0] ^= 0x01;
         assert!(matches!(fold(&entries, &rfp), Err(RosterError::ChainBreak)));
     }
@@ -1104,8 +1141,6 @@ mod tests {
         let d1 = DeviceKey::generate().unwrap();
         let (mut entries, rfp) = chain(&d1, vec![(Op::SetMinAlgo { min_algo: 2 }, &d1)]);
         *entries[1].sig.last_mut().unwrap() ^= 0x01;
-        // tampering the sig also breaks the chain hash of later entries, but here it's the tip;
-        // the signature check must reject it.
         assert!(matches!(
             fold(&entries, &rfp),
             Err(RosterError::BadSignature)
@@ -1119,14 +1154,7 @@ mod tests {
         let (entries, _rfp) = chain(
             &d1,
             vec![
-                (
-                    Op::AddDevice {
-                        pubkey: pubkey_of(&d2),
-                        mk_commit: MK,
-                        enroll_pub: vec![],
-                    },
-                    &d1,
-                ),
+                (add(&d2), &d1),
                 (
                     Op::Rotate {
                         mk_commit: [0xBB; 32],
@@ -1142,8 +1170,6 @@ mod tests {
                 ),
             ],
         );
-        // Genesis + all four other op variants survive a decode→encode round trip byte-for-byte,
-        // and the chain hash is identical to the in-memory entry's hash.
         for e in &entries {
             let bytes = encode_entry(e);
             let decoded = decode_entry(&bytes).unwrap();
@@ -1181,43 +1207,54 @@ mod tests {
         let d1 = DeviceKey::generate().unwrap();
         let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
         let mut bytes = encode_entry(&g);
-        // The op tag sits right after seq(8) + prev(32). Flip Genesis(0) to an unknown tag.
-        bytes[40] = 0xFF;
+        bytes[40] = 0xFF; // the op tag follows seq(8) + prev(32)
         assert!(matches!(decode_entry(&bytes), Err(RosterError::BadOp)));
     }
 
     // ---- Per-entry AEAD (§9.5) ----
 
-    use secsec_kdf::MasterKey;
-
-    fn roster_key_for(gen: u32, key: [u8; 32]) -> secsec_kdf::SecretKey {
+    fn roster_key_for(gen: u32, key: [u8; 32]) -> SecretKey {
         MasterKey::new(gen, key).roster_key()
     }
 
     #[test]
-    fn entry_aead_round_trip() {
+    fn entry_aead_round_trip_v2_and_legacy_v1() {
         let d1 = DeviceKey::generate().unwrap();
         let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
         let pt = encode_entry(&g);
         let rk = roster_key_for(1, [0x33; 32]);
 
-        let blob = seal_entry(&rk, 1, 0, &pt);
-        // The blob is FRAME(11) ‖ ctx_tag(32) ‖ ct and reveals nothing of the plaintext.
-        assert_ne!(&blob[FRAME_LEN + 32..], &pt[..]);
+        let blob = seal_entry(&rk, 1, 0, &pt).unwrap();
+        assert_eq!(blob[4], 2, "new entries are format v2");
+        assert_eq!(open_entry(&rk, 1, 0, &blob).unwrap(), pt);
+        assert_eq!(
+            decode_entry(&open_entry(&rk, 1, 0, &blob).unwrap()).unwrap(),
+            g
+        );
 
-        let got = open_entry(&rk, 1, 0, &blob).unwrap();
-        assert_eq!(got, pt);
-        // ...and the recovered bytes decode back to the original entry.
-        assert_eq!(decode_entry(&got).unwrap(), g);
+        let v1 = seal_entry_v1(&rk, 1, 0, &pt);
+        assert_eq!(open_entry(&rk, 1, 0, &v1).unwrap(), pt);
+    }
+
+    /// Two entries sealed at the same `(key, seq)` (a CAS race) never share a keystream.
+    #[test]
+    fn raced_entries_at_one_seq_use_distinct_keys() {
+        let rk = roster_key_for(1, [0x33; 32]);
+        let a = seal_entry(&rk, 1, 5, &[0u8; 64]).unwrap();
+        let b = seal_entry(&rk, 1, 5, &[0u8; 64]).unwrap();
+        let body = FRAME_LEN + ROSTER_ENTRY_SALT_LEN + CTX_TAG_LEN;
+        assert_ne!(&a[FRAME_LEN..FRAME_LEN + 32], &b[FRAME_LEN..FRAME_LEN + 32]);
+        assert_ne!(
+            &a[body..],
+            &b[body..],
+            "equal plaintexts must not encrypt to equal ciphertexts"
+        );
     }
 
     #[test]
     fn entry_aead_wrong_generation_is_frame_mismatch() {
-        let d1 = DeviceKey::generate().unwrap();
-        let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
         let rk = roster_key_for(1, [0x33; 32]);
-        let blob = seal_entry(&rk, 1, 0, &encode_entry(&g));
-        // Opening as a different generation must fail at the FRAME check (§18) before any AEAD work.
+        let blob = seal_entry(&rk, 1, 0, b"entry").unwrap();
         assert!(matches!(
             open_entry(&rk, 2, 0, &blob),
             Err(RosterError::Frame(FrameError::FrameMismatch))
@@ -1225,90 +1262,55 @@ mod tests {
     }
 
     #[test]
-    fn entry_aead_wrong_seq_rejected() {
-        let d1 = DeviceKey::generate().unwrap();
-        let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
+    fn entry_aead_wrong_seq_key_or_tamper_rejected() {
         let rk = roster_key_for(1, [0x33; 32]);
-        let blob = seal_entry(&rk, 1, 7, &encode_entry(&g));
-        // Same gen, wrong seq: both the per-entry key and AD differ -> AEAD open fails.
+        let other = roster_key_for(1, [0x44; 32]);
+        let blob = seal_entry(&rk, 1, 7, b"entry").unwrap();
         assert!(matches!(
             open_entry(&rk, 1, 8, &blob),
             Err(RosterError::Aead)
         ));
-    }
-
-    #[test]
-    fn entry_aead_wrong_key_rejected() {
-        let d1 = DeviceKey::generate().unwrap();
-        let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
-        let rk = roster_key_for(1, [0x33; 32]);
-        let other = roster_key_for(1, [0x44; 32]);
-        let blob = seal_entry(&rk, 1, 0, &encode_entry(&g));
         assert!(matches!(
-            open_entry(&other, 1, 0, &blob),
+            open_entry(&other, 1, 7, &blob),
             Err(RosterError::Aead)
         ));
-    }
-
-    #[test]
-    fn entry_aead_tamper_rejected() {
-        let d1 = DeviceKey::generate().unwrap();
-        let (g, _rfp) = genesis(&d1, vec![], MK, 0).unwrap();
-        let rk = roster_key_for(1, [0x33; 32]);
-        let mut blob = seal_entry(&rk, 1, 0, &encode_entry(&g));
-        // Flip a ciphertext byte (past FRAME + ctx_tag) -> commitment mismatch.
-        *blob.last_mut().unwrap() ^= 0x01;
+        let mut bad = blob.clone();
+        *bad.last_mut().unwrap() ^= 0x01;
         assert!(matches!(
-            open_entry(&rk, 1, 0, &blob),
+            open_entry(&rk, 1, 7, &bad),
             Err(RosterError::Aead)
         ));
+        let mut salt_flip = blob.clone();
+        salt_flip[FRAME_LEN] ^= 0x01;
+        assert!(matches!(
+            open_entry(&rk, 1, 7, &salt_flip),
+            Err(RosterError::Aead)
+        ));
+        assert!(open_entry(&rk, 1, 7, &blob[..FRAME_LEN + 10]).is_err());
     }
 
-    // ---- Roster-key history (§8.2) ----
+    // ---- key histories (§8.2) ----
 
     #[test]
-    fn roster_keyhist_round_trip_is_64_bytes() {
+    fn roster_keyhist_round_trip_and_rejections() {
         let rk1 = roster_key_for(1, [0x01; 32]);
         let rk2 = roster_key_for(2, [0x02; 32]);
         let wrap = seal_roster_keyhist(&rk2, 1, &rk1);
-        assert_eq!(wrap.len(), ROSTER_KEYHIST_LEN);
-        assert_eq!(ROSTER_KEYHIST_LEN, 64);
-        let got = open_roster_keyhist(&rk2, 1, &wrap).unwrap();
-        assert_eq!(&got[..], &rk1[..]);
-    }
-
-    #[test]
-    fn roster_keyhist_wrong_next_key_rejected() {
-        let rk1 = roster_key_for(1, [0x01; 32]);
-        let rk2 = roster_key_for(2, [0x02; 32]);
+        assert_eq!(wrap.len(), 64);
+        assert_eq!(&open_roster_keyhist(&rk2, 1, &wrap).unwrap()[..], &rk1[..]);
         let wrong = roster_key_for(2, [0x99; 32]);
-        let wrap = seal_roster_keyhist(&rk2, 1, &rk1);
         assert!(matches!(
             open_roster_keyhist(&wrong, 1, &wrap),
             Err(RosterError::Aead)
         ));
-    }
-
-    #[test]
-    fn roster_keyhist_wrong_generation_rejected() {
-        // The AD binds g; opening the g=1 wrap as g=2 must fail (FRAME_rkh mismatch in the AD).
-        let rk1 = roster_key_for(1, [0x01; 32]);
-        let rk2 = roster_key_for(2, [0x02; 32]);
-        let wrap = seal_roster_keyhist(&rk2, 1, &rk1);
         assert!(matches!(
             open_roster_keyhist(&rk2, 2, &wrap),
             Err(RosterError::Aead)
         ));
-    }
-
-    #[test]
-    fn roster_keyhist_tamper_and_bad_length_rejected() {
-        let rk1 = roster_key_for(1, [0x01; 32]);
-        let rk2 = roster_key_for(2, [0x02; 32]);
-        let mut wrap = seal_roster_keyhist(&rk2, 1, &rk1);
-        wrap[ROSTER_KEYHIST_LEN - 1] ^= 0x01;
+        let mut bad = wrap;
+        bad[ROSTER_KEYHIST_LEN - 1] ^= 0x01;
         assert!(matches!(
-            open_roster_keyhist(&rk2, 1, &wrap),
+            open_roster_keyhist(&rk2, 1, &bad),
             Err(RosterError::Aead)
         ));
         assert!(matches!(
@@ -1318,13 +1320,11 @@ mod tests {
     }
 
     #[test]
-    fn peel_recovers_every_generation() {
-        // Five generations with independent master keys; build the never-trimmed wrap chain.
+    fn peel_recovers_every_generation_and_aborts_on_a_missing_wrap() {
         let n = 5u32;
         let rks: Vec<SecretKey> = (1..=n).map(|g| roster_key_for(g, [g as u8; 32])).collect();
         let mut history: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
         for g in 1..n {
-            // wrap roster_key_g under roster_key_{g+1}
             let wrap = seal_roster_keyhist(&rks[g as usize], g, &rks[(g - 1) as usize]);
             history.insert(g, wrap.to_vec());
         }
@@ -1333,77 +1333,65 @@ mod tests {
         for g in 1..=n {
             assert_eq!(&peeled[&g][..], &rks[(g - 1) as usize][..], "gen {g}");
         }
-    }
-
-    #[test]
-    fn peel_aborts_on_missing_wrap() {
-        let n = 3u32;
-        let rks: Vec<SecretKey> = (1..=n).map(|g| roster_key_for(g, [g as u8; 32])).collect();
-        let mut history: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
-        // Only provide the wrap for g=2, omit g=1.
-        history.insert(2, seal_roster_keyhist(&rks[2], 2, &rks[1]).to_vec());
+        history.remove(&1);
         assert!(matches!(
             peel_roster_keys(&rks[(n - 1) as usize], n, &history),
             Err(RosterError::Aead)
         ));
     }
 
-    // ---- DATA key-history (§8.2: read pre-rotation object content) ----
-
     #[test]
-    fn data_keyhist_peels_every_master_key() {
-        // Five generations with independent master keys; build the never-trimmed DATA wrap chain.
+    fn data_keyhist_peels_every_master_key_checked_against_mk_commits() {
         let mks: [[u8; 32]; 5] = [[1; 32], [2; 32], [3; 32], [4; 32], [5; 32]];
+        let commits: BTreeMap<u32, MkCommit> = (1u32..=5)
+            .map(|g| (g, MasterKey::new(g, mks[(g - 1) as usize]).mk_commit()))
+            .collect();
         let mut history: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
         for g in 1u32..5 {
-            // wrap master_key_g under master_key_{g+1}.
             let wrap = seal_data_keyhist(&mks[g as usize], g, &mks[(g - 1) as usize]);
-            assert_eq!(wrap.len(), DATA_KEYHIST_LEN);
             history.insert(g, wrap.to_vec());
         }
-        let peeled = peel_data_keys(&mks[4], 5, &history).unwrap();
+        let peeled = peel_data_keys(&mks[4], 5, &history, &commits).unwrap();
         assert_eq!(peeled.len(), 5);
         for g in 1u32..=5 {
-            // each recovered MasterKey is the genuine generation-g key (same derived subkeys).
-            let want = MasterKey::new(g, mks[(g - 1) as usize]);
-            assert_eq!(peeled[&g].generation(), g);
-            assert_eq!(
-                &peeled[&g].roster_key()[..],
-                &want.roster_key()[..],
-                "recovered master_key_{g} must match"
-            );
-            assert_eq!(peeled[&g].mk_commit(), want.mk_commit());
+            assert_eq!(peeled[&g].mk_commit(), commits[&g]);
         }
-        // wrong next-gen key → AEAD failure (CMT-4, not a silent wrong key).
+        // A wrap re-sealed around a foreign key opens, but fails the chain's commitment.
+        let mut forged = history.clone();
+        forged.insert(1, seal_data_keyhist(&mks[1], 1, &[0x66; 32]).to_vec());
         assert!(matches!(
-            open_data_keyhist(&[0x99; 32], 1, &history[&1]),
-            Err(RosterError::Aead)
+            peel_data_keys(&mks[4], 5, &forged, &commits),
+            Err(RosterError::MkCommitMismatch)
         ));
-        // a missing wrap aborts the peel (a current member can always produce the full chain).
         let mut partial = history.clone();
         partial.remove(&1);
         assert!(matches!(
-            peel_data_keys(&mks[4], 5, &partial),
+            peel_data_keys(&mks[4], 5, &partial, &commits),
             Err(RosterError::Aead)
         ));
     }
 
-    /// Frozen wire KATs for the deterministic AEAD layers, mirrored in
-    /// `vectors/secsec-kat-v1.txt`. Input `roster_key` is `roster_key[g=1]` for
-    /// `master_key=[0x11;32]` (the kdf vector), so the chain of vectors is self-consistent.
+    /// Frozen wire KATs mirrored in `vectors/secsec-kat-v1.txt`, with `roster_key[g=1]` of `master_key=[0x11;32]`.
     #[test]
     fn wire_kat() {
-        let rk = roster_key_for(1, [0x11; 32]); // == roster_key[g=1] in the [kdf] vector
+        let rk = roster_key_for(1, [0x11; 32]);
 
-        // Roster entry AEAD (§9.5): FRAME(11) ‖ ctx_tag(32) ‖ ct, gen=1, seq=1.
-        let blob = seal_entry(&rk, 1, 1, b"roster-entry-kat");
+        // A legacy v1 entry opens.
+        let v1 = seal_entry_v1(&rk, 1, 1, b"roster-entry-kat");
         assert_eq!(
-            hx(&blob),
+            hx(&v1),
             "7373656301010100000004c69b06e76f52eb0570b7bac2eff9552c545c1906dddfc31b06a39faf2e36d4a764087224e2cb1ce70dbe9a15092153aa"
         );
-        assert_eq!(open_entry(&rk, 1, 1, &blob).unwrap(), b"roster-entry-kat");
+        assert_eq!(open_entry(&rk, 1, 1, &v1).unwrap(), b"roster-entry-kat");
 
-        // Roster-key history (§8.2): bare ctx_tag(32) ‖ ct(32), g=1, wrapping 0x00..0x1f.
+        // v2 entry with salt 0x5a*32.
+        let v2 = seal_entry_with_salt(&rk, 1, 1, &[0x5a; 32], b"roster-entry-kat");
+        assert_eq!(
+            hx(&v2),
+            "73736563020101000000045a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a64ad3cec963e4616bf6167e47c529acf1118b20272d7df6f3616cd76cf3ead82768088696a16be8cf17e6f3575496075"
+        );
+        assert_eq!(open_entry(&rk, 1, 1, &v2).unwrap(), b"roster-entry-kat");
+
         let kg: [u8; 32] = core::array::from_fn(|i| i as u8);
         let wrap = seal_roster_keyhist(&rk, 1, &kg);
         assert_eq!(
@@ -1413,10 +1401,10 @@ mod tests {
         assert_eq!(&open_roster_keyhist(&rk, 1, &wrap).unwrap()[..], &kg[..]);
     }
 
-    // ---- Cold-start fold (§8.1 bootstrap; R5 capstone) ----
+    // ---- Cold-start fold (§8.1) ----
 
     #[test]
-    fn cold_start_fold_bootstraps_multigen_chain() {
+    fn cold_start_fold_bootstraps_multigen_chain_with_mixed_entry_versions() {
         const MK1: [u8; 32] = [0x51; 32];
         const MK2: [u8; 32] = [0x52; 32];
         let mkc1 = MasterKey::new(1, MK1).mk_commit();
@@ -1427,7 +1415,6 @@ mod tests {
         let d1 = DeviceKey::generate().unwrap();
         let d2 = DeviceKey::generate().unwrap();
 
-        // Plaintext chain: genesis(g1), AddDevice(g1), Rotate→g2, SetMinAlgo(g2, signed by d2).
         let (g, rfp) = genesis(&d1, vec![], mkc1, 0).unwrap();
         let e1 = append(
             &g,
@@ -1443,25 +1430,22 @@ mod tests {
         let e2 = append(&e1, Op::Rotate { mk_commit: mkc2 }, &d1, 0).unwrap();
         let e3 = append(&e2, Op::SetMinAlgo { min_algo: 2 }, &d2, 0).unwrap();
 
-        // Seal each entry under its generation: genesis+AddDevice = g1; Rotate and after = g2 (§9.5).
+        // A chain of legacy v1 entries followed by v2 ones.
         let stored = vec![
-            seal_entry(&rk1, 1, 0, &encode_entry(&g)),
-            seal_entry(&rk1, 1, 1, &encode_entry(&e1)),
-            seal_entry(&rk2, 2, 2, &encode_entry(&e2)),
-            seal_entry(&rk2, 2, 3, &encode_entry(&e3)),
+            seal_entry_v1(&rk1, 1, 0, &encode_entry(&g)),
+            seal_entry_v1(&rk1, 1, 1, &encode_entry(&e1)),
+            seal_entry(&rk2, 2, 2, &encode_entry(&e2)).unwrap(),
+            seal_entry(&rk2, 2, 3, &encode_entry(&e3)).unwrap(),
         ];
-        // Never-trimmed roster-key history: roster_key_1 wrapped under roster_key_2.
         let mut hist = BTreeMap::new();
         hist.insert(1u32, seal_roster_keyhist(&rk2, 1, &rk1).to_vec());
 
-        // Bootstrap from the gen-2 master key, as a fresh device would after keyslot unwrap.
         let (state, mk) = cold_start_fold(&MK2, 2, &rfp, &hist, &stored).unwrap();
         assert_eq!(state.generation, 2);
         assert_eq!(state.min_algo, 2);
         assert!(state.is_member(&d1.device_id().unwrap()));
         assert!(state.is_member(&d2.device_id().unwrap()));
         assert_eq!(mk.generation(), 2);
-        // the recovered key is the genuine gen-2 key (derives the same roster key)
         assert_eq!(&mk.roster_key()[..], &rk2[..]);
     }
 
@@ -1487,44 +1471,34 @@ mod tests {
         )
         .unwrap();
         let stored = vec![
-            seal_entry(&rk1, 1, 0, &encode_entry(&g)),
-            seal_entry(&rk1, 1, 1, &encode_entry(&e1)),
+            seal_entry(&rk1, 1, 0, &encode_entry(&g)).unwrap(),
+            seal_entry(&rk1, 1, 1, &encode_entry(&e1)).unwrap(),
         ];
 
-        // happy path (gen-1-only chain)
         assert!(cold_start_fold(&MK1, 1, &rfp, &empty, &stored).is_ok());
-
-        // forged keyslot serving a different key: its roster_key can't decrypt the real chain.
         assert!(matches!(
             cold_start_fold(&[0x99; 32], 1, &rfp, &empty, &stored),
             Err(RosterError::Aead)
         ));
-
-        // wrong pinned RFP -> fold rejects.
         assert!(matches!(
             cold_start_fold(&MK1, 1, &[0u8; 32], &empty, &stored),
             Err(RosterError::RfpMismatch)
         ));
-
-        // g_cur that disagrees with the tip's FRAME.gen.
         assert!(matches!(
             cold_start_fold(&MK1, 2, &rfp, &empty, &stored),
             Err(RosterError::BadGeneration)
         ));
-
-        // fake key: chain records a mk_commit for a DIFFERENT key than the one that sealed it. The
-        // candidate decrypts (its roster_key matches) and folds, but fails the §7-step-3 mk_commit
-        // check — the forged-keyslot / fake-universe defense.
+        // A chain whose genesis records another key's commitment fails the §7 step-3 check.
         let wrong_commit = MasterKey::new(1, [0xEE; 32]).mk_commit();
         let (gf, rfpf) = genesis(&d1, vec![], wrong_commit, 0).unwrap();
-        let stored_f = vec![seal_entry(&rk1, 1, 0, &encode_entry(&gf))];
+        let stored_f = vec![seal_entry(&rk1, 1, 0, &encode_entry(&gf)).unwrap()];
         assert!(matches!(
             cold_start_fold(&MK1, 1, &rfpf, &empty, &stored_f),
             Err(RosterError::MkCommitMismatch)
         ));
     }
 
-    // ---- Model-based differential test (R5): fold vs an independent reference state machine ----
+    // ---- Model-based differential test (R5) ----
 
     use proptest::prelude::*;
 
@@ -1546,7 +1520,7 @@ mod tests {
         (0usize..6, kind)
     }
 
-    /// Deterministically pick a current member (always non-empty: device 0 is never revoked).
+    /// Deterministically pick a current member (device 0 is never revoked).
     fn pick_member(members: &BTreeSet<usize>, hint: usize) -> usize {
         let v: Vec<usize> = members.iter().copied().collect();
         v[hint % v.len()]
@@ -1559,19 +1533,15 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
-        /// Build a random *valid* sigchain (signers are always current members, by construction) and
-        /// assert `fold` reproduces an independently-computed reference state — membership set,
-        /// generation, and min_algo. This is the R5 fold-vs-model differential check.
+        /// `fold` reproduces an independent reference model's membership, generation, and min_algo.
         #[test]
         fn fold_matches_reference_model(actions in proptest::collection::vec(act_strategy(), 0..40)) {
             let devices: Vec<DeviceKey> = (0..6).map(|_| DeviceKey::generate().unwrap()).collect();
             let ids: Vec<DeviceId> = devices.iter().map(|d| d.device_id().unwrap()).collect();
 
-            // Genesis by device 0 (the never-revoked founder, so a signer always exists).
             let (g, rfp) = genesis(&devices[0], vec![], commit_for(1), 0).unwrap();
             let mut entries = vec![g];
 
-            // Reference model.
             let mut members: BTreeSet<usize> = BTreeSet::from([0]);
             let mut generation: u32 = 1;
             let mut min_algo: u8 = secsec_frame::MIN_ALGO_ID;
@@ -1604,7 +1574,6 @@ mod tests {
                         entries.push(append(prev, op, &devices[signer], 0).unwrap());
                         min_algo = min_algo.max(v);
                     }
-                    // Add of an existing/founder device, or revoke of a non-member: skip (no-op).
                     _ => {}
                 }
             }
@@ -1619,10 +1588,6 @@ mod tests {
     }
 
     fn hx(b: &[u8]) -> String {
-        let mut s = String::with_capacity(b.len() * 2);
-        for x in b {
-            s.push_str(&format!("{x:02x}"));
-        }
-        s
+        b.iter().map(|x| format!("{x:02x}")).collect()
     }
 }

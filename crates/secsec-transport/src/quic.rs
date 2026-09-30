@@ -1,29 +1,25 @@
-//! QUIC endpoint configs (`secsec-Design.md` §11): [`client_config`] verifies via the SPKI pin (a
-//! MITM key fails the handshake), [`server_config`] presents the self-signed host key. Both pin
-//! TLS 1.3 and the §19 tuning. The app-layer auth handshake is [`crate::handshake`]; per-op RPC is
-//! [`crate::rpc`].
+//! QUIC endpoint configs (`secsec-Design.md` §11): pinned client, TOFU client, and the self-signed server, all TLS 1.3 with §19 tuning.
 
 use crate::{HostPin, PinnedServerVerifier};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, ServerConfig, TransportConfig};
+use quinn::{ClientConfig, IdleTimeout, ServerConfig, TransportConfig, VarInt};
 use rustls::crypto::ring::{cipher_suite, default_provider, kx_group};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// QUIC idle timeout (§19): 30 s.
+/// QUIC idle timeout default (§19).
 pub(crate) const IDLE_TIMEOUT_SECS: u64 = 30;
-/// QUIC keepalive interval (§19): 10 s.
+/// QUIC keepalive interval default (§19).
 pub(crate) const KEEPALIVE_SECS: u64 = 10;
 
-/// QUIC idle/keepalive tuning (§19 `secsec.config`); defaults to the §19 values. The keepalive must
-/// stay strictly below the idle timeout so a live connection refreshes before it can idle out.
+/// Idle/keepalive tuning (§19 `secsec.config`); callers keep the keepalive below the idle timeout.
 #[derive(Debug, Clone, Copy)]
 pub struct Tuning {
     /// Max idle timeout, seconds.
     pub idle_secs: u64,
-    /// Keepalive interval, seconds.
+    /// Client keepalive interval, seconds.
     pub keepalive_secs: u64,
 }
 
@@ -34,6 +30,11 @@ impl Default for Tuning {
             keepalive_secs: KEEPALIVE_SECS,
         }
     }
+}
+
+impl Tuning {
+    /// The largest idle timeout QUIC can express, in whole seconds (a 62-bit millisecond count).
+    pub const MAX_IDLE_SECS: u64 = VarInt::MAX.into_inner() / 1000;
 }
 
 /// Failure to build a QUIC endpoint configuration.
@@ -47,18 +48,7 @@ impl core::fmt::Display for ConfigError {
 }
 impl std::error::Error for ConfigError {}
 
-/// §11: the suite list and key exchange are **fixed, not negotiated**. Pinning the protocol version
-/// alone leaves both to whatever the ring provider happens to ship, so they are enumerated here — a
-/// provider that later adds a group or drops a suite changes nothing silently.
-///
-/// `TLS13_AES_128_GCM_SHA256` is in the list because QUIC cannot run without it: RFC 9001 §5.2 fixes
-/// Initial packet protection to AEAD_AES_128_GCM, and rustls sources those keys from this same list
-/// ("no initial cipher suite found" otherwise). Initial packets carry no secrecy in any case — their
-/// keys derive from the public connection ID.
-///
-/// Signature verification keeps the provider's full algorithm list: it must verify whatever the
-/// pinned host certificate was signed with, and that certificate is trusted by SPKI pin, not by
-/// algorithm.
+/// §11: suites and key exchange are fixed; AES-128-GCM stays because RFC 9001 §5.2 fixes Initial packets to it.
 fn pinned_provider() -> CryptoProvider {
     CryptoProvider {
         cipher_suites: vec![
@@ -71,19 +61,20 @@ fn pinned_provider() -> CryptoProvider {
     }
 }
 
-/// The shared transport tuning (idle / keepalive) for `t`.
-fn transport_config(t: Tuning) -> TransportConfig {
+/// Transport tuning shared by both ends; only a client sends keepalives, so an idle peer times out on the server.
+fn transport_config(t: Tuning, keepalive: bool) -> Result<TransportConfig, ConfigError> {
+    let idle = IdleTimeout::try_from(Duration::from_secs(t.idle_secs))
+        .map_err(|_| ConfigError(format!("idle timeout {}s is out of range", t.idle_secs)))?;
     let mut tc = TransportConfig::default();
-    tc.max_idle_timeout(Some(
-        Duration::from_secs(t.idle_secs)
-            .try_into()
-            .expect("idle timeout fits"),
-    ));
-    tc.keep_alive_interval(Some(Duration::from_secs(t.keepalive_secs)));
-    tc
+    tc.max_idle_timeout(Some(idle));
+    tc.keep_alive_interval(keepalive.then(|| Duration::from_secs(t.keepalive_secs)));
+    // secsec uses only bidirectional streams: no unidirectional streams, no datagrams.
+    tc.max_concurrent_uni_streams(VarInt::from_u32(0));
+    tc.datagram_receive_buffer_size(None);
+    Ok(tc)
 }
 
-/// A pinned TLS 1.3 rustls `ClientConfig` (no ALPN here; set by the caller if needed).
+/// A pinned TLS 1.3 client config; no ALPN, since the §11 hello carries and checks `secsec_version` (RFC 9001 §8.1).
 fn rustls_client_config(pin: HostPin) -> rustls::ClientConfig {
     rustls::ClientConfig::builder_with_provider(Arc::new(pinned_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -93,8 +84,7 @@ fn rustls_client_config(pin: HostPin) -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
-/// A TLS 1.3 rustls `ServerConfig` presenting `cert_der` (a self-signed host key) with `key_der`
-/// (its PKCS#8 private key).
+/// A TLS 1.3 server config presenting `cert_der` with its PKCS#8 `key_der`.
 fn rustls_server_config(
     cert_der: &[u8],
     key_der: &[u8],
@@ -109,26 +99,25 @@ fn rustls_server_config(
         .map_err(|e| ConfigError(e.to_string()))
 }
 
-/// Build a `quinn::ClientConfig` that only completes a handshake against the pinned host key (§11).
+/// A client config that only completes a handshake against the pinned host key (§11).
 pub fn client_config(pin: HostPin) -> Result<ClientConfig, ConfigError> {
     client_config_tuned(pin, Tuning::default())
 }
 
-/// Like [`client_config`] but with explicit idle/keepalive tuning (§19 `secsec.config`).
+/// [`client_config`] with explicit tuning.
 pub fn client_config_tuned(pin: HostPin, tuning: Tuning) -> Result<ClientConfig, ConfigError> {
     let qcc = QuicClientConfig::try_from(rustls_client_config(pin))
         .map_err(|e| ConfigError(e.to_string()))?;
     let mut cfg = ClientConfig::new(Arc::new(qcc));
-    cfg.transport_config(Arc::new(transport_config(tuning)));
+    cfg.transport_config(Arc::new(transport_config(tuning, true)?));
     Ok(cfg)
 }
 
-/// Shared cell into which a TOFU handshake records the server's captured `host_id` (§11).
+/// The cell a TOFU handshake fills with the verified server's `host_id` (§11).
 pub type CapturedHostPin = Arc<std::sync::Mutex<Option<[u8; 32]>>>;
 
-/// TOFU `ClientConfig` for first contact (§11): accepts any host key, records its `host_id` into
-/// the returned cell; the caller confirms out-of-band and pins it ([`client_config`] thereafter).
-pub fn client_config_tofu() -> Result<(ClientConfig, CapturedHostPin), ConfigError> {
+/// First-contact (TOFU) client config with explicit tuning: accepts any key, records its verified `host_id`.
+pub fn client_config_tofu(tuning: Tuning) -> Result<(ClientConfig, CapturedHostPin), ConfigError> {
     let captured = Arc::new(std::sync::Mutex::new(None));
     let rcc = rustls::ClientConfig::builder_with_provider(Arc::new(pinned_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -138,16 +127,16 @@ pub fn client_config_tofu() -> Result<(ClientConfig, CapturedHostPin), ConfigErr
         .with_no_client_auth();
     let qcc = QuicClientConfig::try_from(rcc).map_err(|e| ConfigError(e.to_string()))?;
     let mut cfg = ClientConfig::new(Arc::new(qcc));
-    cfg.transport_config(Arc::new(transport_config(Tuning::default())));
+    cfg.transport_config(Arc::new(transport_config(tuning, true)?));
     Ok((cfg, captured))
 }
 
-/// Build a `quinn::ServerConfig` presenting the self-signed host key `cert_der` / `key_der`.
+/// A server config presenting the self-signed host key.
 pub fn server_config(cert_der: &[u8], key_der: &[u8]) -> Result<ServerConfig, ConfigError> {
     server_config_tuned(cert_der, key_der, Tuning::default())
 }
 
-/// Like [`server_config`] but with explicit idle/keepalive tuning (§19 `secsec.config`).
+/// [`server_config`] with explicit tuning (idle timeout only; the server never keeps a peer alive).
 pub fn server_config_tuned(
     cert_der: &[u8],
     key_der: &[u8],
@@ -156,7 +145,7 @@ pub fn server_config_tuned(
     let qsc = QuicServerConfig::try_from(rustls_server_config(cert_der, key_der)?)
         .map_err(|e| ConfigError(e.to_string()))?;
     let mut cfg = ServerConfig::with_crypto(Arc::new(qsc));
-    cfg.transport_config(Arc::new(transport_config(tuning)));
+    cfg.transport_config(Arc::new(transport_config(tuning, false)?));
     Ok(cfg)
 }
 
@@ -176,8 +165,7 @@ mod tests {
         (Ipv4Addr::LOCALHOST, 0).into()
     }
 
-    /// Spawn a server that accepts one connection and echoes one datagram-sized message on a
-    /// bidirectional stream; return its address and a handle.
+    /// A server that echoes one bidi-stream message.
     async fn run_server(
         cert: Vec<u8>,
         key: Vec<u8>,
@@ -191,7 +179,6 @@ mod tests {
             let Ok(conn) = incoming.await else {
                 return false;
             };
-            // echo one bidi-stream round trip
             if let Ok((mut send, mut recv)) = conn.accept_bi().await {
                 let mut buf = [0u8; 16];
                 if let Ok(Some(n)) = recv.read(&mut buf).await {
@@ -205,16 +192,14 @@ mod tests {
         (addr, handle)
     }
 
-    async fn try_connect(server_addr: SocketAddr, pin: HostPin) -> Result<(), String> {
+    async fn try_connect(server_addr: SocketAddr, cfg: ClientConfig) -> Result<(), String> {
         let mut endpoint = Endpoint::client(loopback()).map_err(|e| e.to_string())?;
-        endpoint.set_default_client_config(client_config(pin).map_err(|e| e.to_string())?);
+        endpoint.set_default_client_config(cfg);
         let conn = endpoint
             .connect(server_addr, "secsec.invalid")
             .map_err(|e| e.to_string())?
             .await
             .map_err(|e| e.to_string())?;
-
-        // exercise one stream to confirm the connection is actually usable.
         let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
         send.write_all(b"ping").await.map_err(|e| e.to_string())?;
         send.finish().map_err(|e| e.to_string())?;
@@ -240,33 +225,53 @@ mod tests {
     }
 
     #[test]
-    fn quic_handshake_succeeds_with_matching_pin() {
+    fn quic_handshake_succeeds_with_matching_pin_and_tofu() {
         runtime().block_on(async {
             let (cert, key) = self_signed_with_key();
             let pin = HostPin::from_cert(&cert).unwrap();
-            let (addr, server) = run_server(cert, key).await;
-            try_connect(addr, pin)
+            let (addr, server) = run_server(cert.clone(), key.clone()).await;
+            try_connect(addr, client_config(pin.clone()).unwrap())
                 .await
                 .expect("pinned handshake + echo");
             assert!(server.await.unwrap());
+
+            let (addr, server) = run_server(cert, key).await;
+            let (cfg, cell) = client_config_tofu(Tuning::default()).unwrap();
+            try_connect(addr, cfg).await.expect("tofu handshake + echo");
+            assert!(server.await.unwrap());
+            assert_eq!(*cell.lock().unwrap(), Some(pin.host_id()));
         });
     }
 
-    /// The end-to-end MITM test at the QUIC layer: connecting to a server presenting a *different*
-    /// host key than the pin must fail the handshake.
+    /// QUIC-layer MITM: a server presenting another key never completes the handshake.
     #[test]
     fn quic_handshake_fails_against_mitm_key() {
         runtime().block_on(async {
             let (real_cert, _real_key) = self_signed_with_key();
             let (mitm_cert, mitm_key) = self_signed_with_key();
-            let pin = HostPin::from_cert(&real_cert).unwrap(); // pinned to the real key
-            let (addr, _server) = run_server(mitm_cert, mitm_key).await; // server uses the MITM key
-            let result = tokio::time::timeout(Duration::from_secs(5), try_connect(addr, pin)).await;
-            // either the connect future resolves to an error, or (defensively) times out — never Ok.
-            assert!(
-                matches!(result, Ok(Err(_))) || result.is_err(),
-                "a handshake against a non-pinned key must not succeed"
-            );
+            let pin = HostPin::from_cert(&real_cert).unwrap();
+            let (addr, _server) = run_server(mitm_cert, mitm_key).await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                try_connect(addr, client_config(pin).unwrap()),
+            )
+            .await;
+            assert!(matches!(result, Ok(Err(_))) || result.is_err());
         });
+    }
+
+    /// An idle timeout QUIC cannot express is a config error, never a panic.
+    #[test]
+    fn out_of_range_idle_timeout_is_an_error() {
+        let bad = Tuning {
+            idle_secs: u64::MAX,
+            keepalive_secs: 1,
+        };
+        assert!(transport_config(bad, true).is_err());
+        let edge = Tuning {
+            idle_secs: Tuning::MAX_IDLE_SECS,
+            keepalive_secs: 1,
+        };
+        assert!(transport_config(edge, false).is_ok());
     }
 }

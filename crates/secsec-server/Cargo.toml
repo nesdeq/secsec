@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Server request handler: §12 per-op authorization pipeline over the object store (secsec-Design.md §12, §19)."
+description = "Blind server: the per-op authorization pipeline over the store, the authorized_keys gate, and the serve loop (secsec-Design.md §11, §12, §19)."
 
 [lints]
 workspace = true
@@ -18,8 +18,9 @@ secsec-transport = { path = "../secsec-transport" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 getrandom = "0.3"
 blake3 = "1"
+tokio = { version = "1", features = ["rt", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net"] }
 rcgen = "0.13"

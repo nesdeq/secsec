@@ -1,30 +1,26 @@
-//! `secsec-snapshot` — the object graph and directory snapshot/restore (`secsec-Design.md` §6, §9.2).
-//!
-//! A snapshot is an SSHSIG-signed `Commit` pointing at a root `Tree`; trees list files (chunk-id
-//! lists) and subtrees, sealed via [`secsec_object`]. Restore walks the tree back, verifying every
-//! object (§9.2), and rebuilds the directory byte-for-byte. Per-path salts ride in the parent
-//! object (root salt in the commit), and a path's salt is **constant across versions** (§9.7) —
-//! [`snapshot_tree`] reuses salts from the previous tree, which is what makes incremental
-//! upload/dedup and merge content-equality work (a correctness requirement, not an optimization).
+//! The Tree/Commit object graph and directory snapshot/restore (`secsec-Design.md` §6, §9.2, §10).
 
 #![forbid(unsafe_code)]
 
 use secsec_canon::{CanonError, Reader, Writer};
 use secsec_frame::{
-    ObjType, MAX_BLOB_SIZE, MAX_CHUNKS_PER_FILE, MAX_LIST_ELEMENTS, MAX_TREE_DEPTH, MAX_TREE_FANOUT,
+    ObjType, MAX_BLOB_SIZE, MAX_CHUNKS_PER_FILE, MAX_LIST_ELEMENTS, MAX_NAME_LEN, MAX_TREE_DEPTH,
+    MAX_TREE_FANOUT,
 };
 use secsec_kdf::{MasterKey, MasterKeys};
 use secsec_object::{
     open_object, seal_object, unpad_chunk, Id, ObjError, Padding, PathSalt, ZERO_SALT,
 };
+use secsec_sig::MAX_SIG_LEN;
 use secsec_store::{Store, StoreError};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// Maximum length of a single path-component name (bytes).
-pub(crate) const MAX_NAME: usize = 4096;
+/// Name prefix of restore's temporary files; the scanner and reconcile never treat such names as user files.
+pub const TMP_PREFIX: &str = ".secsec-tmp-";
 
-/// A directory listing (§6). Entries are kept sorted by name for a canonical encoding.
+/// A directory listing (§6), entries sorted by name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tree {
     /// The directory's entries.
@@ -34,33 +30,32 @@ pub struct Tree {
 /// One tree entry: a file or a subdirectory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
-    /// A regular file: its content is the concatenation of `chunks` (each padded then sealed),
-    /// addressed with `path_salt`.
+    /// A regular file: the concatenation of `chunks`, addressed with `path_salt`.
     File {
-        /// File name (UTF-8 path component).
+        /// File name (one UTF-8 path component).
         name: String,
-        /// Unix mode bits (0 on platforms without them).
+        /// Unix permission bits (0 when the author had none).
         mode: u32,
-        /// Modification time, nanoseconds since the Unix epoch (advisory).
+        /// Modification time, nanoseconds since the epoch (advisory).
         mtime: u64,
         /// Plaintext size in bytes.
         size: u64,
-        /// Per-file path salt used for this file's chunk ids.
+        /// Per-file path salt for the chunk ids.
         path_salt: PathSalt,
         /// Ordered chunk ids.
         chunks: Vec<Id>,
     },
     /// A subdirectory pointing at another `Tree` object.
     Dir {
-        /// Directory name (UTF-8 path component).
+        /// Directory name (one UTF-8 path component).
         name: String,
-        /// Unix mode bits (0 on platforms without them).
+        /// Unix permission bits (0 when the author had none).
         mode: u32,
-        /// Modification time, nanoseconds since the Unix epoch (advisory).
+        /// Modification time, nanoseconds since the epoch (advisory).
         mtime: u64,
-        /// Content address of the subtree object.
+        /// Content address of the subtree.
         subtree: Id,
-        /// Path salt of the subtree object.
+        /// Path salt of the subtree.
         subtree_salt: PathSalt,
     },
 }
@@ -70,19 +65,19 @@ pub enum Entry {
 pub struct Commit {
     /// Root tree content address.
     pub root_tree: Id,
-    /// Root tree path salt (stored here because the root has no parent tree).
+    /// Root tree path salt (the root has no parent tree).
     pub root_salt: PathSalt,
-    /// Parent commit ids (empty for the first commit).
+    /// Parent commit ids (empty for a first commit).
     pub parents: Vec<Id>,
-    /// Authoring device id (`BLAKE3(pubkey)`; zero until identity exists).
+    /// Authoring device id.
     pub device_id: [u8; 32],
     /// Strictly increasing per-device version.
     pub version: u64,
-    /// Roster sequence assumed by this commit.
+    /// Roster sequence the commit was written under.
     pub roster_seq: u64,
     /// Head the author last saw (zero if none).
     pub last_seen_head: [u8; 32],
-    /// Author-asserted timestamp (advisory; never trusted for security).
+    /// Author-asserted timestamp (advisory).
     pub ts: u64,
 }
 
@@ -109,14 +104,13 @@ pub enum SnapError {
     Rng,
     /// Commit signature invalid, or the signer is not the commit's author (§9.6).
     BadSignature,
-    /// A requested path did not exist in the tree being resolved (`secsec log`/`restore`).
+    /// A requested path did not exist in the resolved tree.
     PathNotFound(String),
-    /// The requested version's content has been pruned beyond retention (§15) — it cannot be restored.
+    /// The requested version's content is pruned beyond retention (§15).
     PrunedBeyondRetention(String),
-    /// A directory's encoded tree exceeds the §19 object cap, so no device could ever decode it. Its
-    /// entries reference too many chunk ids in total (32 bytes each inside the parent tree).
+    /// A directory cannot be encoded into a decodable tree (§19 fan-out or object cap).
     TreeTooLarge(String),
-    /// A restore target path was not a clean relative path inside the destination root.
+    /// A restore target was not a clean path inside the destination root.
     UnsafePath(String),
     /// Signing/key error.
     Sig(secsec_sig::SigError),
@@ -183,8 +177,8 @@ impl From<secsec_sig::SigError> for SnapError {
     }
 }
 
-fn random_salt() -> Result<PathSalt, SnapError> {
-    let mut s = [0u8; 16];
+fn random_bytes<const N: usize>() -> Result<[u8; N], SnapError> {
+    let mut s = [0u8; N];
     getrandom::fill(&mut s).map_err(|_| SnapError::Rng)?;
     Ok(s)
 }
@@ -248,10 +242,7 @@ fn encode_tree(tree: &Tree) -> Vec<u8> {
     w.finish()
 }
 
-/// Path-traversal guard (§18): a name is safe iff it is a single non-empty path component — never
-/// `.`/`..`, a separator, or a control character (terminal-escape injection). Enforced both ways: the
-/// scanner ([`snapshot_dir`]) skips a name that fails this, [`decode_tree`] rejects one — so an
-/// unsyncable name is never authored, and a compromised member (§3) still cannot smuggle one past.
+/// §18 name guard, enforced both ways: one non-empty component, no `.`/`..`, separator, or control character.
 fn is_safe_entry_name(name: &str) -> bool {
     !(name.is_empty()
         || name == "."
@@ -261,21 +252,65 @@ fn is_safe_entry_name(name: &str) -> bool {
         || name.chars().any(|c| c.is_control()))
 }
 
+/// The per-component name length limit of this platform's filesystems (NAME_MAX: 255 bytes, 255 UTF-16 units on Windows).
+const OS_NAME_MAX: usize = 255;
+
+/// Whether a Windows filesystem refuses `name` (reserved device names, reserved characters, trailing dot/space).
+fn windows_rejects(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let upper = stem.to_uppercase();
+    let device = matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+        && upper.chars().count() == 4
+        && upper
+            .chars()
+            .nth(3)
+            .is_some_and(|c| c.is_ascii_digit() || matches!(c, '¹' | '²' | '³')));
+    device
+        || name.ends_with('.')
+        || name.ends_with(' ')
+        || name
+            .chars()
+            .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        || name.encode_utf16().count() > OS_NAME_MAX
+}
+
+/// Whether this device can create a tree entry named `name`: one normal path component the OS accepts, not a restore temp.
+#[must_use]
+pub fn is_materializable(name: &str) -> bool {
+    use std::path::Component;
+    let mut comps = Path::new(name).components();
+    let single = matches!(
+        (comps.next(), comps.next()),
+        (Some(Component::Normal(c)), None) if c == std::ffi::OsStr::new(name)
+    );
+    single
+        && is_safe_entry_name(name)
+        && !name.starts_with(TMP_PREFIX)
+        && if cfg!(windows) {
+            !windows_rejects(name)
+        } else {
+            name.len() <= OS_NAME_MAX
+        }
+}
+
 fn decode_tree(bytes: &[u8]) -> Result<Tree, SnapError> {
     let mut r = Reader::new(bytes);
     let count = r.u32()? as usize;
     if count > MAX_TREE_FANOUT {
         return Err(SnapError::Malformed("tree fan-out exceeds maximum"));
     }
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = Vec::with_capacity(count.min(r.remaining()));
     for _ in 0..count {
         let kind = r.u8()?;
-        let name =
-            String::from_utf8(r.bytes(MAX_NAME)?.to_vec()).map_err(|_| SnapError::NonUtf8Name)?;
-        // Name guard + §9.3 canonical ordering: strictly ascending names (also bans duplicates).
+        let name = String::from_utf8(r.bytes(MAX_NAME_LEN)?.to_vec())
+            .map_err(|_| SnapError::NonUtf8Name)?;
         if !is_safe_entry_name(&name) {
             return Err(SnapError::Malformed("unsafe tree entry name"));
         }
+        // §9.3: names strictly ascending, which also bans duplicates.
         if let Some(last) = entries.last() {
             if name.as_str() <= entry_name(last) {
                 return Err(SnapError::Malformed(
@@ -293,8 +328,7 @@ fn decode_tree(bytes: &[u8]) -> Result<Tree, SnapError> {
                 if chunk_count > MAX_CHUNKS_PER_FILE {
                     return Err(SnapError::Malformed("chunk list exceeds maximum"));
                 }
-                // Cap the pre-allocation to what the remaining input can hold (32 bytes per id), so a
-                // lying count cannot force a large allocation ahead of a truncated body.
+                // A lying count cannot pre-allocate past what the remaining input holds.
                 let mut chunks = Vec::with_capacity(chunk_count.min(r.remaining() / 32));
                 for _ in 0..chunk_count {
                     chunks.push(arr32(r.raw(32)?));
@@ -326,9 +360,6 @@ fn decode_tree(bytes: &[u8]) -> Result<Tree, SnapError> {
     Ok(Tree { entries })
 }
 
-/// Maximum stored commit-signature length (an SSHSIG PEM is well under this).
-const MAX_COMMIT_SIG: usize = 4096;
-
 fn write_commit_fields(w: &mut Writer, c: &Commit) {
     w.raw(&c.root_tree)
         .raw(&c.root_salt)
@@ -350,7 +381,7 @@ fn read_commit_fields(r: &mut Reader<'_>) -> Result<Commit, SnapError> {
     if parent_count > MAX_LIST_ELEMENTS {
         return Err(SnapError::Malformed("parent list exceeds maximum"));
     }
-    let mut parents = Vec::with_capacity(parent_count);
+    let mut parents = Vec::with_capacity(parent_count.min(r.remaining() / 32));
     for _ in 0..parent_count {
         parents.push(arr32(r.raw(32)?));
     }
@@ -377,7 +408,7 @@ fn encode_commit(c: &Commit) -> Vec<u8> {
     w.finish()
 }
 
-/// The stored signed-commit object: the canonical commit fields followed by the SSHSIG (§9.6).
+/// The stored signed-commit object: commit fields ‖ SSHSIG (§9.6).
 fn encode_signed_commit(c: &Commit, sig: &[u8]) -> Vec<u8> {
     let mut w = Writer::new();
     write_commit_fields(&mut w, c);
@@ -388,37 +419,52 @@ fn encode_signed_commit(c: &Commit, sig: &[u8]) -> Vec<u8> {
 fn decode_signed_commit(bytes: &[u8]) -> Result<(Commit, Vec<u8>), SnapError> {
     let mut r = Reader::new(bytes);
     let c = read_commit_fields(&mut r)?;
-    let sig = r.bytes(MAX_COMMIT_SIG)?.to_vec();
+    let sig = r.bytes(MAX_SIG_LEN)?.to_vec();
     r.finish()?;
     Ok((c, sig))
 }
 
-/// Fuzz-only hook: drive [`decode_tree`] on arbitrary bytes (must never panic / OOM, §18). Not part
-/// of the public API.
+/// Fuzz hook: drive the tree decoder on arbitrary bytes.
 #[doc(hidden)]
 pub fn __fuzz_decode_tree(bytes: &[u8]) {
     let _ = decode_tree(bytes);
 }
 
-/// Fuzz-only hook: drive [`decode_signed_commit`] on arbitrary bytes (must never panic / OOM, §18).
+/// Fuzz hook: drive the signed-commit decoder on arbitrary bytes.
 #[doc(hidden)]
 pub fn __fuzz_decode_signed_commit(bytes: &[u8]) {
     let _ = decode_signed_commit(bytes);
 }
 
+/// Test hook: seal a commit carrying an arbitrary `sig` (forged-history tests); production seals via [`seal_signed_commit`].
+#[doc(hidden)]
+pub fn __seal_commit_with_sig(
+    mk: &MasterKey,
+    store: &Store,
+    commit: &Commit,
+    sig: &[u8],
+) -> Result<Id, SnapError> {
+    let (id, blob) = seal_object(
+        mk,
+        ObjType::Commit,
+        &ZERO_SALT,
+        &encode_signed_commit(commit, sig),
+    );
+    store.put(&id, &blob)?;
+    Ok(id)
+}
+
 // ---- commit signing (§9.6 secsec-commit-v1) ----
 
 impl Commit {
-    /// The canonical signed message — all commit fields, binding author, replay counter, roster
-    /// state, and last-seen head (§9.3/§9.6).
+    /// The canonical signed message: every commit field (§9.3/§9.6).
     #[must_use]
     pub(crate) fn signed_message(&self) -> Vec<u8> {
         encode_commit(self)
     }
 }
 
-/// Sign a commit under [`secsec_sig::NS_COMMIT`] (§9.6). The signer should be the device named by
-/// `commit.device_id`; [`verify_commit`] enforces that.
+/// Sign a commit under `NS_COMMIT`; [`verify_commit`] requires the signer to be `commit.device_id`.
 pub(crate) fn sign_commit(
     device: &secsec_sig::DeviceKey,
     commit: &Commit,
@@ -426,8 +472,7 @@ pub(crate) fn sign_commit(
     Ok(device.sign(secsec_sig::NS_COMMIT, &commit.signed_message())?)
 }
 
-/// Verify a commit: valid SSHSIG under `NS_COMMIT` **and** `pubkey` is the named author. The caller
-/// resolves `pubkey` from the RFP-anchored roster (§8), so a non-member cannot forge a commit (P3).
+/// Verify a commit's SSHSIG under `NS_COMMIT` and that `pubkey` is its named author (P3).
 pub fn verify_commit(
     pubkey: &secsec_sig::DevicePublic,
     commit: &Commit,
@@ -443,9 +488,7 @@ pub fn verify_commit(
 
 // ---- snapshot ----
 
-/// The recorded permission bits: the 9 standard bits only — setuid/setgid/sticky are dropped (§18;
-/// a member-authored tree must not plant them). Masked symmetrically with [`apply_metadata`] so
-/// snapshot→restore→snapshot stays idempotent.
+/// The 9 standard permission bits only; setuid/setgid/sticky are dropped both ways (§18).
 #[cfg(unix)]
 fn mode_of(meta: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
@@ -456,8 +499,7 @@ fn mode_of(_meta: &std::fs::Metadata) -> u32 {
     0
 }
 
-/// File modification time as nanoseconds since the Unix epoch — the fast-path's change signal (with
-/// size). Nanosecond resolution stops two distinct same-size writes from colliding on one value.
+/// Modification time in nanoseconds since the epoch: with size, the unchanged-file signal.
 fn mtime_of(meta: &std::fs::Metadata) -> u64 {
     meta.modified()
         .ok()
@@ -465,9 +507,7 @@ fn mtime_of(meta: &std::fs::Metadata) -> u64 {
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
-/// The §19 decoder bounds a snapshot must never author past. Carried as a value rather than read from
-/// constants at each use so the tests can drive the guards at sizes that fit in a test; production
-/// always goes through [`Limits::SPEC`].
+/// The §19 bounds a snapshot or merge must never author past; tests shrink them.
 #[derive(Clone, Copy)]
 struct Limits {
     max_chunks_per_file: usize,
@@ -483,84 +523,114 @@ impl Limits {
     };
 }
 
-/// Snapshot the directory `root` into `store`, returning its root tree `(id, salt)` and the paths
-/// **skipped** because they cannot be encoded into a decodable tree (§19 bounds) — the content half
-/// of a sync push ([`seal_signed_commit`] wraps it). `prev` is the previous snapshot's root (`None`
-/// on first sync); each path's salt is reused from it (§9.7 — salts are constant across versions,
-/// the basis for dedup and merge content-equality), fresh salts only for new paths.
-///
-/// The skip list is part of the return type on purpose: a silently dropped file is indistinguishable
-/// from a deleted one, so every caller has to decide what to do with it.
+/// A tree a snapshot builds on: salts are reused per path; `fast_path` trusts matching size+mtime as unchanged.
+#[derive(Clone, Copy)]
+pub struct Prior<'a> {
+    /// Root tree id.
+    pub root: &'a Id,
+    /// Root tree salt.
+    pub salt: &'a PathSalt,
+    /// True only for this device's own last snapshot; false when seeding salts from another device's tree.
+    pub fast_path: bool,
+}
+
+/// State kept across snapshots: files already found past the chunk bound, by path at `(size, mtime)`.
+#[derive(Debug, Default)]
+pub struct SnapshotMemo {
+    oversize: BTreeMap<PathBuf, (u64, u64)>,
+}
+
+/// A snapshot's root and the paths it could not sync this pass.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// Root tree id.
+    pub root: Id,
+    /// Root tree salt.
+    pub salt: PathSalt,
+    /// Unsyncable paths (too many chunks, unreadable); an already-synced one keeps its previous entry.
+    pub skipped: Vec<String>,
+}
+
+/// Snapshot `root` into `store` (§6): per-path salts reused from `prior`, unsyncable paths frozen and reported.
 pub fn snapshot_tree<K: MasterKeys>(
     root: &Path,
     keys: &K,
     store: &Store,
-    prev: Option<(&Id, &PathSalt)>,
-) -> Result<(Id, PathSalt, Vec<String>), SnapError> {
-    snapshot_tree_with(root, keys, store, prev, Limits::SPEC)
+    prior: Option<Prior<'_>>,
+    memo: &mut SnapshotMemo,
+) -> Result<Snapshot, SnapError> {
+    snapshot_tree_with(root, keys, store, prior, memo, Limits::SPEC)
 }
 
-/// [`snapshot_tree`] with explicit bounds (see [`Limits`]).
 fn snapshot_tree_with<K: MasterKeys>(
     root: &Path,
     keys: &K,
     store: &Store,
-    prev: Option<(&Id, &PathSalt)>,
+    prior: Option<Prior<'_>>,
+    memo: &mut SnapshotMemo,
     limits: Limits,
-) -> Result<(Id, PathSalt, Vec<String>), SnapError> {
-    // New objects are chunked and sealed under the current generation; the previous tree may have been
-    // sealed under an older one, so it is read through the whole key ring (§8.2).
+) -> Result<Snapshot, SnapError> {
+    // New objects seal under the current generation; the prior tree reads through the whole ring (§8.2).
     let chunker = secsec_chunk::Chunker::with_defaults(&keys.current().cdc_seed());
-    let prev_tree = match prev {
-        Some((id, salt)) => Some(load_tree(id, salt, keys, store)?),
+    let prev_tree = match prior {
+        Some(p) => Some(load_tree(p.root, p.salt, keys, store)?),
         None => None,
     };
-    // The root tree's own salt persists too (reused if the repo has synced before).
-    let root_salt = match prev {
-        Some((_, salt)) => *salt,
-        None => random_salt()?,
+    let root_salt = match prior {
+        Some(p) => *p.salt,
+        None => random_bytes()?,
     };
-    // Wall-clock at snapshot start: the fast-path reuses a file only when its mtime is strictly before
-    // this, so a file touched during the snapshot is never trusted as unchanged (racy-clean guard).
+    // Racy-clean guard: the fast path trusts a file only if its mtime predates this snapshot.
     let now_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-    let ctx = SnapCtx {
+    let mut ctx = SnapCtx {
         keys,
         store,
         chunker: &chunker,
         now_nanos,
+        fast_path: prior.is_some_and(|p| p.fast_path),
         limits,
-        skipped: std::cell::RefCell::new(Vec::new()),
+        skipped: Vec::new(),
+        memo,
     };
-    let (id, salt) = snapshot_dir(&ctx, root, 0, prev_tree.as_ref(), root_salt)?;
-    Ok((id, salt, ctx.skipped.into_inner()))
+    let (id, salt) = snapshot_dir(&mut ctx, root, 0, prev_tree.as_ref(), root_salt)?;
+    Ok(Snapshot {
+        root: id,
+        salt,
+        skipped: ctx.skipped,
+    })
 }
 
-/// Walk-constant context for a snapshot: the key ring, object store, chunker, and the snapshot-start
-/// time (nanoseconds) used by the unchanged-file fast path's racy-clean guard. Threaded through the
-/// recursion so per-directory calls stay short.
+/// Walk-constant snapshot context.
 struct SnapCtx<'a, K: MasterKeys> {
     keys: &'a K,
     store: &'a Store,
     chunker: &'a secsec_chunk::Chunker,
     now_nanos: u64,
-    /// The §19 bounds this walk must not author past.
+    fast_path: bool,
     limits: Limits,
-    /// Paths the §19 bounds make unsyncable, collected across the whole walk so one oversized entry
-    /// never fails the snapshot (§6) but is never silently dropped either.
-    skipped: std::cell::RefCell<Vec<String>>,
+    skipped: Vec<String>,
+    memo: &'a mut SnapshotMemo,
 }
 
-/// The name field of a tree entry (file or dir).
+/// The name field of a tree entry.
 fn entry_name(e: &Entry) -> &str {
     match e {
         Entry::File { name, .. } | Entry::Dir { name, .. } => name,
     }
 }
 
-/// Sign `commit` (§9.6), seal the signed-commit object (fields ‖ sig), store it, and return its
-/// content id — the commit id a Head points at. The signer must be `commit.device_id`.
+/// The entry named `name` in a (strictly name-sorted) tree.
+fn find_entry<'a>(tree: Option<&'a Tree>, name: &str) -> Option<&'a Entry> {
+    let t = tree?;
+    t.entries
+        .binary_search_by(|e| entry_name(e).cmp(name))
+        .ok()
+        .map(|i| &t.entries[i])
+}
+
+/// Sign `commit`, seal and store the signed object, and return its id; the signer must be `commit.device_id`.
 pub fn seal_signed_commit(
     mk: &MasterKey,
     store: &Store,
@@ -574,9 +644,7 @@ pub fn seal_signed_commit(
     Ok(id)
 }
 
-/// Fetch and open the signed-commit object `commit_id`, returning `(commit, sig)`. The content id
-/// is re-verified by [`open_object`]; the caller must still [`verify_commit`] against the author's
-/// roster key (§9.6).
+/// Fetch, open (id re-verified), and decode a signed commit; callers still [`verify_commit`].
 pub fn open_signed_commit<K: MasterKeys>(
     commit_id: &Id,
     keys: &K,
@@ -591,20 +659,148 @@ pub fn open_signed_commit<K: MasterKeys>(
     )?)
 }
 
-/// Restore the tree named by `commit` (its `root_tree`/`root_salt`) into `dest` (created if absent).
-/// The caller is expected to have already [`verify_commit`]-ed the commit (§9.6).
-pub fn restore_commit_tree<K: MasterKeys>(
-    commit: &Commit,
+/// Verify an in-memory commit blob against `commit_id` and decode it (fetch path: verify before storing).
+pub fn verified_commit<K: MasterKeys>(
     keys: &K,
-    store: &Store,
-    dest: &Path,
+    commit_id: &Id,
+    blob: &[u8],
+) -> Result<(Commit, Vec<u8>), SnapError> {
+    decode_signed_commit(&open_object(
+        keys,
+        ObjType::Commit,
+        &ZERO_SALT,
+        commit_id,
+        blob,
+    )?)
+}
+
+/// Verify an in-memory tree blob against `(tree_id, salt)` and decode it (fetch path: verify before storing).
+pub fn verified_tree<K: MasterKeys>(
+    keys: &K,
+    tree_id: &Id,
+    salt: &PathSalt,
+    blob: &[u8],
+) -> Result<Tree, SnapError> {
+    decode_tree(&open_object(keys, ObjType::Tree, salt, tree_id, blob)?)
+}
+
+/// Verify an in-memory chunk blob against `(chunk_id, salt)` (fetch path: verify before storing).
+pub fn verify_chunk<K: MasterKeys>(
+    keys: &K,
+    chunk_id: &Id,
+    salt: &PathSalt,
+    blob: &[u8],
 ) -> Result<(), SnapError> {
-    std::fs::create_dir_all(dest)?;
-    restore_tree(&commit.root_tree, &commit.root_salt, keys, store, dest, 0)
+    open_object(keys, ObjType::Chunk, salt, chunk_id, blob)?;
+    Ok(())
+}
+
+/// How one file entry resolved during a snapshot walk.
+enum FileScan {
+    Entry(Entry),
+    Skip(String),
+    Gone,
+}
+
+fn snapshot_file<K: MasterKeys>(
+    ctx: &mut SnapCtx<'_, K>,
+    path: &Path,
+    name: String,
+    meta: &std::fs::Metadata,
+    prev_entry: Option<&Entry>,
+) -> Result<FileScan, SnapError> {
+    let this_mtime = mtime_of(meta);
+    if let Some(Entry::File {
+        mtime: prev_mtime,
+        size: prev_size,
+        path_salt,
+        chunks,
+        ..
+    }) = prev_entry
+    {
+        // Fast path: same size and nanosecond mtime as our last snapshot, and older than this pass.
+        if ctx.fast_path
+            && *prev_size == meta.len()
+            && *prev_mtime == this_mtime
+            && this_mtime < ctx.now_nanos
+        {
+            return Ok(FileScan::Entry(Entry::File {
+                name,
+                mode: mode_of(meta),
+                mtime: this_mtime,
+                size: *prev_size,
+                path_salt: *path_salt,
+                chunks: chunks.clone(),
+            }));
+        }
+    }
+    let too_many = format!(
+        "{} (needs more than {} chunks)",
+        path.display(),
+        ctx.limits.max_chunks_per_file
+    );
+    if ctx.memo.oversize.get(path) == Some(&(meta.len(), this_mtime)) {
+        return Ok(FileScan::Skip(too_many));
+    }
+    let path_salt = match prev_entry {
+        Some(Entry::File { path_salt, .. }) => *path_salt,
+        _ => random_bytes()?,
+    };
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        // Deleted between the listing and the open: a plain deletion, not an unreadable file.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileScan::Gone),
+        Err(e) => {
+            return Ok(FileScan::Skip(format!(
+                "{} (unreadable: {e})",
+                path.display()
+            )))
+        }
+    };
+    let mut chunks = Vec::new();
+    let mut over_chunk_limit = false;
+    let (keys, store, chunker, limit) = (
+        ctx.keys,
+        ctx.store,
+        ctx.chunker,
+        ctx.limits.max_chunks_per_file,
+    );
+    let streamed = chunker.chunk_stream(file, |chunk| -> Result<(), SnapError> {
+        if chunks.len() >= limit {
+            over_chunk_limit = true;
+            return Err(SnapError::Malformed("chunk list exceeds maximum"));
+        }
+        let padded = secsec_object::pad_chunk(chunk, Padding::PowerOfTwo);
+        let (id, blob) = seal_object(keys.current(), ObjType::Chunk, &path_salt, &padded);
+        store.put(&id, &blob)?;
+        chunks.push(id);
+        Ok(())
+    });
+    match streamed {
+        Ok(size) => Ok(FileScan::Entry(Entry::File {
+            name,
+            mode: mode_of(meta),
+            mtime: this_mtime,
+            size,
+            path_salt,
+            chunks,
+        })),
+        Err(_) if over_chunk_limit => {
+            ctx.memo
+                .oversize
+                .insert(path.to_path_buf(), (meta.len(), this_mtime));
+            Ok(FileScan::Skip(too_many))
+        }
+        Err(secsec_chunk::StreamError::Read(io)) => Ok(FileScan::Skip(format!(
+            "{} (unreadable: {io})",
+            path.display()
+        ))),
+        Err(secsec_chunk::StreamError::Emit(se)) => Err(se),
+    }
 }
 
 fn snapshot_dir<K: MasterKeys>(
-    ctx: &SnapCtx<'_, K>,
+    ctx: &mut SnapCtx<'_, K>,
     dir: &Path,
     depth: usize,
     prev: Option<&Tree>,
@@ -613,124 +809,36 @@ fn snapshot_dir<K: MasterKeys>(
     if depth >= MAX_TREE_DEPTH {
         return Err(SnapError::DepthExceeded);
     }
-    // Read and sort entries by name for a deterministic, canonical tree.
     let mut names: Vec<std::ffi::OsString> = Vec::new();
     for ent in std::fs::read_dir(dir)? {
         names.push(ent?.file_name());
     }
     names.sort();
 
-    let mut entries = Vec::with_capacity(names.len());
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut entries: Vec<Entry> = Vec::with_capacity(names.len());
     for name_os in names {
-        // §19 fan-out: a tree past MAX_TREE_FANOUT entries is rejected by every decoder. Unlike one
-        // oversized file this is not attributable to a single entry, and silently truncating the
-        // directory would read as a bulk deletion on every other device — so fail loudly instead.
-        if entries.len() >= ctx.limits.max_fanout {
-            return Err(SnapError::TreeTooLarge(dir.display().to_string()));
-        }
-        // §6: an entry whose name can't be a valid tree entry name — non-UTF-8, or one the decoder
-        // rejects (control char, backslash, `.`/`..`) — is skipped like a symlink, never authored.
-        // Keeps the macOS `Icon\r` custom-folder-icon file from failing the whole snapshot.
+        // A name no tree may carry (non-UTF-8, unsafe, or a restore temp) is skipped like a symlink (§6).
         let Some(name) = name_os
             .to_str()
-            .filter(|n| is_safe_entry_name(n))
+            .filter(|n| is_safe_entry_name(n) && !n.starts_with(TMP_PREFIX))
             .map(str::to_owned)
         else {
             continue;
         };
         let path = dir.join(&name_os);
-        let meta = std::fs::symlink_metadata(&path)?;
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
         let ft = meta.file_type();
-        // The same-named entry in the prior tree (if any), used to reuse this path's salt.
-        let prev_entry = prev.and_then(|t| t.entries.iter().find(|e| entry_name(e) == name));
-        if ft.is_file() {
-            let this_mtime = mtime_of(&meta);
-            // Fast path: a file with the same size and the same nanosecond mtime as the previous
-            // snapshot — and whose mtime is strictly before this snapshot started, so it cannot still
-            // be changing within the current clock tick — is taken as unchanged and reuses its prior
-            // chunk ids verbatim, with no read, re-chunk, or re-seal. Those ids stay valid across a key
-            // rotation (they address the old generation; cross-generation reads are legal, §8.2), so a
-            // revoke does not re-store the whole working set.
-            if let Some(Entry::File {
-                mtime: prev_mtime,
-                size: prev_size,
-                path_salt,
-                chunks,
-                ..
-            }) = prev_entry
-            {
-                if *prev_size == meta.len()
-                    && *prev_mtime == this_mtime
-                    && this_mtime < ctx.now_nanos
-                {
-                    entries.push(Entry::File {
-                        name,
-                        mode: mode_of(&meta),
-                        mtime: this_mtime,
-                        size: *prev_size,
-                        path_salt: *path_salt,
-                        chunks: chunks.clone(),
-                    });
-                    continue;
-                }
-            }
-            // Reuse the path's salt across versions (§9.7); a path first seen now gets a fresh one.
-            let path_salt = match prev_entry {
-                Some(Entry::File { path_salt, .. }) => *path_salt,
-                _ => random_salt()?,
-            };
-            // Stream the file through the chunker so a file larger than RAM is never read whole.
-            let file = std::fs::File::open(&path)?;
-            let mut chunks = Vec::new();
-            // Stop as soon as the list outgrows what a tree can encode. The chunks already sealed are
-            // orphans that the next `local_sweep` drops (§15.4); reading the rest of the file would
-            // only add more of them. There is no cheaper pre-check — chunk counts are content-defined,
-            // so the file has to be cut before its length is known.
-            let mut over_chunk_limit = false;
-            let streamed = ctx
-                .chunker
-                .chunk_stream(file, |chunk| -> Result<(), SnapError> {
-                    if chunks.len() >= ctx.limits.max_chunks_per_file {
-                        over_chunk_limit = true;
-                        return Err(SnapError::Malformed("chunk list exceeds maximum"));
-                    }
-                    let padded = secsec_object::pad_chunk(chunk, Padding::PowerOfTwo);
-                    let (id, blob) =
-                        seal_object(ctx.keys.current(), ObjType::Chunk, &path_salt, &padded);
-                    ctx.store.put(&id, &blob)?;
-                    chunks.push(id);
-                    Ok(())
-                });
-            let size = match streamed {
-                Ok(n) => n,
-                // Unsyncable, like an unsafe name (§6): report it and move on rather than failing the
-                // whole snapshot over one file. If the path was already synced, keep its previous
-                // entry verbatim — an omitted name is a deletion to every other device, so a file
-                // that grows past the limit must freeze at its last syncable version, not vanish.
-                Err(_) if over_chunk_limit => {
-                    ctx.skipped.borrow_mut().push(format!(
-                        "{} (needs more than {} chunks)",
-                        path.display(),
-                        ctx.limits.max_chunks_per_file
-                    ));
-                    if let Some(kept @ Entry::File { .. }) = prev_entry {
-                        entries.push(kept.clone());
-                    }
-                    continue;
-                }
-                Err(secsec_chunk::StreamError::Read(io)) => return Err(SnapError::Io(io)),
-                Err(secsec_chunk::StreamError::Emit(se)) => return Err(se),
-            };
-            entries.push(Entry::File {
-                name,
-                mode: mode_of(&meta),
-                mtime: this_mtime,
-                size,
-                path_salt,
-                chunks,
-            });
+        let prev_entry = find_entry(prev, &name);
+        let scanned = if ft.is_file() {
+            seen.insert(name.clone());
+            snapshot_file(ctx, &path, name, &meta, prev_entry)?
         } else if ft.is_dir() {
-            // Reuse the subdir's salt and feed its prior tree down so its descendants reuse salts too.
+            seen.insert(name.clone());
             let (prev_sub, sub_salt) = match prev_entry {
                 Some(Entry::Dir {
                     subtree,
@@ -740,21 +848,51 @@ fn snapshot_dir<K: MasterKeys>(
                     Some(load_tree(subtree, subtree_salt, ctx.keys, ctx.store)?),
                     *subtree_salt,
                 ),
-                _ => (None, random_salt()?),
+                _ => (None, random_bytes()?),
             };
-            let (subtree, subtree_salt) =
-                snapshot_dir(ctx, &path, depth + 1, prev_sub.as_ref(), sub_salt)?;
-            entries.push(Entry::Dir {
-                name,
-                mode: mode_of(&meta),
-                mtime: mtime_of(&meta),
-                subtree,
-                subtree_salt,
-            });
+            match snapshot_dir(ctx, &path, depth + 1, prev_sub.as_ref(), sub_salt) {
+                Ok((subtree, subtree_salt)) => FileScan::Entry(Entry::Dir {
+                    name,
+                    mode: mode_of(&meta),
+                    mtime: mtime_of(&meta),
+                    subtree,
+                    subtree_salt,
+                }),
+                // A directory whose own listing fails (read_dir, an entry, or an entry's metadata) is frozen, not failed.
+                Err(SnapError::Io(e)) => {
+                    FileScan::Skip(format!("{} (unreadable: {e})", path.display()))
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            // Symlinks, FIFOs, sockets, devices: never synced, never an error (§6).
+            continue;
+        };
+        match scanned {
+            FileScan::Entry(e) => entries.push(e),
+            FileScan::Gone => {}
+            FileScan::Skip(msg) => {
+                ctx.skipped.push(msg);
+                // An omitted name is a deletion everywhere else, so an already-synced path freezes instead.
+                if let Some(kept) = prev_entry {
+                    entries.push(kept.clone());
+                }
+            }
         }
-        // Symlinks/FIFOs/sockets/devices are skipped, never an error (§6: files + dirs only).
     }
-
+    // Entries this device cannot create on disk ride forward unchanged instead of reading as deletions.
+    if let Some(p) = prev {
+        for e in &p.entries {
+            let n = entry_name(e);
+            if !seen.contains(n) && !is_materializable(n) {
+                entries.push(e.clone());
+            }
+        }
+    }
+    entries.sort_by(|a, b| entry_name(a).cmp(entry_name(b)));
+    if entries.len() > ctx.limits.max_fanout {
+        return Err(SnapError::TreeTooLarge(dir.display().to_string()));
+    }
     let tree = Tree { entries };
     let (id, blob) = seal_object(
         ctx.keys.current(),
@@ -762,8 +900,6 @@ fn snapshot_dir<K: MasterKeys>(
         &this_salt,
         &encode_tree(&tree),
     );
-    // §19: a blob past the object cap is rejected by every decoder, this device's included. Unlike an
-    // oversized file it cannot be attributed to one entry, so it is a hard error naming the directory.
     if blob.len() > ctx.limits.max_blob {
         return Err(SnapError::TreeTooLarge(dir.display().to_string()));
     }
@@ -784,138 +920,518 @@ fn fetch_open<K: MasterKeys>(
     Ok(open_object(keys, obj_type, salt, id, &blob)?)
 }
 
-fn restore_tree<K: MasterKeys>(
-    tree_id: &Id,
-    tree_salt: &PathSalt,
+/// What a restore did beyond the plain reconcile.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreReport {
+    /// Incoming versions written beside a local edit made after the snapshot (keep-both).
+    pub conflicts: Vec<String>,
+    /// Entries this device cannot create (OS name rules); they ride forward in the next snapshot.
+    pub skipped: Vec<String>,
+}
+
+/// What restore reconciles the disk against.
+#[derive(Clone, Copy)]
+enum Against<'a> {
+    /// This device's snapshot of the folder (`None` = nothing tracked here): only unchanged tracked entries are replaced or deleted.
+    Snapshot(Option<&'a Tree>),
+    /// Explicit `secsec restore`: the target overwrites whatever is there.
+    Overwrite,
+}
+
+/// Restore `target` into `dest` against `ours` (this device's snapshot of `dest`); `label` names keep-both copies.
+pub fn restore_tree_into<K: MasterKeys>(
+    target: (&Id, &PathSalt),
+    ours: Option<(&Id, &PathSalt)>,
     keys: &K,
     store: &Store,
+    dest: &Path,
+    label: &str,
+) -> Result<RestoreReport, SnapError> {
+    std::fs::create_dir_all(dest)?;
+    let ours_tree = match ours {
+        Some((id, salt)) => Some(load_tree(id, salt, keys, store)?),
+        None => None,
+    };
+    let mut rctx = RestoreCtx {
+        keys,
+        store,
+        label,
+        report: RestoreReport::default(),
+    };
+    restore_dir(
+        &mut rctx,
+        target.0,
+        target.1,
+        Against::Snapshot(ours_tree.as_ref()),
+        dest,
+        "",
+        0,
+    )?;
+    Ok(rctx.report)
+}
+
+/// Restore `commit`'s tree into `dest` against `ours`, labelling keep-both copies by the commit's author and id.
+pub fn restore_commit_tree<K: MasterKeys>(
+    commit: &Commit,
+    commit_id: &Id,
+    ours: Option<(&Id, &PathSalt)>,
+    keys: &K,
+    store: &Store,
+    dest: &Path,
+) -> Result<RestoreReport, SnapError> {
+    let label = format!("{}-{}", hex12(&commit.device_id), hex12(commit_id));
+    restore_tree_into(
+        (&commit.root_tree, &commit.root_salt),
+        ours,
+        keys,
+        store,
+        dest,
+        &label,
+    )
+}
+
+/// First 6 bytes as 12 lowercase hex characters (the §10 keep-both label component).
+#[must_use]
+pub fn hex12(b: &[u8; 32]) -> String {
+    b[..6].iter().map(|x| format!("{x:02x}")).collect()
+}
+
+struct RestoreCtx<'a, K: MasterKeys> {
+    keys: &'a K,
+    store: &'a Store,
+    label: &'a str,
+    report: RestoreReport,
+}
+
+fn join_rel(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}/{name}")
+    }
+}
+
+/// Whether the on-disk file still matches our snapshot entry (same size and nanosecond mtime).
+fn unchanged_since(meta: &std::fs::Metadata, snap: Option<&Entry>) -> bool {
+    matches!(snap, Some(Entry::File { size, mtime, .. })
+        if meta.is_file() && meta.len() == *size && mtime_of(meta) == *mtime)
+}
+
+/// Grant the owner write on `dir` for the duration of a restore; returns the permissions to put back.
+#[cfg(unix)]
+fn ensure_writable(dir: &Path) -> Result<Option<std::fs::Permissions>, SnapError> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::symlink_metadata(dir)?.permissions();
+    if perms.mode() & 0o200 != 0 {
+        return Ok(None);
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(perms.mode() | 0o700))?;
+    Ok(Some(perms))
+}
+#[cfg(not(unix))]
+fn ensure_writable(_dir: &Path) -> Result<Option<std::fs::Permissions>, SnapError> {
+    Ok(None)
+}
+
+/// Remove leftover restore temps (a crash mid-write); they are ours by name.
+fn remove_stale_temps(dir: &Path) -> Result<(), SnapError> {
+    for ent in std::fs::read_dir(dir)? {
+        let ent = ent?;
+        if ent
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(TMP_PREFIX))
+            && ent.file_type()?.is_file()
+        {
+            std::fs::remove_file(ent.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// macOS's custom-folder-icon file: never synced, and never deleted while its folder lives.
+const MACOS_FOLDER_ICON: &str = "Icon\r";
+
+/// Remove `dir`'s macOS folder icon when it is the only entry left, so a folder deleted upstream can go.
+fn remove_lone_folder_icon(dir: &Path) -> Result<(), SnapError> {
+    let mut entries = std::fs::read_dir(dir)?;
+    let (Some(only), None) = (entries.next().transpose()?, entries.next()) else {
+        return Ok(());
+    };
+    if only.file_name().as_os_str() == MACOS_FOLDER_ICON && only.file_type()?.is_file() {
+        std::fs::remove_file(only.path())?;
+    }
+    Ok(())
+}
+
+/// A name for the incoming version beside a local edit, colliding with nothing on disk or in `taken`.
+fn local_conflict_name(dir: &Path, name: &str, label: &str, taken: &BTreeSet<&str>) -> String {
+    let base = |l: &str| match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem}.conflict-{l}.{ext}"),
+        _ => format!("{name}.conflict-{l}"),
+    };
+    let mut candidate = base(label);
+    let mut n = 2u32;
+    while taken.contains(candidate.as_str())
+        || std::fs::symlink_metadata(dir.join(&candidate)).is_ok()
+        || !is_materializable(&candidate)
+    {
+        candidate = base(&format!("{label}-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
+/// Delete what our snapshot tracked under `dir` and is still unchanged, then a lone macOS folder icon; keep everything else. Returns whether `dir` is now gone.
+fn remove_tracked<K: MasterKeys>(
+    rctx: &RestoreCtx<'_, K>,
     dir: &Path,
+    snap: &Tree,
+    depth: usize,
+) -> Result<bool, SnapError> {
+    if depth >= MAX_TREE_DEPTH {
+        return Err(SnapError::DepthExceeded);
+    }
+    let restore_perms = ensure_writable(dir)?;
+    for e in &snap.entries {
+        let path = dir.join(entry_name(e));
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        match e {
+            Entry::File { .. } if unchanged_since(&meta, Some(e)) => std::fs::remove_file(&path)?,
+            Entry::Dir {
+                subtree,
+                subtree_salt,
+                ..
+            } if meta.is_dir() => {
+                let sub = load_tree(subtree, subtree_salt, rctx.keys, rctx.store)?;
+                remove_tracked(rctx, &path, &sub, depth + 1)?;
+            }
+            _ => {}
+        }
+    }
+    remove_stale_temps(dir)?;
+    remove_lone_folder_icon(dir)?;
+    match std::fs::remove_dir(dir) {
+        Ok(()) => Ok(true),
+        Err(_) => {
+            if let Some(p) = restore_perms {
+                std::fs::set_permissions(dir, p)?;
+            }
+            Ok(false)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_dir<K: MasterKeys>(
+    rctx: &mut RestoreCtx<'_, K>,
+    tree_id: &Id,
+    tree_salt: &PathSalt,
+    against: Against<'_>,
+    dir: &Path,
+    rel: &str,
     depth: usize,
 ) -> Result<(), SnapError> {
     if depth >= MAX_TREE_DEPTH {
         return Err(SnapError::DepthExceeded);
     }
-    let tree = decode_tree(&fetch_open(keys, ObjType::Tree, tree_salt, tree_id, store)?)?;
+    let tree = load_tree(tree_id, tree_salt, rctx.keys, rctx.store)?;
     std::fs::create_dir_all(dir)?;
+    let restore_perms = ensure_writable(dir)?;
+    remove_stale_temps(dir)?;
+    let ours = match against {
+        Against::Snapshot(t) => t,
+        Against::Overwrite => None,
+    };
 
-    // Reconcile the directory TO the tree (§10 Materialize): tracked-kind on-disk entries absent
-    // from the tree are removed, so upstream deletions apply instead of resurrecting. Untracked
-    // kinds (symlinks/special files) are left alone.
-    let keep: std::collections::BTreeSet<&str> = tree.entries.iter().map(entry_name).collect();
+    // Deletions: what our snapshot tracked and is unchanged since; Overwrite deletes every file and directory the tree lacks.
+    let keep: BTreeSet<&str> = tree.entries.iter().map(entry_name).collect();
     for ent in std::fs::read_dir(dir)? {
         let ent = ent?;
-        let on_disk = ent.file_name();
-        // A non-UTF-8 name can never be a (UTF-8) tree entry → extra.
-        let is_kept = on_disk.to_str().is_some_and(|n| keep.contains(n));
-        if !is_kept {
-            remove_extra(&ent.path())?;
+        let Some(name) = ent.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if keep.contains(name.as_str())
+            || !is_safe_entry_name(&name)
+            || name.starts_with(TMP_PREFIX)
+        {
+            continue;
+        }
+        let path = ent.path();
+        let meta = std::fs::symlink_metadata(&path)?;
+        match (against, find_entry(ours, &name)) {
+            (Against::Overwrite, _) if meta.is_file() => std::fs::remove_file(&path)?,
+            (Against::Overwrite, _) if meta.is_dir() => std::fs::remove_dir_all(&path)?,
+            (Against::Snapshot(_), snap @ Some(Entry::File { .. })) => {
+                if unchanged_since(&meta, snap) {
+                    std::fs::remove_file(&path)?;
+                }
+            }
+            (
+                Against::Snapshot(_),
+                Some(Entry::Dir {
+                    subtree,
+                    subtree_salt,
+                    ..
+                }),
+            ) if meta.is_dir() => {
+                let sub = load_tree(subtree, subtree_salt, rctx.keys, rctx.store)?;
+                remove_tracked(rctx, &path, &sub, depth + 1)?;
+            }
+            _ => {}
         }
     }
 
     for entry in &tree.entries {
+        let name = entry_name(entry);
+        let rel_path = join_rel(rel, name);
+        if !is_materializable(name) {
+            rctx.report.skipped.push(rel_path);
+            continue;
+        }
+        let path = dir.join(name);
+        let disk = std::fs::symlink_metadata(&path).ok();
+        let snap = find_entry(ours, name);
+        let overwrite = matches!(against, Against::Overwrite);
         match entry {
             Entry::File {
-                name,
                 mode,
                 mtime,
                 size,
                 path_salt,
                 chunks,
+                ..
             } => {
-                let path = dir.join(name);
-                // Clear a non-file at this path first; a symlink is unlinked, never followed (the
-                // write must not dereference it onto a target outside the folder).
-                clear_for_regular_file(&path)?;
-                // Stream chunk-by-chunk to disk so a file larger than RAM is never held whole.
-                let mut file = std::fs::File::create(&path)?;
-                let mut written: u64 = 0;
-                for cid in chunks {
-                    let padded = fetch_open(keys, ObjType::Chunk, path_salt, cid, store)?;
-                    let plain = unpad_chunk(&padded, Padding::PowerOfTwo)?;
-                    file.write_all(plain)?;
-                    written += plain.len() as u64;
+                let file = FileTarget {
+                    mode: *mode,
+                    mtime: *mtime,
+                    size: *size,
+                    path_salt,
+                    chunks,
+                };
+                let dest = match &disk {
+                    None => match snap {
+                        // Deleted locally after the snapshot and unchanged upstream: the deletion propagates.
+                        Some(Entry::File { chunks: c, .. }) if !overwrite && c == chunks => None,
+                        _ => Some(path.clone()),
+                    },
+                    Some(m) if m.is_file() => match snap {
+                        // Content unchanged upstream: the disk copy stays, and only an unedited one takes the incoming metadata.
+                        Some(Entry::File { chunks: c, .. }) if !overwrite && c == chunks => {
+                            if unchanged_since(m, snap) {
+                                apply_metadata(&path, *mode, *mtime)?;
+                            }
+                            None
+                        }
+                        _ if overwrite || unchanged_since(m, snap) => Some(path.clone()),
+                        _ => Some(conflict_dest(rctx, dir, name, &rel_path, &keep)),
+                    },
+                    Some(m) if m.is_dir() => {
+                        let cleared = match (overwrite, snap) {
+                            (true, _) => {
+                                std::fs::remove_dir_all(&path)?;
+                                true
+                            }
+                            (
+                                false,
+                                Some(Entry::Dir {
+                                    subtree,
+                                    subtree_salt,
+                                    ..
+                                }),
+                            ) => {
+                                let sub = load_tree(subtree, subtree_salt, rctx.keys, rctx.store)?;
+                                remove_tracked(rctx, &path, &sub, depth + 1)?
+                            }
+                            _ => false,
+                        };
+                        if cleared {
+                            Some(path.clone())
+                        } else {
+                            Some(conflict_dest(rctx, dir, name, &rel_path, &keep))
+                        }
+                    }
+                    // An untracked symlink/special file is unlinked, never followed (§10).
+                    Some(_) => {
+                        std::fs::remove_file(&path)?;
+                        Some(path.clone())
+                    }
+                };
+                if let Some(dest) = dest {
+                    write_file_atomic(rctx, dir, &dest, &file)?;
                 }
-                if written != *size {
-                    return Err(SnapError::Malformed("restored file size mismatch"));
-                }
-                apply_metadata(&path, *mode, *mtime)?;
             }
             Entry::Dir {
-                name,
                 mode,
                 mtime,
                 subtree,
                 subtree_salt,
+                ..
             } => {
-                let path = dir.join(name);
-                // file/symlink → dir type change: remove the old entry (a symlink as a link).
-                if let Ok(meta) = std::fs::symlink_metadata(&path) {
-                    if !meta.file_type().is_dir() {
-                        std::fs::remove_file(&path)?;
+                let snap_sub = match snap {
+                    Some(Entry::Dir {
+                        subtree: s,
+                        subtree_salt: ss,
+                        ..
+                    }) => Some((s, ss)),
+                    _ => None,
+                };
+                let target_dir = match &disk {
+                    None => match snap_sub {
+                        Some((s, _)) if !overwrite && s == subtree => None,
+                        _ => Some(path.clone()),
+                    },
+                    Some(m) if m.is_dir() => Some(path.clone()),
+                    Some(m) if m.is_file() => {
+                        if overwrite || unchanged_since(m, snap) {
+                            std::fs::remove_file(&path)?;
+                            Some(path.clone())
+                        } else {
+                            Some(conflict_dest(rctx, dir, name, &rel_path, &keep))
+                        }
                     }
-                }
-                restore_tree(subtree, subtree_salt, keys, store, &path, depth + 1)?;
-                // Set the dir's metadata AFTER populating it (writing children bumps its mtime).
-                apply_metadata(&path, *mode, *mtime)?;
+                    Some(_) => {
+                        std::fs::remove_file(&path)?;
+                        Some(path.clone())
+                    }
+                };
+                let Some(target_dir) = target_dir else {
+                    continue;
+                };
+                // Recurse against our snapshot of this same path only when writing to it.
+                let sub_snap = match (snap_sub, target_dir == path) {
+                    (Some((s, ss)), true) => Some(load_tree(s, ss, rctx.keys, rctx.store)?),
+                    _ => None,
+                };
+                let sub_against = match against {
+                    Against::Overwrite => Against::Overwrite,
+                    Against::Snapshot(_) => Against::Snapshot(sub_snap.as_ref()),
+                };
+                restore_dir(
+                    rctx,
+                    subtree,
+                    subtree_salt,
+                    sub_against,
+                    &target_dir,
+                    &rel_path,
+                    depth + 1,
+                )?;
+                // Metadata after populating (writing children bumps the dir mtime).
+                apply_metadata(&target_dir, *mode, *mtime)?;
             }
         }
     }
-    Ok(())
-}
-
-/// Apply a deletion: remove a regular file or real directory not in the restored tree. Symlinks and
-/// special files are untouched (never synced, so never secsec's to delete; never traversed).
-fn remove_extra(path: &Path) -> Result<(), SnapError> {
-    let ft = std::fs::symlink_metadata(path)?.file_type();
-    if ft.is_dir() {
-        std::fs::remove_dir_all(path)?;
-    } else if ft.is_file() {
-        std::fs::remove_file(path)?;
+    if let Some(p) = restore_perms {
+        std::fs::set_permissions(dir, p)?;
     }
     Ok(())
 }
 
-/// Free `path` for a regular-file write: remove a directory recursively, unlink a symlink/special
-/// file (never followed); an existing regular file or absent path is left for `write`.
-fn clear_for_regular_file(path: &Path) -> Result<(), SnapError> {
-    if let Ok(ft) = std::fs::symlink_metadata(path).map(|m| m.file_type()) {
-        if ft.is_dir() {
-            std::fs::remove_dir_all(path)?;
-        } else if !ft.is_file() {
-            std::fs::remove_file(path)?;
+/// Record a keep-both copy and return its path.
+fn conflict_dest<K: MasterKeys>(
+    rctx: &mut RestoreCtx<'_, K>,
+    dir: &Path,
+    name: &str,
+    rel_path: &str,
+    keep: &BTreeSet<&str>,
+) -> PathBuf {
+    let cname = local_conflict_name(dir, name, rctx.label, keep);
+    rctx.report.conflicts.push(rel_path.to_string());
+    dir.join(cname)
+}
+
+/// A file's content and metadata to materialize.
+struct FileTarget<'a> {
+    mode: u32,
+    mtime: u64,
+    size: u64,
+    path_salt: &'a PathSalt,
+    chunks: &'a [Id],
+}
+
+/// Write `file` to `dest` atomically: stream into a same-directory temp, fsync, set metadata, rename over.
+fn write_file_atomic<K: MasterKeys>(
+    rctx: &RestoreCtx<'_, K>,
+    dir: &Path,
+    dest: &Path,
+    file: &FileTarget<'_>,
+) -> Result<(), SnapError> {
+    let tmp = dir.join(format!("{TMP_PREFIX}{}", hex_of(&random_bytes::<8>()?)));
+    let result = (|| -> Result<(), SnapError> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        let mut written: u64 = 0;
+        for cid in file.chunks {
+            let padded = fetch_open(rctx.keys, ObjType::Chunk, file.path_salt, cid, rctx.store)?;
+            let plain = unpad_chunk(&padded, Padding::PowerOfTwo)?;
+            // A member-authored entry never makes restore write past its declared size or a chunk past the chunker max.
+            if plain.len() > secsec_chunk::MAX_CHUNK_LEN
+                || written.saturating_add(plain.len() as u64) > file.size
+            {
+                return Err(SnapError::Malformed(
+                    "restored file exceeds its declared size",
+                ));
+            }
+            f.write_all(plain)?;
+            written += plain.len() as u64;
+        }
+        if written != file.size {
+            return Err(SnapError::Malformed("restored file size mismatch"));
+        }
+        f.sync_all()?;
+        drop(f);
+        apply_metadata(&tmp, file.mode, file.mtime)?;
+        replace_file(&tmp, dest)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Rename `tmp` over `dest`; Windows refuses to replace a read-only file, so that attribute is cleared first.
+fn replace_file(tmp: &Path, dest: &Path) -> Result<(), SnapError> {
+    #[cfg(windows)]
+    if let Ok(meta) = std::fs::symlink_metadata(dest) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            std::fs::set_permissions(dest, perms)?;
         }
     }
+    std::fs::rename(tmp, dest)?;
     Ok(())
 }
 
-/// Reproduce the recorded `mode`/`mtime` on the restored path — required for snapshot→restore→
-/// snapshot idempotence (the tree id covers them, §6; dropping them would spuriously re-commit).
+fn hex_of(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Apply the recorded mode (9 bits, §18; 0 means the author had none) and mtime.
 fn apply_metadata(path: &Path, mode: u32, mtime: u64) -> Result<(), SnapError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // 9 standard permission bits only — never restore setuid/setgid/sticky (§18, matches mode_of).
         if mode != 0 {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o0777))?;
         }
     }
     #[cfg(not(unix))]
     let _ = mode;
-    // mtime is nanoseconds since the epoch, member-authored: split into whole seconds + sub-second
-    // nanos, saturating so a hostile value can't wrap and break restore→snapshot idempotence.
+    // Member-authored nanoseconds: split and saturate so a hostile value cannot wrap.
     let secs = i64::try_from(mtime / 1_000_000_000).unwrap_or(i64::MAX);
     let subsec_nanos = (mtime % 1_000_000_000) as u32;
     filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(secs, subsec_nanos))?;
     Ok(())
 }
 
-// ---- tree bridge primitives (§10 merge orchestration) ----
-//
-// Single-level tree I/O exposed for the sync engine, which converts a `Tree` to/from its in-memory
-// merge model and drives the recursion itself (it does not pull `secsec-sync` in here).
+// ---- tree primitives for the merge engine (§10) ----
 
-/// Fetch, open (re-verifying the content address, §9.2), and decode a single `Tree` object. Used by
-/// the merge engine to materialize one directory level; it recurses on `Entry::Dir` children itself.
+/// Fetch, verify (§9.2), and decode one `Tree`.
 pub fn load_tree<K: MasterKeys>(
     tree_id: &Id,
     tree_salt: &PathSalt,
@@ -925,65 +1441,59 @@ pub fn load_tree<K: MasterKeys>(
     decode_tree(&fetch_open(keys, ObjType::Tree, tree_salt, tree_id, store)?)
 }
 
-/// Seal a single `Tree` object under a fresh random salt, store it, and return its `(id, salt)`. The
-/// caller seals child subtrees first and records each child's returned salt in its `Entry::Dir`.
-pub fn seal_tree(tree: &Tree, mk: &MasterKey, store: &Store) -> Result<(Id, PathSalt), SnapError> {
-    let salt = random_salt()?;
-    let (id, blob) = seal_object(mk, ObjType::Tree, &salt, &encode_tree(tree));
-    store.put(&id, &blob)?;
-    Ok((id, salt))
-}
-
-/// Restore the tree named by `(tree_id, tree_salt)` into `dest` (created if absent). Like [`restore`]
-/// but starting from a bare tree id rather than a commit — used to materialize a merged tree.
-pub fn restore_tree_into<K: MasterKeys>(
-    tree_id: &Id,
-    tree_salt: &PathSalt,
-    keys: &K,
+/// Seal one `Tree` under `salt` within the §19 fan-out and object bounds; `dir` names it in the error.
+pub fn seal_tree(
+    tree: &Tree,
+    salt: &PathSalt,
+    mk: &MasterKey,
     store: &Store,
-    dest: &Path,
-) -> Result<(), SnapError> {
-    std::fs::create_dir_all(dest)?;
-    restore_tree(tree_id, tree_salt, keys, store, dest, 0)
+    dir: &str,
+) -> Result<Id, SnapError> {
+    seal_tree_with(tree, salt, mk, store, dir, Limits::SPEC)
 }
 
-// ---- reachable closure (push set / retention, §15) ----
+fn seal_tree_with(
+    tree: &Tree,
+    salt: &PathSalt,
+    mk: &MasterKey,
+    store: &Store,
+    dir: &str,
+    limits: Limits,
+) -> Result<Id, SnapError> {
+    if tree.entries.len() > limits.max_fanout {
+        return Err(SnapError::TreeTooLarge(dir.to_string()));
+    }
+    let (id, blob) = seal_object(mk, ObjType::Tree, salt, &encode_tree(tree));
+    if blob.len() > limits.max_blob {
+        return Err(SnapError::TreeTooLarge(dir.to_string()));
+    }
+    store.put(&id, &blob)?;
+    Ok(id)
+}
 
-/// All object ids reachable from `heads` (commits + parents + trees + chunks). Each commit in `heads`
-/// and its own tree are **strict** — a missing object errors, because current content must be complete
-/// — while an ancestor commit's content is **skip-missing**: history pruned beyond retention is simply
-/// absent (§15/I5). Every present object is opened (§9.2-verified).
+// ---- closures (push set / retention / cache sweep, §15) ----
+
+/// Every object reachable from `head`: commits and their present content; the head's own tree is strict.
 pub fn reachable_objects<K: MasterKeys>(
     keys: &K,
     store: &Store,
-    heads: &[Id],
-) -> Result<std::collections::BTreeSet<Id>, SnapError> {
-    use std::collections::BTreeSet;
-    let head_set: BTreeSet<Id> = heads.iter().copied().collect();
+    head: &Id,
+) -> Result<BTreeSet<Id>, SnapError> {
     let mut reachable: BTreeSet<Id> = BTreeSet::new();
     let mut commits_done: BTreeSet<Id> = BTreeSet::new();
-    let mut work: Vec<Id> = heads.to_vec();
-
+    let mut work: Vec<Id> = vec![*head];
     while let Some(cid) = work.pop() {
         if !commits_done.insert(cid) {
             continue;
         }
-        let is_head = head_set.contains(&cid);
-        // A head commit must be present; a pruned ancestor commit is skipped (commits are kept, I4,
-        // so this only fires on a genuinely truncated history).
+        let is_head = cid == *head;
         let blob = match store.get(&cid)? {
             Some(b) => b,
             None if is_head => return Err(SnapError::Missing(cid)),
             None => continue,
         };
         reachable.insert(cid);
-        let (commit, _sig) = decode_signed_commit(&open_object(
-            keys,
-            ObjType::Commit,
-            &ZERO_SALT,
-            &cid,
-            &blob,
-        )?)?;
+        let (commit, _sig) = verified_commit(keys, &cid, &blob)?;
         collect_tree(
             keys,
             store,
@@ -993,50 +1503,68 @@ pub fn reachable_objects<K: MasterKeys>(
             &mut reachable,
             is_head,
         )?;
-        for parent in commit.parents {
-            work.push(parent);
-        }
+        work.extend(commit.parents);
     }
     Ok(reachable)
 }
 
+/// Every tree and chunk id under `(root, salt)`, strict, not descending into subtrees already in `known`.
+pub fn tree_closure<K: MasterKeys>(
+    keys: &K,
+    store: &Store,
+    root: &Id,
+    salt: &PathSalt,
+    known: &BTreeSet<Id>,
+    out: &mut BTreeSet<Id>,
+) -> Result<(), SnapError> {
+    let mut work: Vec<(Id, PathSalt, usize)> = vec![(*root, *salt, 0)];
+    while let Some((id, s, depth)) = work.pop() {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(SnapError::DepthExceeded);
+        }
+        if known.contains(&id) || !out.insert(id) {
+            continue;
+        }
+        for e in load_tree(&id, &s, keys, store)?.entries {
+            match e {
+                Entry::File { chunks, .. } => out.extend(chunks),
+                Entry::Dir {
+                    subtree,
+                    subtree_salt,
+                    ..
+                } => work.push((subtree, subtree_salt, depth + 1)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk one tree into `reachable`; chunk ids come from the verified tree. Missing is an error only when `strict`.
 fn collect_tree<K: MasterKeys>(
     keys: &K,
     store: &Store,
     tree_id: &Id,
     tree_salt: &PathSalt,
     depth: usize,
-    reachable: &mut std::collections::BTreeSet<Id>,
+    reachable: &mut BTreeSet<Id>,
     strict: bool,
 ) -> Result<(), SnapError> {
     if depth >= MAX_TREE_DEPTH {
         return Err(SnapError::DepthExceeded);
     }
     if reachable.contains(tree_id) {
-        return Ok(()); // shared subtree already walked
+        return Ok(());
     }
-    // A pruned tree is absent: under the head's own tree that is an error (current content must be
-    // complete); under an ancestor it is skipped — its old content fell out of retention (§15/I5).
     let blob = match store.get(tree_id)? {
         Some(b) => b,
         None if strict => return Err(SnapError::Missing(*tree_id)),
         None => return Ok(()),
     };
     reachable.insert(*tree_id);
-    let tree = decode_tree(&open_object(
-        keys,
-        ObjType::Tree,
-        tree_salt,
-        tree_id,
-        &blob,
-    )?)?;
+    let tree = verified_tree(keys, tree_id, tree_salt, &blob)?;
     for entry in &tree.entries {
         match entry {
-            Entry::File { chunks, .. } => {
-                for cid in chunks {
-                    reachable.insert(*cid);
-                }
-            }
+            Entry::File { chunks, .. } => reachable.extend(chunks.iter().copied()),
             Entry::Dir {
                 subtree,
                 subtree_salt,
@@ -1055,12 +1583,12 @@ fn collect_tree<K: MasterKeys>(
     Ok(())
 }
 
-// ---- path resolution, single-path restore, and tree diff (§10 history: `secsec log` / `restore`) ----
+// ---- path resolution, single-path restore, and tree diff (`secsec log` / `restore`) ----
 
-/// A file or directory resolved at a path within a commit's tree (for `secsec log`/`restore`).
+/// A file or directory resolved at a path within a commit's tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathNode {
-    /// A regular file: its content is the ordered `chunks` sealed under `path_salt` (§9.2).
+    /// A regular file.
     File {
         /// Unix mode bits.
         mode: u32,
@@ -1070,10 +1598,10 @@ pub enum PathNode {
         size: u64,
         /// The file's path salt.
         path_salt: PathSalt,
-        /// Ordered chunk ids — the file's content identity.
+        /// Ordered chunk ids.
         chunks: Vec<Id>,
     },
-    /// A directory: the subtree object id + its salt.
+    /// A directory.
     Dir {
         /// Subtree content id.
         subtree: Id,
@@ -1082,16 +1610,14 @@ pub enum PathNode {
     },
 }
 
-/// Split a slash-separated repo-relative path into clean components (dropping empty/`.` segments).
+/// Split a slash path into components, dropping empty and `.` segments.
 fn path_components(path: &str) -> Vec<&str> {
     path.split('/')
         .filter(|c| !c.is_empty() && *c != ".")
         .collect()
 }
 
-/// Resolve the slash-separated `path` (relative to `(root_tree, root_salt)`) to the file or directory
-/// there, or `None` if any component is missing (or a non-final component is a file). An empty path
-/// resolves to the root directory. Walks one tree level per component (re-verifying §9.2 on each).
+/// Resolve `path` under `(root_tree, root_salt)`; `None` if missing or a non-final component is a file.
 pub fn resolve_path<K: MasterKeys>(
     keys: &K,
     store: &Store,
@@ -1109,7 +1635,7 @@ pub fn resolve_path<K: MasterKeys>(
     let (mut cur_tree, mut cur_salt) = (*root_tree, *root_salt);
     for (i, comp) in comps.iter().enumerate() {
         let tree = load_tree(&cur_tree, &cur_salt, keys, store)?;
-        let Some(entry) = tree.entries.iter().find(|e| entry_name(e) == *comp) else {
+        let Some(entry) = find_entry(Some(&tree), comp) else {
             return Ok(None);
         };
         let last = i + 1 == comps.len();
@@ -1149,66 +1675,73 @@ pub fn resolve_path<K: MasterKeys>(
     Ok(None)
 }
 
-/// The object ids needed to materialize `path` from `(root_tree, root_salt)`: the tree ids on the
-/// spine from the root to `path`, plus — for a file — its chunk ids, or — for a directory — the full
-/// closure under it. `None` if `path` does not resolve (or its spine has already been pruned). Used by
-/// retention to keep one specific version's content (§15); skip-missing, so an already-pruned part is
-/// simply not added.
-pub fn path_content<K: MasterKeys>(
+/// Chunk ids needed to materialize `path` (a file's chunks, or all under a directory); skip-missing, `None` if unresolvable.
+pub fn path_chunks<K: MasterKeys>(
     keys: &K,
     store: &Store,
     root_tree: &Id,
     root_salt: &PathSalt,
     path: &str,
-) -> Result<Option<std::collections::BTreeSet<Id>>, SnapError> {
-    let mut content: std::collections::BTreeSet<Id> = std::collections::BTreeSet::new();
-    content.insert(*root_tree);
-    let comps = path_components(path);
-    if comps.is_empty() {
-        collect_tree(keys, store, root_tree, root_salt, 0, &mut content, false)?;
-        return Ok(Some(content));
-    }
-    let (mut cur_tree, mut cur_salt) = (*root_tree, *root_salt);
-    for (i, comp) in comps.iter().enumerate() {
-        let tree = match load_tree(&cur_tree, &cur_salt, keys, store) {
-            Ok(t) => t,
-            Err(SnapError::Missing(_)) => return Ok(None), // this version's spine is already pruned
-            Err(e) => return Err(e),
-        };
-        let Some(entry) = tree.entries.iter().find(|e| entry_name(e) == *comp) else {
-            return Ok(None);
-        };
-        let last = i + 1 == comps.len();
-        match entry {
-            Entry::File { chunks, .. } => {
-                if last {
-                    content.extend(chunks.iter().copied());
-                    return Ok(Some(content));
+) -> Result<Option<BTreeSet<Id>>, SnapError> {
+    let node = match resolve_path(keys, store, root_tree, root_salt, path) {
+        Ok(Some(n)) => n,
+        Ok(None) | Err(SnapError::Missing(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut out = BTreeSet::new();
+    match node {
+        PathNode::File { chunks, .. } => out.extend(chunks),
+        PathNode::Dir {
+            subtree,
+            subtree_salt,
+        } => {
+            let mut all = BTreeSet::new();
+            collect_tree(keys, store, &subtree, &subtree_salt, 0, &mut all, false)?;
+            let mut trees = BTreeSet::new();
+            let mut work = vec![(subtree, subtree_salt)];
+            while let Some((t, s)) = work.pop() {
+                if !trees.insert(t) {
+                    continue;
                 }
-                return Ok(None); // a non-final component is a file
-            }
-            Entry::Dir {
-                subtree,
-                subtree_salt,
-                ..
-            } => {
-                content.insert(*subtree);
-                if last {
-                    collect_tree(keys, store, subtree, subtree_salt, 0, &mut content, false)?;
-                    return Ok(Some(content));
+                if let Some(blob) = store.get(&t)? {
+                    for e in verified_tree(keys, &t, &s, &blob)?.entries {
+                        if let Entry::Dir {
+                            subtree,
+                            subtree_salt,
+                            ..
+                        } = e
+                        {
+                            work.push((subtree, subtree_salt));
+                        }
+                    }
                 }
-                cur_tree = *subtree;
-                cur_salt = *subtree_salt;
             }
+            out.extend(all.difference(&trees).copied());
         }
     }
-    Ok(None)
+    Ok(Some(out))
 }
 
-/// Restore the file or directory at `path` from `commit` into `dest_root` at the same relative
-/// `path` — the read side of `secsec restore`. A file is materialized (parent dirs created, §9.2
-/// verified, padding stripped); a directory is restored recursively. `PathNotFound` if the path did
-/// not exist in that commit's tree. The caller then lets the normal sync commit + propagate it.
+/// Resolve `comps` under `root` one by one, creating directories but refusing any symlink or non-directory on the way.
+fn safe_join(root: &Path, comps: &[&str]) -> Result<PathBuf, SnapError> {
+    let mut cur = root.to_path_buf();
+    let Some((last, parents)) = comps.split_last() else {
+        return Ok(cur);
+    };
+    for c in parents {
+        cur.push(c);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(SnapError::UnsafePath(cur.display().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&cur)?,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    cur.push(last);
+    Ok(cur)
+}
+
+/// `secsec restore`: write `path` from `commit` into `dest_root` at the same relative path, overwriting (§10 history).
 pub fn restore_path<K: MasterKeys>(
     keys: &K,
     store: &Store,
@@ -1216,13 +1749,9 @@ pub fn restore_path<K: MasterKeys>(
     path: &str,
     dest_root: &Path,
 ) -> Result<(), SnapError> {
-    // Confine the write to `dest_root` before doing any work. `path` is caller-supplied and
-    // `Path::join` with an absolute argument discards the base entirely, so build the target from
-    // validated components (which drops a leading `/`) and reject `..` outright rather than leaning
-    // on `resolve_path` failing first — no tree entry can be named `..` (§18), but that is a
-    // property of another function.
+    // Confine the write to `dest_root` by construction: validated components only, never `..`, never a symlink.
     let comps = path_components(path);
-    if comps.contains(&"..") {
+    if comps.iter().any(|c| *c == ".." || !is_materializable(c)) {
         return Err(SnapError::UnsafePath(path.to_string()));
     }
     let node = match resolve_path(keys, store, &commit.root_tree, &commit.root_salt, path) {
@@ -1233,7 +1762,18 @@ pub fn restore_path<K: MasterKeys>(
         }
         Err(e) => return Err(e),
     };
-    let target = comps.iter().fold(dest_root.to_path_buf(), |t, c| t.join(c));
+    let target = safe_join(dest_root, &comps)?;
+    let parent = target.parent().unwrap_or(dest_root).to_path_buf();
+    let rctx = RestoreCtx {
+        keys,
+        store,
+        label: "",
+        report: RestoreReport::default(),
+    };
+    let pruned = |e: SnapError| match e {
+        SnapError::Missing(_) => SnapError::PrunedBeyondRetention(path.to_string()),
+        e => e,
+    };
     match node {
         PathNode::File {
             mode,
@@ -1242,42 +1782,52 @@ pub fn restore_path<K: MasterKeys>(
             path_salt,
             chunks,
         } => {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
+            // A symlink or directory in the way is replaced, never followed.
+            if let Ok(m) = std::fs::symlink_metadata(&target) {
+                if m.is_dir() {
+                    std::fs::remove_dir_all(&target)?;
+                }
             }
-            let mut file = std::fs::File::create(&target)?;
-            let mut written: u64 = 0;
-            for cid in &chunks {
-                let padded = match fetch_open(keys, ObjType::Chunk, &path_salt, cid, store) {
-                    Ok(b) => b,
-                    Err(SnapError::Missing(_)) => {
-                        return Err(SnapError::PrunedBeyondRetention(path.to_string()))
-                    }
-                    Err(e) => return Err(e),
-                };
-                let plain = unpad_chunk(&padded, Padding::PowerOfTwo)?;
-                file.write_all(plain)?;
-                written += plain.len() as u64;
-            }
-            if written != size {
-                return Err(SnapError::Malformed("restored file size mismatch"));
-            }
-            apply_metadata(&target, mode, mtime)?;
+            write_file_atomic(
+                &rctx,
+                &parent,
+                &target,
+                &FileTarget {
+                    mode,
+                    mtime,
+                    size,
+                    path_salt: &path_salt,
+                    chunks: &chunks,
+                },
+            )
+            .map_err(pruned)?;
         }
         PathNode::Dir {
             subtree,
             subtree_salt,
         } => {
-            restore_tree_into(&subtree, &subtree_salt, keys, store, &target)?;
+            if let Ok(m) = std::fs::symlink_metadata(&target) {
+                if !m.is_dir() {
+                    std::fs::remove_file(&target)?;
+                }
+            }
+            let mut rctx = rctx;
+            restore_dir(
+                &mut rctx,
+                &subtree,
+                &subtree_salt,
+                Against::Overwrite,
+                &target,
+                path,
+                0,
+            )
+            .map_err(pruned)?;
         }
     }
     Ok(())
 }
 
-/// The set of **file** paths whose content differs between `old` and `new` trees (each `(id, salt)`,
-/// or `None` for an empty side — e.g. a commit with no parent). Slash-separated, sorted. Unchanged
-/// subtrees are pruned by id equality, so this is cheap (it never descends into identical subtrees).
-/// Used to summarize what a commit changed vs its parent (`secsec log`).
+/// File paths whose content differs between two trees (`None` = empty side), sorted; identical subtrees are skipped.
 pub fn changed_paths<K: MasterKeys>(
     keys: &K,
     store: &Store,
@@ -1290,7 +1840,6 @@ pub fn changed_paths<K: MasterKeys>(
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn diff_trees<K: MasterKeys>(
     keys: &K,
     store: &Store,
@@ -1303,12 +1852,11 @@ fn diff_trees<K: MasterKeys>(
     if depth >= MAX_TREE_DEPTH {
         return Err(SnapError::DepthExceeded);
     }
+    // A tree absent from the store is an empty side, so `log` lists the commit without a diff.
     let load = |t: Option<(&Id, &PathSalt)>| -> Result<Vec<Entry>, SnapError> {
         match t {
             Some((id, salt)) => match load_tree(id, salt, keys, store) {
                 Ok(tree) => Ok(tree.entries),
-                // A tree pruned beyond retention is treated as an empty side, so `log` lists the commit
-                // without a diff rather than erroring (§15).
                 Err(SnapError::Missing(_)) => Ok(Vec::new()),
                 Err(e) => Err(e),
             },
@@ -1317,22 +1865,23 @@ fn diff_trees<K: MasterKeys>(
     };
     let old_entries = load(old)?;
     let new_entries = load(new)?;
-    let by_name = |es: &[Entry]| -> std::collections::BTreeMap<String, Entry> {
+    let by_name = |es: &[Entry]| -> BTreeMap<String, Entry> {
         es.iter()
             .map(|e| (entry_name(e).to_string(), e.clone()))
             .collect()
     };
     let om = by_name(&old_entries);
     let nm = by_name(&new_entries);
-    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for k in om.keys().chain(nm.keys()) {
-        names.insert(k.clone());
-    }
-    for name in &names {
-        let path = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}/{name}")
+    let names: BTreeSet<&String> = om.keys().chain(nm.keys()).collect();
+    for name in names {
+        let path = join_rel(prefix, name);
+        let dir_side = |e: Option<&Entry>| match e {
+            Some(Entry::Dir {
+                subtree,
+                subtree_salt,
+                ..
+            }) => Some((*subtree, *subtree_salt)),
+            _ => None,
         };
         match (om.get(name), nm.get(name)) {
             (Some(Entry::File { chunks: oc, .. }), Some(Entry::File { chunks: nc, .. })) => {
@@ -1340,47 +1889,22 @@ fn diff_trees<K: MasterKeys>(
                     out.push(path);
                 }
             }
-            (
-                Some(Entry::Dir {
-                    subtree: os,
-                    subtree_salt: oss,
-                    ..
-                }),
-                Some(Entry::Dir {
-                    subtree: ns,
-                    subtree_salt: nss,
-                    ..
-                }),
-            ) => {
-                if os != ns {
+            (o, n) => {
+                // A file on either side is itself a change (added, removed, or replaced by a directory).
+                if matches!(o, Some(Entry::File { .. })) || matches!(n, Some(Entry::File { .. })) {
+                    out.push(path.clone());
+                }
+                let (od, nd) = (dir_side(o), dir_side(n));
+                if (od.is_some() || nd.is_some()) && od.map(|d| d.0) != nd.map(|d| d.0) {
                     diff_trees(
                         keys,
                         store,
-                        Some((os, oss)),
-                        Some((ns, nss)),
+                        od.as_ref().map(|(i, s)| (i, s)),
+                        nd.as_ref().map(|(i, s)| (i, s)),
                         &path,
                         depth + 1,
                         out,
                     )?;
-                }
-            }
-            // added / removed / type-changed: recurse into a present dir to list its files, else report.
-            (o, n) => {
-                let side = |e: Option<&Entry>| match e {
-                    Some(Entry::Dir {
-                        subtree,
-                        subtree_salt,
-                        ..
-                    }) => Some((*subtree, *subtree_salt)),
-                    _ => None,
-                };
-                match (side(o), side(n)) {
-                    (od, nd) if od.is_some() || nd.is_some() => {
-                        let oref = od.as_ref().map(|(i, s)| (i, s));
-                        let nref = nd.as_ref().map(|(i, s)| (i, s));
-                        diff_trees(keys, store, oref, nref, &path, depth + 1, out)?;
-                    }
-                    _ => out.push(path), // file added/removed, or file<->dir type change
                 }
             }
         }
@@ -1391,144 +1915,217 @@ fn diff_trees<K: MasterKeys>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
-    /// A file too big to encode into a decodable tree must be reported, must NOT fail the snapshot,
-    /// and — once it has been synced before — must keep its previous entry. Dropping the name instead
-    /// would reach every other device as a deletion of a file the user still has.
+    fn mk() -> MasterKey {
+        MasterKey::new(1, [0x66; 32])
+    }
+
+    fn store_in(dir: &tempfile::TempDir) -> Store {
+        Store::open(dir.path().join("s.redb")).unwrap()
+    }
+
+    fn snap(
+        src: &Path,
+        m: &impl MasterKeys,
+        store: &Store,
+        prior: Option<(&Id, &PathSalt)>,
+    ) -> Snapshot {
+        snapshot_tree(
+            src,
+            m,
+            store,
+            prior.map(|(root, salt)| Prior {
+                root,
+                salt,
+                fast_path: true,
+            }),
+            &mut SnapshotMemo::default(),
+        )
+        .unwrap()
+    }
+
+    fn restore_into(t: &Snapshot, m: &MasterKey, store: &Store, dst: &Path) -> RestoreReport {
+        restore_tree_into((&t.root, &t.salt), None, m, store, dst, "L").unwrap()
+    }
+
+    /// Read a directory into `relative-path → contents` (dirs as `path/`).
+    fn read_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            let mut ents: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            ents.sort();
+            for p in ents {
+                let rel = p
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .replace('\\', "/");
+                if p.is_dir() {
+                    out.insert(format!("{rel}/"), Vec::new());
+                    walk(base, &p, out);
+                } else {
+                    out.insert(rel, std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
     #[test]
-    fn oversized_file_is_reported_and_freezes_at_its_last_version() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+    fn oversized_file_is_reported_frozen_and_memoized() {
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let m = mk();
-        // A one-chunk cap: any file the chunker cuts twice is "oversized" for this walk.
         let tight = Limits {
             max_chunks_per_file: 1,
             ..Limits::SPEC
         };
+        let mut memo = SnapshotMemo::default();
 
         let src = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("small"), b"still small").unwrap();
         std::fs::write(src.path().join("big"), vec![7u8; 8]).unwrap();
-        let (rt1, rs1, skipped) = snapshot_tree_with(src.path(), &m, &store, None, tight).unwrap();
-        assert!(skipped.is_empty(), "one chunk each, nothing skipped yet");
-        let v1 = load_tree(&rt1, &rs1, &m, &store).unwrap();
-        assert_eq!(v1.entries.len(), 2);
+        let s1 = snapshot_tree_with(src.path(), &m, &store, None, &mut memo, tight).unwrap();
+        assert!(s1.skipped.is_empty());
+        let v1 = load_tree(&s1.root, &s1.salt, &m, &store).unwrap();
 
-        // Grow `big` past the cap. The snapshot still succeeds, says so, and keeps v1's entry.
         std::fs::write(src.path().join("big"), vec![7u8; 600 * 1024]).unwrap();
-        let (rt2, rs2, skipped) =
-            snapshot_tree_with(src.path(), &m, &store, Some((&rt1, &rs1)), tight).unwrap();
-        assert_eq!(
-            skipped.len(),
-            1,
-            "the oversized file is reported: {skipped:?}"
-        );
-        assert!(skipped[0].contains("big"));
+        let prior = Prior {
+            root: &s1.root,
+            salt: &s1.salt,
+            fast_path: true,
+        };
+        let s2 = snapshot_tree_with(src.path(), &m, &store, Some(prior), &mut memo, tight).unwrap();
+        assert_eq!(s2.skipped.len(), 1);
+        assert!(s2.skipped[0].contains("big"));
+        let v2 = load_tree(&s2.root, &s2.salt, &m, &store).unwrap();
+        assert_eq!(find_entry(Some(&v1), "big"), find_entry(Some(&v2), "big"));
 
-        let v2 = load_tree(&rt2, &rs2, &m, &store).unwrap();
-        let names: Vec<&str> = v2.entries.iter().map(entry_name).collect();
-        assert!(
-            names.contains(&"big"),
-            "an oversized file must freeze, never disappear (a missing name is a deletion)"
-        );
-        // Frozen at v1's content, not the new oversized content.
-        let (before, after) = (
-            v1.entries.iter().find(|e| entry_name(e) == "big").unwrap(),
-            v2.entries.iter().find(|e| entry_name(e) == "big").unwrap(),
-        );
-        assert_eq!(before, after, "the kept entry is the last syncable version");
+        // The memo spares the next pass a re-chunk: no new chunk objects appear.
+        let before = store.object_count().unwrap();
+        let s3 = snapshot_tree_with(src.path(), &m, &store, Some(prior), &mut memo, tight).unwrap();
+        assert_eq!(s3.skipped.len(), 1);
+        assert_eq!(s3.root, s2.root);
+        assert_eq!(store.object_count().unwrap(), before);
     }
 
-    /// A first-ever oversized file has no previous version to keep, so it is simply reported and
-    /// left out — never authored into a tree no device could decode.
     #[test]
     fn oversized_file_never_seen_before_is_just_reported() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let m = mk();
         let src = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("keep"), b"ok").unwrap();
         std::fs::write(src.path().join("huge"), vec![3u8; 600 * 1024]).unwrap();
-
-        let (rt, rs, skipped) = snapshot_tree_with(
+        let s = snapshot_tree_with(
             src.path(),
             &m,
             &store,
             None,
+            &mut SnapshotMemo::default(),
             Limits {
                 max_chunks_per_file: 1,
                 ..Limits::SPEC
             },
         )
         .unwrap();
-        assert_eq!(skipped.len(), 1);
-        let tree = load_tree(&rt, &rs, &m, &store).unwrap();
+        assert_eq!(s.skipped.len(), 1);
+        let tree = load_tree(&s.root, &s.salt, &m, &store).unwrap();
         let names: Vec<&str> = tree.entries.iter().map(entry_name).collect();
         assert_eq!(names, vec!["keep"]);
     }
 
-    /// Fan-out and encoded-size overflow are not attributable to one entry, and silently truncating a
-    /// directory reads as a bulk deletion — so both fail loudly instead of authoring an undecodable
-    /// tree. The regression this guards: before, the encoder had no bound at all and the decoder did.
+    /// Fan-out and object-size overflow fail loudly; a skipped name does not count toward fan-out.
     #[test]
     fn undecodable_directory_fails_loudly_rather_than_being_authored() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let m = mk();
         let src = tempfile::tempdir().unwrap();
         for i in 0..4 {
             std::fs::write(src.path().join(format!("f{i}")), b"x").unwrap();
         }
-
-        assert!(matches!(
+        let run = |limits: Limits| {
             snapshot_tree_with(
                 src.path(),
                 &m,
                 &store,
                 None,
-                Limits {
-                    max_fanout: 3,
-                    ..Limits::SPEC
-                }
-            ),
+                &mut SnapshotMemo::default(),
+                limits,
+            )
+        };
+        assert!(matches!(
+            run(Limits {
+                max_fanout: 3,
+                ..Limits::SPEC
+            }),
             Err(SnapError::TreeTooLarge(_))
         ));
         assert!(matches!(
-            snapshot_tree_with(
-                src.path(),
-                &m,
-                &store,
-                None,
-                Limits {
-                    max_blob: 32,
-                    ..Limits::SPEC
-                }
-            ),
+            run(Limits {
+                max_blob: 32,
+                ..Limits::SPEC
+            }),
             Err(SnapError::TreeTooLarge(_))
         ));
-        // At the real bounds the same directory is fine.
-        assert!(snapshot_tree_with(src.path(), &m, &store, None, Limits::SPEC).is_ok());
+        std::fs::write(src.path().join(format!("{TMP_PREFIX}x")), b"temp").unwrap();
+        assert!(run(Limits {
+            max_fanout: 4,
+            ..Limits::SPEC
+        })
+        .is_ok());
     }
 
-    /// `restore_path` writes attacker-influenceable paths to the real filesystem, so the target must
-    /// stay under `dest_root` on its own — not because some other function happened to reject the
-    /// path first. `Path::join` with an absolute argument discards the base entirely.
+    /// `seal_tree` applies the same §19 bounds as a snapshot (merges never author undecodable trees).
+    #[test]
+    fn seal_tree_enforces_bounds() {
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
+        let m = mk();
+        let file = |n: &str| Entry::File {
+            name: n.into(),
+            mode: 0o644,
+            mtime: 0,
+            size: 0,
+            path_salt: [0; 16],
+            chunks: vec![],
+        };
+        let tree = Tree {
+            entries: vec![file("a"), file("b")],
+        };
+        let tight = Limits {
+            max_fanout: 1,
+            ..Limits::SPEC
+        };
+        assert!(matches!(
+            seal_tree_with(&tree, &[1; 16], &m, &store, "d", tight),
+            Err(SnapError::TreeTooLarge(_))
+        ));
+        let a = seal_tree(&tree, &[1; 16], &m, &store, "d").unwrap();
+        assert_eq!(a, seal_tree(&tree, &[1; 16], &m, &store, "d").unwrap());
+    }
+
+    /// `restore_path` confines writes to `dest_root`: no `..`, no leading `/` escape, no symlink traversal.
     #[test]
     fn restore_path_stays_inside_the_destination_root() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let m = mk();
         let src = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(src.path().join("d")).unwrap();
         std::fs::write(src.path().join("d/f"), b"content").unwrap();
-        let (rt, rs, _) = snapshot_tree(src.path(), &m, &store, None).unwrap();
-        let dev = secsec_sig::DeviceKey::generate().unwrap();
+        let s = snap(src.path(), &m, &store, None);
         let commit = Commit {
-            root_tree: rt,
-            root_salt: rs,
+            root_tree: s.root,
+            root_salt: s.salt,
             parents: vec![],
-            device_id: dev.device_id().unwrap(),
+            device_id: [0; 32],
             version: 1,
             roster_seq: 0,
             last_seen_head: [0u8; 32],
@@ -1536,70 +2133,72 @@ mod tests {
         };
 
         let dest = tempfile::tempdir().unwrap();
-        // `..` is refused outright rather than resolved.
         assert!(matches!(
             restore_path(&m, &store, &commit, "../escape", dest.path()),
             Err(SnapError::UnsafePath(_))
         ));
-        // A leading `/` must not turn the target absolute: the components resolve under dest_root.
         restore_path(&m, &store, &commit, "/d/f", dest.path()).unwrap();
         assert_eq!(std::fs::read(dest.path().join("d/f")).unwrap(), b"content");
-        // ...and the plain relative form lands in the same place.
-        restore_path(&m, &store, &commit, "d/f", dest.path()).unwrap();
-        assert_eq!(std::fs::read(dest.path().join("d/f")).unwrap(), b"content");
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            let dest2 = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), dest2.path().join("d")).unwrap();
+            assert!(matches!(
+                restore_path(&m, &store, &commit, "d/f", dest2.path()),
+                Err(SnapError::UnsafePath(_))
+            ));
+            assert!(
+                !outside.path().join("f").exists(),
+                "no write through a symlink"
+            );
+        }
     }
 
-    fn mk() -> MasterKey {
-        MasterKey::new(1, [0x66; 32])
-    }
-
-    /// `secsec log`/`restore` cores: resolve a path, diff two snapshots for the changed file, and
-    /// restore an old version of a file/folder over the current working copy.
     #[test]
     fn path_resolve_diff_and_restore() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let m = mk();
 
-        // v1: a/x="one", a/y="two", b="three".
         let src = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(src.path().join("a")).unwrap();
         std::fs::write(src.path().join("a/x"), b"one").unwrap();
         std::fs::write(src.path().join("a/y"), b"two").unwrap();
         std::fs::write(src.path().join("b"), b"three").unwrap();
-        let (rt1, rs1, _) = snapshot_tree(src.path(), &m, &store, None).unwrap();
+        let s1 = snap(src.path(), &m, &store, None);
 
-        // resolve a file, a dir, and missing paths.
         let Some(PathNode::File { size, .. }) =
-            resolve_path(&m, &store, &rt1, &rs1, "a/x").unwrap()
+            resolve_path(&m, &store, &s1.root, &s1.salt, "a/x").unwrap()
         else {
             panic!("a/x is a file")
         };
         assert_eq!(size, 3);
         assert!(matches!(
-            resolve_path(&m, &store, &rt1, &rs1, "a").unwrap(),
+            resolve_path(&m, &store, &s1.root, &s1.salt, "a").unwrap(),
             Some(PathNode::Dir { .. })
         ));
-        assert!(resolve_path(&m, &store, &rt1, &rs1, "nope")
-            .unwrap()
-            .is_none());
-        assert!(resolve_path(&m, &store, &rt1, &rs1, "a/nope")
+        assert!(resolve_path(&m, &store, &s1.root, &s1.salt, "nope")
             .unwrap()
             .is_none());
 
-        // v2: change only a/x.
         std::fs::write(src.path().join("a/x"), b"ONE-modified").unwrap();
-        let (rt2, rs2, _) = snapshot_tree(src.path(), &m, &store, Some((&rt1, &rs1))).unwrap();
+        let s2 = snap(src.path(), &m, &store, Some((&s1.root, &s1.salt)));
         assert_eq!(
-            changed_paths(&m, &store, Some((&rt1, &rs1)), Some((&rt2, &rs2))).unwrap(),
-            vec!["a/x".to_string()],
-            "only a/x changed between the two snapshots"
+            changed_paths(
+                &m,
+                &store,
+                Some((&s1.root, &s1.salt)),
+                Some((&s2.root, &s2.salt))
+            )
+            .unwrap(),
+            vec!["a/x".to_string()]
         );
 
-        // restore the OLD a/x (v1) over the current (v2) working copy.
         let c1 = Commit {
-            root_tree: rt1,
-            root_salt: rs1,
+            root_tree: s1.root,
+            root_salt: s1.salt,
             parents: vec![],
             device_id: [0; 32],
             version: 1,
@@ -1610,20 +2209,49 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(work.path().join("a")).unwrap();
         std::fs::write(work.path().join("a/x"), b"ONE-modified").unwrap();
+        std::fs::write(work.path().join("a/new"), b"later").unwrap();
         restore_path(&m, &store, &c1, "a/x", work.path()).unwrap();
         assert_eq!(std::fs::read(work.path().join("a/x")).unwrap(), b"one");
 
-        // restore a whole folder (a/) from v1 — both files come back.
-        std::fs::remove_dir_all(work.path().join("a")).unwrap();
+        // A folder restore makes the folder exactly the old version.
         restore_path(&m, &store, &c1, "a", work.path()).unwrap();
-        assert_eq!(std::fs::read(work.path().join("a/x")).unwrap(), b"one");
         assert_eq!(std::fs::read(work.path().join("a/y")).unwrap(), b"two");
-
-        // a path that never existed errors clearly.
+        assert!(!work.path().join("a/new").exists());
         assert!(matches!(
             restore_path(&m, &store, &c1, "nope", work.path()),
             Err(SnapError::PathNotFound(_))
         ));
+    }
+
+    /// A file↔directory swap reports the file path and the directory's files.
+    #[test]
+    fn changed_paths_reports_type_changes() {
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
+        let m = mk();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("x"), b"file").unwrap();
+        let s1 = snap(src.path(), &m, &store, None);
+        std::fs::remove_file(src.path().join("x")).unwrap();
+        std::fs::create_dir(src.path().join("x")).unwrap();
+        std::fs::write(src.path().join("x/inner"), b"i").unwrap();
+        let s2 = snap(src.path(), &m, &store, Some((&s1.root, &s1.salt)));
+        let fwd = changed_paths(
+            &m,
+            &store,
+            Some((&s1.root, &s1.salt)),
+            Some((&s2.root, &s2.salt)),
+        )
+        .unwrap();
+        assert_eq!(fwd, vec!["x".to_string(), "x/inner".to_string()]);
+        let back = changed_paths(
+            &m,
+            &store,
+            Some((&s2.root, &s2.salt)),
+            Some((&s1.root, &s1.salt)),
+        )
+        .unwrap();
+        assert_eq!(back, vec!["x".to_string(), "x/inner".to_string()]);
     }
 
     #[test]
@@ -1659,16 +2287,13 @@ mod tests {
             last_seen_head: [5u8; 32],
             ts: 1234,
         };
-        // the stored commit object is the signed form (fields ‖ sig); round-trips through the codec.
         let (got, sig) =
             decode_signed_commit(&encode_signed_commit(&commit, b"sig-bytes")).unwrap();
         assert_eq!(got, commit);
         assert_eq!(sig, b"sig-bytes");
     }
 
-    /// Path-traversal guard (§9.2/§18): `decode_tree` MUST reject a tree entry whose name could escape
-    /// the synced folder on restore. `encode_tree` happily serializes any name (a malicious member
-    /// authors the bytes), so the decode-side check is the security boundary.
+    /// §18: the decoder rejects names that could escape the folder or inject control bytes.
     #[test]
     fn decode_tree_rejects_path_traversal_names() {
         let one = |name: &str| Tree {
@@ -1690,7 +2315,7 @@ mod tests {
             "/abs",
             "back\\slash",
             "nul\0byte",
-            "tab\there", // control characters are rejected (terminal-escape / cross-platform safety)
+            "tab\there",
             "bell\x07",
             "esc\x1b[2J",
             "del\x7f",
@@ -1700,45 +2325,329 @@ mod tests {
                     decode_tree(&encode_tree(&one(bad))),
                     Err(SnapError::Malformed(_))
                 ),
-                "name {bad:?} must be rejected as an unsafe tree entry name"
+                "name {bad:?} must be rejected"
             );
         }
-        // a benign single-component name still decodes.
         assert!(decode_tree(&encode_tree(&one("ok.txt"))).is_ok());
     }
 
-    /// Scan/decode symmetry (§6): the scanner SKIPS a name the decoder would refuse (like a symlink),
-    /// never authoring it or failing the snapshot. Unix-only: the fixture names (`Icon\r`, an embedded
-    /// tab) are invalid filenames on Windows and cannot be created there; the decode-side guard is
-    /// covered cross-platform by [`decode_tree_rejects_path_traversal_names`].
+    /// Materializability: one normal component the OS accepts; Windows device names and prefixes never pass there.
+    #[test]
+    fn materializable_names() {
+        assert!(is_materializable("ok.txt"));
+        assert!(!is_materializable(&format!("{TMP_PREFIX}abc")));
+        assert!(!is_materializable(".."));
+        assert!(!is_materializable(&"x".repeat(OS_NAME_MAX + 1)));
+        for bad in [
+            "CON", "con.txt", "Com1", "LPT9.log", "NUL ", "a:b", "C:x", "q?", "trail.", "star*",
+        ] {
+            assert!(windows_rejects(bad), "{bad} is not a Windows name");
+        }
+        for ok in ["CONSOLE", "com10", "report.txt", "résumé"] {
+            assert!(!windows_rejects(ok), "{ok} is a Windows name");
+        }
+        if cfg!(windows) {
+            assert!(!is_materializable("C:x"));
+        } else {
+            assert!(is_materializable("C:x"));
+        }
+    }
+
+    /// Scan/decode symmetry (§6): unsafe names are skipped like symlinks. Unix-only fixtures.
     #[cfg(unix)]
     #[test]
     fn snapshot_skips_unsafe_names() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let m = mk();
         let work = tempfile::tempdir().unwrap();
         std::fs::write(work.path().join("keep.txt"), b"good").unwrap();
         std::fs::write(work.path().join("Icon\r"), b"resource fork").unwrap();
         std::fs::write(work.path().join("tab\there"), b"weird").unwrap();
-
-        let (root, salt, _) = snapshot_tree(work.path(), &m, &store, None).unwrap();
-        let tree = load_tree(&root, &salt, &m, &store).unwrap();
+        let s = snap(work.path(), &m, &store, None);
+        let tree = load_tree(&s.root, &s.salt, &m, &store).unwrap();
         let names: Vec<&str> = tree.entries.iter().map(entry_name).collect();
-        assert_eq!(names, vec!["keep.txt"], "only the safe name is authored");
+        assert_eq!(names, vec!["keep.txt"]);
     }
 
-    /// Restore hardening (§18): setuid / setgid / sticky bits in a member-authored tree are stripped —
-    /// only the 9 standard permission bits are applied, so a compromised member cannot plant a
-    /// setgid/setuid file on every device.
+    /// Restore never deletes what the snapshot skipped (unsafe names, never-synced oversize, unreadable).
+    #[cfg(unix)]
+    #[test]
+    fn restore_keeps_everything_the_snapshot_never_tracked() {
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
+        let m = mk();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("keep.txt"), b"good").unwrap();
+        std::fs::write(work.path().join("Icon\r"), b"resource fork").unwrap();
+        let ours = snap(work.path(), &m, &store, None);
+        std::fs::write(work.path().join("born-after-snapshot"), b"new").unwrap();
+
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("upstream.txt"), b"u").unwrap();
+        let target = snap(other.path(), &m, &store, None);
+        let rep = restore_tree_into(
+            (&target.root, &target.salt),
+            Some((&ours.root, &ours.salt)),
+            &m,
+            &store,
+            work.path(),
+            "L",
+        )
+        .unwrap();
+        assert!(rep.conflicts.is_empty());
+        assert!(work.path().join("Icon\r").exists(), "unsafe name untouched");
+        assert!(work.path().join("born-after-snapshot").exists());
+        assert!(
+            !work.path().join("keep.txt").exists(),
+            "tracked + unchanged is deleted"
+        );
+        assert_eq!(
+            std::fs::read(work.path().join("upstream.txt")).unwrap(),
+            b"u"
+        );
+    }
+
+    /// A folder deleted or replaced upstream takes a lone macOS icon with it; anything else untracked keeps both.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_gone_upstream_takes_only_a_lone_macos_icon_with_it() {
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
+        let m = mk();
+        let work = tempfile::tempdir().unwrap();
+        for d in ["deleted", "replaced", "busy"] {
+            std::fs::create_dir(work.path().join(d)).unwrap();
+            std::fs::write(work.path().join(d).join("f"), b"tracked").unwrap();
+            std::fs::write(work.path().join(d).join("Icon\r"), b"icon").unwrap();
+        }
+        let ours = snap(work.path(), &m, &store, None);
+        std::fs::write(work.path().join("busy/born-after-snapshot"), b"new").unwrap();
+
+        let up = tempfile::tempdir().unwrap();
+        std::fs::write(up.path().join("replaced"), b"now a file").unwrap();
+        let target = snap(up.path(), &m, &store, None);
+        let rep = restore_tree_into(
+            (&target.root, &target.salt),
+            Some((&ours.root, &ours.salt)),
+            &m,
+            &store,
+            work.path(),
+            "L",
+        )
+        .unwrap();
+        assert!(rep.conflicts.is_empty());
+        assert!(!work.path().join("deleted").exists());
+        assert_eq!(
+            std::fs::read(work.path().join("replaced")).unwrap(),
+            b"now a file"
+        );
+        assert!(!work.path().join("busy/f").exists());
+        assert_eq!(
+            std::fs::read(work.path().join("busy/Icon\r")).unwrap(),
+            b"icon"
+        );
+        assert!(work.path().join("busy/born-after-snapshot").exists());
+    }
+
+    /// A local edit made after the snapshot is kept; the incoming version lands beside it.
+    #[test]
+    fn restore_never_clobbers_an_edit_made_after_the_snapshot() {
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
+        let m = mk();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("f.txt"), b"base").unwrap();
+        std::fs::write(work.path().join("g.txt"), b"base").unwrap();
+        let ours = snap(work.path(), &m, &store, None);
+
+        let up = tempfile::tempdir().unwrap();
+        std::fs::write(up.path().join("f.txt"), b"upstream").unwrap();
+        std::fs::write(up.path().join("g.txt"), b"upstream-g").unwrap();
+        let target = snap(up.path(), &m, &store, None);
+
+        // Edit f.txt after the snapshot (a different size guarantees a changed signal).
+        std::fs::write(work.path().join("f.txt"), b"local edit!").unwrap();
+        let rep = restore_tree_into(
+            (&target.root, &target.salt),
+            Some((&ours.root, &ours.salt)),
+            &m,
+            &store,
+            work.path(),
+            "dev-abc",
+        )
+        .unwrap();
+        assert_eq!(rep.conflicts, vec!["f.txt".to_string()]);
+        assert_eq!(
+            std::fs::read(work.path().join("f.txt")).unwrap(),
+            b"local edit!"
+        );
+        assert_eq!(
+            std::fs::read(work.path().join("f.conflict-dev-abc.txt")).unwrap(),
+            b"upstream"
+        );
+        assert_eq!(
+            std::fs::read(work.path().join("g.txt")).unwrap(),
+            b"upstream-g"
+        );
+        // No temp file survives.
+        assert!(std::fs::read_dir(work.path()).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_str()
+            .unwrap()
+            .starts_with(TMP_PREFIX)));
+    }
+
+    /// A local edit to a file upstream left alone stays as it is, with no conflict copy.
+    #[test]
+    fn an_edit_to_a_file_upstream_left_alone_is_not_a_conflict() {
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
+        let m = mk();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("mine.txt"), b"base").unwrap();
+        std::fs::write(work.path().join("theirs.txt"), b"base").unwrap();
+        let ours = snap(work.path(), &m, &store, None);
+
+        let up = tempfile::tempdir().unwrap();
+        std::fs::write(up.path().join("mine.txt"), b"base").unwrap();
+        std::fs::write(up.path().join("theirs.txt"), b"upstream").unwrap();
+        let target = snapshot_tree(
+            up.path(),
+            &m,
+            &store,
+            Some(Prior {
+                root: &ours.root,
+                salt: &ours.salt,
+                fast_path: false,
+            }),
+            &mut SnapshotMemo::default(),
+        )
+        .unwrap();
+
+        std::fs::write(work.path().join("mine.txt"), b"local edit!").unwrap();
+        let rep = restore_tree_into(
+            (&target.root, &target.salt),
+            Some((&ours.root, &ours.salt)),
+            &m,
+            &store,
+            work.path(),
+            "L",
+        )
+        .unwrap();
+        assert!(rep.conflicts.is_empty());
+        assert_eq!(
+            std::fs::read(work.path().join("mine.txt")).unwrap(),
+            b"local edit!"
+        );
+        assert_eq!(
+            std::fs::read(work.path().join("theirs.txt")).unwrap(),
+            b"upstream"
+        );
+        assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 2);
+    }
+
+    /// A read-only file and a read-only directory are replaced without an EACCES wedge.
+    #[cfg(unix)]
+    #[test]
+    fn restore_replaces_read_only_files_and_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
+        let m = mk();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir(work.path().join("ro")).unwrap();
+        std::fs::write(work.path().join("ro/f"), b"v1").unwrap();
+        std::fs::set_permissions(
+            work.path().join("ro/f"),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            work.path().join("ro"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        let ours = snap(work.path(), &m, &store, None);
+
+        let up = tempfile::tempdir().unwrap();
+        std::fs::create_dir(up.path().join("ro")).unwrap();
+        std::fs::write(up.path().join("ro/f"), b"version two").unwrap();
+        std::fs::set_permissions(
+            up.path().join("ro/f"),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        std::fs::set_permissions(up.path().join("ro"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+        let target = snap(up.path(), &m, &store, None);
+
+        restore_tree_into(
+            (&target.root, &target.salt),
+            Some((&ours.root, &ours.salt)),
+            &m,
+            &store,
+            work.path(),
+            "L",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(work.path().join("ro/f")).unwrap(),
+            b"version two"
+        );
+        let dir_mode = std::fs::metadata(work.path().join("ro"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o555,
+            "the recorded dir mode is reapplied"
+        );
+        for p in [up.path().join("ro"), work.path().join("ro")] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Entries this OS cannot create ride forward instead of reading as deletions.
+    #[test]
+    fn unmaterializable_entries_are_carried_forward() {
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
+        let m = mk();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("real"), b"r").unwrap();
+        let s = snap(src.path(), &m, &store, None);
+        let mut tree = load_tree(&s.root, &s.salt, &m, &store).unwrap();
+        tree.entries.push(Entry::File {
+            name: "x".repeat(OS_NAME_MAX + 1),
+            mode: 0o644,
+            mtime: 0,
+            size: 0,
+            path_salt: [0; 16],
+            chunks: vec![],
+        });
+        tree.entries
+            .sort_by(|a, b| entry_name(a).cmp(entry_name(b)));
+        let root = seal_tree(&tree, &s.salt, &m, &store, "").unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        let rep = restore_tree_into((&root, &s.salt), None, &m, &store, dst.path(), "L").unwrap();
+        assert_eq!(rep.skipped.len(), 1);
+        let again = snap(dst.path(), &m, &store, Some((&root, &s.salt)));
+        let t2 = load_tree(&again.root, &again.salt, &m, &store).unwrap();
+        assert_eq!(t2.entries.len(), 2, "the long name is carried forward");
+    }
+
+    /// §18: setuid/setgid/sticky in a member-authored tree are stripped on restore.
     #[cfg(unix)]
     #[test]
     fn restore_strips_setuid_setgid_sticky() {
         use std::os::unix::fs::PermissionsExt;
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let m = mk();
-        // A hand-built tree entry carrying setuid+setgid+sticky (0o7000) plus rwxr-xr-x.
         let tree = Tree {
             entries: vec![Entry::File {
                 name: "x".into(),
@@ -1749,20 +2658,39 @@ mod tests {
                 chunks: vec![],
             }],
         };
-        let (id, salt) = seal_tree(&tree, &m, &store).unwrap();
+        let id = seal_tree(&tree, &[3; 16], &m, &store, "").unwrap();
         let dst = tempfile::tempdir().unwrap();
-        restore_tree_into(&id, &salt, &m, &store, dst.path()).unwrap();
+        restore_tree_into((&id, &[3; 16]), None, &m, &store, dst.path(), "L").unwrap();
         let mode = std::fs::metadata(dst.path().join("x"))
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o7000, 0, "setuid/setgid/sticky must be stripped");
-        assert_eq!(mode & 0o0777, 0o0755, "standard permission bits preserved");
+        assert_eq!(mode & 0o7000, 0);
+        assert_eq!(mode & 0o0777, 0o0755);
     }
 
-    /// Canonical ordering (§9.3 "no duplicate keys", deterministic order): `decode_tree` MUST reject
-    /// entries that are not strictly ascending by name (out-of-order or duplicate). `snapshot_dir`
-    /// only ever emits sorted, unique names, so anything else is a malformed/forged tree.
+    /// A member-authored entry declaring a smaller size than its chunks never writes past it.
+    #[test]
+    fn restore_refuses_content_past_the_declared_size() {
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
+        let m = mk();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), vec![5u8; 10_000]).unwrap();
+        let s = snap(src.path(), &m, &store, None);
+        let mut tree = load_tree(&s.root, &s.salt, &m, &store).unwrap();
+        if let Entry::File { size, .. } = &mut tree.entries[0] {
+            *size = 10;
+        }
+        let root = seal_tree(&tree, &s.salt, &m, &store, "").unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            restore_tree_into((&root, &s.salt), None, &m, &store, dst.path(), "L"),
+            Err(SnapError::Malformed(_))
+        ));
+        assert!(!dst.path().join("f").exists());
+    }
+
     #[test]
     fn decode_tree_rejects_unsorted_and_duplicate_names() {
         let file = |name: &str| Entry::File {
@@ -1773,23 +2701,12 @@ mod tests {
             path_salt: [0u8; 16],
             chunks: vec![],
         };
-        // out of order ("b" before "a").
-        let unsorted = Tree {
-            entries: vec![file("b"), file("a")],
-        };
-        assert!(matches!(
-            decode_tree(&encode_tree(&unsorted)),
-            Err(SnapError::Malformed(_))
-        ));
-        // duplicate name.
-        let dup = Tree {
-            entries: vec![file("a"), file("a")],
-        };
-        assert!(matches!(
-            decode_tree(&encode_tree(&dup)),
-            Err(SnapError::Malformed(_))
-        ));
-        // strictly ascending is accepted.
+        for bad in [vec![file("b"), file("a")], vec![file("a"), file("a")]] {
+            assert!(matches!(
+                decode_tree(&encode_tree(&Tree { entries: bad })),
+                Err(SnapError::Malformed(_))
+            ));
+        }
         let ok = Tree {
             entries: vec![file("a"), file("b"), file("c")],
         };
@@ -1804,7 +2721,7 @@ mod tests {
             root_tree: [9u8; 32],
             root_salt: [8u8; 16],
             parents: vec![[7u8; 32]],
-            device_id: dev.device_id().unwrap(), // author = dev
+            device_id: dev.device_id().unwrap(),
             version: 3,
             roster_seq: 2,
             last_seen_head: [5u8; 32],
@@ -1812,15 +2729,11 @@ mod tests {
         };
         let sig = sign_commit(&dev, &commit).unwrap();
         assert!(verify_commit(&dev.public(), &commit, &sig).is_ok());
-
-        // a key that isn't the named author is rejected (device_id binding, §9.6).
         let other = DeviceKey::generate().unwrap();
         assert!(matches!(
             verify_commit(&other.public(), &commit, &sig),
             Err(SnapError::BadSignature)
         ));
-
-        // tampering any signed field invalidates the signature.
         let mut tampered = commit.clone();
         tampered.version = 4;
         assert!(matches!(
@@ -1829,68 +2742,28 @@ mod tests {
         ));
     }
 
-    /// Read a directory tree into a sorted map of relative-path -> contents for comparison.
-    fn read_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
-        fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
-            let mut ents: Vec<_> = std::fs::read_dir(dir)
-                .unwrap()
-                .map(|e| e.unwrap().path())
-                .collect();
-            ents.sort();
-            for p in ents {
-                let rel = p
-                    .strip_prefix(base)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .replace('\\', "/");
-                if p.is_dir() {
-                    out.insert(format!("{rel}/"), Vec::new());
-                    walk(base, &p, out);
-                } else {
-                    out.insert(rel, std::fs::read(&p).unwrap());
-                }
-            }
-        }
-        let mut out = BTreeMap::new();
-        walk(root, root, &mut out);
-        out
-    }
-
     #[test]
-    fn snapshot_then_restore_is_byte_identical() {
+    fn snapshot_then_restore_is_byte_identical_and_idempotent() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let m = mk();
 
-        // Build a directory tree: empty file, small file, a >256 KiB file (multi-chunk),
-        // and nested subdirs.
         std::fs::write(src.path().join("empty"), b"").unwrap();
         std::fs::write(src.path().join("small.txt"), b"hello world").unwrap();
         let mut big = vec![0u8; 700 * 1024];
-        // random content so the file actually splits into several chunks
         getrandom::fill(&mut big).unwrap();
         std::fs::write(src.path().join("big.bin"), &big).unwrap();
         std::fs::create_dir_all(src.path().join("sub/deeper")).unwrap();
         std::fs::write(src.path().join("sub/note.md"), b"# note\n").unwrap();
         std::fs::write(src.path().join("sub/deeper/leaf"), [7u8; 40 * 1024]).unwrap();
 
-        let (root_tree, root_salt, _) = snapshot_tree(src.path(), &m, &store, None).unwrap();
-        restore_tree_into(&root_tree, &root_salt, &m, &store, dst.path()).unwrap();
-
-        // restore→snapshot idempotence: identical root id (mtimes/modes preserved), else every
-        // post-clone sync would author a spurious commit.
-        let (resnap, _, _) =
-            snapshot_tree(dst.path(), &m, &store, Some((&root_tree, &root_salt))).unwrap();
-        assert_eq!(resnap, root_tree, "restore→snapshot must be idempotent");
-
-        assert_eq!(
-            read_tree(src.path()),
-            read_tree(dst.path()),
-            "restored tree differs from source"
-        );
+        let s = snap(src.path(), &m, &store, None);
+        restore_into(&s, &m, &store, dst.path());
+        let again = snap(dst.path(), &m, &store, Some((&s.root, &s.salt)));
+        assert_eq!(again.root, s.root, "restore→snapshot must be idempotent");
+        assert_eq!(read_tree(src.path()), read_tree(dst.path()));
     }
 
     #[test]
@@ -1898,8 +2771,8 @@ mod tests {
         use secsec_sig::DeviceKey;
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let m = mk();
         let device = DeviceKey::generate().unwrap();
 
@@ -1907,11 +2780,10 @@ mod tests {
         std::fs::create_dir_all(src.path().join("sub")).unwrap();
         std::fs::write(src.path().join("sub/b.bin"), [3u8; 8 * 1024]).unwrap();
 
-        // produce side: snapshot the tree, wrap it in a signed commit, seal+store it.
-        let (root_tree, root_salt, _) = snapshot_tree(src.path(), &m, &store, None).unwrap();
+        let s = snap(src.path(), &m, &store, None);
         let commit = Commit {
-            root_tree,
-            root_salt,
+            root_tree: s.root,
+            root_salt: s.salt,
             parents: vec![[0x44u8; 32]],
             device_id: device.device_id().unwrap(),
             version: 7,
@@ -1920,28 +2792,18 @@ mod tests {
             ts: 99,
         };
         let commit_id = seal_signed_commit(&m, &store, &device, &commit).unwrap();
-
-        // consume side: fetch, verify against the author key, restore the tree.
         let (got, sig) = open_signed_commit(&commit_id, &m, &store).unwrap();
         assert_eq!(got, commit);
         verify_commit(&device.public(), &got, &sig).unwrap();
-        restore_commit_tree(&got, &m, &store, dst.path()).unwrap();
-
+        restore_commit_tree(&got, &commit_id, None, &m, &store, dst.path()).unwrap();
         assert_eq!(read_tree(src.path()), read_tree(dst.path()));
-
-        // a forged commit by a non-author is rejected on the consume side.
-        let attacker = DeviceKey::generate().unwrap();
-        assert!(matches!(
-            verify_commit(&attacker.public(), &got, &sig),
-            Err(SnapError::BadSignature)
-        ));
     }
 
     #[test]
     fn incremental_snapshot_reuses_salts_and_is_idempotent() {
         let src = tempfile::tempdir().unwrap();
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let m = mk();
 
         std::fs::write(src.path().join("a.txt"), b"AAAA").unwrap();
@@ -1949,119 +2811,172 @@ mod tests {
         std::fs::create_dir_all(src.path().join("sub")).unwrap();
         std::fs::write(src.path().join("sub/c"), b"CCCC").unwrap();
 
-        let (id1, salt1, _) = snapshot_tree(src.path(), &m, &store, None).unwrap();
-        let tree1 = load_tree(&id1, &salt1, &m, &store).unwrap();
+        let s1 = snap(src.path(), &m, &store, None);
+        let tree1 = load_tree(&s1.root, &s1.salt, &m, &store).unwrap();
+        let s2 = snap(src.path(), &m, &store, Some((&s1.root, &s1.salt)));
+        assert_eq!(s1.root, s2.root);
+        assert_eq!(s1.salt, s2.salt);
 
-        // Re-snapshot with NO change, feeding the prior tree: full idempotence — identical root id
-        // and salt (§9.2/§9.7: salts are constant across versions). Without salt reuse this would
-        // mint all-new ids.
-        let (id2, salt2, _) = snapshot_tree(src.path(), &m, &store, Some((&id1, &salt1))).unwrap();
-        assert_eq!(
-            id1, id2,
-            "unchanged repo must produce the identical root tree id"
-        );
-        assert_eq!(salt1, salt2);
-
-        // Change exactly one file; unchanged paths keep their entries verbatim (same salt → same
-        // chunk ids → idempotent put), only a.txt's chunks change, and the root salt persists.
         std::fs::write(src.path().join("a.txt"), b"A-modified").unwrap();
-        let (id3, salt3, _) = snapshot_tree(src.path(), &m, &store, Some((&id2, &salt2))).unwrap();
-        assert_ne!(id1, id3, "a real change must change the root tree");
-        assert_eq!(salt3, salt1, "root salt persists across versions");
-        let tree3 = load_tree(&id3, &salt3, &m, &store).unwrap();
-
-        let find = |t: &Tree, n: &str| {
-            t.entries
-                .iter()
-                .find(|e| entry_name(e) == n)
-                .unwrap()
-                .clone()
-        };
-        // b.txt and the sub/ subtree are byte-for-byte the same entries as before.
-        assert_eq!(find(&tree1, "b.txt"), find(&tree3, "b.txt"));
-        assert_eq!(find(&tree1, "sub"), find(&tree3, "sub"));
-        // a.txt: salt reused (constant per path), chunk ids differ (content changed).
+        let s3 = snap(src.path(), &m, &store, Some((&s2.root, &s2.salt)));
+        assert_ne!(s1.root, s3.root);
+        assert_eq!(s3.salt, s1.salt);
+        let tree3 = load_tree(&s3.root, &s3.salt, &m, &store).unwrap();
+        assert_eq!(
+            find_entry(Some(&tree1), "b.txt"),
+            find_entry(Some(&tree3), "b.txt")
+        );
+        assert_eq!(
+            find_entry(Some(&tree1), "sub"),
+            find_entry(Some(&tree3), "sub")
+        );
         let (
-            Entry::File {
+            Some(Entry::File {
                 path_salt: ps1,
                 chunks: ch1,
                 ..
-            },
-            Entry::File {
+            }),
+            Some(Entry::File {
                 path_salt: ps3,
                 chunks: ch3,
                 ..
-            },
-        ) = (find(&tree1, "a.txt"), find(&tree3, "a.txt"))
+            }),
+        ) = (
+            find_entry(Some(&tree1), "a.txt"),
+            find_entry(Some(&tree3), "a.txt"),
+        )
         else {
             panic!("a.txt must be a file")
         };
-        assert_eq!(ps1, ps3, "path_salt is constant across versions");
-        assert_ne!(ch1, ch3, "changed content yields new chunk ids");
+        assert_eq!(ps1, ps3);
+        assert_ne!(ch1, ch3);
+    }
+
+    /// Seeding salts from another device's tree makes identical content identical ids, with no fast path.
+    #[test]
+    fn seeded_salts_give_identical_ids_for_identical_content() {
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
+        let m = mk();
+        let a = tempfile::tempdir().unwrap();
+        std::fs::write(a.path().join("same.txt"), b"identical").unwrap();
+        std::fs::write(a.path().join("diff.txt"), b"from a").unwrap();
+        let sa = snap(a.path(), &m, &store, None);
+
+        let b = tempfile::tempdir().unwrap();
+        std::fs::write(b.path().join("same.txt"), b"identical").unwrap();
+        std::fs::write(b.path().join("diff.txt"), b"from b").unwrap();
+        let sb = snapshot_tree(
+            b.path(),
+            &m,
+            &store,
+            Some(Prior {
+                root: &sa.root,
+                salt: &sa.salt,
+                fast_path: false,
+            }),
+            &mut SnapshotMemo::default(),
+        )
+        .unwrap();
+        let ta = load_tree(&sa.root, &sa.salt, &m, &store).unwrap();
+        let tb = load_tree(&sb.root, &sb.salt, &m, &store).unwrap();
+        assert_eq!(
+            find_entry(Some(&ta), "same.txt"),
+            {
+                let mut e = find_entry(Some(&tb), "same.txt").cloned().unwrap();
+                if let (
+                    Entry::File { mtime, mode, .. },
+                    Some(Entry::File {
+                        mtime: ma,
+                        mode: mo,
+                        ..
+                    }),
+                ) = (&mut e, find_entry(Some(&ta), "same.txt"))
+                {
+                    *mtime = *ma;
+                    *mode = *mo;
+                }
+                Some(e)
+            }
+            .as_ref()
+        );
+        assert_ne!(
+            find_entry(Some(&ta), "diff.txt").map(|e| match e {
+                Entry::File { chunks, .. } => chunks.clone(),
+                Entry::Dir { .. } => vec![],
+            }),
+            find_entry(Some(&tb), "diff.txt").map(|e| match e {
+                Entry::File { chunks, .. } => chunks.clone(),
+                Entry::Dir { .. } => vec![],
+            })
+        );
     }
 
     #[test]
     fn reachable_objects_covers_graph_and_fails_safe() {
         let src = tempfile::tempdir().unwrap();
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let m = mk();
-
         std::fs::write(src.path().join("a.txt"), b"alpha").unwrap();
         std::fs::create_dir_all(src.path().join("sub")).unwrap();
         std::fs::write(src.path().join("sub/b.bin"), [3u8; 8 * 1024]).unwrap();
-
         let commit_id = test_signed_commit(src.path(), &m, &store);
-        let reachable = reachable_objects(&m, &store, &[commit_id]).unwrap();
-
-        // every stored object is reachable from the single commit (no garbage; keep-everything).
+        let reachable = reachable_objects(&m, &store, &commit_id).unwrap();
         assert_eq!(reachable.len() as u64, store.object_count().unwrap());
-        assert!(reachable.contains(&commit_id));
-
-        // fail-safe (§15): an empty store can't resolve the commit → Missing, so GC must not proceed.
-        let empty_dir = tempfile::tempdir().unwrap();
-        let empty = Store::open(empty_dir.path().join("e.redb")).unwrap();
+        let ed = tempfile::tempdir().unwrap();
+        let empty = store_in(&ed);
         assert!(matches!(
-            reachable_objects(&m, &empty, &[commit_id]),
+            reachable_objects(&m, &empty, &commit_id),
             Err(SnapError::Missing(_))
         ));
     }
 
+    /// `tree_closure` never descends into a known subtree and matches the full walk otherwise.
     #[test]
-    fn restore_detects_missing_object() {
+    fn tree_closure_skips_known_subtrees() {
         let src = tempfile::tempdir().unwrap();
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let m = mk();
-        std::fs::write(src.path().join("f"), b"data").unwrap();
-        let commit_id = test_signed_commit(src.path(), &m, &store);
-
-        // Reading the commit against a *fresh empty* store must fail (object missing), not panic.
-        let empty_dir = tempfile::tempdir().unwrap();
-        let empty = Store::open(empty_dir.path().join("e.redb")).unwrap();
-        assert!(matches!(
-            open_signed_commit(&commit_id, &m, &empty),
-            Err(SnapError::Missing(_))
-        ));
+        std::fs::create_dir_all(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/b"), b"b").unwrap();
+        std::fs::write(src.path().join("a"), b"a").unwrap();
+        let s = snap(src.path(), &m, &store, None);
+        let mut all = BTreeSet::new();
+        tree_closure(&m, &store, &s.root, &s.salt, &BTreeSet::new(), &mut all).unwrap();
+        assert_eq!(all.len() as u64, store.object_count().unwrap());
+        let t = load_tree(&s.root, &s.salt, &m, &store).unwrap();
+        let Some(Entry::Dir { subtree, .. }) = find_entry(Some(&t), "sub") else {
+            panic!("sub is a dir")
+        };
+        let mut partial = BTreeSet::new();
+        tree_closure(
+            &m,
+            &store,
+            &s.root,
+            &s.salt,
+            &BTreeSet::from([*subtree]),
+            &mut partial,
+        )
+        .unwrap();
+        assert_eq!(partial.len(), 2, "root tree + a's chunk only");
     }
 
-    /// §8.2 cross-rotation reads: a history whose parent commit predates a rotation is reachable and
-    /// restorable with the peeled key ring, but NOT with a single generation's key.
     #[test]
     fn reads_across_a_generation_boundary_with_a_key_ring() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let dev = secsec_sig::DeviceKey::generate().unwrap();
         let mk1 = MasterKey::new(1, [0x11; 32]);
         let mk2 = MasterKey::new(2, [0x22; 32]);
 
-        // gen-1 commit C1 over a dir; gen-2 commit C2 (parent C1) over another, sealed under mk2.
         let src1 = tempfile::tempdir().unwrap();
         std::fs::write(src1.path().join("old.txt"), b"gen1 file").unwrap();
-        let (rt1, rs1, _) = snapshot_tree(src1.path(), &mk1, &store, None).unwrap();
+        let s1 = snap(src1.path(), &mk1, &store, None);
         let c1 = Commit {
-            root_tree: rt1,
-            root_salt: rs1,
+            root_tree: s1.root,
+            root_salt: s1.salt,
             parents: vec![],
             device_id: dev.device_id().unwrap(),
             version: 1,
@@ -2073,10 +2988,10 @@ mod tests {
 
         let src2 = tempfile::tempdir().unwrap();
         std::fs::write(src2.path().join("new.txt"), b"gen2 file").unwrap();
-        let (rt2, rs2, _) = snapshot_tree(src2.path(), &mk2, &store, None).unwrap();
+        let s2 = snap(src2.path(), &mk2, &store, None);
         let c2 = Commit {
-            root_tree: rt2,
-            root_salt: rs2,
+            root_tree: s2.root,
+            root_salt: s2.salt,
             parents: vec![c1_id],
             device_id: dev.device_id().unwrap(),
             version: 2,
@@ -2086,35 +3001,28 @@ mod tests {
         };
         let c2_id = seal_signed_commit(&mk2, &store, &dev, &c2).unwrap();
 
-        // A single-generation key cannot walk across the rotation boundary: traversing from C2 hits
-        // C1 (gen 1) and fails to resolve its key.
         assert!(matches!(
-            reachable_objects(&mk2, &store, &[c2_id]),
+            reachable_objects(&mk2, &store, &c2_id),
             Err(SnapError::Object(ObjError::UnknownGeneration(1)))
         ));
-
-        // The peeled key ring {1: mk1, 2: mk2} reads the whole history and restores either commit.
-        let keyring: std::collections::BTreeMap<u32, MasterKey> =
-            [(1u32, mk1), (2u32, mk2)].into_iter().collect();
-        let reachable = reachable_objects(&keyring, &store, &[c2_id]).unwrap();
+        let keyring: BTreeMap<u32, MasterKey> = [(1u32, mk1), (2u32, mk2)].into_iter().collect();
+        let reachable = reachable_objects(&keyring, &store, &c2_id).unwrap();
         assert!(reachable.contains(&c1_id) && reachable.contains(&c2_id));
-
         let (got_c1, _) = open_signed_commit(&c1_id, &keyring, &store).unwrap();
         let dst = tempfile::tempdir().unwrap();
-        restore_commit_tree(&got_c1, &keyring, &store, dst.path()).unwrap();
+        restore_commit_tree(&got_c1, &c1_id, None, &keyring, &store, dst.path()).unwrap();
         assert_eq!(
             std::fs::read(dst.path().join("old.txt")).unwrap(),
             b"gen1 file"
         );
     }
 
-    /// Snapshot `src` and seal a signed commit (a throwaway device) — the production commit form.
     fn test_signed_commit(src: &Path, m: &MasterKey, store: &Store) -> Id {
         let dev = secsec_sig::DeviceKey::generate().unwrap();
-        let (root_tree, root_salt, _) = snapshot_tree(src, m, store, None).unwrap();
+        let s = snap(src, m, store, None);
         let commit = Commit {
-            root_tree,
-            root_salt,
+            root_tree: s.root,
+            root_salt: s.salt,
             parents: Vec::new(),
             device_id: dev.device_id().unwrap(),
             version: 1,
@@ -2125,92 +3033,60 @@ mod tests {
         seal_signed_commit(m, store, &dev, &commit).unwrap()
     }
 
-    /// A symlink (or special file) must not fail the whole snapshot — it is skipped, not synced. And on
-    /// restore, an untracked symlink in the destination is left alone (snapshots never tracked it), while
-    /// a tracked file that disappeared upstream is removed.
+    /// Symlinks are skipped; an untracked one in the destination survives restore.
     #[cfg(unix)]
     #[test]
     fn symlinks_are_skipped_and_untracked_ones_survive_restore() {
         use std::os::unix::fs::symlink;
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let m = mk();
-
-        // Source: a real file plus a symlink — the snapshot must succeed and track only the file.
         let src = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("real.txt"), b"data").unwrap();
         symlink("real.txt", src.path().join("link")).unwrap();
-        let (rt, rs, _) = snapshot_tree(src.path(), &m, &store, None).unwrap();
-        let tree = load_tree(&rt, &rs, &m, &store).unwrap();
+        let s = snap(src.path(), &m, &store, None);
+        let tree = load_tree(&s.root, &s.salt, &m, &store).unwrap();
         let names: Vec<&str> = tree.entries.iter().map(entry_name).collect();
-        assert_eq!(
-            names,
-            vec!["real.txt"],
-            "the symlink is skipped, the file is tracked"
-        );
+        assert_eq!(names, vec!["real.txt"]);
 
-        // Destination already holds its own untracked symlink and a now-deleted-upstream file.
         let dst = tempfile::tempdir().unwrap();
-        std::fs::write(dst.path().join("stale.txt"), b"old").unwrap();
         symlink("/nonexistent-target", dst.path().join("mylink")).unwrap();
-        restore_tree_into(&rt, &rs, &m, &store, dst.path()).unwrap();
-
+        restore_into(&s, &m, &store, dst.path());
         assert_eq!(std::fs::read(dst.path().join("real.txt")).unwrap(), b"data");
-        assert!(
-            !dst.path().join("stale.txt").exists(),
-            "a tracked file gone upstream is removed on restore"
-        );
-        assert!(
-            std::fs::symlink_metadata(dst.path().join("mylink")).is_ok(),
-            "an untracked symlink in the destination is preserved (never secsec's to delete)"
-        );
+        assert!(std::fs::symlink_metadata(dst.path().join("mylink")).is_ok());
     }
 
-    /// The mtime/size fast-path: re-snapshotting an unchanged file under a NEW generation reuses its
-    /// prior chunk ids verbatim (they address the old generation; cross-generation reads are legal,
-    /// §8.2), so a key rotation does not re-store the working set's chunks.
+    /// An unchanged file keeps its chunk ids across a rotation (the fast path reads through the ring).
     #[test]
     fn unchanged_file_reuses_chunk_ids_across_a_rotation() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Store::open(store_dir.path().join("s.redb")).unwrap();
+        let sd = tempfile::tempdir().unwrap();
+        let store = store_in(&sd);
         let mk1 = MasterKey::new(1, [0x11; 32]);
-        let mk2 = MasterKey::new(2, [0x22; 32]);
-
         let src = tempfile::tempdir().unwrap();
-        let mut big = vec![0u8; 400 * 1024]; // multi-chunk so there are real ids to compare
+        let mut big = vec![0u8; 400 * 1024];
         getrandom::fill(&mut big).unwrap();
         std::fs::write(src.path().join("f.bin"), &big).unwrap();
-
-        let file_chunks = |id: &Id, salt: &PathSalt, mk: &MasterKey| -> Vec<Id> {
-            let Entry::File { chunks, .. } = load_tree(id, salt, mk, &store)
-                .unwrap()
-                .entries
-                .into_iter()
-                .find(|e| entry_name(e) == "f.bin")
-                .unwrap()
-            else {
-                panic!("f.bin must be a file")
+        let chunks_of =
+            |root: &Id, salt: &PathSalt, keys: &dyn Fn(&Id, &PathSalt) -> Tree| match find_entry(
+                Some(&keys(root, salt)),
+                "f.bin",
+            ) {
+                Some(Entry::File { chunks, .. }) => chunks.clone(),
+                _ => panic!("f.bin must be a file"),
             };
-            chunks
-        };
-
-        let (rt1, rs1, _) = snapshot_tree(src.path(), &mk1, &store, None).unwrap();
-        let ch1 = file_chunks(&rt1, &rs1, &mk1);
-
-        // Re-snapshot the UNCHANGED dir under generation 2, reading the prior tree through the key ring
-        // {1, 2}; the mtime/size fast-path reuses the gen-1 chunk ids (the new tree object is re-sealed
-        // under gen 2, but the bulk chunk content is not).
+        let s1 = snap(src.path(), &mk1, &store, None);
         let ring: BTreeMap<u32, MasterKey> = [
             (1u32, MasterKey::new(1, [0x11; 32])),
             (2u32, MasterKey::new(2, [0x22; 32])),
         ]
         .into_iter()
         .collect();
-        let (rt2, rs2, _) = snapshot_tree(src.path(), &ring, &store, Some((&rt1, &rs1))).unwrap();
-        let ch2 = file_chunks(&rt2, &rs2, &mk2);
+        let s2 = snap(src.path(), &ring, &store, Some((&s1.root, &s1.salt)));
+        let load1 = |r: &Id, s: &PathSalt| load_tree(r, s, &mk1, &store).unwrap();
+        let load2 = |r: &Id, s: &PathSalt| load_tree(r, s, &ring, &store).unwrap();
         assert_eq!(
-            ch1, ch2,
-            "an unchanged file keeps its chunk ids across a rotation"
+            chunks_of(&s1.root, &s1.salt, &load1),
+            chunks_of(&s2.root, &s2.salt, &load2)
         );
     }
 }

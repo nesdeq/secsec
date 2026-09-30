@@ -1,10 +1,6 @@
 name: release
 
-# Build the `secsec` binary for the three OSes × {x86_64, aarch64} and attach the archives
-# + a SHA256SUMS to the GitHub Release for the tag. Each arch builds on a native runner,
-# except macOS x86_64, which is cross-built on an Apple-Silicon runner (universal SDK) —
-# GitHub's Intel macOS runners are scarce/deprecated. Linux is static musl. Triggered by
-# rc*/v* tag pushes; also runnable manually for a dry build.
+# rc*/v* tags: run CI, build the binary for three OSes on x86_64 and aarch64 plus both desktop UIs, then publish them with SHA256SUMS and build-provenance attestations.
 on:
   push:
     tags:
@@ -16,60 +12,64 @@ permissions:
   contents: read
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: ${{ matrix.name }}
+    needs: ci
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x86_64,   runner: ubuntu-latest,    target: x86_64-unknown-linux-musl }
-          - { name: linux-aarch64,  runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
-          - { name: macos-x86_64,   runner: macos-latest,     target: x86_64-apple-darwin }
-          - { name: macos-aarch64,  runner: macos-latest,     target: aarch64-apple-darwin }
-          - { name: windows-x86_64, runner: windows-latest,   target: x86_64-pc-windows-msvc }
-          - { name: windows-aarch64, runner: windows-11-arm,  target: aarch64-pc-windows-msvc }
+          - { name: linux-x86_64,    runner: ubuntu-latest,    target: x86_64-unknown-linux-musl }
+          - { name: linux-aarch64,   runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { name: macos-x86_64,    runner: macos-latest,     target: x86_64-apple-darwin }
+          - { name: macos-aarch64,   runner: macos-latest,     target: aarch64-apple-darwin }
+          - { name: windows-x86_64,  runner: windows-latest,   target: x86_64-pc-windows-msvc }
+          - { name: windows-aarch64, runner: windows-11-arm,   target: aarch64-pc-windows-msvc }
+    env:
+      TARGET: ${{ matrix.target }}
+      NAME: ${{ matrix.name }}
+      REF: ${{ github.ref_name }}
+      SECSEC_RELEASE: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v6
-
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      # musl C toolchain for ring's C shims on the static Linux targets.
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-
       - name: Build
-        run: cargo build --release --locked -p secsec --target ${{ matrix.target }}
-
+        shell: bash
+        run: cargo build --release --locked -p secsec --target "$TARGET"
+      # Linux binaries are stripped; macOS ones keep the linker's ad-hoc signature, which strip would break.
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          bin="target/${{ matrix.target }}/release/secsec"
-          strip "$bin" || true
-          archive="secsec-${{ github.ref_name }}-${{ matrix.name }}.tar.gz"
+          bin="target/$TARGET/release/secsec"
+          if [ "$RUNNER_OS" = Linux ]; then strip "$bin"; fi
+          archive="secsec-$REF-$NAME.tar.gz"
           cp "$bin" secsec && chmod 755 secsec
           tar -czf "$archive" secsec
           rm -f secsec
           shasum -a 256 "$archive" > "$archive.sha256"
-
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $bin = "target/${{ matrix.target }}/release/secsec.exe"
-          $archive = "secsec-${{ github.ref_name }}-${{ matrix.name }}.zip"
+          $bin = "target/$env:TARGET/release/secsec.exe"
+          $archive = "secsec-$env:REF-$env:NAME.zip"
           Copy-Item $bin secsec.exe
           Compress-Archive -Path secsec.exe -DestinationPath $archive -Force
           Remove-Item secsec.exe
           $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
           [System.IO.File]::WriteAllText("$archive.sha256", "$hash  $archive`n")
-
       - uses: actions/upload-artifact@v7
         with:
           name: secsec-${{ matrix.name }}
@@ -79,31 +79,71 @@ jobs:
             secsec-*.sha256
           if-no-files-found: error
 
-  # Collect every artifact, fold the per-archive checksums into one SHA256SUMS, and
-  # publish the lot to the Release. Tag pushes only.
+  ui-gnome:
+    needs: ci
+    runs-on: ubuntu-latest
+    env:
+      REF: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Package the extension
+        run: |
+          set -eu
+          archive="secsec-ui-gnome-$REF.tar.gz"
+          tar -czf "$archive" -C ui/gnome secsec@nesdeq.github.io
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: secsec-ui-gnome
+          path: secsec-ui-gnome-*
+          if-no-files-found: error
+
+  ui-macos:
+    needs: ci
+    runs-on: macos-latest
+    env:
+      REF: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and package the menu-bar app
+        run: |
+          set -eu
+          sh ui/macos/build.sh
+          archive="secsec-ui-macos-$REF.tar.gz"
+          tar -czf "$archive" -C ui/macos secsec-menubar.app
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: secsec-ui-macos
+          path: secsec-ui-macos-*
+          if-no-files-found: error
+
   release:
     name: publish release
-    needs: build
+    needs: [build, ui-gnome, ui-macos]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: secsec-*
           merge-multiple: true
-
       - name: Combine checksums
-        shell: bash
         run: |
-          set -euo pipefail
+          set -eu
           cd dist
           cat ./*.sha256 > SHA256SUMS
           rm -f ./*.sha256
           ls -la
-
+      # Provenance for every published asset; install.sh checks it with `gh attestation verify`.
+      - uses: actions/attest@v4
+        with:
+          subject-checksums: dist/SHA256SUMS
       - uses: softprops/action-gh-release@v3
         with:
           files: |

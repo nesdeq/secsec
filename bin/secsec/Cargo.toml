@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "secsec CLI — the single static binary (secsec-Design.md §11, §12)."
+description = "secsec CLI: the single binary for the server and every client command (secsec-Design.md §7, §10, §11, §12)."
 
 [[bin]]
 name = "secsec"
@@ -19,14 +19,22 @@ secsec-proto = { path = "../../crates/secsec-proto" }
 secsec-store = { path = "../../crates/secsec-store" }
 secsec-transport = { path = "../../crates/secsec-transport" }
 secsec-client = { path = "../../crates/secsec-client" }
+secsec-engine = { path = "../../crates/secsec-engine" }
+secsec-kdf = { path = "../../crates/secsec-kdf" }
+secsec-roster = { path = "../../crates/secsec-roster" }
 secsec-sig = { path = "../../crates/secsec-sig" }
+secsec-snapshot = { path = "../../crates/secsec-snapshot" }
 secsec-sync = { path = "../../crates/secsec-sync" }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 getrandom = "0.3"
 blake3 = "1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+socket2 = "0.6"
 rcgen = "0.13"
-rpassword = "7"              # no-echo TTY prompt for an encrypted ~/.ssh/id_ed25519 passphrase
-zeroize = "1"                # wipe the typed passphrase from memory after decrypting the key
-tempfile = "3"               # throwaway object store for `log`/`restore` (avoids the synced-cache lock)
+rpassword = "7"
+zeroize = "1"
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }

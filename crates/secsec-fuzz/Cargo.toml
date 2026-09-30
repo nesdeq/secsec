@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Decoder fuzz harness: one entry per untrusted-input decoder (secsec-Design.md §3, §18)."
+description = "Decoder fuzz harness: one entry per untrusted-input decoder (secsec-Design.md §18)."
 
 [lints]
 workspace = true
@@ -17,3 +17,5 @@ secsec-roster = { path = "../secsec-roster" }
 secsec-sync = { path = "../secsec-sync" }
 secsec-proto = { path = "../secsec-proto" }
 secsec-kdf = { path = "../secsec-kdf" }
+secsec-pq = { path = "../secsec-pq" }
+secsec-client = { path = "../secsec-client" }

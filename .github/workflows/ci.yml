@@ -2,26 +2,29 @@ name: ci
 
 on:
   push:
-    branches: ['**']   # all branches, but NOT tags — tag builds are release.yml's job
+    branches: ['**']   # branches only: tags run release.yml, which calls this workflow first
   pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
 jobs:
-  # Format + lint once (fast, OS-independent).
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo xtask vectors --check
 
-  # Build + test on all three target platforms (Linux/macOS/Windows).
   test:
     strategy:
       fail-fast: false
@@ -29,29 +32,55 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --all --all-features
+      - run: cargo test --locked --all --all-features
 
-  # Supply-chain: advisory scan. (cargo-vet bring-up is tracked separately.)
+  # The declared rust-version must keep building.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.89
+      - run: cargo check --locked --workspace --all-targets
+
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-audit --locked
       - run: cargo audit
 
-  # Continuous fuzzing requires a nightly toolchain + cargo-fuzz (libFuzzer). Until the dev
-  # toolchain is rustup-managed, the "decoder never panics on arbitrary input" property is
-  # covered by the stable proptest robustness tests in each crate's tests/robustness.rs (run by
-  # the `test` job above). This job is a placeholder for the nightly libFuzzer harness.
-  #
-  # fuzz:
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v6
-  #     - uses: dtolnay/rust-toolchain@nightly
-  #     - run: cargo install cargo-fuzz --locked
-  #     - run: cargo fuzz build
-  #     - run: for t in $(cargo fuzz list); do cargo fuzz run "$t" -- -max_total_time=60; done
+  # Coverage-guided fuzzing, one minute per decoder (the stable corpus test runs in `test`).
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: Run every target
+        run: |
+          set -eu
+          for t in $(cargo fuzz list); do
+            cargo fuzz run "$t" -- -max_total_time=60
+          done
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: shellcheck -s sh install.sh ui/install.sh ui/macos/build.sh
+      - name: GNOME extension parses
+        run: |
+          set -eu
+          for f in ui/gnome/secsec@nesdeq.github.io/*.js; do
+            cp "$f" "$RUNNER_TEMP/check.mjs"
+            node --check "$RUNNER_TEMP/check.mjs"
+          done
+
+  menubar:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sh ui/macos/build.sh

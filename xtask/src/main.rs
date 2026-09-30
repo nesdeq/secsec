@@ -1,13 +1,6 @@
-//! `xtask` — build tooling (`secsec-Design.md` §3, §20).
-//!
-//! - `cargo xtask vectors` regenerates `vectors/secsec-kat-v1.txt` **mechanically** from the same code
-//!   paths the inline KAT `#[test]`s assert, so the human/cross-impl export can never drift from the
-//!   code. `cargo xtask vectors --check` regenerates in memory and fails if the committed file differs
-//!   (CI guard).
-//! - `cargo xtask release` prints/runs the reproducible static-`musl` release build (§20): pinned
-//!   target, deterministic flags, `panic=abort` + overflow-checks from the workspace release profile.
+//! `cargo xtask`: `vectors [--check]` recomputes the KAT file from live code; `release` prints the reproducible build (`secsec-Implementation.md` §3, `secsec-Design.md` §18).
 
-#![allow(missing_docs)] // a binary crate exports no public API
+#![allow(missing_docs)] // a binary crate has no public API
 
 use std::process::ExitCode;
 
@@ -37,21 +30,20 @@ fn main() -> ExitCode {
     }
 }
 
-/// Print the reproducible static-musl release recipe (§20). Kept as instructions rather than shelling
-/// out, so it is inspectable and works regardless of the host toolchain.
+/// Print the reproducible static-musl release recipe (`secsec-Design.md` §18) rather than running it, so it stays inspectable.
 fn release_help() {
     println!(
-        "reproducible static release (§20):\n\
+        "reproducible static release (secsec-Design.md §18):\n\
          \n\
          # one-time:\n\
          rustup target add x86_64-unknown-linux-musl\n\
          \n\
-         # deterministic build (release profile pins panic=abort + overflow-checks):\n\
+         # deterministic build (the release profile pins panic=abort and overflow-checks):\n\
          SOURCE_DATE_EPOCH=0 \\\n\
-         RUSTFLAGS='-C target-feature=+crt-static --remap-path-prefix=$PWD=. -C link-arg=-s' \\\n\
+         RUSTFLAGS=\"-C target-feature=+crt-static --remap-path-prefix=$PWD=. -C link-arg=-s\" \\\n\
          cargo build --release --locked --bin secsec --target x86_64-unknown-linux-musl\n\
          \n\
-         # the artifact is a single static binary:\n\
+         # the artifact is one static binary:\n\
          #   target/x86_64-unknown-linux-musl/release/secsec\n\
          # verify reproducibility by building twice and comparing sha256."
     );
@@ -61,9 +53,7 @@ fn release_help() {
 mod tests {
     use std::path::PathBuf;
 
-    /// Every workspace member must carry `[lints] workspace = true`. That inheritance is what actually
-    /// applies `unsafe_code = "forbid"`, `unreachable_pub` and `clippy::all = deny` to a crate; a new
-    /// member that omits it silently opts out of all three, and nothing else in the build would notice.
+    /// Every workspace member inherits `[lints] workspace = true`, which is what applies `unsafe_code = forbid` and the lint levels.
     #[test]
     fn every_workspace_member_inherits_the_workspace_lints() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -76,8 +66,8 @@ mod tests {
             .expect("workspace.members array");
         let members: Vec<&str> = array
             .split(',')
-            .filter_map(|m| m.trim().trim_matches('"').into())
-            .filter(|m: &&str| !m.is_empty())
+            .map(|m| m.trim().trim_matches('"'))
+            .filter(|m| !m.is_empty())
             .collect();
         assert!(members.len() > 10, "parsed too few members: {members:?}");
 
@@ -89,7 +79,7 @@ mod tests {
                 .split_once("[lints]")
                 .unwrap_or_else(|| panic!("{member} has no [lints] section"))
                 .1;
-            // Only look as far as the next section header, so a later table cannot satisfy this.
+            // Only up to the next section header, so a later table cannot satisfy the check.
             let section = after.split_once("\n[").map_or(after, |(head, _)| head);
             assert!(
                 section.contains("workspace = true"),

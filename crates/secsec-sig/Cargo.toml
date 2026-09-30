@@ -10,8 +10,8 @@ description = "Device identity and SSHSIG signing with disjoint namespaces, Ed25
 workspace = true
 
 [dependencies]
-ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }
-sha2 = "0.10"                # SHA-512 for the X25519 secret-scalar derivation
+ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "encryption"] }
+sha2 = "0.10"                # SHA-512 for the legacy clamped-scalar derivation
 rand_core = { version = "0.6", features = ["getrandom"] }
-blake3 = "1"
+blake3 = { version = "1", features = ["zeroize"] }
 zeroize = "1"

@@ -1,42 +1,37 @@
-//! The §11 application-layer handshake on a control stream after the pinned TLS handshake:
-//! ClientHello → ServerHello → both build the [`SessionTranscript`] and the TLS-exporter channel
-//! binding → client sends `ClientAuth` (the `secsec-auth-v1` signature, [`ConnectionAuth`]) →
-//! server verifies. Both sides return the transcript every later per-op request signs (§9.6); the
-//! server also returns the authenticated client key (keyslot check is the caller's, §12).
+//! The §11 application handshake after pinned TLS: hellos → transcript + exporter binding → `ClientAuth` → server verifies.
 
 use crate::auth::{ConnectionAuth, SessionTranscript, NONCE_LEN, SECSEC_VERSION};
-use crate::frame::{read_frame, write_frame, FrameError, MAX_FRAME_LEN};
+use crate::frame::{read_frame, write_frame, FrameError};
 use quinn::Connection;
 use secsec_proto::wire::{ClientAuth, ClientHello, ServerHello, WireError};
 use secsec_sig::{DeviceKey, DevicePublic};
 
 /// TLS exporter label for the channel binding (§11).
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-Channel-Binding";
-/// Channel-binding length, bytes (§11: 32).
+/// Channel-binding length, bytes (§11).
 const CHANNEL_BINDING_LEN: usize = 32;
-/// The server's post-auth acknowledgement byte (sent only after the client is authenticated).
+/// The server's post-auth acknowledgement byte.
 const AUTH_OK: u8 = 1;
 
-/// Errors from the application-layer handshake.
+/// Errors from the application handshake.
 #[derive(Debug)]
 pub enum HandshakeError {
     /// Stream framing/I/O error.
     Frame(FrameError),
     /// A handshake message failed to decode.
     Wire(WireError),
-    /// The server presented a `host_id` other than the one the client pinned.
+    /// The server presented a `host_id` other than the pin.
     HostIdMismatch,
-    /// The peer speaks a different `secsec_version`. There is no negotiation and no compatibility
-    /// window, so this is fatal; it is checked explicitly only so the failure names its cause.
+    /// The peer speaks another `secsec_version`; fatal, named so the cause is clear.
     VersionMismatch {
-        /// The version this build speaks.
+        /// This build's version.
         ours: u16,
-        /// The version the peer announced.
+        /// The peer's version.
         theirs: u16,
     },
-    /// The connection-auth signature did not verify (or the presented key was malformed).
+    /// The connection-auth signature did not verify (or the key was malformed).
     Auth,
-    /// The TLS keying-material exporter was unavailable.
+    /// The TLS exporter was unavailable.
     Exporter,
     /// Opening/accepting the control stream failed.
     Stream(String),
@@ -72,15 +67,15 @@ impl From<WireError> for HandshakeError {
     }
 }
 
-/// The client's post-handshake session: the transcript to bind into every per-op signature (§9.6).
+/// The client's post-handshake session: the transcript every per-op signature binds (§9.6).
 pub struct ClientSession {
     /// The per-connection session transcript.
     pub transcript: [u8; 32],
 }
 
-/// The server's post-handshake session: the authenticated client key + the transcript.
+/// The server's post-handshake session: the authenticated key and the transcript.
 pub struct ServerSession {
-    /// The authenticated client public key (the caller must still confirm it owns a keyslot, §12).
+    /// The authenticated client public key (keyslot checks are per op, §12).
     pub pubkey: DevicePublic,
     /// The per-connection session transcript.
     pub transcript: [u8; 32],
@@ -93,8 +88,7 @@ fn channel_binding(conn: &Connection) -> Result<[u8; CHANNEL_BINDING_LEN], Hands
     Ok(out)
 }
 
-/// Run the client side of the handshake. `host_id` is the client's **pinned** `host_id`
-/// ([`crate::HostPin::host_id`]); `client_nonce` is freshly random.
+/// Client side: `host_id` is the locally pinned value, `client_nonce` fresh random.
 pub async fn client_handshake(
     conn: &Connection,
     device: &DeviceKey,
@@ -112,17 +106,13 @@ pub async fn client_handshake(
     };
     write_frame(&mut send, &hello.encode()).await?;
 
-    let server_hello = ServerHello::decode(&read_frame(&mut recv, MAX_FRAME_LEN).await?)?;
-    // A version mismatch already fails below — each side folds its OWN SECSEC_VERSION into the
-    // transcript, so the auth signature will not verify — but it fails as a bad signature. Check it
-    // here so the error names the actual cause.
+    let server_hello = ServerHello::decode(&read_frame(&mut recv, ServerHello::LEN).await?)?;
     if server_hello.version != SECSEC_VERSION {
         return Err(HandshakeError::VersionMismatch {
             ours: SECSEC_VERSION,
             theirs: server_hello.version,
         });
     }
-    // Cross-check: the server must claim the host_id we already pinned (the TLS pin guaranteed it).
     if server_hello.host_id != host_id {
         return Err(HandshakeError::HostIdMismatch);
     }
@@ -148,19 +138,15 @@ pub async fn client_handshake(
     write_frame(&mut send, &ClientAuth { pubkey, sig }.encode()).await?;
     let _ = send.finish();
 
-    // Wait for the server's acknowledgement: it is sent only after auth succeeds, so its receipt
-    // confirms we are authenticated (and keeps the connection up until the server has processed).
+    // The acknowledgement is sent only after auth succeeds.
     let ack = read_frame(&mut recv, 1).await?;
     if ack.as_slice() != [AUTH_OK] {
         return Err(HandshakeError::Auth);
     }
-
     Ok(ClientSession { transcript })
 }
 
-/// Run the server side of the handshake. `host_id` is the server's own `host_id`; `server_nonce` is
-/// freshly random. Returns the authenticated client key; the caller MUST then check keyslot
-/// existence (§12) before honouring requests.
+/// Server side: every read is capped at its message's size bound; the caller bounds the whole call in time.
 pub async fn server_handshake(
     conn: &Connection,
     host_id: [u8; 32],
@@ -171,7 +157,7 @@ pub async fn server_handshake(
         .await
         .map_err(|e| HandshakeError::Stream(e.to_string()))?;
 
-    let client_hello = ClientHello::decode(&read_frame(&mut recv, MAX_FRAME_LEN).await?)?;
+    let client_hello = ClientHello::decode(&read_frame(&mut recv, ClientHello::LEN).await?)?;
     if client_hello.version != SECSEC_VERSION {
         return Err(HandshakeError::VersionMismatch {
             ours: SECSEC_VERSION,
@@ -192,7 +178,7 @@ pub async fn server_handshake(
     let transcript = transcript.finalize();
 
     let cb = channel_binding(conn)?;
-    let client_auth = ClientAuth::decode(&read_frame(&mut recv, MAX_FRAME_LEN).await?)?;
+    let client_auth = ClientAuth::decode(&read_frame(&mut recv, ClientAuth::MAX_LEN).await?)?;
     let pubkey =
         DevicePublic::from_canonical(&client_auth.pubkey).map_err(|_| HandshakeError::Auth)?;
     let ctx = ConnectionAuth {
@@ -204,10 +190,8 @@ pub async fn server_handshake(
     ctx.verify(&pubkey, &client_auth.sig)
         .map_err(|_| HandshakeError::Auth)?;
 
-    // Acknowledge: only sent on success, so the client learns it is authenticated.
     write_frame(&mut send, &[AUTH_OK]).await?;
     let _ = send.finish();
-
     Ok(ServerSession { pubkey, transcript })
 }
 
@@ -231,8 +215,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Full handshake over a live pinned QUIC connection: the server authenticates the client and
-    /// the two ends agree on the transcript; an enrolled, correctly-signing client succeeds.
+    /// Over live pinned QUIC the server authenticates the client and both agree on the transcript.
     #[test]
     fn handshake_authenticates_the_client() {
         runtime().block_on(async {
@@ -240,13 +223,11 @@ mod tests {
             let (cert, key) = (ck.cert.der().to_vec(), ck.key_pair.serialize_der());
             let pin = HostPin::from_cert(&cert).unwrap();
             let host_id = pin.host_id();
-
             let device = DeviceKey::generate().unwrap();
             let device_pub_id = device.device_id().unwrap();
 
             let server = Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
             let addr = server.local_addr().unwrap();
-
             let srv = tokio::spawn(async move {
                 let conn = server.accept().await.unwrap().await.unwrap();
                 let sess = match server_handshake(&conn, host_id, [0xAB; 32]).await {
@@ -269,11 +250,43 @@ mod tests {
                 Err(e) => panic!("client handshake: {e}"),
             };
             conn.close(0u32.into(), b"done");
-
             let (srv_pubid, srv_transcript) = srv.await.unwrap();
-            // the server authenticated *this* client key, and both derived the same transcript.
             assert_eq!(srv_pubid, device_pub_id);
             assert_eq!(srv_transcript, csess.transcript);
+        });
+    }
+
+    /// A client hello longer than its fixed size is refused before any allocation for it.
+    #[test]
+    fn oversized_hello_is_refused() {
+        runtime().block_on(async {
+            let ck = generate_simple_self_signed(vec!["secsec.invalid".to_string()]).unwrap();
+            let (cert, key) = (ck.cert.der().to_vec(), ck.key_pair.serialize_der());
+            let pin = HostPin::from_cert(&cert).unwrap();
+            let host_id = pin.host_id();
+            let server = Endpoint::server(server_config(&cert, &key).unwrap(), loopback()).unwrap();
+            let addr = server.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                server_handshake(&conn, host_id, [0xAB; 32]).await.err()
+            });
+            let mut client = Endpoint::client(loopback()).unwrap();
+            client.set_default_client_config(client_config(pin).unwrap());
+            let conn = client
+                .connect(addr, "secsec.invalid")
+                .unwrap()
+                .await
+                .unwrap();
+            let (mut send, _recv) = conn.open_bi().await.unwrap();
+            write_frame(&mut send, &[0u8; ClientHello::LEN + 1])
+                .await
+                .unwrap();
+            let err = srv.await.unwrap();
+            assert!(matches!(
+                err,
+                Some(HandshakeError::Frame(FrameError::TooLarge(_)))
+            ));
+            conn.close(0u32.into(), b"done");
         });
     }
 }

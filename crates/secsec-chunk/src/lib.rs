@@ -1,25 +1,26 @@
-//! `secsec-chunk` — keyed FastCDC content-defined chunking (`secsec-Design.md` §9.7).
-//!
-//! Standard FastCDC v2020 normalized chunking, except the 256-entry gear table is derived from the
-//! per-generation secret `cdc_seed`, making boundaries repo-specific (privacy limits + the role of
-//! default-on padding: §9.7/§21). Deterministic: same seed + same input ⇒ same cut points.
+//! Keyed content-defined chunking: a FastCDC-style gear hash with normalized two-mask cuts, keyed by `cdc_seed` (`secsec-Design.md` §9.7).
 
 #![forbid(unsafe_code)]
 
 use std::io::Read;
+use zeroize::Zeroize;
 
-/// Default FastCDC sizes (§19): 16 / 64 / 256 KiB.
+/// Minimum chunk size (§19).
 pub(crate) const DEFAULT_MIN: usize = 16 * 1024;
-/// Default average chunk size.
+/// Target average chunk size (§19).
 pub(crate) const DEFAULT_AVG: usize = 64 * 1024;
-/// Default maximum chunk size.
+/// Maximum chunk size (§19).
 pub(crate) const DEFAULT_MAX: usize = 256 * 1024;
+/// The largest plaintext chunk any conforming chunker emits; restore rejects longer chunks.
+pub const MAX_CHUNK_LEN: usize = DEFAULT_MAX;
 
-/// Normalization level (FastCDC NC): how many bits the pre-/post-average masks differ from
-/// `log2(avg)`. Level 2 is the common choice; it tightens the chunk-size distribution toward `avg`.
+/// Normalization level: the pre-/post-average masks carry `log2(avg) ± 2` one-bits (§9.7).
 const NORMALIZATION: u32 = 2;
 
-/// A configured keyed chunker. Cheap to clone; holds the derived gear table and masks.
+/// Label keying the gear-table XOF (§9.7).
+const GEAR_LABEL: &[u8] = b"secsec-cdc-gear-v1";
+
+/// A configured keyed chunker holding the secret gear table (wiped on drop).
 #[derive(Clone)]
 pub struct Chunker {
     gear: [u64; 256],
@@ -28,6 +29,12 @@ pub struct Chunker {
     max: usize,
     mask_s: u64,
     mask_l: u64,
+}
+
+impl Drop for Chunker {
+    fn drop(&mut self) {
+        self.gear.zeroize();
+    }
 }
 
 /// An error from [`Chunker::chunk_stream`]: reading the source, or the caller's `emit` callback.
@@ -50,23 +57,23 @@ impl<E: core::fmt::Display> core::fmt::Display for StreamError<E> {
 
 impl<E: std::error::Error> std::error::Error for StreamError<E> {}
 
-/// Build a 256-entry gear table by expanding `cdc_seed` with BLAKE3 in XOF mode.
+/// Gear table: 256 little-endian `u64`s from `BLAKE3::keyed_hash(cdc_seed, "secsec-cdc-gear-v1")` in XOF mode.
 fn build_gear(cdc_seed: &[u8; 32]) -> [u64; 256] {
     let mut h = blake3::Hasher::new_keyed(cdc_seed);
-    h.update(b"secsec-cdc-gear-v1");
+    h.update(GEAR_LABEL);
     let mut xof = h.finalize_xof();
+    h.zeroize();
     let mut bytes = [0u8; 256 * 8];
     xof.fill(&mut bytes);
     let mut gear = [0u64; 256];
     for (i, g) in gear.iter_mut().enumerate() {
         *g = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
     }
+    bytes.zeroize();
     gear
 }
 
-/// A mask with `count` one-bits spread across the high, well-mixed bits of the 64-bit fingerprint
-/// (the Gear hash accumulates entropy upward via `<< 1`). Cut probability per byte ≈ `2^-count`,
-/// so `count = log2(target)` yields an average run length of `target`.
+/// A mask with `count` one-bits at bits 63, 61, 59, …, so a cut fires with probability `2^-count` per byte.
 fn spread_mask(count: u32) -> u64 {
     let count = count.clamp(1, 30);
     let mut m = 0u64;
@@ -77,16 +84,13 @@ fn spread_mask(count: u32) -> u64 {
 }
 
 impl Chunker {
-    /// Build a chunker with the §19 default sizes.
+    /// A chunker with the §19 default sizes.
     #[must_use]
     pub fn with_defaults(cdc_seed: &[u8; 32]) -> Self {
         Self::new(cdc_seed, DEFAULT_MIN, DEFAULT_AVG, DEFAULT_MAX)
     }
 
-    /// Build a chunker with explicit `min < avg < max` sizes.
-    ///
-    /// # Panics
-    /// Panics unless `0 < min <= avg <= max`.
+    /// A chunker with explicit sizes; panics unless `0 < min <= avg <= max`.
     #[must_use]
     pub(crate) fn new(cdc_seed: &[u8; 32], min: usize, avg: usize, max: usize) -> Self {
         assert!(
@@ -94,20 +98,17 @@ impl Chunker {
             "require 0 < min <= avg <= max"
         );
         let bits = floor_log2(avg);
-        let mask_s = spread_mask(bits + NORMALIZATION); // stricter (rarer cut) before the avg point
-        let mask_l = spread_mask(bits.saturating_sub(NORMALIZATION)); // looser after it
         Self {
             gear: build_gear(cdc_seed),
             min,
             avg,
             max,
-            mask_s,
-            mask_l,
+            mask_s: spread_mask(bits + NORMALIZATION),
+            mask_l: spread_mask(bits.saturating_sub(NORMALIZATION)),
         }
     }
 
-    /// Length of the first chunk in `data` (the FastCDC cut point), in `[min, max]` unless `data`
-    /// is shorter than `min` (then the whole of `data`).
+    /// Length of the first chunk of `data`: in `[min, max]`, or all of `data` when shorter than `min`.
     #[must_use]
     pub(crate) fn next_cut(&self, data: &[u8]) -> usize {
         let n = data.len();
@@ -118,7 +119,7 @@ impl Chunker {
         let center = self.avg.min(end);
         let mut fp = 0u64;
         let mut i = self.min;
-        // Phase 1: stricter mask up to the normalized split point.
+        // Stricter mask up to the average, looser after it (normalized chunking).
         while i < center {
             fp = (fp << 1).wrapping_add(self.gear[data[i] as usize]);
             if fp & self.mask_s == 0 {
@@ -126,7 +127,6 @@ impl Chunker {
             }
             i += 1;
         }
-        // Phase 2: looser mask up to the end (= max, or end of data).
         while i < end {
             fp = (fp << 1).wrapping_add(self.gear[data[i] as usize]);
             if fp & self.mask_l == 0 {
@@ -137,7 +137,7 @@ impl Chunker {
         end
     }
 
-    /// Cut `data` into chunk end-offsets. The final offset always equals `data.len()`.
+    /// Chunk end-offsets of `data`; the last equals `data.len()`.
     #[cfg(test)]
     #[must_use]
     pub fn cut_points(&self, data: &[u8]) -> Vec<usize> {
@@ -163,13 +163,7 @@ impl Chunker {
         out
     }
 
-    /// Chunk `reader` as a stream, invoking `emit` once per content-defined chunk and holding at most
-    /// `max` bytes in memory regardless of input length. Returns the total bytes read.
-    ///
-    /// The cut points are **byte-identical** to [`Chunker::chunks`] over the whole input, the property
-    /// that keeps cross-device dedup and merge content-equality intact: a cut is decided only once the
-    /// window holds at least `max` bytes, or the reader is at EOF — so the window always covers exactly
-    /// the bytes the in-memory cutter (which scans at most `max` ahead) would have seen.
+    /// Stream `reader` through `emit` holding at most `max` bytes; cuts are byte-identical to [`Chunker::chunks`].
     pub fn chunk_stream<R, E, F>(&self, mut reader: R, mut emit: F) -> Result<u64, StreamError<E>>
     where
         R: Read,
@@ -179,8 +173,7 @@ impl Chunker {
         let mut eof = false;
         let mut total: u64 = 0;
         loop {
-            // Refill the window up to `max` bytes; only EOF lets a shorter window be cut. The tail is
-            // zeroed once here (not per `read`), so a slow drip of tiny reads stays O(n), not O(n·max).
+            // Only a full `max` window or EOF may be cut; the tail is zeroed once per refill, not per read.
             if !eof && buf.len() < self.max {
                 let mut filled = buf.len();
                 buf.resize(self.max, 0);
@@ -208,7 +201,7 @@ impl Chunker {
     }
 }
 
-/// floor(log2(x)) for x >= 1.
+/// `floor(log2(x))` for `x >= 1`.
 fn floor_log2(x: usize) -> u32 {
     debug_assert!(x >= 1);
     (usize::BITS - 1) - x.leading_zeros()
@@ -220,7 +213,7 @@ mod tests {
 
     const SEED: [u8; 32] = [0x33; 32];
 
-    /// Deterministic pseudo-random bytes (BLAKE3 XOF) so size-distribution tests are reproducible.
+    /// Deterministic pseudo-random bytes (BLAKE3 XOF).
     fn pseudo_random(label: &str, len: usize) -> Vec<u8> {
         let mut h = blake3::Hasher::new();
         h.update(label.as_bytes());
@@ -242,12 +235,10 @@ mod tests {
         let c = Chunker::with_defaults(&SEED);
         let data = pseudo_random("coverage", 4 * 1024 * 1024);
         let chunks = c.chunks(&data);
-        // Reassembly is exact.
         let joined: Vec<u8> = chunks.iter().flat_map(|s| s.iter().copied()).collect();
         assert_eq!(joined, data);
-        // Every chunk <= max; every chunk except the last >= min.
         for (idx, ch) in chunks.iter().enumerate() {
-            assert!(ch.len() <= DEFAULT_MAX, "chunk over max");
+            assert!(ch.len() <= MAX_CHUNK_LEN, "chunk over max");
             if idx + 1 < chunks.len() {
                 assert!(
                     ch.len() >= DEFAULT_MIN,
@@ -264,8 +255,6 @@ mod tests {
         let data = pseudo_random("avg", 8 * 1024 * 1024);
         let chunks = c.chunks(&data);
         let mean = data.len() / chunks.len();
-        // Generous band around the 64 KiB target — validates the mask popcount logic without
-        // being flaky (data is deterministic).
         assert!(
             (32 * 1024..=110 * 1024).contains(&mean),
             "mean chunk size {mean} outside expected band around {DEFAULT_AVG}"
@@ -284,8 +273,7 @@ mod tests {
     fn small_and_empty_inputs() {
         let c = Chunker::with_defaults(&SEED);
         assert!(c.cut_points(b"").is_empty());
-        let small = [0u8; 100]; // < min
-        assert_eq!(c.cut_points(&small), vec![100]);
+        assert_eq!(c.cut_points(&[0u8; 100]), vec![100]);
     }
 
     #[test]
@@ -295,7 +283,19 @@ mod tests {
         assert_eq!(floor_log2(DEFAULT_AVG), 16);
     }
 
-    /// A reader that yields at most `step` bytes per `read` — exercises read-width independence.
+    /// Frozen cut-point KAT, mirrored in `vectors/secsec-kat-v1.txt [chunk]`: seed `[0x33;32]`, 1 MiB of `BLAKE3-XOF("secsec-chunk-kat")`.
+    #[test]
+    fn cut_points_kat() {
+        let c = Chunker::with_defaults(&SEED);
+        let data = pseudo_random("secsec-chunk-kat", 1024 * 1024);
+        let cuts: Vec<String> = c.cut_points(&data).iter().map(usize::to_string).collect();
+        assert_eq!(
+            cuts.join(","),
+            "68501,148938,222181,295054,369270,443063,523306,610218,698060,764506,822342,904665,970724,1037519,1048576"
+        );
+    }
+
+    /// A reader yielding at most `step` bytes per `read`.
     struct ChoppyReader<'a> {
         data: &'a [u8],
         pos: usize,
@@ -329,8 +329,7 @@ mod tests {
         got
     }
 
-    /// The streaming cutter yields byte-identical boundaries to the in-RAM cutter, across the full
-    /// size matrix, high- and low-entropy inputs, and every read width.
+    /// Streaming cuts equal in-RAM cuts across sizes, entropy, and read widths.
     #[test]
     fn streaming_cuts_match_in_ram_across_sizes_and_read_widths() {
         let c = Chunker::with_defaults(&SEED);

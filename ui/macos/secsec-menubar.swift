@@ -1,21 +1,8 @@
-// secsec — macOS menu-bar agent.
-//
-// A thin shell around the `secsec` binary: at login it prompts for the SSH-key passphrase, spawns
-// `secsec sync <folder> --passphrase-stdin [--key <keyfile>]`, and feeds the passphrase over the
-// child's stdin pipe — so the secret never appears in argv (invisible to `ps`/`top`). The child's
-// stdout+stderr go to ~/.config/secsec/ui/sync.log. A retro LED in the menu bar shows the connect
-// status (refreshed every 15 s from process liveness + the log). Folder and SSH key are set from the
-// menu via native file pickers.
-//
-// Config: ~/.config/secsec/ui.conf — `folder=<path>` (default ~/cloud), optional `key=<ssh key>`,
-// optional `bin=<path to secsec>`. The folder must already be linked by a manual first
-// `secsec sync <folder> --server …`. `~` is expanded in `folder` and `key`.
-//
-// Build: ./build.sh  (or `swiftc -O secsec-menubar.swift -o secsec-menubar`).
+// secsec macOS menu-bar agent: runs `secsec sync` for one folder, feeding the key passphrase over a pipe, and shows its status; build with ./build.sh.
 
 import Cocoa
 
-// ---- config + paths ----
+// ---- config and paths ----
 
 func home() -> String { NSHomeDirectory() }
 
@@ -31,7 +18,13 @@ struct Config {
     var bin: String = "secsec"
 }
 
-let configPath = "\(home())/.config/secsec/ui.conf"
+// The secsec binary's client root: $XDG_CONFIG_HOME/secsec when that is absolute, else ~/.config/secsec.
+let configDir: String = {
+    if let x = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"], x.hasPrefix("/") { return "\(x)/secsec" }
+    return "\(home())/.config/secsec"
+}()
+let configPath = "\(configDir)/ui.conf"
+let logURL = URL(fileURLWithPath: "\(configDir)/ui/sync.log")
 
 func readConfig() -> Config {
     var cfg = Config()
@@ -52,25 +45,33 @@ func readConfig() -> Config {
     return cfg
 }
 
+// Write ui.conf owner-only inside the owner-only secsec config directory.
 func writeConfig(_ cfg: Config) {
-    let dir = "\(home())/.config/secsec"
-    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let fm = FileManager.default
+    try? fm.createDirectory(atPath: configDir, withIntermediateDirectories: true,
+                            attributes: [.posixPermissions: 0o700])
     var body = "# secsec desktop UI config (managed by the secsec UI)\n"
     body += "folder=\(cfg.folder)\n"
     if !cfg.key.isEmpty { body += "key=\(cfg.key)\n" }
     if cfg.bin != "secsec" { body += "bin=\(cfg.bin)\n" }
     try? body.write(toFile: configPath, atomically: true, encoding: .utf8)
+    try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configPath)
 }
 
-// Kept under ~/.config/secsec/ alongside ui.conf so the UI's files don't scatter.
-func logURL() -> URL {
-    let dir = URL(fileURLWithPath: "\(home())/.config/secsec/ui")
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir.appendingPathComponent("sync.log")
+// A fresh, empty, owner-only log in an owner-only directory, for one launch.
+func freshLog() -> FileHandle? {
+    let fm = FileManager.default
+    let dir = logURL.deletingLastPathComponent().path
+    try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true,
+                            attributes: [.posixPermissions: 0o700])
+    try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+    guard fm.createFile(atPath: logURL.path, contents: nil,
+                        attributes: [.posixPermissions: 0o600]) else { return nil }
+    try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logURL.path)
+    return try? FileHandle(forWritingTo: logURL)
 }
 
-// Resolve the secsec binary: the configured path, then the usual install dirs, else fall back to a
-// PATH search via /usr/bin/env (a GUI agent's PATH is minimal, so we resolve explicitly first).
+// The configured binary, else the usual install directories, else a PATH search (a GUI agent's PATH is minimal).
 func resolveBinary(_ configured: String) -> (exec: URL, args: [String]) {
     let fm = FileManager.default
     var candidates = [String]()
@@ -85,50 +86,72 @@ func resolveBinary(_ configured: String) -> (exec: URL, args: [String]) {
     return (URL(fileURLWithPath: "/usr/bin/env"), [configured])
 }
 
-func lastLogLine(_ url: URL) -> String {
-    guard let text = try? String(contentsOf: url, encoding: .utf8) else { return "" }
-    let lines = text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
-        .filter { !$0.isEmpty }
-    return lines.last ?? ""
+// Run `secsec <args>` to completion and return its stdout; it blocks, so it runs off the main thread.
+func runSecsec(_ cfg: Config, _ args: [String]) -> String {
+    let (exec, prefix) = resolveBinary(cfg.bin)
+    let p = Process()
+    p.executableURL = exec
+    p.arguments = prefix + args
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return "" }
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return String(data: data, encoding: .utf8) ?? ""
 }
 
-// ---- connect health (the 15 s poll) ----
+// ---- status ----
 
 enum Health { case connected, connecting, error, stopped }
 
-// Scan the log newest-first: a hard error marker → .error, a transient "connection lost" →
-// .connecting, a healthy sync line → .connected; a running process with nothing notable → .connected.
-func health(running: Bool, log: URL) -> Health {
-    if !running { return .stopped }
-    guard let text = try? String(contentsOf: log, encoding: .utf8) else { return .connected }
-    let hard = ["reconnect failed", "sync error", "alarm", "wrong passphrase", "could not", "no server"]
-    let warn = ["connection lost"]
-    let ok = ["watching", "sync: uptodate", "sync: pushed", "sync: pulled", "sync: merged",
-              "sync: published", "sync: cloned", "synced "]
-    for raw in text.split(separator: "\n").reversed() {
-        let line = raw.lowercased()
-        if hard.contains(where: { line.contains($0) }) { return .error }
-        if warn.contains(where: { line.contains($0) }) { return .connecting }
-        if ok.contains(where: { line.contains($0) }) { return .connected }
+struct SyncStatus {
+    var running = false
+    var state = "stopped"
+    var message = ""
+}
+
+// `secsec status` key=value lines.
+func parseStatus(_ text: String) -> SyncStatus {
+    var s = SyncStatus()
+    for line in text.split(separator: "\n") {
+        guard let eq = line.firstIndex(of: "=") else { continue }
+        let key = String(line[..<eq])
+        let val = String(line[line.index(after: eq)...])
+        switch key {
+        case "running": s.running = val == "yes"
+        case "state": s.state = val
+        case "message": s.message = val
+        default: break
+        }
     }
-    return .connected
+    return s
+}
+
+func health(_ s: SyncStatus, ownChild: Bool) -> Health {
+    if !s.running { return ownChild ? .connecting : .stopped }
+    switch s.state {
+    case "error", "alarm": return .error
+    case "starting", "connecting", "stopping": return .connecting
+    default: return .connected
+    }
 }
 
 // ---- session passphrase cache ----
 
-// A passphrase kept only in RAM for the session, so the agent can relaunch the wedged sync child
-// after a wake without re-prompting. XOR-masked with a per-store random key, mlock'd out of swap,
-// zeroed on clear. NOT proof against a memory-dump attacker (the mask is in the same RAM) — it
-// defeats casual scraping and swap leakage. Never disk, never argv.
+// The session passphrase in RAM only, XOR-masked and mlock'd, so a wake can relaunch the sync without a prompt.
 final class SecretCache {
     private var data: UnsafeMutableRawPointer?
     private var mask: UnsafeMutableRawPointer?
     private var len = 0
+    private var entered = false
 
-    var hasValue: Bool { data != nil && len > 0 }
+    // Whether a passphrase was entered this session; an empty one (a key without a passphrase) counts.
+    var unlocked: Bool { entered }
 
     func store(_ s: String) {
         clear()
+        entered = true
         var plain = Array(s.utf8)
         len = plain.count
         guard len > 0 else { return }
@@ -139,7 +162,7 @@ final class SecretCache {
         let dp = d.assumingMemoryBound(to: UInt8.self)
         let mp = m.assumingMemoryBound(to: UInt8.self)
         for i in 0..<len { dp[i] = plain[i] ^ mp[i] }
-        for i in plain.indices { plain[i] = 0 } // scrub the transient plaintext copy
+        for i in plain.indices { plain[i] = 0 }
         data = d; mask = m
     }
 
@@ -155,7 +178,7 @@ final class SecretCache {
     func clear() {
         if let data { _ = memset(data, 0, len); _ = munlock(data, len); data.deallocate() }
         if let mask { _ = memset(mask, 0, len); _ = munlock(mask, len); mask.deallocate() }
-        data = nil; mask = nil; len = 0
+        data = nil; mask = nil; len = 0; entered = false
     }
 }
 
@@ -167,26 +190,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var toggleItem: NSMenuItem!
     private var task: Process?
     private var pollTimer: Timer?
-    private let log = logURL()
-    private let cache = SecretCache()  // session passphrase, for seamless wake-restart
-    private var intendRunning = false  // user wants sync up → relaunch it after a wake
+    private let cache = SecretCache()
+    private var intendRunning = false
+    private var lastStatus = SyncStatus()
+    private let worker = DispatchQueue(label: "secsec.ui.worker")
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        NSApp.setActivationPolicy(.accessory) // menu-bar agent, no Dock icon
-
+        NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         buildMenu()
-        refresh()
+        redraw()
         promptAndStart()
-
-        // Poll every 15 s: refresh the retro connect LED from process liveness + the log.
         pollTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             self?.refresh()
         }
-
-        // After a sleep the child's async runtime is permanently wedged — tokio timers run on a
-        // monotonic clock that doesn't advance while macOS sleeps, so it can never reconnect. Can't
-        // be fixed in the child; relaunch it fresh on wake.
+        // After sleep the child's runtime timers are wedged; a wake relaunches it.
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(systemDidWake(_:)),
             name: NSWorkspace.didWakeNotification, object: nil)
@@ -195,7 +213,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ note: Notification) {
         pollTimer?.invalidate()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
-        stop()
+        intendRunning = false
+        if let proc = task, proc.isRunning { proc.terminate() }
         cache.clear()
     }
 
@@ -239,10 +258,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    private var isRunning: Bool { task?.isRunning ?? false }
+    private var ownChild: Bool { task?.isRunning ?? false }
+    private var isRunning: Bool { ownChild || lastStatus.running }
 
-    // The menu-bar mark: a white diagonal "/" crossed by the status bar, drawn on top so its colour
-    // reads at menu-bar size — green when connected & syncing, orange otherwise. Matches assets/secsec.svg.
+    // The menu-bar mark: a white diagonal crossed by the status bar, green when connected, orange otherwise.
     private static func markImage(connected: Bool) -> NSImage {
         let px: CGFloat = 18
         let img = NSImage(size: NSSize(width: px, height: px))
@@ -256,18 +275,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             p.lineWidth = 7 * k; p.lineCapStyle = .round
             color.setStroke(); p.stroke()
         }
-        stroke(point(17.858, 46.142), point(46.142, 17.858), .white)   // diagonal
+        stroke(point(17.858, 46.142), point(46.142, 17.858), .white)
         let bar = connected
             ? NSColor(srgbRed: 0x2a / 255.0, green: 0xa8 / 255.0, blue: 0x5a / 255.0, alpha: 1)
             : NSColor(srgbRed: 0xe0 / 255.0, green: 0x8a / 255.0, blue: 0x30 / 255.0, alpha: 1)
-        stroke(point(12, 32), point(52, 32), bar)                       // status bar (foreground)
+        stroke(point(12, 32), point(52, 32), bar)
         img.unlockFocus()
         img.isTemplate = false
         return img
     }
 
+    // Ask `secsec status` off the main thread, then redraw.
     private func refresh() {
-        let h = health(running: isRunning, log: log)
+        let cfg = readConfig()
+        worker.async { [weak self] in
+            let s = parseStatus(runSecsec(cfg, ["status", expandTilde(cfg.folder)]))
+            DispatchQueue.main.async {
+                self?.lastStatus = s
+                self?.redraw()
+            }
+        }
+    }
+
+    private func redraw() {
+        let h = health(lastStatus, ownChild: ownChild)
         if let button = statusItem.button {
             button.attributedTitle = NSAttributedString(string: "")
             button.image = Self.markImage(connected: h == .connected)
@@ -277,61 +308,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let folder = expandTilde(readConfig().folder)
         let head: String = {
             switch h {
-            case .connected: return "secsec: connected — \(folder)"
-            case .connecting: return "secsec: connecting… — \(folder)"
-            case .error: return "secsec: problem — \(folder)"
-            case .stopped: return "secsec: stopped — \(folder)"
+            case .connected: return "secsec: connected · \(folder)"
+            case .connecting: return "secsec: connecting… · \(folder)"
+            case .error: return "secsec: problem · \(folder)"
+            case .stopped: return "secsec: stopped · \(folder)"
             }
         }()
-        let tail = lastLogLine(log)
-        statusLine.title = tail.isEmpty ? head : "\(head) — \(tail)"
+        statusLine.title = lastStatus.message.isEmpty ? head : "\(head) · \(lastStatus.message)"
     }
 
-    // Kill any running secsec, then prompt for a fresh passphrase and spawn — the user-initiated
-    // Start / Restart, and the launch prompt. Config is read fresh, so a folder/key changed from the
-    // menu takes effect here.
-    private func promptAndStart() {
-        killAllSecsec()
-        promptAndSpawn()
-    }
-
-    // Kill any running secsec, then relaunch reusing the session passphrase if it is still cached
-    // (seamless), else prompt. The wake-restart and folder/key reload paths.
-    private func startFromCacheOrPrompt() {
-        killAllSecsec()
-        if cache.hasValue {
-            intendRunning = true
-            spawn(readConfig())
-        } else {
-            promptAndSpawn()
+    // Stop whatever sync holds the configured folder (secsec signals it by its lock pid and waits), then continue on the main thread.
+    private func stopFolderSync(then next: @escaping () -> Void) {
+        let cfg = readConfig()
+        worker.async {
+            _ = runSecsec(cfg, ["stop", expandTilde(cfg.folder)])
+            DispatchQueue.main.async(execute: next)
         }
     }
 
-    // Prompt for the passphrase (masked), cache it for the session, spawn. The caller has already
-    // killed any running secsec.
-    private func promptAndSpawn() {
+    // Prompt for the passphrase, cache it for the session, stop any sync of the folder, spawn.
+    private func promptAndStart() {
         let cfg = readConfig()
         guard let pass = promptPassphrase(folder: expandTilde(cfg.folder)) else {
-            intendRunning = false // cancelled — don't auto-relaunch on the next wake
+            intendRunning = false
             refresh()
             return
         }
         cache.store(pass)
         intendRunning = true
-        spawn(cfg)
+        stopFolderSync { [weak self] in self?.spawn(readConfig()) }
     }
 
-    // Maximum-aggressive clean slate: SIGKILL every `secsec` process (any folder, any subcommand) so a
-    // fresh sync can never race a stray, wedged, or orphaned one — there is no folder lock to stop two
-    // `secsec sync` at once. Matched by exact name, so this `secsec-menubar` agent is never a target.
-    // Synchronous, so the kill completes before we respawn.
-    private func killAllSecsec() {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        p.arguments = ["-KILL", "-x", "secsec"]
-        try? p.run()
-        p.waitUntilExit()
-        task = nil
+    // Relaunch from the cached passphrase when there is one, else prompt.
+    private func startFromCacheOrPrompt() {
+        guard cache.unlocked else { promptAndStart(); return }
+        intendRunning = true
+        stopFolderSync { [weak self] in self?.spawn(readConfig()) }
     }
 
     private func promptPassphrase(folder: String) -> String? {
@@ -345,7 +357,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
         let resp = alert.runModal()
-        return resp == .alertFirstButtonReturn ? field.stringValue : nil
+        let value = field.stringValue
+        field.stringValue = ""
+        return resp == .alertFirstButtonReturn ? value : nil
     }
 
     private func spawn(_ cfg: Config) {
@@ -356,22 +370,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !cfg.key.isEmpty { args += ["--key", expandTilde(cfg.key)] }
         proc.arguments = args
 
-        // Fresh log per launch; stdout+stderr both go to it.
-        FileManager.default.createFile(atPath: log.path, contents: nil)
-        guard let logHandle = try? FileHandle(forWritingTo: log) else {
-            notify("cannot open log file \(log.path)")
+        guard let logHandle = freshLog() else {
+            notify("cannot open log file \(logURL.path)")
             return
         }
         proc.standardOutput = logHandle
         proc.standardError = logHandle
-
         let stdinPipe = Pipe()
         proc.standardInput = stdinPipe
 
         proc.terminationHandler = { [weak self] p in
             DispatchQueue.main.async {
                 guard let self else { return }
-                if self.task === p { // ignore a just-killed prior process's exit
+                if self.task === p {
                     self.task = nil
                     self.refresh()
                 }
@@ -385,55 +396,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         task = proc
 
-        // Feed the cached passphrase over stdin, then close so `secsec` reads EOF. The secret only
-        // ever travels this pipe — it is never an argument.
+        // The passphrase only ever travels this pipe; the plaintext copy is scrubbed once written.
         if var pass = cache.reveal() {
             try? stdinPipe.fileHandleForWriting.write(contentsOf: pass)
-            pass.resetBytes(in: 0..<pass.count) // scrub the transient plaintext copy
+            pass.resetBytes(in: 0..<pass.count)
         }
         try? stdinPipe.fileHandleForWriting.close()
         refresh()
     }
 
     private func stop() {
-        intendRunning = false // a manual stop must not be auto-restarted on the next wake
-        guard let proc = task, proc.isRunning else { task = nil; return }
-        proc.terminate() // SIGTERM — let secsec close its connection cleanly
-        task = nil
-    }
-
-    // Re-launch with current config (after a folder/key change) only if a sync is already running.
-    private func reloadIfRunning() {
-        if isRunning {
-            startFromCacheOrPrompt() // kills the old child + any stray, relaunches with new config
-        } else {
+        intendRunning = false
+        if let proc = task, proc.isRunning {
+            proc.terminate()
+            task = nil
             refresh()
+        } else {
+            stopFolderSync { [weak self] in self?.refresh() }
         }
     }
 
+    // After a folder or key change, relaunch only if a sync is running.
+    private func reloadIfRunning() {
+        if isRunning { startFromCacheOrPrompt() } else { refresh() }
+    }
+
     @objc private func toggle() {
-        if isRunning { stop(); refresh() } else { promptAndStart() }
+        if isRunning { stop() } else { promptAndStart() }
     }
 
     @objc private func restart() {
-        promptAndStart() // kill any running secsec, re-ask the passphrase, respawn
+        promptAndStart()
     }
 
-    // Wake from sleep: the child's runtime is wedged, so kill it (and any stray) and start a fresh
-    // process from the cached passphrase. A short delay lets Wi-Fi reassociate; the fresh child's own
-    // reconnect loop rides out any remaining settling.
+    // A wake relaunches the sync from the cached passphrase after Wi-Fi has had a moment to reassociate.
     @objc private func systemDidWake(_ note: Notification) {
-        guard intendRunning else { return } // sync not started, or stopped by the user — leave it
-        killAllSecsec()
-        refresh()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self, self.intendRunning, !self.isRunning, self.cache.hasValue else { return }
-            self.spawn(readConfig())
+        guard intendRunning else { return }
+        stopFolderSync { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                guard let self, self.intendRunning, !self.ownChild, self.cache.unlocked else { return }
+                self.spawn(readConfig())
+            }
         }
     }
 
     @objc private func openLog() {
-        NSWorkspace.shared.open(log)
+        NSWorkspace.shared.open(logURL)
     }
 
     @objc private func chooseFolder() {
@@ -467,7 +475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if panel.runModal() == .OK, let url = panel.url {
             cfg.key = url.path
             writeConfig(cfg)
-            cache.clear() // new key → the cached passphrase no longer applies; prompt again
+            cache.clear()
             reloadIfRunning()
         }
     }
@@ -476,13 +484,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var cfg = readConfig()
         cfg.key = ""
         writeConfig(cfg)
-        cache.clear() // key changed → drop the cached passphrase
+        cache.clear()
         reloadIfRunning()
     }
 
+    // Quitting stops this agent's own sync (applicationWillTerminate), never one started elsewhere.
     @objc private func quit() {
-        stop()
-        cache.clear()
         NSApp.terminate(nil)
     }
 

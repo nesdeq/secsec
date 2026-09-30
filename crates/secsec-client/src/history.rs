@@ -1,81 +1,40 @@
-//! Repository history — the read side of `secsec log` / `secsec restore` (`secsec-Design.md` §10),
-//! walking the commit DAG over the existing object plane (keep-everything GC retains it; a peeled
-//! key ring reads across rotations). [`fetch_history`] brings commits + trees local (no chunk blobs
-//! — listing/diffing only needs tree structure); [`repo_log`] lists commits newest-first with the
-//! files each changed; [`path_history`] lists one path's versions. The restore side is
-//! [`secsec_snapshot::restore_path`], driven by the CLI.
+//! Repository history for `secsec log` and `secsec restore` (`secsec-Design.md` §10, §15): verified commits and trees, chunks on demand.
 
-use crate::{ClientError, Remote};
+use crate::{fetch_commits, fetch_tree, ClientError, Remote, Walk};
 use secsec_kdf::MasterKeys;
 use secsec_object::{Id, PathSalt};
-use secsec_sig::DeviceId;
+use secsec_sig::{DeviceId, DevicePublic};
 use secsec_snapshot::{
     changed_paths, load_tree, open_signed_commit, resolve_path, Commit, Entry, PathNode, SnapError,
 };
 use secsec_store::Store;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
-enum Work {
-    Commit(Id, bool),
-    Tree(Id, PathSalt, bool),
-}
-
-/// Fetch every commit + tree reachable from `head_commit` into `store` (not chunk blobs — listing and
-/// diffing never need them), verifying each on arrival (§9.2). Strict on the head commit and its own
-/// tree (a missing *current* object is a real error); skip-missing on ancestors, whose content may be
-/// pruned beyond retention (§15/I5), as in [`crate::fetch_closure`].
+/// Bring `head_commit`'s history local: every commit, signature-checked against `ever_members`, and every tree it still has.
 pub async fn fetch_history<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
     keys: &K,
+    ever_members: &BTreeMap<DeviceId, DevicePublic>,
     head_commit: &Id,
 ) -> Result<(), ClientError> {
-    let mut seen: BTreeSet<Id> = BTreeSet::new();
-    let mut work = vec![Work::Commit(*head_commit, true)];
-    while let Some(item) = work.pop() {
-        let (id, strict) = match &item {
-            Work::Commit(id, s) | Work::Tree(id, _, s) => (*id, *s),
-        };
-        if !seen.insert(id) {
-            continue;
-        }
-        if store.get(&id)?.is_none() {
-            match remote.get_blob(&id).await? {
-                Some(blob) => {
-                    store.put(&id, &blob)?;
-                }
-                None if strict => return Err(ClientError::MissingRemote(id)),
-                None => continue, // pruned ancestor content (§15/I5)
-            }
-        }
-        match item {
-            Work::Commit(_, _) => {
-                let (commit, _sig) = open_signed_commit(&id, keys, store)?;
-                // Parents are ancestors (lenient); the head's own tree is current content (strict).
-                for p in &commit.parents {
-                    work.push(Work::Commit(*p, false));
-                }
-                work.push(Work::Tree(commit.root_tree, commit.root_salt, strict));
-            }
-            Work::Tree(_, salt, _) => {
-                let tree = load_tree(&id, &salt, keys, store)?;
-                for e in tree.entries {
-                    if let Entry::Dir {
-                        subtree,
-                        subtree_salt,
-                        ..
-                    } = e
-                    {
-                        work.push(Work::Tree(subtree, subtree_salt, strict));
-                    }
-                }
-            }
+    fetch_commits(remote, store, keys, head_commit).await?;
+    let ids = topo_order(keys, store, head_commit)?;
+    let all: BTreeSet<Id> = ids.iter().copied().collect();
+    secsec_engine::verify_commits(&all, ever_members, keys, store)?;
+    for cid in &ids {
+        let (c, _) = open_signed_commit(cid, keys, store)?;
+        match fetch_tree(remote, store, keys, &c.root_tree, &c.root_salt, Walk::Trees).await {
+            Ok(_) => {}
+            // A tree the server no longer holds is skipped; only the head's own tree is required.
+            Err(ClientError::MissingRemote(_)) if cid != head_commit => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(())
 }
 
-/// A commit in the log: who, when, and which files it changed vs its first parent.
+/// A commit in the log: who, when, and which files it changed against its first parent.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     /// The commit's content id.
@@ -86,15 +45,13 @@ pub struct LogEntry {
     pub version: u64,
     /// Author-asserted timestamp (advisory).
     pub ts: u64,
-    /// Parent commit ids (2 = a merge).
+    /// Parent commit ids (two for a merge).
     pub parents: Vec<Id>,
-    /// File paths whose content changed vs the first parent (empty = a metadata-only / merge commit).
+    /// File paths whose content changed against the first parent.
     pub changed: Vec<String>,
 }
 
-/// All commits reachable from `head` in newest-first **topological** order — a child always precedes
-/// its parents; ties are broken by timestamp then id (Kahn's algorithm over the commit DAG). Topology
-/// is authoritative; the advisory timestamp only orders independent branches.
+/// Commits reachable from `head`, newest first in topological order (children before parents, ties by timestamp then id).
 fn topo_order<K: MasterKeys>(keys: &K, store: &Store, head: &Id) -> Result<Vec<Id>, ClientError> {
     let mut parents: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
     let mut ts: BTreeMap<Id, u64> = BTreeMap::new();
@@ -105,21 +62,15 @@ fn topo_order<K: MasterKeys>(keys: &K, store: &Store, head: &Id) -> Result<Vec<I
         }
         let (commit, _sig) = open_signed_commit(&cid, keys, store)?;
         ts.insert(cid, commit.ts);
-        for p in &commit.parents {
-            if !parents.contains_key(p) {
-                stack.push(*p);
-            }
-        }
-        parents.insert(cid, commit.parents.clone());
+        stack.extend(commit.parents.iter().filter(|p| !parents.contains_key(*p)));
+        parents.insert(cid, commit.parents);
     }
-    // children[node] = number of commits that list `node` as a parent (incoming edges).
     let mut children: BTreeMap<Id, usize> = parents.keys().map(|k| (*k, 0)).collect();
     for ps in parents.values() {
         for p in ps {
             *children.entry(*p).or_insert(0) += 1;
         }
     }
-    // Ready = commits with no remaining children; pop the newest (max ts, then id) each step.
     let mut ready: BinaryHeap<(u64, Id)> = children
         .iter()
         .filter(|(_, c)| **c == 0)
@@ -128,13 +79,11 @@ fn topo_order<K: MasterKeys>(keys: &K, store: &Store, head: &Id) -> Result<Vec<I
     let mut order = Vec::with_capacity(parents.len());
     while let Some((_, cid)) = ready.pop() {
         order.push(cid);
-        if let Some(ps) = parents.get(&cid) {
-            for p in ps {
-                if let Some(c) = children.get_mut(p) {
-                    *c -= 1;
-                    if *c == 0 {
-                        ready.push((*ts.get(p).unwrap_or(&0), *p));
-                    }
+        for p in parents.get(&cid).into_iter().flatten() {
+            if let Some(c) = children.get_mut(p) {
+                *c -= 1;
+                if *c == 0 {
+                    ready.push((*ts.get(p).unwrap_or(&0), *p));
                 }
             }
         }
@@ -142,8 +91,7 @@ fn topo_order<K: MasterKeys>(keys: &K, store: &Store, head: &Id) -> Result<Vec<I
     Ok(order)
 }
 
-/// All commit ids reachable from `head_commit`, newest-first (topological) — for resolving a
-/// commit-id prefix in `secsec restore <path> <id>`.
+/// Every commit id reachable from `head_commit`, newest first (resolves `secsec restore` id prefixes).
 pub fn commit_ids<K: MasterKeys>(
     keys: &K,
     store: &Store,
@@ -152,10 +100,8 @@ pub fn commit_ids<K: MasterKeys>(
     topo_order(keys, store, head_commit)
 }
 
-/// Fetch only the chunk blobs needed to materialize `path` from `commit` (the trees are assumed
-/// already local via [`fetch_history`]). For a file: its chunks; for a directory: every chunk under
-/// it. So restoring one file from a large repo does not download the whole snapshot.
-pub(crate) async fn fetch_path_content<R: Remote, K: MasterKeys>(
+/// Fetch, verified, only the chunks that materialize `path` in `commit` (trees are already local).
+async fn fetch_path_content<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
     keys: &K,
@@ -164,14 +110,18 @@ pub(crate) async fn fetch_path_content<R: Remote, K: MasterKeys>(
 ) -> Result<(), ClientError> {
     let node = match resolve_path(keys, store, &commit.root_tree, &commit.root_salt, path) {
         Ok(Some(n)) => n,
-        Ok(None) => return Err(ClientError::Snap(SnapError::PathNotFound(path.to_string()))),
-        // Spine pruned beyond retention — nothing to fetch; restore_path reports PrunedBeyondRetention.
+        Ok(None) => return Err(SnapError::PathNotFound(path.to_string()).into()),
+        // A spine absent from the store: restore_path reports it.
         Err(SnapError::Missing(_)) => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    let mut chunk_ids: Vec<Id> = Vec::new();
+    let mut chunks: Vec<(Id, PathSalt)> = Vec::new();
     match node {
-        PathNode::File { chunks, .. } => chunk_ids = chunks,
+        PathNode::File {
+            chunks: cs,
+            path_salt,
+            ..
+        } => chunks.extend(cs.into_iter().map(|c| (c, path_salt))),
         PathNode::Dir {
             subtree,
             subtree_salt,
@@ -180,7 +130,11 @@ pub(crate) async fn fetch_path_content<R: Remote, K: MasterKeys>(
             while let Some((tid, tsalt)) = work.pop() {
                 for e in load_tree(&tid, &tsalt, keys, store)?.entries {
                     match e {
-                        Entry::File { chunks, .. } => chunk_ids.extend(chunks),
+                        Entry::File {
+                            chunks: cs,
+                            path_salt,
+                            ..
+                        } => chunks.extend(cs.into_iter().map(|c| (c, path_salt))),
                         Entry::Dir {
                             subtree,
                             subtree_salt,
@@ -191,21 +145,21 @@ pub(crate) async fn fetch_path_content<R: Remote, K: MasterKeys>(
             }
         }
     }
-    for cid in &chunk_ids {
-        if store.get(cid)?.is_none() {
-            let blob = remote
-                .get_blob(cid)
-                .await?
-                .ok_or(ClientError::MissingRemote(*cid))?;
-            store.put(cid, &blob)?;
+    for (cid, salt) in &chunks {
+        if store.get(cid)?.is_some() {
+            continue;
         }
+        // Chunks pruned beyond retention are left for restore_path to report.
+        let Some(blob) = remote.get_blob(cid).await? else {
+            continue;
+        };
+        secsec_snapshot::verify_chunk(keys, cid, salt, &blob)?;
+        store.put(cid, &blob)?;
     }
     Ok(())
 }
 
-/// Restore `path` from `commit_id` into `dest_root` (the working folder root): fetch just that path's
-/// chunks, then write the historic file/folder over the current copy (`secsec restore`). The caller
-/// lets the normal commit-on-change sync propagate it to other devices.
+/// `secsec restore`: write `path` as of `commit_id` into `dest_root`, overwriting the current copy.
 pub async fn restore<R: Remote, K: MasterKeys>(
     remote: &R,
     store: &Store,
@@ -220,7 +174,7 @@ pub async fn restore<R: Remote, K: MasterKeys>(
     Ok(())
 }
 
-/// The whole-repo change log: every commit newest-first, with the files it changed vs its first parent.
+/// The whole-repo change log, newest first.
 pub fn repo_log<K: MasterKeys>(
     keys: &K,
     store: &Store,
@@ -255,23 +209,22 @@ pub fn repo_log<K: MasterKeys>(
     Ok(out)
 }
 
-/// One version of a tracked path: the commit where it changed, and whether it exists / is a directory.
+/// One version of a tracked path.
 #[derive(Debug, Clone)]
 pub struct PathVersion {
-    /// The commit at which `path`'s content changed.
+    /// The commit at which the path changed.
     pub commit_id: Id,
     /// The authoring device.
     pub device_id: DeviceId,
     /// Author timestamp (advisory).
     pub ts: u64,
-    /// Whether `path` exists at this version (`false` = it was deleted here).
+    /// Whether the path exists at this version (`false`: deleted here).
     pub present: bool,
-    /// Whether `path` is a directory at this version.
+    /// Whether the path is a directory at this version.
     pub is_dir: bool,
 }
 
-/// Content identity of a resolved path (a file's chunk list, or a dir's subtree id; `None` if absent).
-/// Mode/mtime are excluded, so a pure `touch` is not counted as a new version.
+/// Content identity of a resolved path: a file's chunk list or a directory's subtree id; mode and mtime are excluded.
 fn content_key(node: &Option<PathNode>) -> Option<Vec<Id>> {
     match node {
         Some(PathNode::File { chunks, .. }) => Some(chunks.clone()),
@@ -280,15 +233,12 @@ fn content_key(node: &Option<PathNode>) -> Option<Vec<Id>> {
     }
 }
 
-/// A path's state at a commit: `Resolved` (the spine is present, so the path is `Some`/`None` there)
-/// or `Pruned` (the spine was dropped beyond retention, §15 — unknown and unrestorable).
+/// A path at a commit: resolved (present or absent) or unknowable because its trees are gone.
 enum PathState {
     Resolved(Option<PathNode>),
     Pruned,
 }
 
-/// Resolve `path` within a commit, mapping a pruned spine to [`PathState::Pruned`] rather than a fatal
-/// `Missing`, so [`path_history`] can skip versions it cannot characterize.
 fn resolve_state<K: MasterKeys>(
     keys: &K,
     store: &Store,
@@ -303,9 +253,7 @@ fn resolve_state<K: MasterKeys>(
     }
 }
 
-/// The version history of one `path` (file or folder): the commits where its content changed, newest
-/// first. A commit is a version iff `path`'s content there differs from its first parent. Versions
-/// whose spine is pruned beyond retention (§15/I5) are skipped — never surfaced as phantom deletions.
+/// One path's versions, newest first: commits where its content differs from the first parent; unknowable ones are skipped.
 pub fn path_history<K: MasterKeys>(
     keys: &K,
     store: &Store,
@@ -316,7 +264,6 @@ pub fn path_history<K: MasterKeys>(
     let mut out = Vec::new();
     for cid in order {
         let (commit, _sig) = open_signed_commit(&cid, keys, store)?;
-        // A pruned spine can't be characterized or restored — skip it (§15/I5).
         let PathState::Resolved(cur) =
             resolve_state(keys, store, &commit.root_tree, &commit.root_salt, path)?
         else {
@@ -329,8 +276,7 @@ pub fn path_history<K: MasterKeys>(
             }
             None => PathState::Resolved(None),
         };
-        // Emit on a content change vs a resolvable parent; a pruned parent is the retention boundary,
-        // so the oldest still-present version is emitted there.
+        // Past an unknowable parent (its trees absent), the oldest version still resolvable is listed.
         let changed = match parent {
             PathState::Resolved(p) => content_key(&cur) != content_key(&p),
             PathState::Pruned => cur.is_some(),
@@ -346,4 +292,105 @@ pub fn path_history<K: MasterKeys>(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testmem::{roster_of, MemRemote};
+    use crate::{push_head, push_objects};
+    use secsec_kdf::MasterKey;
+    use secsec_sig::DeviceKey;
+    use secsec_snapshot::{seal_signed_commit, snapshot_tree, Prior, SnapshotMemo};
+
+    /// Log, path history, and a single-file restore over a fresh store; a commit by a non-member is refused.
+    #[tokio::test]
+    async fn log_path_history_and_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = MasterKey::new(1, [0x21; 32]);
+        let dev = DeviceKey::generate().unwrap();
+        let r = MemRemote::new(Store::open(dir.path().join("r.redb")).unwrap());
+        let a = Store::open(dir.path().join("a.redb")).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let mut prev: Option<(Id, Commit)> = None;
+        let mut head: Option<(secsec_sync::Head, Vec<u8>)> = None;
+        for v in 1..=3u64 {
+            std::fs::write(work.path().join("f.txt"), format!("version {v}")).unwrap();
+            let snap = snapshot_tree(
+                work.path(),
+                &m,
+                &a,
+                prev.as_ref().map(|(_, c)| Prior {
+                    root: &c.root_tree,
+                    salt: &c.root_salt,
+                    fast_path: false,
+                }),
+                &mut SnapshotMemo::default(),
+            )
+            .unwrap();
+            let commit = Commit {
+                root_tree: snap.root,
+                root_salt: snap.salt,
+                parents: prev.iter().map(|(id, _)| *id).collect(),
+                device_id: dev.device_id().unwrap(),
+                version: v,
+                roster_seq: 0,
+                last_seen_head: [0; 32],
+                ts: v,
+            };
+            let id = seal_signed_commit(&m, &a, &dev, &commit).unwrap();
+            push_objects(
+                &r,
+                &a,
+                &m,
+                &id,
+                prev.as_ref().map(|(p, _)| p),
+                &[v as u8; 16],
+            )
+            .await
+            .unwrap();
+            let pushed = push_head(
+                &r,
+                &m,
+                &dev,
+                "main",
+                id,
+                0,
+                head.as_ref().map(|(h, b)| (h, b.as_slice())),
+                &[v as u8; 16],
+            )
+            .await
+            .unwrap();
+            head = Some(pushed);
+            prev = Some((id, commit));
+        }
+        let tip = prev.unwrap().0;
+        let roster = roster_of(&[&dev]);
+        let fresh = Store::open(dir.path().join("h.redb")).unwrap();
+        fetch_history(&r, &fresh, &m, &roster.ever_members, &tip)
+            .await
+            .unwrap();
+        let log = repo_log(&m, &fresh, &tip).unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0].commit_id, tip);
+        assert_eq!(log[0].changed, vec!["f.txt".to_string()]);
+        let hist = path_history(&m, &fresh, &tip, "f.txt").unwrap();
+        assert_eq!(hist.len(), 3);
+        let oldest = hist.last().unwrap().commit_id;
+        let out = tempfile::tempdir().unwrap();
+        restore(&r, &fresh, &m, &oldest, "f.txt", out.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(out.path().join("f.txt")).unwrap(),
+            b"version 1"
+        );
+
+        let stranger = roster_of(&[&DeviceKey::generate().unwrap()]);
+        let other = Store::open(dir.path().join("o.redb")).unwrap();
+        assert!(matches!(
+            fetch_history(&r, &other, &m, &stranger.ever_members, &tip).await,
+            Err(ClientError::Merge(secsec_engine::MergeError::NotMember(_)))
+        ));
+    }
 }

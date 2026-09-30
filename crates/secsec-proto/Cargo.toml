@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Server-API per-op authorization: args_hash + write/read-auth signatures (secsec-Design.md §12, §9.6)."
+description = "Wire protocol: bounded codecs, per-op args_hash and read/write auth, prune hashes, server limits (secsec-Design.md §9.6, §12, §15, §19)."
 
 [lints]
 workspace = true

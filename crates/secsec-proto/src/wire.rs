@@ -1,34 +1,50 @@
-//! Wire messages for the server API (`secsec-Design.md` §11 handshake, §12 RPC). Strict, bounded
-//! canonical codecs for the handshake hellos and the request/response types.
-//!
-//! Every length-prefixed field is bounded by its §19 limit **before allocation** (alloc-bomb guard),
-//! and decode is exhausted via [`secsec_canon::Reader::finish`] (no trailing bytes). The transport
-//! frames these payloads on QUIC streams (length-prefixed); that framing + the auth wrapper live in
-//! the transport/handshake layer.
+//! Wire messages for the handshake (§11) and the RPC surface (§12): strict, bounded canonical codecs.
 
 use crate::server::limits::MAX_HAS_IDS;
 use crate::PUSH_ID_LEN;
 use secsec_canon::{CanonError, Reader, Writer};
-use secsec_frame::{MAX_BLOB_SIZE, MAX_ROSTER_ENTRY_SIZE};
+use secsec_frame::{MAX_BLOB_SIZE, MAX_LIST_ELEMENTS, MAX_ROSTER_ENTRY_SIZE};
+use secsec_sig::MAX_SIG_LEN;
 
 /// A 256-bit id / hash.
 pub type Id = [u8; 32];
 
-/// Maximum canonical device-pubkey length (Ed25519 SSH encoding is ~51 bytes; bounded generously).
+/// Maximum canonical device-pubkey length (an Ed25519 SSH encoding is 51 bytes).
 pub(crate) const MAX_PUBKEY: usize = 1024;
-/// Maximum SSHSIG length (a PEM SSHSIG is well under this).
-pub(crate) const MAX_SIG: usize = MAX_ROSTER_ENTRY_SIZE;
-/// Maximum encoded `Request` length: a 16 MiB `put` blob plus envelope overhead.
-pub(crate) const MAX_REQUEST_LEN: usize = MAX_BLOB_SIZE + 4096;
+/// Maximum encoded `Request`: a 16 MiB blob plus envelope.
+pub const MAX_REQUEST_LEN: usize = MAX_BLOB_SIZE + 4096;
+/// Maximum encoded `Response`: a 16 MiB blob plus envelope.
+pub const MAX_RESPONSE_LEN: usize = MAX_BLOB_SIZE + 4096;
 
-/// Errors decoding a wire message.
+/// The largest genesis [`Request::RosterBatch`]: one entry and one keyslot, nothing else.
+const GENESIS_BATCH_MAX: usize = 1
+    + 32
+    + 4
+    + (4 + MAX_ROSTER_ENTRY_SIZE)
+    + 4
+    + (32 + 4 + 4 + MAX_ROSTER_ENTRY_SIZE)
+    + 1
+    + 1
+    + 4
+    + 1;
+/// The largest [`Request::PairPut`].
+const PAIR_PUT_MAX: usize = 1 + 32 + 4 + MAX_ROSTER_ENTRY_SIZE;
+const _: () = assert!(PAIR_PUT_MAX <= GENESIS_BATCH_MAX);
+/// The largest [`AuthedRequest`] a key without a keyslot can send (pairing or the genesis batch).
+pub const MAX_UNENROLLED_AUTHED_LEN: usize = 4 + MAX_SIG_LEN + 4 + GENESIS_BATCH_MAX;
+/// The largest [`AuthedRequest`] any key can send.
+pub const MAX_AUTHED_LEN: usize = 4 + MAX_SIG_LEN + 4 + MAX_REQUEST_LEN;
+
+/// Errors decoding or validating a wire message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
     /// Unknown message tag.
     BadTag(u8),
-    /// A `has`/list count exceeded its §19 cap.
+    /// A list count exceeded its §19 cap.
     TooLarge,
-    /// Strict canonical decode failed (truncation, over-long field, trailing bytes).
+    /// A field exceeded its bound on the write side.
+    FieldTooLong,
+    /// Strict canonical decode failed.
     Canon(CanonError),
 }
 
@@ -37,6 +53,7 @@ impl core::fmt::Display for WireError {
         match self {
             WireError::BadTag(t) => write!(f, "unknown wire tag {t}"),
             WireError::TooLarge => f.write_str("list field exceeds its §19 cap"),
+            WireError::FieldTooLong => f.write_str("field exceeds its §19 bound"),
             WireError::Canon(e) => write!(f, "canon: {e}"),
         }
     }
@@ -60,6 +77,24 @@ fn read_push_id(r: &mut Reader<'_>) -> Result<[u8; PUSH_ID_LEN], WireError> {
     Ok(out)
 }
 
+/// A strict `0`/`1` presence byte.
+fn read_flag(r: &mut Reader<'_>) -> Result<bool, WireError> {
+    match r.u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        t => Err(WireError::BadTag(t)),
+    }
+}
+
+/// A `u32` list count bounded by `max` before anything is allocated.
+fn read_count(r: &mut Reader<'_>, max: usize) -> Result<usize, WireError> {
+    let n = r.u32()? as usize;
+    if n > max {
+        return Err(WireError::TooLarge);
+    }
+    Ok(n)
+}
+
 /// The §11 client hello: protocol version + the client's handshake nonce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientHello {
@@ -70,6 +105,9 @@ pub struct ClientHello {
 }
 
 impl ClientHello {
+    /// Encoded length.
+    pub const LEN: usize = 2 + 32;
+
     /// Canonical encoding `version(u16) ‖ client_nonce(32)`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -103,6 +141,9 @@ pub struct ServerHello {
 }
 
 impl ServerHello {
+    /// Encoded length.
+    pub const LEN: usize = 2 + 32 + 32;
+
     /// Canonical encoding `version(u16) ‖ server_nonce(32) ‖ host_id(32)`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -128,148 +169,129 @@ impl ServerHello {
     }
 }
 
-/// A server-API request (§12). The per-op authorization signature ([`crate::WriteAuth`] /
-/// [`crate::ReadAuth`]) wraps this on the wire; here is just the operation payload.
+/// One keyslot carried by a [`Request::RosterBatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyslotPut {
+    /// Owner device id.
+    pub device_id: Id,
+    /// Generation the keyslot wraps.
+    pub gen: u32,
+    /// Opaque `algo_id ‖ body` keyslot (§8.3).
+    pub blob: Vec<u8>,
+}
+
+/// A head swap carried by a [`Request::RosterBatch`] (the revoke-time re-sign, §8.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadPut {
+    /// Keyed-hash ref name.
+    pub ref_h: Id,
+    /// Expected `BLAKE3` of the current head blob.
+    pub old_head: Id,
+    /// The new head blob.
+    pub new_blob: Vec<u8>,
+}
+
+/// A server-API request (§12); the per-op signature wraps it as an [`AuthedRequest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     /// Fetch a blob by id.
     Get {
-        /// The content address to fetch.
+        /// The content address.
         id: Id,
     },
-    /// Existence check for a batch of ids (≤ [`MAX_HAS_IDS`]).
+    /// Durable existence for up to [`MAX_HAS_IDS`] ids.
     Has {
-        /// The ids to check, in request order.
+        /// The ids, in request order.
         ids: Vec<Id>,
     },
-    /// Stage an object under an in-flight push (idempotent by id). The object is held in `STAGING`
-    /// until this push's `cas-head` promotes it; it is not durably stored on its own.
+    /// Stage an object under an in-flight push until its `cas-head` promotes it (§15).
     Put {
         /// Content address.
         id: Id,
-        /// Declared size (server rejects `> 16 MiB` before reading the body).
+        /// Declared size, rejected above 16 MiB before the body is used.
         declared_size: u32,
-        /// The per-attempt push id this object is staged under (§15).
+        /// The per-attempt push id (§15).
         push_id: [u8; PUSH_ID_LEN],
         /// The object blob.
         blob: Vec<u8>,
     },
-    /// Atomic ref CAS with staged-object promotion: swap `/refs/<ref_h>` from `old_head` to `new_head`
-    /// (the new head blob attached) and, in the same transaction, promote every object staged under
-    /// `promote` to durable storage (§15) — so a durable head never references a non-durable object.
+    /// Atomic ref CAS promoting `promote`'s staging in the same transaction (§12, §15).
     CasHead {
         /// Keyed-hash ref name.
         ref_h: Id,
-        /// Expected current head id.
+        /// Expected `BLAKE3` of the current head blob (all-zero = absent).
         old_head: Id,
-        /// New head id.
+        /// `BLAKE3` of `new_blob`.
         new_head: Id,
-        /// The push whose staged objects this swap promotes.
+        /// The push whose staging this swap promotes.
         promote: [u8; PUSH_ID_LEN],
-        /// The new head blob to store.
+        /// The new head blob.
         new_blob: Vec<u8>,
     },
-    /// Append a sigchain entry, CAS-guarded by the current `/roster-head` tip (§8.1).
-    RosterAppend {
-        /// `BLAKE3` of the current tip entry blob the client built on, or [`secsec_frame`]'s
-        /// all-zero sentinel for the genesis append (the server CASes on this).
+    /// Every roster-side write of one sigchain operation, atomic under the tip CAS (§8.1, §8.4, §12).
+    RosterBatch {
+        /// `BLAKE3` of the current tip entry blob, or all-zero for genesis.
         old_tip: Id,
-        /// The stored (encrypted) roster-entry blob.
-        entry: Vec<u8>,
+        /// Sealed entry blobs appended in order.
+        entries: Vec<Vec<u8>>,
+        /// Keyslots written.
+        keyslots: Vec<KeyslotPut>,
+        /// Data key-history wrap `(g, wrap)`; one the chain has rotated past is never replaced.
+        keyhist: Option<(u32, Vec<u8>)>,
+        /// Roster-key-history wrap `(g, wrap)`; one the chain has rotated past is never replaced.
+        roster_keyhist: Option<(u32, Vec<u8>)>,
+        /// Devices whose keyslots at every generation are deleted.
+        revoke: Vec<Id>,
+        /// Optional head swap under its own CAS.
+        head: Option<HeadPut>,
     },
-    /// Fetch the current stored head blob at `/refs/<ref_h>` (§13). A read op; the server returns the
-    /// opaque §9.8 head blob (or absent) and never learns the ref name behind `ref_h`.
+    /// Fetch the head blob at `/refs/<ref_h>` (§13).
     GetRef {
-        /// Keyed-hash ref name `H = BLAKE3::keyed_hash(ref_name_key, ref_name)`.
+        /// `H = keyed_hash(ref_name_key, ref_name)`.
         ref_h: Id,
     },
-    /// Fetch a sigchain entry blob at `/roster/<seq>` (§13) — cold-start fold (§8.1). Absent past the
-    /// tip, so the client reads `seq = 0, 1, …` until `None`.
+    /// Fetch the sigchain entry at `/roster/<seq>` (§13), absent past the tip.
     GetRosterEntry {
         /// Sigchain sequence number.
         seq: u64,
     },
-    /// Fetch a device's keyslot blob at `/keyslots/<device_id>/<gen>` (§13) — cold-start unwrap (§8.1).
+    /// Fetch `/keyslots/<device_id>/<gen>` (§13).
     GetKeyslot {
         /// `device_id = BLAKE3(canonical(pubkey))`.
         device_id: Id,
         /// Master-key generation.
         gen: u32,
     },
-    /// Client-driven retention prune (§15): delete the durable objects in `dead` that retention has
-    /// dropped — no kept version references them. The `secsec-write-v1` `args_hash` binds `dead`, the server's
-    /// current `all_heads_hash`, and `roster_seq` (a head-binding compare-and-swap; see
-    /// [`crate::prune`]), so a concurrent `cas-head`/`roster-append` rejects the prune rather than
-    /// deleting an object a reverted head now references. `dead` is capped at [`MAX_HAS_IDS`] per call;
-    /// the client batches a larger delete-set (each batch is independently CAS-guarded).
+    /// Retention prune (§15): delete `dead` iff the server's heads and roster length still equal the claimed ones.
     Prune {
-        /// The durable object ids to delete.
+        /// Durable object ids to delete (≤ [`MAX_HAS_IDS`]).
         dead: Vec<Id>,
-        /// The client's view of the server's `all_heads_hash` — the CAS token (§15).
+        /// The client's view of `all_heads_hash`.
         all_heads_hash: [u8; 32],
-        /// The client's view of the current sigchain tip sequence.
-        roster_seq: u64,
+        /// The client's view of the number of sigchain entries.
+        roster_len: u64,
     },
-    /// Fetch the roster-key-history wrap at `/roster-keyhist/<gen>` (§8.2) — for rotation-era cold-start
-    /// (peeling `roster_key_g` across generations). A read op; the server returns the opaque wrap.
+    /// Fetch `/roster-keyhist/<gen>` (§8.2).
     GetRosterKeyhist {
-        /// The generation whose wrap is requested.
+        /// Generation.
         gen: u32,
     },
-    /// Fetch the DATA key-history wrap at `/keyhist/<gen>` (§8.2) — peeling `master_key_g` across
-    /// generations so a current member can read pre-rotation **object** content. A read op; the server
-    /// returns the opaque wrap.
+    /// Fetch `/keyhist/<gen>` (§8.2).
     GetKeyhist {
-        /// The generation whose wrap is requested.
+        /// Generation.
         gen: u32,
     },
-    /// Store a device's keyslot blob at `/keyslots/<device_id>/<gen>` (§13) — the network half of
-    /// enrollment (`init`/`grant`/`rotate` writing a member's keyslot). A write op; the keyslot is an
-    /// opaque wrap the recipient authenticates against `mk_commit` (§7), so the server cannot forge a
-    /// valid one.
-    PutKeyslot {
-        /// `device_id = BLAKE3(canonical(pubkey))` of the keyslot owner.
-        device_id: Id,
-        /// Master-key generation the keyslot wraps.
-        gen: u32,
-        /// The opaque `algo_id ‖ body` keyslot blob (§8.3).
-        blob: Vec<u8>,
-    },
-    /// Post an opaque blob to the transient **pairing mailbox** slot `slot` (§7 invite onboarding). The
-    /// slot is `BLAKE3::derive_key(label, invite_code)`, so only parties holding the code address it; the blob is
-    /// MAC'd under the code, so the server (which never learns the code) only relays it. Allowed
-    /// **pre-enrollment** (a joining device owns no keyslot yet) and aggressively rate-limited + TTL'd.
+    /// Post a code-MAC'd blob to the pairing mailbox (§7); allowed pre-enrollment.
     PairPut {
-        /// Mailbox slot id (a hash of the invite code + a direction label).
+        /// Slot id `derive_key(label, code)`.
         slot: Id,
-        /// The opaque, code-MAC'd pairing message.
+        /// The opaque pairing message.
         blob: Vec<u8>,
     },
-    /// Read the transient pairing mailbox slot `slot` (`None` if empty/expired). Pre-enrollment allowed.
+    /// Take (read and remove) a pairing mailbox slot (§7); allowed pre-enrollment.
     PairGet {
-        /// Mailbox slot id.
+        /// Slot id.
         slot: Id,
-    },
-    /// Store a DATA key-history wrap at `/keyhist/<gen>` (§8.2) — the network half of rotation.
-    PutKeyhist {
-        /// The generation whose wrap is written.
-        gen: u32,
-        /// The opaque wrap blob.
-        blob: Vec<u8>,
-    },
-    /// Store a roster-key-history wrap at `/roster-keyhist/<gen>` (§8.2) — the network half of rotation.
-    PutRosterKeyhist {
-        /// The generation whose wrap is written.
-        gen: u32,
-        /// The opaque wrap blob.
-        blob: Vec<u8>,
-    },
-    /// Delete a device's keyslot at `/keyslots/<device_id>/<gen>` (§8.4 revocation, over the wire).
-    DeleteKeyslot {
-        /// `device_id` of the keyslot to delete.
-        device_id: Id,
-        /// The generation whose keyslot is removed.
-        gen: u32,
     },
 }
 
@@ -277,22 +299,37 @@ const T_GET: u8 = 0;
 const T_HAS: u8 = 1;
 const T_PUT: u8 = 2;
 const T_CAS: u8 = 3;
-const T_ROSTER: u8 = 4;
+const T_BATCH: u8 = 4;
 const T_GETREF: u8 = 5;
 const T_GETROSTER: u8 = 6;
 const T_GETKEYSLOT: u8 = 7;
 const T_PRUNE: u8 = 8;
 const T_GETRKH: u8 = 9;
 const T_GETKH: u8 = 10;
-const T_PUTKEYSLOT: u8 = 11;
 const T_PAIRPUT: u8 = 12;
 const T_PAIRGET: u8 = 13;
-const T_PUTKEYHIST: u8 = 14;
-const T_PUTRKH: u8 = 15;
-const T_DELKEYSLOT: u8 = 16;
+
+fn write_wrap(w: &mut Writer, wrap: &Option<(u32, Vec<u8>)>) {
+    match wrap {
+        None => {
+            w.u8(0);
+        }
+        Some((g, blob)) => {
+            w.u8(1).u32(*g).bytes(blob);
+        }
+    }
+}
+
+fn read_wrap(r: &mut Reader<'_>) -> Result<Option<(u32, Vec<u8>)>, WireError> {
+    Ok(if read_flag(r)? {
+        Some((r.u32()?, r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec()))
+    } else {
+        None
+    })
+}
 
 impl Request {
-    /// Canonical encoding (tag-prefixed).
+    /// Canonical encoding (tag-prefixed); call [`Self::validate`] first on anything built locally.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
@@ -332,8 +369,37 @@ impl Request {
                     .raw(promote)
                     .bytes(new_blob);
             }
-            Request::RosterAppend { old_tip, entry } => {
-                w.u8(T_ROSTER).raw(old_tip).bytes(entry);
+            Request::RosterBatch {
+                old_tip,
+                entries,
+                keyslots,
+                keyhist,
+                roster_keyhist,
+                revoke,
+                head,
+            } => {
+                w.u8(T_BATCH).raw(old_tip).u32(entries.len() as u32);
+                for e in entries {
+                    w.bytes(e);
+                }
+                w.u32(keyslots.len() as u32);
+                for k in keyslots {
+                    w.raw(&k.device_id).u32(k.gen).bytes(&k.blob);
+                }
+                write_wrap(&mut w, keyhist);
+                write_wrap(&mut w, roster_keyhist);
+                w.u32(revoke.len() as u32);
+                for d in revoke {
+                    w.raw(d);
+                }
+                match head {
+                    None => {
+                        w.u8(0);
+                    }
+                    Some(h) => {
+                        w.u8(1).raw(&h.ref_h).raw(&h.old_head).bytes(&h.new_blob);
+                    }
+                }
             }
             Request::GetRef { ref_h } => {
                 w.u8(T_GETREF).raw(ref_h);
@@ -347,13 +413,13 @@ impl Request {
             Request::Prune {
                 dead,
                 all_heads_hash,
-                roster_seq,
+                roster_len,
             } => {
                 w.u8(T_PRUNE).u32(dead.len() as u32);
                 for id in dead {
                     w.raw(id);
                 }
-                w.raw(all_heads_hash).u64(*roster_seq);
+                w.raw(all_heads_hash).u64(*roster_len);
             }
             Request::GetRosterKeyhist { gen } => {
                 w.u8(T_GETRKH).u32(*gen);
@@ -361,30 +427,74 @@ impl Request {
             Request::GetKeyhist { gen } => {
                 w.u8(T_GETKH).u32(*gen);
             }
-            Request::PutKeyslot {
-                device_id,
-                gen,
-                blob,
-            } => {
-                w.u8(T_PUTKEYSLOT).raw(device_id).u32(*gen).bytes(blob);
-            }
             Request::PairPut { slot, blob } => {
                 w.u8(T_PAIRPUT).raw(slot).bytes(blob);
             }
             Request::PairGet { slot } => {
                 w.u8(T_PAIRGET).raw(slot);
             }
-            Request::PutKeyhist { gen, blob } => {
-                w.u8(T_PUTKEYHIST).u32(*gen).bytes(blob);
-            }
-            Request::PutRosterKeyhist { gen, blob } => {
-                w.u8(T_PUTRKH).u32(*gen).bytes(blob);
-            }
-            Request::DeleteKeyslot { device_id, gen } => {
-                w.u8(T_DELKEYSLOT).raw(device_id).u32(*gen);
-            }
         }
         w.finish()
+    }
+
+    /// Write-side bounds, identical to the decoder's: a request that passes always decodes on the server.
+    pub fn validate(&self) -> Result<(), WireError> {
+        let within = |ok: bool| {
+            if ok {
+                Ok(())
+            } else {
+                Err(WireError::FieldTooLong)
+            }
+        };
+        match self {
+            Request::Has { ids } => {
+                if ids.len() > MAX_HAS_IDS {
+                    return Err(WireError::TooLarge);
+                }
+            }
+            Request::Prune { dead, .. } => {
+                if dead.len() > MAX_HAS_IDS {
+                    return Err(WireError::TooLarge);
+                }
+            }
+            Request::Put { blob, .. } => within(blob.len() <= MAX_BLOB_SIZE)?,
+            Request::CasHead { new_blob, .. } => within(new_blob.len() <= MAX_BLOB_SIZE)?,
+            Request::PairPut { blob, .. } => within(blob.len() <= MAX_ROSTER_ENTRY_SIZE)?,
+            Request::RosterBatch {
+                entries,
+                keyslots,
+                keyhist,
+                roster_keyhist,
+                revoke,
+                head,
+                ..
+            } => {
+                if entries.len() > MAX_LIST_ELEMENTS
+                    || keyslots.len() > MAX_LIST_ELEMENTS
+                    || revoke.len() > MAX_LIST_ELEMENTS
+                {
+                    return Err(WireError::TooLarge);
+                }
+                within(entries.iter().all(|e| e.len() <= MAX_ROSTER_ENTRY_SIZE))?;
+                within(
+                    keyslots
+                        .iter()
+                        .all(|k| k.blob.len() <= MAX_ROSTER_ENTRY_SIZE),
+                )?;
+                within(
+                    [keyhist, roster_keyhist]
+                        .into_iter()
+                        .flatten()
+                        .all(|(_, b)| b.len() <= MAX_ROSTER_ENTRY_SIZE),
+                )?;
+                within(
+                    head.as_ref()
+                        .is_none_or(|h| h.new_blob.len() <= MAX_BLOB_SIZE),
+                )?;
+            }
+            _ => {}
+        }
+        within(self.encode().len() <= MAX_REQUEST_LEN)
     }
 
     /// Strictly decode a request, enforcing every §19 bound before allocation.
@@ -395,12 +505,7 @@ impl Request {
                 id: read32(&mut r)?,
             },
             T_HAS => {
-                let n = r.u32()? as usize;
-                if n > MAX_HAS_IDS {
-                    return Err(WireError::TooLarge);
-                }
-                // Pre-allocate no more than the remaining input can hold (each id is 32 bytes), so a
-                // lying count cannot force a large allocation ahead of a truncated body.
+                let n = read_count(&mut r, MAX_HAS_IDS)?;
                 let mut ids = Vec::with_capacity(n.min(r.remaining() / 32));
                 for _ in 0..n {
                     ids.push(read32(&mut r)?);
@@ -420,10 +525,48 @@ impl Request {
                 promote: read_push_id(&mut r)?,
                 new_blob: r.bytes(MAX_BLOB_SIZE)?.to_vec(),
             },
-            T_ROSTER => Request::RosterAppend {
-                old_tip: read32(&mut r)?,
-                entry: r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec(),
-            },
+            T_BATCH => {
+                let old_tip = read32(&mut r)?;
+                let n = read_count(&mut r, MAX_LIST_ELEMENTS)?;
+                let mut entries = Vec::with_capacity(n.min(r.remaining() / 4));
+                for _ in 0..n {
+                    entries.push(r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec());
+                }
+                let n = read_count(&mut r, MAX_LIST_ELEMENTS)?;
+                let mut keyslots = Vec::with_capacity(n.min(r.remaining() / 40));
+                for _ in 0..n {
+                    keyslots.push(KeyslotPut {
+                        device_id: read32(&mut r)?,
+                        gen: r.u32()?,
+                        blob: r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec(),
+                    });
+                }
+                let keyhist = read_wrap(&mut r)?;
+                let roster_keyhist = read_wrap(&mut r)?;
+                let n = read_count(&mut r, MAX_LIST_ELEMENTS)?;
+                let mut revoke = Vec::with_capacity(n.min(r.remaining() / 32));
+                for _ in 0..n {
+                    revoke.push(read32(&mut r)?);
+                }
+                let head = if read_flag(&mut r)? {
+                    Some(HeadPut {
+                        ref_h: read32(&mut r)?,
+                        old_head: read32(&mut r)?,
+                        new_blob: r.bytes(MAX_BLOB_SIZE)?.to_vec(),
+                    })
+                } else {
+                    None
+                };
+                Request::RosterBatch {
+                    old_tip,
+                    entries,
+                    keyslots,
+                    keyhist,
+                    roster_keyhist,
+                    revoke,
+                    head,
+                }
+            }
             T_GETREF => Request::GetRef {
                 ref_h: read32(&mut r)?,
             },
@@ -433,12 +576,7 @@ impl Request {
                 gen: r.u32()?,
             },
             T_PRUNE => {
-                let n = r.u32()? as usize;
-                if n > MAX_HAS_IDS {
-                    return Err(WireError::TooLarge);
-                }
-                // Cap the pre-allocation to what the remaining input can hold (32 bytes per id), so a
-                // lying count cannot force a large allocation ahead of a truncated body.
+                let n = read_count(&mut r, MAX_HAS_IDS)?;
                 let mut dead = Vec::with_capacity(n.min(r.remaining() / 32));
                 for _ in 0..n {
                     dead.push(read32(&mut r)?);
@@ -446,34 +584,17 @@ impl Request {
                 Request::Prune {
                     dead,
                     all_heads_hash: read32(&mut r)?,
-                    roster_seq: r.u64()?,
+                    roster_len: r.u64()?,
                 }
             }
             T_GETRKH => Request::GetRosterKeyhist { gen: r.u32()? },
             T_GETKH => Request::GetKeyhist { gen: r.u32()? },
-            T_PUTKEYSLOT => Request::PutKeyslot {
-                device_id: read32(&mut r)?,
-                gen: r.u32()?,
-                blob: r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec(),
-            },
             T_PAIRPUT => Request::PairPut {
                 slot: read32(&mut r)?,
                 blob: r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec(),
             },
             T_PAIRGET => Request::PairGet {
                 slot: read32(&mut r)?,
-            },
-            T_PUTKEYHIST => Request::PutKeyhist {
-                gen: r.u32()?,
-                blob: r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec(),
-            },
-            T_PUTRKH => Request::PutRosterKeyhist {
-                gen: r.u32()?,
-                blob: r.bytes(MAX_ROSTER_ENTRY_SIZE)?.to_vec(),
-            },
-            T_DELKEYSLOT => Request::DeleteKeyslot {
-                device_id: read32(&mut r)?,
-                gen: r.u32()?,
             },
             other => return Err(WireError::BadTag(other)),
         };
@@ -482,18 +603,18 @@ impl Request {
     }
 }
 
-/// A server error code returned to the client (§12).
+/// A server error code (§12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
-    /// The key owns no keyslot (not a rostered device) (§12).
+    /// The key owns no keyslot (§12).
     NotEnrolled,
-    /// Per-op authorization failed (bad signature / stale nonce).
+    /// Per-op authorization failed (bad signature or stale nonce).
     BadAuth,
     /// A rate limit or quota was exceeded (§19).
     RateLimit,
     /// A `has`/`prune` batch exceeded its cap (§12).
     TooManyIds,
-    /// `cas-head` lost the compare-and-swap race.
+    /// A compare-and-swap lost (`cas-head`, the roster tip, or the prune head-binding, §15).
     CasConflict,
     /// Malformed request.
     BadRequest,
@@ -501,16 +622,30 @@ pub enum ErrorCode {
     Internal,
 }
 
+impl core::fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            ErrorCode::NotEnrolled => "this device is not enrolled in the repo",
+            ErrorCode::BadAuth => "per-op authorization failed",
+            ErrorCode::RateLimit => "rate limit or quota exceeded",
+            ErrorCode::TooManyIds => "too many ids in one request",
+            ErrorCode::CasConflict => "compare-and-swap conflict",
+            ErrorCode::BadRequest => "malformed request",
+            ErrorCode::Internal => "server internal error",
+        })
+    }
+}
+
 /// A server-API response (§12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
-    /// `get` result: the blob, or `None` if absent.
+    /// A fetched blob, or `None` if absent.
     Blob(Option<Vec<u8>>),
-    /// `has` result: one bool per requested id, in order.
+    /// One bool per `has` id, in order.
     Exists(Vec<bool>),
-    /// A write op (`put`/`cas-head`/`roster-append`/`prune`) was accepted.
+    /// A write op was accepted.
     Ok,
-    /// The op was rejected with this code.
+    /// The op was rejected.
     Err(ErrorCode),
 }
 
@@ -575,19 +710,18 @@ impl Response {
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
         let mut r = Reader::new(bytes);
         let resp = match r.u8()? {
-            R_BLOB => match r.u8()? {
-                0 => Response::Blob(None),
-                1 => Response::Blob(Some(r.bytes(MAX_BLOB_SIZE)?.to_vec())),
-                other => return Err(WireError::BadTag(other)),
-            },
-            R_EXISTS => {
-                let n = r.u32()? as usize;
-                if n > MAX_HAS_IDS {
-                    return Err(WireError::TooLarge);
+            R_BLOB => {
+                if read_flag(&mut r)? {
+                    Response::Blob(Some(r.bytes(MAX_BLOB_SIZE)?.to_vec()))
+                } else {
+                    Response::Blob(None)
                 }
-                let mut bits = Vec::with_capacity(n);
+            }
+            R_EXISTS => {
+                let n = read_count(&mut r, MAX_HAS_IDS)?;
+                let mut bits = Vec::with_capacity(n.min(r.remaining()));
                 for _ in 0..n {
-                    bits.push(r.u8()? != 0);
+                    bits.push(read_flag(&mut r)?);
                 }
                 Response::Exists(bits)
             }
@@ -600,9 +734,7 @@ impl Response {
     }
 }
 
-/// The client's connection-auth message (§11): its canonical device public key plus the
-/// `secsec-auth-v1` signature over the handshake. The server verifies the signature against the
-/// presented key and checks that key owns a keyslot (§12).
+/// The client's connection-auth message (§11): canonical pubkey + `secsec-auth-v1` signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAuth {
     /// Canonical SSH encoding of the client's device public key.
@@ -612,6 +744,9 @@ pub struct ClientAuth {
 }
 
 impl ClientAuth {
+    /// Maximum encoded length.
+    pub const MAX_LEN: usize = 4 + MAX_PUBKEY + 4 + MAX_SIG_LEN;
+
     /// Canonical encoding `bytes(pubkey) ‖ bytes(sig)`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -624,13 +759,13 @@ impl ClientAuth {
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
         let mut r = Reader::new(bytes);
         let pubkey = r.bytes(MAX_PUBKEY)?.to_vec();
-        let sig = r.bytes(MAX_SIG)?.to_vec();
+        let sig = r.bytes(MAX_SIG_LEN)?.to_vec();
         r.finish()?;
         Ok(Self { pubkey, sig })
     }
 }
 
-/// A per-op request with its authorization signature (§12): the wire form of one RPC.
+/// One RPC on the wire: the per-op signature and the request (§12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthedRequest {
     /// The per-op `secsec-write-v1` / `secsec-read-v1` signature.
@@ -651,7 +786,7 @@ impl AuthedRequest {
     /// Strictly decode, bounding the signature and request.
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
         let mut r = Reader::new(bytes);
-        let op_sig = r.bytes(MAX_SIG)?.to_vec();
+        let op_sig = r.bytes(MAX_SIG_LEN)?.to_vec();
         let req_bytes = r.bytes(MAX_REQUEST_LEN)?;
         let request = Request::decode(req_bytes)?;
         r.finish()?;
@@ -663,18 +798,40 @@ impl AuthedRequest {
 mod tests {
     use super::*;
 
+    fn batch() -> Request {
+        Request::RosterBatch {
+            old_tip: [8; 32],
+            entries: vec![b"e1".to_vec(), b"e2".to_vec()],
+            keyslots: vec![KeyslotPut {
+                device_id: [3; 32],
+                gen: 2,
+                blob: b"ks".to_vec(),
+            }],
+            keyhist: Some((1, b"kh".to_vec())),
+            roster_keyhist: None,
+            revoke: vec![[4; 32]],
+            head: Some(HeadPut {
+                ref_h: [5; 32],
+                old_head: [6; 32],
+                new_blob: b"head".to_vec(),
+            }),
+        }
+    }
+
     #[test]
-    fn hello_round_trips() {
+    fn hello_round_trips_with_fixed_lengths() {
         let c = ClientHello {
             version: 1,
             client_nonce: [0xC1; 32],
         };
+        assert_eq!(c.encode().len(), ClientHello::LEN);
         assert_eq!(ClientHello::decode(&c.encode()).unwrap(), c);
         let s = ServerHello {
             version: 1,
             server_nonce: [0x5e; 32],
             host_id: [0x40; 32],
         };
+        assert_eq!(s.encode().len(), ServerHello::LEN);
         assert_eq!(ServerHello::decode(&s.encode()).unwrap(), s);
     }
 
@@ -698,10 +855,7 @@ mod tests {
                 promote: [0xcd; 16],
                 new_blob: b"head".to_vec(),
             },
-            Request::RosterAppend {
-                old_tip: [8; 32],
-                entry: b"entry-bytes".to_vec(),
-            },
+            batch(),
             Request::GetRef { ref_h: [9; 32] },
             Request::GetRosterEntry { seq: 7 },
             Request::GetKeyslot {
@@ -711,29 +865,38 @@ mod tests {
             Request::Prune {
                 dead: vec![[11; 32], [12; 32]],
                 all_heads_hash: [0x44; 32],
-                roster_seq: 9,
+                roster_len: 9,
             },
             Request::GetRosterKeyhist { gen: 2 },
             Request::GetKeyhist { gen: 5 },
+            Request::PairPut {
+                slot: [13; 32],
+                blob: b"pair".to_vec(),
+            },
+            Request::PairGet { slot: [14; 32] },
         ];
         for req in reqs {
+            req.validate().unwrap();
             assert_eq!(Request::decode(&req.encode()).unwrap(), req);
         }
     }
 
     #[test]
-    fn response_round_trips_every_variant() {
-        let resps = [
+    fn response_round_trips_and_rejects_non_canonical_flags() {
+        for resp in [
             Response::Blob(None),
             Response::Blob(Some(b"blob".to_vec())),
             Response::Exists(vec![true, false, true]),
             Response::Ok,
             Response::Err(ErrorCode::CasConflict),
             Response::Err(ErrorCode::NotEnrolled),
-        ];
-        for resp in resps {
+        ] {
             assert_eq!(Response::decode(&resp.encode()).unwrap(), resp);
         }
+        let mut bytes = Response::Exists(vec![true]).encode();
+        *bytes.last_mut().unwrap() = 2;
+        assert_eq!(Response::decode(&bytes), Err(WireError::BadTag(2)));
+        assert_eq!(Response::decode(&[R_BLOB, 7]), Err(WireError::BadTag(7)));
     }
 
     #[test]
@@ -742,23 +905,19 @@ mod tests {
             pubkey: b"ssh-ed25519-canonical-bytes".to_vec(),
             sig: b"sshsig-pem".to_vec(),
         };
+        assert!(ca.encode().len() <= ClientAuth::MAX_LEN);
         assert_eq!(ClientAuth::decode(&ca.encode()).unwrap(), ca);
-
         let ar = AuthedRequest {
             op_sig: b"write-auth-sig".to_vec(),
-            request: Request::Put {
-                id: [9; 32],
-                declared_size: 3,
-                push_id: [0; 16],
-                blob: b"abc".to_vec(),
-            },
+            request: batch(),
         };
         assert_eq!(AuthedRequest::decode(&ar.encode()).unwrap(), ar);
     }
 
     #[test]
-    fn decode_rejects_bad_tag_and_trailing_bytes() {
+    fn decode_rejects_bad_tag_trailing_bytes_and_removed_ops() {
         assert_eq!(Request::decode(&[0xFF]), Err(WireError::BadTag(0xFF)));
+        assert_eq!(Request::decode(&[11]), Err(WireError::BadTag(11)));
         let mut bytes = Request::Get { id: [1; 32] }.encode();
         bytes.push(0x00);
         assert!(matches!(
@@ -768,25 +927,71 @@ mod tests {
     }
 
     #[test]
-    fn has_count_over_cap_is_rejected_before_alloc() {
-        // a `has` claiming more than MAX_HAS_IDS ids must be rejected on the count, not allocated.
+    fn list_counts_over_cap_are_rejected_before_alloc() {
         let mut w = Writer::new();
         w.u8(T_HAS).u32((MAX_HAS_IDS + 1) as u32);
         assert_eq!(Request::decode(&w.finish()), Err(WireError::TooLarge));
+        let mut w = Writer::new();
+        w.u8(T_BATCH)
+            .raw(&[0; 32])
+            .u32((MAX_LIST_ELEMENTS + 1) as u32);
+        assert_eq!(Request::decode(&w.finish()), Err(WireError::TooLarge));
+        assert_eq!(
+            Request::Has {
+                ids: vec![[0; 32]; MAX_HAS_IDS + 1]
+            }
+            .validate(),
+            Err(WireError::TooLarge)
+        );
     }
 
     #[test]
-    fn put_blob_over_max_is_rejected() {
-        // claim a blob length far over MAX_BLOB_SIZE; canon rejects on the length prefix.
+    fn put_blob_over_max_is_rejected_both_ways() {
         let mut w = Writer::new();
         w.u8(T_PUT)
             .raw(&[0u8; 32])
             .u32(0)
             .raw(&[0u8; 16])
-            .u32(u32::MAX); // bytes() prefix = u32::MAX
+            .u32(u32::MAX);
         assert!(matches!(
             Request::decode(&w.finish()),
             Err(WireError::Canon(CanonError::LengthExceedsMax { .. }))
         ));
+        let big = Request::PairPut {
+            slot: [0; 32],
+            blob: vec![0; MAX_ROSTER_ENTRY_SIZE + 1],
+        };
+        assert_eq!(big.validate(), Err(WireError::FieldTooLong));
+    }
+
+    /// The unenrolled frame cap fits the largest genesis batch and pairing message it must carry.
+    #[test]
+    fn unenrolled_cap_fits_genesis_and_pairing() {
+        let genesis = Request::RosterBatch {
+            old_tip: [0; 32],
+            entries: vec![vec![0; MAX_ROSTER_ENTRY_SIZE]],
+            keyslots: vec![KeyslotPut {
+                device_id: [0; 32],
+                gen: 1,
+                blob: vec![0; MAX_ROSTER_ENTRY_SIZE],
+            }],
+            keyhist: None,
+            roster_keyhist: None,
+            revoke: vec![],
+            head: None,
+        };
+        for req in [
+            genesis,
+            Request::PairPut {
+                slot: [0; 32],
+                blob: vec![0; MAX_ROSTER_ENTRY_SIZE],
+            },
+        ] {
+            let ar = AuthedRequest {
+                op_sig: vec![0; MAX_SIG_LEN],
+                request: req,
+            };
+            assert!(ar.encode().len() <= MAX_UNENROLLED_AUTHED_LEN);
+        }
     }
 }

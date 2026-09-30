@@ -1,7 +1,4 @@
-//! `secsec-transport` — QUIC + TLS 1.3 with a pinned, self-signed host key; no CA (`secsec-Design.md`
-//! §11; risk R1). The pin is the cert's SPKI DER; `host_id = BLAKE3(SPKI)`. The verifier follows the
-//! R1 safe pattern: SPKI-pin compare only (no chain/name checks), `verify_tls13_signature`
-//! **delegated, never stubbed**, TLS 1.2 refused. Mandatory negative tests live here and gate CI.
+//! QUIC + TLS 1.3 to a pinned self-signed host key, no CA (`secsec-Design.md` §11; R1): SPKI pin, delegated signature checks, TLS 1.2 refused.
 
 #![forbid(unsafe_code)]
 
@@ -19,50 +16,35 @@ use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 use subtle::ConstantTimeEq;
 use x509_cert::der::{Decode, Encode};
 
-/// The server's pinned identity, anchored on `host_id = BLAKE3(SPKI)` (§11) — buildable from a
-/// cert/SPKI or from the 32-byte fingerprint alone (the verifier compares the hash either way).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The server's pinned identity `host_id = BLAKE3(SPKI)` (§11), from its certificate or the fingerprint alone.
+#[derive(Clone, Debug)]
 pub struct HostPin {
     host_id: [u8; 32],
-    /// The full SPKI when known (cert/SPKI pins); `None` for a fingerprint-only (`--host-fp`) pin.
-    spki: Option<Vec<u8>>,
 }
 
+impl PartialEq for HostPin {
+    /// Two pins are equal iff they pin the same `host_id` (constant-time).
+    fn eq(&self, other: &Self) -> bool {
+        bool::from(self.host_id.ct_eq(&other.host_id))
+    }
+}
+impl Eq for HostPin {}
+
 impl HostPin {
-    /// Pin to a SubjectPublicKeyInfo DER directly (e.g. recovered from a stored pin).
-    #[must_use]
-    pub(crate) fn from_spki(spki: Vec<u8>) -> Self {
-        Self {
-            host_id: *blake3::hash(&spki).as_bytes(),
-            spki: Some(spki),
-        }
-    }
-
-    /// Extract and pin the SPKI from a server certificate (DER). This is what `init`/TOFU records.
+    /// Pin the SPKI of a server certificate (DER).
     pub fn from_cert(cert_der: &[u8]) -> Result<Self, PinError> {
-        Ok(Self::from_spki(spki_of(cert_der)?))
+        Ok(Self::from_host_id(
+            *blake3::hash(&spki_of(cert_der)?).as_bytes(),
+        ))
     }
 
-    /// Pin to a `host_id` fingerprint directly (§11 `--host-fp`): the BLAKE3 of the server's SPKI,
-    /// obtained out-of-band. No certificate is needed to pin — the verifier hashes the presented SPKI
-    /// and compares to this.
+    /// Pin a `host_id` fingerprint; the verifier hashes the presented SPKI and compares.
     #[must_use]
     pub fn from_host_id(host_id: [u8; 32]) -> Self {
-        Self {
-            host_id,
-            spki: None,
-        }
+        Self { host_id }
     }
 
-    /// The pinned SPKI DER bytes, if this pin carries them (cert/SPKI pins; `None` for `--host-fp`).
-    #[cfg(test)]
-    #[must_use]
-    pub fn spki(&self) -> Option<&[u8]> {
-        self.spki.as_deref()
-    }
-
-    /// `host_id = BLAKE3(canonical(server pinned SPKI bytes))` (§11): bound into the connection-auth
-    /// signature (§9.6). MUST be computed by the client from this locally-pinned material.
+    /// `host_id = BLAKE3(SPKI)`, computed from locally pinned material, never taken from the server (§11).
     #[must_use]
     pub fn host_id(&self) -> [u8; 32] {
         self.host_id
@@ -89,9 +71,7 @@ fn spki_of(cert_der: &[u8]) -> Result<Vec<u8>, PinError> {
         .map_err(|_| PinError)
 }
 
-/// A `rustls` server-certificate verifier that accepts **exactly one** pinned self-signed host key
-/// (§11). It performs no CA-chain or hostname validation — identity rests entirely on the SPKI pin —
-/// and delegates handshake-signature verification to the crypto provider.
+/// A verifier accepting exactly one pinned host key: no chain or name checks, handshake signatures delegated.
 #[derive(Debug)]
 pub(crate) struct PinnedServerVerifier {
     pin: HostPin,
@@ -99,7 +79,7 @@ pub(crate) struct PinnedServerVerifier {
 }
 
 impl PinnedServerVerifier {
-    /// Build a verifier for the given host pin.
+    /// A verifier for `pin`.
     #[must_use]
     pub(crate) fn new(pin: HostPin) -> Self {
         Self {
@@ -118,8 +98,7 @@ impl ServerCertVerifier for PinnedServerVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        // Constant-time pin check: BLAKE3(leaf SPKI) == pinned host_id. No chain, no name — the pin
-        // IS the trust anchor (§11); hashing lets a fingerprint-only pin work.
+        // The pin is the trust anchor: constant-time BLAKE3(leaf SPKI) == host_id.
         let presented = spki_of(end_entity)
             .map_err(|_| Error::General("malformed server certificate".into()))?;
         let presented_id = *blake3::hash(&presented).as_bytes();
@@ -137,7 +116,6 @@ impl ServerCertVerifier for PinnedServerVerifier {
         _cert: &CertificateDer<'_>,
         _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        // TLS 1.2 refused outright (§11 downgrade guard; mandatory negative test).
         Err(Error::PeerIncompatible(
             rustls::PeerIncompatible::Tls12NotOffered,
         ))
@@ -149,7 +127,6 @@ impl ServerCertVerifier for PinnedServerVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        // DELEGATED to the provider — never stubbed (R1).
         verify_tls13_signature(message, cert, dss, &self.supported)
     }
 
@@ -158,9 +135,7 @@ impl ServerCertVerifier for PinnedServerVerifier {
     }
 }
 
-/// Trust-on-first-use verifier (§11): accepts any cert and captures its `host_id` into a shared
-/// cell; the caller confirms the fingerprint out-of-band and pins it for every later connection.
-/// The ssh `known_hosts` first-contact model, with the same one-time risk.
+/// First-contact verifier (§11 TOFU): records the host_id only once the handshake signature verifies.
 #[derive(Debug)]
 pub(crate) struct TofuVerifier {
     captured: std::sync::Arc<std::sync::Mutex<Option<[u8; 32]>>>,
@@ -168,7 +143,7 @@ pub(crate) struct TofuVerifier {
 }
 
 impl TofuVerifier {
-    /// Build a TOFU verifier that writes the presented server's `host_id` into `captured`.
+    /// A TOFU verifier writing the verified server's `host_id` into `captured`.
     #[must_use]
     pub(crate) fn new(captured: std::sync::Arc<std::sync::Mutex<Option<[u8; 32]>>>) -> Self {
         Self {
@@ -187,11 +162,7 @@ impl ServerCertVerifier for TofuVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        // First-use: accept and record the host_id. Authenticity of *this* contact is the caller's
-        // out-of-band fingerprint confirmation; from then on the recorded pin is enforced.
-        let spki = spki_of(end_entity)
-            .map_err(|_| Error::General("malformed server certificate".into()))?;
-        *self.captured.lock().expect("tofu cell") = Some(*blake3::hash(&spki).as_bytes());
+        spki_of(end_entity).map_err(|_| Error::General("malformed server certificate".into()))?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -212,8 +183,11 @@ impl ServerCertVerifier for TofuVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        // Still never stubbed: the handshake signature must verify against the presented leaf (R1).
-        verify_tls13_signature(message, cert, dss, &self.supported)
+        let valid = verify_tls13_signature(message, cert, dss, &self.supported)?;
+        let spki =
+            spki_of(cert).map_err(|_| Error::General("malformed server certificate".into()))?;
+        *self.captured.lock().expect("tofu cell") = Some(*blake3::hash(&spki).as_bytes());
+        Ok(valid)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -228,8 +202,7 @@ mod tests {
     use rustls::internal::msgs::codec::{Codec, Reader};
     use rustls::pki_types::ServerName;
 
-    /// Construct a `DigitallySignedStruct` from wire bytes (its `new` is crate-private): an ED25519
-    /// scheme (0x0807) followed by a `u16`-length-prefixed signature.
+    /// A `DigitallySignedStruct` from wire bytes: ED25519 scheme (0x0807) + u16-prefixed signature.
     fn dss_ed25519(sig: &[u8]) -> DigitallySignedStruct {
         let mut bytes = vec![0x08u8, 0x07];
         bytes.extend_from_slice(&(sig.len() as u16).to_be_bytes());
@@ -256,108 +229,80 @@ mod tests {
     }
 
     #[test]
-    fn host_id_is_blake3_of_spki_and_stable() {
-        let (_der, spki) = self_signed();
-        let pin = HostPin::from_spki(spki.clone());
-        assert_eq!(pin.host_id(), *blake3::hash(&spki).as_bytes());
-        // host_id is derived only from the pinned SPKI, not the cert envelope.
-        assert_eq!(HostPin::from_spki(spki).host_id(), pin.host_id());
-    }
-
-    #[test]
-    fn from_cert_extracts_the_same_spki() {
+    fn host_id_is_blake3_of_spki_and_pins_compare_by_host_id() {
         let (der, spki) = self_signed();
-        assert_eq!(HostPin::from_cert(&der).unwrap().spki(), Some(&spki[..]));
+        let pin = HostPin::from_cert(&der).unwrap();
+        assert_eq!(pin.host_id(), *blake3::hash(&spki).as_bytes());
+        assert_eq!(pin, HostPin::from_host_id(pin.host_id()));
+        assert_ne!(pin, HostPin::from_host_id([0; 32]));
     }
 
     #[test]
     fn fingerprint_pin_accepts_matching_and_rejects_wrong() {
-        // A client pinning by host_id alone (--host-fp) must accept the real cert and reject another.
         let (der, spki) = self_signed();
-        let host_id = *blake3::hash(&spki).as_bytes();
-        let fp_pin = HostPin::from_host_id(host_id);
-        assert!(fp_pin.spki().is_none()); // fingerprint-only pin carries no SPKI
-        assert_eq!(fp_pin.host_id(), host_id);
-
+        let fp_pin = HostPin::from_host_id(*blake3::hash(&spki).as_bytes());
         let v = PinnedServerVerifier::new(fp_pin);
         assert!(verify_cert(&v, &der).is_ok());
-
-        // a different server cert (different SPKI → different host_id) is rejected.
         let (other_der, _) = self_signed();
         assert!(verify_cert(&v, &other_der).is_err());
     }
 
-    #[test]
-    fn matching_pin_accepts_the_server_cert() {
-        let (der, _spki) = self_signed();
-        let pin = HostPin::from_cert(&der).unwrap();
-        let v = PinnedServerVerifier::new(pin);
-        assert!(verify_cert(&v, &der).is_ok());
-    }
-
-    /// R1 mandatory negative test: a different (wrong) server key must NOT be accepted against the
-    /// pin — this is the whole point of pinning.
+    /// R1 mandatory negative test: another key is never accepted against the pin.
     #[test]
     fn wrong_pinned_key_is_rejected() {
         let (der_a, _) = self_signed();
-        let (der_b, _) = self_signed(); // a different, independently-generated key
+        let (der_b, _) = self_signed();
         let v = PinnedServerVerifier::new(HostPin::from_cert(&der_a).unwrap());
-        assert!(
-            verify_cert(&v, &der_b).is_err(),
-            "a server presenting a different key than the pin must be rejected"
-        );
-        // ...and the genuine cert still passes under the same verifier.
+        assert!(verify_cert(&v, &der_b).is_err());
         assert!(verify_cert(&v, &der_a).is_ok());
-    }
-
-    #[test]
-    fn malformed_certificate_is_rejected() {
-        let (der, _) = self_signed();
-        let v = PinnedServerVerifier::new(HostPin::from_cert(&der).unwrap());
         assert!(verify_cert(&v, b"not a certificate").is_err());
     }
 
-    /// R1 mandatory negative test: a tampered/garbage handshake signature MUST fail — i.e. the
-    /// signature path is really delegated to the provider, not stubbed to `Ok`.
+    /// R1 mandatory negative test: a garbage handshake signature fails (delegated, never stubbed).
     #[test]
-    fn garbage_handshake_signature_is_rejected() {
+    fn garbage_handshake_signature_is_rejected_and_tls12_refused() {
         let (der, _) = self_signed();
         let v = PinnedServerVerifier::new(HostPin::from_cert(&der).unwrap());
         let cert = CertificateDer::from(der);
         let dss = dss_ed25519(&[0u8; 64]);
-        assert!(
-            v.verify_tls13_signature(b"transcript bytes", &cert, &dss)
-                .is_err(),
-            "a bogus signature must be rejected — verify_tls13_signature must not be stubbed"
-        );
-    }
-
-    #[test]
-    fn tls12_is_refused() {
-        let (der, _) = self_signed();
-        let v = PinnedServerVerifier::new(HostPin::from_cert(&der).unwrap());
-        let cert = CertificateDer::from(der);
-        let dss = dss_ed25519(&[0u8; 64]);
-        assert!(
-            v.verify_tls12_signature(b"x", &cert, &dss).is_err(),
-            "TLS 1.2 must be refused (pinned to 1.3, §11)"
-        );
-    }
-
-    #[test]
-    fn advertises_supported_schemes() {
-        let (der, _) = self_signed();
-        let v = PinnedServerVerifier::new(HostPin::from_cert(&der).unwrap());
+        assert!(v
+            .verify_tls13_signature(b"transcript bytes", &cert, &dss)
+            .is_err());
+        assert!(v.verify_tls12_signature(b"x", &cert, &dss).is_err());
         assert!(!v.supported_verify_schemes().is_empty());
     }
 
-    // ---- End-to-end TLS 1.3 handshake (the definitive R1 / MITM test) ----
+    /// TOFU records nothing until a handshake signature has verified.
+    #[test]
+    fn tofu_captures_only_after_signature_verification() {
+        let (der, _) = self_signed();
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let v = TofuVerifier::new(cell.clone());
+        let cert = CertificateDer::from(der);
+        v.verify_server_cert(
+            &cert,
+            &[],
+            &ServerName::try_from("secsec.invalid").unwrap(),
+            &[],
+            UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_700_000_000)),
+        )
+        .unwrap();
+        assert!(cell.lock().unwrap().is_none());
+        assert!(v
+            .verify_tls13_signature(b"transcript", &cert, &dss_ed25519(&[0u8; 64]))
+            .is_err());
+        assert!(
+            cell.lock().unwrap().is_none(),
+            "a bad signature captures nothing"
+        );
+    }
+
+    // ---- End-to-end TLS 1.3 handshake (R1 / MITM) ----
 
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
     use std::sync::Arc;
 
-    /// A self-signed server cert (DER) + its PKCS#8 private key (DER).
     fn self_signed_with_key() -> (Vec<u8>, Vec<u8>) {
         let ck = generate_simple_self_signed(vec!["secsec.invalid".to_string()]).unwrap();
         (ck.cert.der().to_vec(), ck.key_pair.serialize_der())
@@ -375,7 +320,7 @@ mod tests {
         Arc::new(cfg)
     }
 
-    fn client_config(verifier: PinnedServerVerifier) -> Arc<ClientConfig> {
+    fn client_config(verifier: impl ServerCertVerifier + 'static) -> Arc<ClientConfig> {
         let cfg = ClientConfig::builder_with_provider(Arc::new(default_provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap()
@@ -385,8 +330,7 @@ mod tests {
         Arc::new(cfg)
     }
 
-    /// Drive a full in-memory handshake; returns the client-side result (the verifier runs inside
-    /// `client.process_new_packets()`, so a pin mismatch surfaces as `Err` there).
+    /// Drive an in-memory handshake; the verifier runs in `client.process_new_packets()`.
     fn do_handshake(
         client_cfg: Arc<ClientConfig>,
         server_cfg: Arc<ServerConfig>,
@@ -394,7 +338,6 @@ mod tests {
         let name = ServerName::try_from("secsec.invalid").unwrap();
         let mut client = ClientConnection::new(client_cfg, name).unwrap();
         let mut server = ServerConnection::new(server_cfg).unwrap();
-
         for _ in 0..16 {
             let mut c2s = Vec::new();
             while client.wants_write() {
@@ -405,7 +348,6 @@ mod tests {
                 server.read_tls(&mut cur).unwrap();
             }
             server.process_new_packets()?;
-
             let mut s2c = Vec::new();
             while server.wants_write() {
                 server.write_tls(&mut s2c).unwrap();
@@ -414,8 +356,7 @@ mod tests {
             while (cur.position() as usize) < cur.get_ref().len() {
                 client.read_tls(&mut cur).unwrap();
             }
-            client.process_new_packets()?; // verifier runs here
-
+            client.process_new_packets()?;
             if !client.is_handshaking() && !server.is_handshaking() {
                 return Ok(());
             }
@@ -424,25 +365,28 @@ mod tests {
     }
 
     #[test]
-    fn e2e_handshake_succeeds_with_matching_pin() {
+    fn e2e_handshake_succeeds_with_matching_pin_and_tofu_captures_it() {
         let (cert, key) = self_signed_with_key();
         let v = PinnedServerVerifier::new(HostPin::from_cert(&cert).unwrap());
-        assert!(
-            do_handshake(client_config(v), server_config(&cert, &key)).is_ok(),
-            "a TLS 1.3 handshake to the pinned host key must complete"
+        assert!(do_handshake(client_config(v), server_config(&cert, &key)).is_ok());
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+        assert!(do_handshake(
+            client_config(TofuVerifier::new(cell.clone())),
+            server_config(&cert, &key)
+        )
+        .is_ok());
+        assert_eq!(
+            *cell.lock().unwrap(),
+            Some(HostPin::from_cert(&cert).unwrap().host_id())
         );
     }
 
-    /// The definitive R1 / MITM test: a man-in-the-middle presenting a *different* host key (even a
-    /// valid self-signed one) must make the real handshake fail at the pin check.
+    /// R1 / MITM: a server presenting another key fails the real handshake at the pin.
     #[test]
     fn e2e_handshake_fails_against_a_mitm_key() {
         let (real_cert, _real_key) = self_signed_with_key();
-        let (mitm_cert, mitm_key) = self_signed_with_key(); // attacker's own key
-        let v = PinnedServerVerifier::new(HostPin::from_cert(&real_cert).unwrap()); // pinned to the real key
-        assert!(
-            do_handshake(client_config(v), server_config(&mitm_cert, &mitm_key)).is_err(),
-            "a handshake to a non-pinned (MITM) key must fail"
-        );
+        let (mitm_cert, mitm_key) = self_signed_with_key();
+        let v = PinnedServerVerifier::new(HostPin::from_cert(&real_cert).unwrap());
+        assert!(do_handshake(client_config(v), server_config(&mitm_cert, &mitm_key)).is_err());
     }
 }

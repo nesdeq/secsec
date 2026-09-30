@@ -1,9 +1,4 @@
-//! `secsec-frame` — object framing, type tags, and decoder bounds (`secsec-Design.md` §9.1, §19).
-//!
-//! `blob = FRAME ‖ ctx_tag(32) ‖ ciphertext`; `FRAME = MAGIC ‖ format_version ‖ algo_id ‖ gen ‖
-//! type` (11 bytes), doubling as the AEAD AD (§9.4). Enforced here: never trust attacker-set FRAME
-//! fields ([`parse_blob`] checks against the *expected* frame, §18), and §19 bounds before
-//! allocation.
+//! Object framing, type tags, and the §19 decoder bounds (`secsec-Design.md` §9.1, §19).
 
 #![forbid(unsafe_code)]
 
@@ -13,16 +8,18 @@ use secsec_canon::{Reader, Writer};
 /// 4-byte object magic.
 pub(crate) const MAGIC: [u8; 4] = *b"ssec";
 
-/// Current on-disk format version.
+/// Format version of every object type except salted roster entries.
 pub(crate) const FORMAT_VERSION_V1: u8 = 1;
-/// Compile-time format-version floor (§16): anything below this is rejected outright.
+/// Format version of a salted roster entry (§9.5); readers still accept v1 entries.
+pub(crate) const FORMAT_VERSION_V2: u8 = 2;
+/// Compile-time format-version floor (§16).
 pub(crate) const MIN_FORMAT_VERSION: u8 = 1;
+/// Highest format version this build decodes.
+pub(crate) const MAX_FORMAT_VERSION: u8 = FORMAT_VERSION_V2;
 
-/// `algo_id` for the object AEAD suite (ChaCha20-Poly1305 CTX, §9.4). This is the FRAME's
-/// symmetric-suite tag, a **separate namespace** from the keyslot KEM `algo_id` (X-Wing = 1, §8.3),
-/// which is carried in the keyslot blob rather than the FRAME.
+/// FRAME `algo_id` of the CTX object suite (§9.4), a namespace separate from the keyslot KEM id (§8.3).
 pub(crate) const ALGO_V1: u8 = 1;
-/// Compile-time algorithm floor (§16): `algo_id` below this is rejected as a downgrade.
+/// Compile-time algorithm floor (§16).
 pub const MIN_ALGO_ID: u8 = 1;
 
 /// Encoded FRAME length in bytes.
@@ -32,23 +29,22 @@ pub const CTX_TAG_LEN: usize = 32;
 /// Content-address / id length in bytes.
 pub const ID_LEN: usize = 32;
 
-// §19 normative decoder bounds (enforced before allocation).
-/// Maximum size of any single stored object, in bytes.
+/// Maximum size of any single stored object, in bytes (§19).
 pub const MAX_BLOB_SIZE: usize = 16 * 1024 * 1024;
-/// Maximum tree nesting depth.
+/// Maximum tree nesting depth (§19).
 pub const MAX_TREE_DEPTH: usize = 64;
-/// Maximum directory fan-out (entries per tree node).
+/// Maximum directory fan-out, entries per tree node (§19).
 pub const MAX_TREE_FANOUT: usize = 65_536;
-/// Maximum size of a single roster sigchain entry, in bytes.
+/// Maximum size of a single roster sigchain entry, in bytes (§19).
 pub const MAX_ROSTER_ENTRY_SIZE: usize = 4 * 1024;
-/// Maximum number of elements in any decoded list field.
+/// Maximum number of elements in any decoded list field (§19).
 pub const MAX_LIST_ELEMENTS: usize = 4_096;
-/// Maximum chunk ids in one file's chunk list: exactly what a [`MAX_BLOB_SIZE`] tree blob can hold at
-/// [`ID_LEN`] bytes per id. Derived from the object cap rather than chosen, so it bounds the decoder's
-/// pre-allocation without capping file size below what the format can already express.
+/// Maximum tree entry name length in bytes (§19).
+pub const MAX_NAME_LEN: usize = 4_096;
+/// Maximum chunk ids per file: exactly what a [`MAX_BLOB_SIZE`] tree can hold at [`ID_LEN`] bytes each.
 pub const MAX_CHUNKS_PER_FILE: usize = MAX_BLOB_SIZE / ID_LEN;
 
-/// The object `type` byte. Feeds `enc_key[g][t]` / `id_key[g][t]` (§9.5) and the FRAME.
+/// The object `type` byte; feeds `enc_key[g][t]` / `id_key[g][t]` (§9.5) and the FRAME.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjType {
@@ -105,7 +101,7 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// A FRAME at the current format version and AEAD suite.
+    /// A format-v1 FRAME at the current AEAD suite.
     #[must_use]
     pub fn v1(gen: u32, obj_type: ObjType) -> Self {
         Self {
@@ -114,6 +110,21 @@ impl Frame {
             gen,
             obj_type,
         }
+    }
+
+    /// A format-v2 FRAME at the current AEAD suite (salted roster entries, §9.5).
+    #[must_use]
+    pub fn v2(gen: u32, obj_type: ObjType) -> Self {
+        Self {
+            format_version: FORMAT_VERSION_V2,
+            ..Self::v1(gen, obj_type)
+        }
+    }
+
+    /// Whether this FRAME carries the v2 format version.
+    #[must_use]
+    pub fn is_v2(&self) -> bool {
+        self.format_version == FORMAT_VERSION_V2
     }
 
     /// Encode to the fixed 11-byte FRAME.
@@ -131,8 +142,7 @@ impl Frame {
         out
     }
 
-    /// Decode and validate an 11-byte FRAME: magic, the compile-time version/algorithm floor
-    /// (§16), and a known object type. `bytes` must be exactly [`FRAME_LEN`].
+    /// Decode and validate exactly [`FRAME_LEN`] bytes: magic, version/algorithm floors (§16), known type.
     pub fn decode(bytes: &[u8]) -> Result<Frame, FrameError> {
         let mut r = Reader::new(bytes);
         let magic = r.raw(4).map_err(|_| FrameError::Truncated)?;
@@ -140,7 +150,7 @@ impl Frame {
             return Err(FrameError::BadMagic);
         }
         let format_version = r.u8().map_err(|_| FrameError::Truncated)?;
-        if format_version < MIN_FORMAT_VERSION || format_version > FORMAT_VERSION_V1 {
+        if !(MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION).contains(&format_version) {
             return Err(FrameError::UnsupportedFormatVersion(format_version));
         }
         let algo_id = r.u8().map_err(|_| FrameError::Truncated)?;
@@ -160,7 +170,7 @@ impl Frame {
     }
 }
 
-/// The associated data for the per-object AEAD (§9.4): `FRAME ‖ id` (fixed 43 bytes).
+/// The per-object AEAD associated data (§9.4): `FRAME ‖ id`.
 #[must_use]
 pub fn aead_ad(frame: &Frame, id: &[u8; ID_LEN]) -> [u8; FRAME_LEN + ID_LEN] {
     let mut ad = [0u8; FRAME_LEN + ID_LEN];
@@ -179,31 +189,35 @@ pub fn assemble_blob(frame: &Frame, ctx_tag: &[u8; CTX_TAG_LEN], ct: &[u8]) -> V
     out
 }
 
-/// Parse a stored blob into `(ctx_tag, ciphertext)`, enforcing the §19 size bound **before** any
-/// work and verifying the decoded FRAME equals `expected` (§18 — never trust server-supplied FRAME
-/// fields; the client derives `expected` from the `(gen, type)` it requested).
+/// Split a stored blob into `(ctx_tag, ciphertext)` after the size bound and an exact match against `expected` (§18).
 pub fn parse_blob<'a>(
     bytes: &'a [u8],
     expected: &Frame,
 ) -> Result<(&'a [u8; CTX_TAG_LEN], &'a [u8]), FrameError> {
+    let rest = parse_frame_prefix(bytes, expected)?;
+    if rest.len() < CTX_TAG_LEN {
+        return Err(FrameError::ShortBlob);
+    }
+    let (tag, ct) = rest.split_at(CTX_TAG_LEN);
+    let ctx_tag: &[u8; CTX_TAG_LEN] = tag.try_into().expect("slice is exactly CTX_TAG_LEN");
+    Ok((ctx_tag, ct))
+}
+
+/// Check the size bound and that the leading FRAME equals `expected` (§18); returns the bytes after it.
+pub fn parse_frame_prefix<'a>(bytes: &'a [u8], expected: &Frame) -> Result<&'a [u8], FrameError> {
     if bytes.len() > MAX_BLOB_SIZE {
         return Err(FrameError::BlobTooLarge {
             len: bytes.len(),
             max: MAX_BLOB_SIZE,
         });
     }
-    if bytes.len() < FRAME_LEN + CTX_TAG_LEN {
+    if bytes.len() < FRAME_LEN {
         return Err(FrameError::ShortBlob);
     }
-    let frame = Frame::decode(&bytes[..FRAME_LEN])?;
-    if &frame != expected {
+    if &Frame::decode(&bytes[..FRAME_LEN])? != expected {
         return Err(FrameError::FrameMismatch);
     }
-    let ctx_tag: &[u8; CTX_TAG_LEN] = bytes[FRAME_LEN..FRAME_LEN + CTX_TAG_LEN]
-        .try_into()
-        .expect("slice is exactly CTX_TAG_LEN");
-    let ct = &bytes[FRAME_LEN + CTX_TAG_LEN..];
-    Ok((ctx_tag, ct))
+    Ok(&bytes[FRAME_LEN..])
 }
 
 /// Errors from FRAME / blob decoding.
@@ -213,11 +227,11 @@ pub enum FrameError {
     BadMagic,
     /// Format version below the floor or above what this build understands.
     UnsupportedFormatVersion(u8),
-    /// Algorithm id below the floor or not in the supported set (downgrade guard, §16).
+    /// Algorithm id below the floor or not in the supported set (§16).
     UnsupportedAlgo(u8),
     /// Unknown object `type` byte.
     UnknownType(u8),
-    /// FRAME bytes were truncated.
+    /// FRAME bytes were truncated or had trailing bytes.
     Truncated,
     /// Blob exceeded the §19 maximum object size.
     BlobTooLarge {
@@ -226,9 +240,9 @@ pub enum FrameError {
         /// Maximum permitted (`MAX_BLOB_SIZE`).
         max: usize,
     },
-    /// Blob is too short to contain a FRAME and a commitment tag.
+    /// Blob too short for its FRAME and tag.
     ShortBlob,
-    /// Decoded FRAME did not equal the FRAME the client expected (§18).
+    /// Decoded FRAME differs from the FRAME the client expected (§18).
     FrameMismatch,
 }
 
@@ -257,17 +271,19 @@ mod tests {
 
     #[test]
     fn frame_encode_kat() {
-        // Frame::v1(gen=1, Chunk) = "ssec" ‖ 01 ‖ 01 ‖ 01000000 ‖ 00
         let f = Frame::v1(1, ObjType::Chunk);
         assert_eq!(
             f.encode(),
             [0x73, 0x73, 0x65, 0x63, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00]
         );
         assert_eq!(f.encode().len(), FRAME_LEN);
+        let v2 = Frame::v2(1, ObjType::RosterEntry);
+        assert_eq!(v2.encode()[4], FORMAT_VERSION_V2);
+        assert!(v2.is_v2());
     }
 
     #[test]
-    fn frame_round_trip_all_types() {
+    fn frame_round_trip_all_types_and_versions() {
         for t in [
             ObjType::Chunk,
             ObjType::Tree,
@@ -277,8 +293,9 @@ mod tests {
             ObjType::Keyhist,
             ObjType::RosterKeyhist,
         ] {
-            let f = Frame::v1(42, t);
-            assert_eq!(Frame::decode(&f.encode()).unwrap(), f);
+            for f in [Frame::v1(42, t), Frame::v2(42, t)] {
+                assert_eq!(Frame::decode(&f.encode()).unwrap(), f);
+            }
         }
     }
 
@@ -289,30 +306,35 @@ mod tests {
         assert_eq!(Frame::decode(&f), Err(FrameError::BadMagic));
 
         let mut f = Frame::v1(1, ObjType::Chunk).encode();
-        f[4] = 0; // format_version below floor
+        f[4] = 0;
         assert_eq!(
             Frame::decode(&f),
             Err(FrameError::UnsupportedFormatVersion(0))
         );
+        f[4] = MAX_FORMAT_VERSION + 1;
+        assert_eq!(
+            Frame::decode(&f),
+            Err(FrameError::UnsupportedFormatVersion(MAX_FORMAT_VERSION + 1))
+        );
 
         let mut f = Frame::v1(1, ObjType::Chunk).encode();
-        f[5] = 2; // unknown algo
+        f[5] = 2;
         assert_eq!(Frame::decode(&f), Err(FrameError::UnsupportedAlgo(2)));
 
         let mut f = Frame::v1(1, ObjType::Chunk).encode();
-        f[10] = 99; // unknown type
+        f[10] = 99;
         assert_eq!(Frame::decode(&f), Err(FrameError::UnknownType(99)));
     }
 
     #[test]
     fn decode_rejects_wrong_length() {
-        assert_eq!(Frame::decode(&[0u8; 10]), Err(FrameError::BadMagic)); // magic mismatch first
+        assert_eq!(Frame::decode(&[0u8; 10]), Err(FrameError::BadMagic));
         let mut short = Frame::v1(1, ObjType::Chunk).encode().to_vec();
         short.pop();
         assert_eq!(Frame::decode(&short), Err(FrameError::Truncated));
         let mut long = Frame::v1(1, ObjType::Chunk).encode().to_vec();
         long.push(0);
-        assert_eq!(Frame::decode(&long), Err(FrameError::Truncated)); // trailing byte
+        assert_eq!(Frame::decode(&long), Err(FrameError::Truncated));
     }
 
     #[test]
@@ -324,19 +346,23 @@ mod tests {
         assert_eq!(got_tag, &tag);
         assert_eq!(got_ct, b"ciphertext");
 
-        // §18: a blob whose FRAME says a different generation must be rejected.
-        let wrong_expected = Frame::v1(4, ObjType::Chunk);
+        // §18: another generation, or the same frame at another format version, is a mismatch.
         assert_eq!(
-            parse_blob(&blob, &wrong_expected),
+            parse_blob(&blob, &Frame::v1(4, ObjType::Chunk)),
             Err(FrameError::FrameMismatch)
         );
-
-        // too short
+        assert_eq!(
+            parse_blob(&blob, &Frame::v2(3, ObjType::Chunk)),
+            Err(FrameError::FrameMismatch)
+        );
         assert_eq!(parse_blob(&[0u8; 5], &frame), Err(FrameError::ShortBlob));
+        assert_eq!(
+            parse_blob(&blob[..FRAME_LEN + 4], &frame),
+            Err(FrameError::ShortBlob)
+        );
     }
 
-    /// End-to-end object-plane crypto: derive key (kdf) → AD = FRAME‖id → seal (aead) →
-    /// assemble blob → parse blob (with expected FRAME) → open. And a tampered FRAME must break it.
+    /// kdf key → AD = FRAME‖id → seal → assemble → parse → open; a tampered FRAME breaks it.
     #[test]
     fn object_plane_round_trip() {
         let mk = secsec_kdf::MasterKey::new(1, [0x55; 32]);
@@ -357,10 +383,8 @@ mod tests {
         let pt = secsec_aead::open(&k_obj, &aead_ad(&frame, &id), got_tag, got_ct).unwrap();
         assert_eq!(pt, b"file chunk contents");
 
-        // Flip a FRAME byte in the stored blob: parse rejects it (FRAME mismatch) before the AEAD
-        // would even be consulted — and even if forced through, the AD would differ and open fails.
         let mut bad = blob.clone();
-        bad[6] ^= 0x01; // a gen byte
+        bad[6] ^= 0x01;
         assert!(parse_blob(&bad, &frame).is_err());
     }
 }

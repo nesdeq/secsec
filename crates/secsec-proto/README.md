@@ -1,35 +1,38 @@
 # secsec-proto
 
-Per-operation authorization and the wire protocol for the server API (`secsec-Design.md` §12, §9.6,
-§15).
+The wire protocol and per-operation authorization for the server API (`secsec-Design.md` §9.6, §12,
+§15, §19).
 
-**Every** repo operation — including reads — requires a per-op signature from a key that owns a
-keyslot (a rostered device); connection-level auth alone is not enough (§12). This crate builds the
-two signed payloads and the per-op `args_hash` that binds the exact operation:
+**Every** repo operation, reads included, carries a per-op signature; the server additionally
+requires the signer to own a keyslot, except for the pairing mailbox and the genesis batch (§12).
+This crate builds the two signed payloads and the `args_hash` that binds the exact operation:
 
-- **Write** ops (`put` (binds `push_id`), `cas-head` (binds `promote`), `roster-append`,
-  `put-keyslot`, `delete-keyslot`, `put-keyhist`, `put-roster-keyhist`, `prune`): sign under
-  `NS_WRITE` over
-  `op ‖ args_hash ‖ session_transcript ‖ server_nonce` (§9.6). The server supplies only the fresh
-  single-use `server_nonce`; the client constructs `op`/`args`.
-- **Read** ops (`get`, `get-ref`, `get-roster`, `get-keyslot`, `has`, and the §7 `pair-put`/`pair-get`
-  invite-mailbox relay): sign under `NS_READ` over `op ‖ args_hash ‖ session_transcript` — no
-  `server_nonce`, since `session_transcript` provides per-connection freshness.
+- **Write** ops (`put`, which binds `push_id`; `cas-head`, which binds `promote`; `roster-batch`,
+  which binds the hash of its whole encoding; `prune`): signed under `NS_WRITE` over
+  `bytes(op) ‖ args_hash ‖ session_transcript ‖ server_nonce` (§9.6). The server supplies only the
+  per-stream `server_nonce`; the client constructs op and args.
+- **Read** ops (`get`, `has`, `get-ref`, `get-roster`, `get-keyslot`, `get-keyhist`,
+  `get-roster-keyhist`, and the §7 `pair-put` / `pair-get` mailbox relay): signed under `NS_READ` over
+  `bytes(op) ‖ args_hash ‖ session_transcript`; no nonce, since the transcript binds the connection.
 
 ## Public API
 
-- `op_and_args(request) -> (op, args_hash, is_write)` — the single shared binding. Client and server
-  both call it, so neither can disagree about what a signature covers. The individual `args_*` binders
-  behind it are crate-internal on purpose: computing one by hand at a call site is how the two sides
-  drift apart.
-- `op` — the op-label constants (`PUT`, `CAS_HEAD`, `ROSTER_APPEND`, `PRUNE`, `GET`, …).
-- `WriteAuth` / `ReadAuth` — `sign` / `verify` over `op ‖ args_hash ‖ transcript` (+ `server_nonce`
-  for writes, §9.6).
-- `prune` (§15) — `all_heads_hash`, `dead_set_hash` (canonical ascending id-list), `args_prune` (the
-  head-binding CAS input). Public because `prune`'s binding is state-dependent, so it is computed
-  outside `op_and_args` by both the client driver and the server handler.
-- `wire` — `Request` / `Response` / `ClientHello` / `ServerHello` / `ClientAuth` / `AuthedRequest`
-  (`encode` / `decode`), `ErrorCode`, `WireError`.
-- `server` — the enforcement state, clock-injected: `NonceStore` (single-use `server_nonce`),
-  `TokenBucket`, `WindowCounter`, `StorageQuota`, `Limits`, and the normative `limits` constants.
+- `op_and_args(request) -> (op, args_hash, is_write)`: the single shared binding. Client and server
+  both call it, so neither can disagree about what a signature covers; the per-op binders behind it
+  are crate-internal.
+- `op`: the op-label constants (`PUT`, `CAS_HEAD`, `ROSTER_BATCH`, `PRUNE`, `GET`, `HAS`, `GET_REF`,
+  `GET_ROSTER`, `GET_KEYSLOT`, `GET_KEYHIST`, `GET_ROSTER_KEYHIST`, `PAIR_PUT`, `PAIR_GET`).
+- `WriteAuth` / `ReadAuth`: `sign` / `verify` over the payloads above.
+- `prune` (§15): `dead_set_hash` (ids sorted and deduplicated), `all_heads_hash` (refs sorted,
+  exact duplicates folded), and `args_prune(dead_set_hash, all_heads_hash, roster_len)`, public so the
+  server's store predicate recomputes them against its own state.
+- `wire`: `Request` / `Response` / `ClientHello` / `ServerHello` / `ClientAuth` / `AuthedRequest`
+  (`encode`, strict `decode`; `Request::validate` applies the decoder's bounds on the write side),
+  `KeyslotPut`, `HeadPut`, `ErrorCode`, `WireError`, and the frame caps `MAX_REQUEST_LEN`,
+  `MAX_RESPONSE_LEN`, `MAX_AUTHED_LEN`, and `MAX_UNENROLLED_AUTHED_LEN` (just the genesis batch or a
+  pairing message).
+- `server`: the enforcement primitives, clock-injected: `TokenBucket`, `WindowCounter` (record and
+  refund batches), `StorageQuota`, the operator-tunable `Limits`, and the normative `limits`
+  constants (60 s nonce TTL, 1,024 ids per `has` or `prune`, 60 sigchain entries per key per hour,
+  10,000 entries in total, the byte rates and connection limits).
 - `Id`, `PUSH_ID_LEN`, `ProtoError`.

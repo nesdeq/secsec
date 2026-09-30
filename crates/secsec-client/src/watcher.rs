@@ -1,17 +1,14 @@
-//! Filesystem watcher — the §10 live trigger for commit-on-change. Wraps `notify` and **debounces**
-//! a burst of events into a single "directory changed" callback, so an editor's write-rename dance
-//! produces one commit, not dozens. The debounce window is caller-supplied (§19 leaves the cadence
-//! to configuration); `on_change` returns `true` to keep watching, `false` to stop.
+//! Filesystem watcher, the §10 commit-on-change trigger: a burst of events becomes one callback.
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Errors from the watcher.
 #[derive(Debug)]
 pub enum WatchError {
-    /// The underlying `notify` backend failed to start or watch.
+    /// The `notify` backend failed to start, or reported a failure (events may have been lost).
     Notify(notify::Error),
 }
 impl core::fmt::Display for WatchError {
@@ -28,40 +25,44 @@ impl From<notify::Error> for WatchError {
     }
 }
 
-/// Watch `dir` recursively and call `on_change` once per **debounced burst** of filesystem changes.
-/// Blocks: each iteration waits for the first change, then drains further changes until the tree has
-/// been quiet for `debounce`, then fires `on_change`. Returns `Ok(())` when `on_change` returns
-/// `false` (requested stop) or the watcher is dropped. `debounce` is the caller's snapshot cadence
-/// (§10/§19) — there is no hidden default.
-pub fn watch_dir<F>(dir: &Path, debounce: Duration, mut on_change: F) -> Result<(), WatchError>
+/// Watch `dir` recursively; call `on_change` (with the burst's first backend error) once per burst, after `debounce` of quiet or `max_delay`; `false` stops.
+pub fn watch_dir<F>(
+    dir: &Path,
+    debounce: Duration,
+    max_delay: Duration,
+    mut on_change: F,
+) -> Result<(), WatchError>
 where
-    F: FnMut() -> bool,
+    F: FnMut(Option<WatchError>) -> bool,
 {
-    let (tx, rx) = mpsc::channel::<()>();
-    // A successful event is coalesced to a single "something changed" tick; the specific path/op is
-    // not needed (the next snapshot re-reads the whole tree and dedups via content addressing).
+    let (tx, rx) = mpsc::channel::<Option<notify::Error>>();
     let mut watcher: RecommendedWatcher =
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if res.is_ok() {
-                let _ = tx.send(());
-            }
+            let _ = tx.send(res.err());
         })?;
     watcher.watch(dir, RecursiveMode::Recursive)?;
 
     loop {
-        // Block until the first change of a new burst (or the watcher goes away).
-        if rx.recv().is_err() {
+        let Ok(mut error) = rx.recv() else {
             return Ok(());
-        }
-        // Coalesce: keep draining until the tree has been quiet for `debounce`.
+        };
+        let started = Instant::now();
         loop {
-            match rx.recv_timeout(debounce) {
-                Ok(()) => continue,
+            let left = max_delay.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(debounce.min(left)) {
+                Ok(e) => {
+                    if error.is_none() {
+                        error = e;
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }
         }
-        if !on_change() {
+        if !on_change(error.map(WatchError::Notify)) {
             return Ok(());
         }
     }
@@ -72,38 +73,71 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::Instant;
+
+    /// Wait up to `limit` for `count` to reach at least `want`.
+    fn wait_for(count: &AtomicUsize, want: usize, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        while count.load(Ordering::SeqCst) < want && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     #[test]
-    fn debounced_change_fires_once_per_burst() {
+    fn a_burst_fires_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let fired = Arc::new(AtomicUsize::new(0));
-
         let f2 = fired.clone();
         let handle = std::thread::spawn(move || {
-            // ~80 ms debounce; stop after the first fire so the thread exits cleanly.
-            watch_dir(&path, Duration::from_millis(80), || {
-                f2.fetch_add(1, Ordering::SeqCst);
-                false
-            })
+            watch_dir(
+                &path,
+                Duration::from_millis(80),
+                Duration::from_secs(60),
+                |_| {
+                    f2.fetch_add(1, Ordering::SeqCst);
+                    false
+                },
+            )
         });
-
-        // Give the watcher a moment to start, then write a burst of files (one coalesced change).
         std::thread::sleep(Duration::from_millis(150));
         for i in 0..5 {
             std::fs::write(dir.path().join(format!("f{i}")), b"x").unwrap();
         }
+        wait_for(&fired, 1, Duration::from_secs(10));
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        let _ = handle.join();
+    }
 
-        // Wait (generously, for FSEvents latency) for the single debounced fire.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while fired.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+    /// A never-quiet stream still fires once `max_delay` passes.
+    #[test]
+    fn a_continuous_stream_fires_by_max_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let f2 = fired.clone();
+        let handle = std::thread::spawn(move || {
+            watch_dir(
+                &path,
+                Duration::from_secs(30),
+                Duration::from_millis(300),
+                |_| {
+                    f2.fetch_add(1, Ordering::SeqCst);
+                    false
+                },
+            )
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        let writer_ends = Instant::now() + Duration::from_secs(10);
+        let mut i = 0u64;
+        while fired.load(Ordering::SeqCst) == 0 && Instant::now() < writer_ends {
+            std::fs::write(dir.path().join("stream"), i.to_le_bytes()).unwrap();
+            i += 1;
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(
             fired.load(Ordering::SeqCst),
             1,
-            "a burst of writes must coalesce into exactly one change"
+            "fired while events kept coming"
         );
         let _ = handle.join();
     }
